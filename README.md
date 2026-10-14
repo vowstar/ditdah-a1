@@ -36,6 +36,8 @@ E, R, A, and P identify embedded, real-time, application, and performance-orient
 
 ## Credits
 
+- [CHIPS Alliance Rocket](https://github.com/chipsalliance/rocket-chip): processor architecture and configurable hardware design.
+- [CHIPS Alliance T1](https://github.com/chipsalliance/t1): hardware generation and verification workflows.
 - [DitDah-E1](https://github.com/vowstar/ditdah-e1): project structure and reproducible configuration workflow.
 - [Zaozi](https://github.com/xinpian-tech/zaozi): hardware description framework and pinned development tools.
 - [RISC-V specifications](https://riscv.org/specifications/ratified/): instruction and privilege contracts.
