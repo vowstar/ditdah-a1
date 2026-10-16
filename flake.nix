@@ -80,6 +80,16 @@
             --main-class com.vowstar.ditdah.a1.DitDahA1Config \
             ditdah_a1/src -- "$@"
         '';
+        elaborate = pkgs.writeShellScriptBin "elaborate-ditdah-a1" ''
+          set -euo pipefail
+          exec ${pkgs.scala-cli}/bin/scala-cli run ${scalaArgs} \
+            --main-class "com.vowstar.ditdah.a1.''${DITDAH_A1_GENERATOR:-DitDahA1Module}" \
+            "$DITDAH_A1_SOURCE" -- "$@"
+        '';
+        build = pkgs.writeShellScriptBin "build-ditdah-a1" ''
+          set -euo pipefail
+          exec python3 scripts/build_rtl.py "$@"
+        '';
         configuration = pkgs.runCommand "ditdah-a1-configuration" {
           nativeBuildInputs = [
             pkgs.scala-cli
@@ -107,7 +117,7 @@
         };
         devShells.default = pkgs.mkShell {
           buildInputs = [
-            configure pkgs.scala-cli pkgs.circt-install pkgs.mlir-install
+            configure elaborate build pkgs.scala-cli pkgs.circt-install pkgs.mlir-install
             pkgs.jextract pkgs.verilator pkgs.iverilog pkgs.yosys
             (pkgs.python313.withPackages (ps: [ ps.pytest ]))
           ];

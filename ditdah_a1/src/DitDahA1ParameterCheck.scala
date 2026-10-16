@@ -11,7 +11,7 @@ object DitDahA1ParameterCheck:
 
   def run(): Unit =
     val baseline = DitDahA1Parameter()
-    val highAddress = baseline.copy(resetAddress = (BigInt(1) << 40) + 2)
+    val highAddress = baseline.copy(resetVector = (BigInt(1) << 40) + 2)
     val encoded = upickle.default.write(highAddress)
     assert(upickle.default.read[DitDahA1Parameter](encoded) == highAddress)
     assert(DitDahA1Config.parameter(ujson.read(encoded)) == highAddress)
@@ -21,9 +21,9 @@ object DitDahA1ParameterCheck:
     assert(DitDahA1Config.document(baseline)("target")("isa").str == "RV64GCB")
     assert(baseline.copy(l2CacheBytes = 0).l2CacheBytes == 0)
     assert(baseline.copy(virtualAddressBits = 48).virtualAddressBits == 48)
-    rejects { baseline.copy(resetAddress = -1); () }
-    rejects { baseline.copy(resetAddress = 1); () }
-    rejects { baseline.copy(resetAddress = BigInt(1) << 56); () }
+    rejects { baseline.copy(resetVector = -1); () }
+    rejects { baseline.copy(resetVector = 1); () }
+    rejects { baseline.copy(resetVector = BigInt(1) << 56); () }
     rejects { baseline.copy(virtualAddressBits = 32); () }
     rejects { baseline.copy(hartCount = 0); () }
     rejects { baseline.copy(hartCount = 9); () }
@@ -32,4 +32,26 @@ object DitDahA1ParameterCheck:
     rejects { baseline.copy(axiDataBits = 96); () }
     rejects { baseline.copy(pmpEntries = 65); () }
     rejects { DitDahA1Config.parameter(ujson.Obj("unused" -> 1)); () }
+    val rtl = DitDahA1Parameter.uncached
+    rtl.validateRtl()
+    rtl.copy(axiDataBits = 64).validateRtl()
+    rejects { baseline.validateRtl() }
+    rejects { rtl.copy(issueWidth = 2).validateRtl() }
+    rejects { rtl.copy(resetVector = 2).validateRtl() }
+    rejects { rtl.copy(axiDataBits = 256).validateRtl() }
+    rejects { rtl.copy(memoryRegions = Seq(MemoryRegion(), MemoryRegion())).validateRtl() }
+    rejects { MemoryRegion(device = true); () }
+    assert(DitDahA1Config.parameter(ujson.Obj("resetAddress" -> "4")).resetVector == 4)
+    rejects { DitDahA1Config.parameter(ujson.Obj("resetAddress" -> 4, "resetVector" -> 8)); () }
+    assert(DitDahA1Config.document(rtl)("parameters")("resetVector").str == "0")
+    assert(DitDahA1Config.document(rtl)("parameters")("memoryRegions")(0)("readable").bool)
+    assert(DitDahA1Config.document(rtl)("implementation")("maxInflight").num == 5)
+    rejects { DitDahA1Config.parameter(ujson.Obj("memoryRegions" -> ujson.Arr(ujson.Obj("execute" -> false)))); () }
+    rejects { rtl.copy(hartCount = 2).validateRtl() }
+    rejects { rtl.copy(virtualAddressBits = 39).validateRtl() }
+    rejects { rtl.copy(pmpEntries = 1).validateRtl() }
+    rejects { rtl.copy(iCacheBytes = 8192).validateRtl() }
+    rejects { rtl.copy(memoryRegions = Seq.empty).validateRtl() }
+    rejects { rtl.copy(memoryRegions = Seq(MemoryRegion(executable = false))).validateRtl() }
+    rejects { rtl.copy(memoryRegions = Seq(MemoryRegion(base = (BigInt(1) << 56) - 8, size = 16))); () }
     println("Configuration contracts passed")
