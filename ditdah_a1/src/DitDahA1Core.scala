@@ -14,6 +14,40 @@ object DitDahA1Core extends Generator[DitDahA1Parameter, DitDahA1Layers, DitDahA
     parameter.validateCore()
     val io = summon[Interface[DitDahA1CoreIO]]
     val probe = summon[ProbeInterface[DitDahA1Probe]]
+    val frontend = DitDahA1Frontend.instantiate(parameter)
+    val backend = DitDahA1Backend.instantiate(parameter)
+    frontend.io.clock := io.clock
+    frontend.io.reset := io.reset
+    backend.io.clock := io.clock
+    backend.io.reset := io.reset
+    backend.io.instruction :<>= frontend.io.output
+    frontend.io.redirect := backend.io.redirect
+    frontend.io.redirectPc := backend.io.redirectPc
+    io.instruction :<>= frontend.io.memory
+    io.data :<>= backend.io.data
+    io.status :<= backend.io.status
+    layer("DV"):
+      probe.valid <== backend.probe.valid
+      probe.order <== backend.probe.order
+      probe.pc <== backend.probe.pc
+      probe.instruction <== backend.probe.instruction
+      probe.nextPc <== backend.probe.nextPc
+      probe.rd <== backend.probe.rd
+      probe.rdWrite <== backend.probe.rdWrite
+      probe.value <== backend.probe.value
+      probe.trap <== backend.probe.trap
+      probe.cause <== backend.probe.cause
+      probe.tval <== backend.probe.tval
+      probe.pipelineOccupancy <== backend.probe.pipelineOccupancy
+      probe.pipelineStall <== backend.probe.pipelineStall
+
+@generator
+object DitDahA1Backend extends Generator[DitDahA1Parameter, DitDahA1Layers, DitDahA1BackendIO, DitDahA1Probe]:
+  override def moduleName(parameter: DitDahA1Parameter): String = "DitDahA1Backend"
+  def architecture(parameter: DitDahA1Parameter) =
+    parameter.validateBackend()
+    val io = summon[Interface[DitDahA1BackendIO]]
+    val probe = summon[ProbeInterface[DitDahA1Probe]]
     given ClockScope = ClockScope.posedge(io.clock)
     given ResetScope = ResetScope.syncActiveHigh(io.reset)
     val decodedValid = RegInit(false.B)
@@ -25,7 +59,6 @@ object DitDahA1Core extends Generator[DitDahA1Parameter, DitDahA1Layers, DitDahA
     val resultPacket = Reg(new ResultPacket)
     val commitPacket = Reg(new ResultPacket)
     val memoryPending = RegInit(false.B)
-    val frontend = DitDahA1Frontend.instantiate(parameter)
     val decode = DitDahA1Decode.instantiate(parameter)
     val issue = DitDahA1Issue.instantiate(parameter)
     val execute = DitDahA1Execute.instantiate(parameter)
@@ -33,15 +66,13 @@ object DitDahA1Core extends Generator[DitDahA1Parameter, DitDahA1Layers, DitDahA
     val gpr = DitDahA1Gpr.instantiate(parameter)
     val csr = DitDahA1Csr.instantiate(parameter)
     val lsu = DitDahA1Lsu.instantiate(parameter)
-    frontend.io.clock := io.clock
-    frontend.io.reset := io.reset
     gpr.io.clock := io.clock
     gpr.io.reset := io.reset
     csr.io.clock := io.clock
     csr.io.reset := io.reset
     lsu.io.clock := io.clock
     lsu.io.reset := io.reset
-    decode.io.input :<>= frontend.io.output
+    decode.io.input :<>= io.instruction
     issue.io.input.bits :<= decodedPacket
     execute.io.input.bits :<= issuedPacket
     gpr.io.raddr1 := issue.io.raddr1
@@ -80,8 +111,8 @@ object DitDahA1Core extends Generator[DitDahA1Parameter, DitDahA1Layers, DitDahA
     val issued = issue.io.output.valid & issue.io.output.ready
     decode.io.output.ready := (!decodedValid | issued) & !redirect
     val decoded = decode.io.output.valid & decode.io.output.ready
-    frontend.io.redirect := redirect
-    frontend.io.redirectPc := retire.bits.nextPc
+    io.redirect := redirect
+    io.redirectPc := retire.bits.nextPc
     lsu.io.input.valid := resultValid & memoryOperation & !memoryPending & !commitValid & !redirect
     lsu.io.input.bits :<= resultPacket
     lsu.io.storeAllowed := !commitValid & !redirect
@@ -100,7 +131,6 @@ object DitDahA1Core extends Generator[DitDahA1Parameter, DitDahA1Layers, DitDahA
     io.status.trap := csr.io.trap
     io.status.busy := true.B
     io.status.sleep := false.B
-    io.instruction :<>= frontend.io.memory
     io.data :<>= lsu.io.memory
     when(retired) { commitValid := false.B }
     when(resultAdvance) {

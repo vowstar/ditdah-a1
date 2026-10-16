@@ -37,6 +37,8 @@ object DitDahA1ParameterCheck:
     rtl.copy(axiDataBits = 64).validateRtl()
     rtl.copy(issueWidth = 2).validateFrontend()
     rejects { rtl.copy(resetVector = 2).validateFrontend() }
+    rtl.copy(resetVector = 2, axiDataBits = 512, iCacheBytes = 8192).validateBackend()
+    rejects { rtl.copy(issueWidth = 2).validateBackend() }
     rtl.copy(axiDataBits = 256).validateCore()
     rtl.copy(iCacheBytes = 8192).validateCore()
     rejects { rtl.copy(issueWidth = 2).validateCore() }

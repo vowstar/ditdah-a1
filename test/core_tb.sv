@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2026 Huang Rui <vowstar@gmail.com>
 // SPDX-License-Identifier: MIT
 `timescale 1ns/1ps
-`define CORE_TRACE dut.core.dV
+`define CORE_TRACE dut.core.backend.dV
 module core_tb;
   localparam integer DW = `AXI_BITS;
   localparam integer PA = `PA_BITS;

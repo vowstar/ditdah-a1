@@ -24,7 +24,7 @@ def main():
     trace_options = parser.add_mutually_exclusive_group()
     trace_options.add_argument("--trace", action="store_true", default=None)
     trace_options.add_argument("--no-trace", action="store_false", dest="trace")
-    parser.add_argument("--top", choices=["DitDahA1", "DitDahA1Core", "DitDahA1Frontend", "DitDahA1MemoryFabric", "DitDahA1Fetch", "DitDahA1Lsu"], default="DitDahA1")
+    parser.add_argument("--top", choices=["DitDahA1", "DitDahA1Core", "DitDahA1Backend", "DitDahA1Frontend", "DitDahA1MemoryFabric", "DitDahA1Fetch", "DitDahA1Lsu"], default="DitDahA1")
     args = parser.parse_args()
     hashes = source_hashes()
     output = args.output.resolve()
@@ -33,7 +33,7 @@ def main():
     scratch = scratch if scratch.is_dir() and os.access(scratch, os.W_OK) else None
     with tempfile.TemporaryDirectory(prefix="ditdah-a1-", dir=scratch) as directory:
         work = Path(directory)
-        scope = {"DitDahA1Core": "core", "DitDahA1Frontend": "frontend", "DitDahA1MemoryFabric": "fabric"}.get(args.top, "system")
+        scope = {"DitDahA1Core": "core", "DitDahA1Backend": "backend", "DitDahA1Frontend": "frontend", "DitDahA1MemoryFabric": "fabric"}.get(args.top, "system")
         command = ["configure-ditdah-a1", "--output", str(work / "manifest.json")]
         if scope == "system":
             command += ["--rtl"]

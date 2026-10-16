@@ -188,6 +188,7 @@ def main():
         report = compare(binary, directory, manifest['parameters'])
         report['interfaceContracts'] = ['fetch cancellation and identity', 'LSU authorization and completion',
                                         'frontend sequencing and redirects',
+                                        'backend instruction packets, hazards, and precise traps',
                                         'decode dependencies', 'memory arbitration and response ownership',
                                         'memory permissions and transfer attributes', 'AXI request and response handling',
                                         'physical fabric ownership, backpressure, and faults']
@@ -217,6 +218,8 @@ def main():
     Path('result/frontend-input.json').write_text(json.dumps(frontend_config, indent=2) + '\n')
     fabric_config = dict(frontend_config, resetVector='2', hartCount=8, virtualAddressBits=48, pmpEntries=16)
     Path('result/fabric-input.json').write_text(json.dumps(fabric_config, indent=2) + '\n')
+    backend_config = dict(fabric_config, issueWidth=1)
+    Path('result/backend-input.json').write_text(json.dumps(backend_config, indent=2) + '\n')
     summary['sourceHashes'] = {str(p): hashlib.sha256(p.read_bytes()).hexdigest()
                               for p in sorted(Path('ditdah_a1/src').glob('*.scala'))}
     for name, digest in test_hashes.items():

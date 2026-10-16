@@ -41,9 +41,12 @@ case class DitDahA1Parameter(
   def validateFrontend(): Unit =
     require((resetVector & 3) == 0, "Frontend requires a word-aligned resetVector")
 
+  def validateBackend(): Unit =
+    require(issueWidth == 1, "Backend supports single issue")
+
   def validateCore(): Unit =
     validateFrontend()
-    require(issueWidth == 1, "Core supports single issue")
+    validateBackend()
 
   def validateRtl(): Unit =
     validateCore()

@@ -21,7 +21,7 @@ endinterface
   .P``_request_bits_fetch(B.request.fetch), .P``_response_ready(B.response_ready), \
   .P``_response_valid(B.response_valid), .P``_response_bits_data(B.response.data), \
   .P``_response_bits_fault(B.response.fault), .P``_response_bits_tag(B.response.tag)
-`define CORE_TRACE dut.dV
+`define CORE_TRACE dut.backend.dV
 module memory_tb;
   logic clock = 0, reset = 1;
   always #5 clock = ~clock;

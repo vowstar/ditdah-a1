@@ -7,6 +7,8 @@ import json
 import re
 import subprocess
 
+from programs import addi, csr, sd
+
 
 FETCH = r'''
     request_bits_pc = 64'h100; request_bits_tag = 8'h21;
@@ -381,6 +383,58 @@ def fabric_contract(parameters):
 '''
 
 
+def backend_contract():
+    words = [(2 << 12) | (1 << 7) | 0x37, addi(2, 0, 42), sd(2, 1), 0x73, sd(2, 1, 8)]
+    body = '    instruction_bits_length = 4;\n'
+    for index, word in enumerate(words):
+        body += f'''
+    instruction_bits_pc = 'h{0x100 + 4 * index:x}; instruction_bits_instruction = 'h{word:x};
+    instruction_bits_tag = {index}; instruction_valid = 1;
+    while (!instruction_ready) tick();
+    tick(); instruction_valid = 0;
+'''
+    body += f'''
+    while (!data_request_valid) tick();
+    instruction_bits_pc = 'h114; instruction_bits_instruction = 'h{addi(0, 0, 0):x};
+    instruction_bits_tag = 5; instruction_valid = 1;
+    repeat (3) begin
+      check(!instruction_ready && data_request_valid && data_request_bits_write && data_request_bits_address == 'h2000 && data_request_bits_data == 42 && data_request_bits_mask == 255 && data_request_bits_tag == 2, "Backend RAW dependencies and blocked store"); tick();
+    end
+    data_request_ready = 1; tick(); data_request_ready = 0;
+    data_response_bits_tag = 2; data_response_valid = 1; tick(); data_response_valid = 0;
+    while (!redirect) begin
+      check(!data_request_valid, "Younger store escaped before trap");
+      if (instruction_valid && instruction_ready) begin tick(); instruction_valid = 0; end
+      else tick();
+    end
+    check(redirectPc == 0 && status_trap && !instruction_ready && !data_request_valid, "Precise trap redirect");
+    instruction_valid = 0; tick();
+    repeat (3) begin check(!data_request_valid, "Younger store survived redirect"); tick(); end
+    instruction_bits_pc = 'h200; instruction_bits_instruction = 'h{sd(2, 1):x};
+    instruction_bits_tag = 6; instruction_bits_fault = 1;
+    instruction_bits_cause = 1; instruction_bits_tval = 'h200; instruction_valid = 1;
+    while (!instruction_ready) tick();
+    tick(); instruction_valid = 0;
+    while (!redirect) begin check(!data_request_valid, "Fault packet caused a data access"); tick(); end
+    check(redirectPc == 0 && status_trap, "Injected instruction fault");
+    tick(); instruction_bits_fault = 0; instruction_bits_cause = 0; instruction_bits_tval = 0;
+'''
+    for index, word in enumerate((csr(3, 0x342, 0, True), sd(3, 1))):
+        body += f'''
+    instruction_bits_pc = 'h{0x300 + 4 * index:x}; instruction_bits_instruction = 'h{word:x};
+    instruction_bits_tag = {7 + index}; instruction_valid = 1;
+    while (!instruction_ready) tick();
+    tick(); instruction_valid = 0;
+'''
+    return body + '''
+    while (!data_request_valid) tick();
+    check(data_request_bits_write && data_request_bits_address == 'h2000 && data_request_bits_data == 1 && data_request_bits_tag == 8, "Fault context survived retirement");
+    data_request_ready = 1; tick(); data_request_ready = 0;
+    data_response_bits_tag = 8; data_response_valid = 1; tick(); data_response_valid = 0;
+    repeat (6) begin check(!data_request_valid && !redirect, "Unexpected backend effect"); tick(); end
+'''
+
+
 def bench(module, body):
     header = module.read_text().split(');', 1)[0].split('(', 1)[1]
     declarations, connections, names = [], [], []
@@ -421,6 +475,7 @@ def verify(rtl, directory):
     for name, body in (('DitDahA1Fetch', FETCH), ('DitDahA1Lsu', LSU),
                        ('DitDahA1Frontend', frontend_contract(parameters)),
                        ('DitDahA1Decode', decode_contract()),
+                       ('DitDahA1Backend', backend_contract()),
                        ('DitDahA1MemoryArbiter', ARBITER),
                        ('DitDahA1Memory', memory_contract(parameters)),
                        ('DitDahA1Axi', axi_contract(parameters['axiDataBits'])),
@@ -432,6 +487,8 @@ def verify(rtl, directory):
         dependencies = [rtl / 'DitDahA1Fetch.sv'] if name == 'DitDahA1Frontend' else []
         if name == 'DitDahA1MemoryFabric':
             dependencies = [rtl / (child + '.sv') for child in ('DitDahA1MemoryArbiter', 'DitDahA1Memory', 'DitDahA1Axi')]
+        if name == 'DitDahA1Backend':
+            dependencies = [rtl / ('DitDahA1' + child + '.sv') for child in ('Decode', 'Issue', 'Execute', 'Commit', 'Gpr', 'Csr', 'Lsu')]
         subprocess.run(['iverilog', '-g2012', '-s', 'contract_tb', '-o', str(binary),
                         str(module), *map(str, dependencies), str(test)], check=True)
         result = subprocess.run(['vvp', str(binary)], capture_output=True, text=True, timeout=30)

@@ -7,17 +7,20 @@ import json
 import subprocess
 
 for directory, top in (("production", "DitDahA1"), ("core", "DitDahA1Core"),
-                       ("frontend", "DitDahA1Frontend"), ("fabric", "DitDahA1MemoryFabric")):
+                       ("frontend", "DitDahA1Frontend"), ("fabric", "DitDahA1MemoryFabric"), ("backend", "DitDahA1Backend")):
     rtl = Path("result") / directory
     manifest = json.loads((rtl / 'ditdah_a1_config.json').read_text())
-    assert manifest['validationScope'] == {'production': 'system', 'core': 'core', 'frontend': 'frontend', 'fabric': 'fabric'}[directory]
+    assert manifest['validationScope'] == {'production': 'system', 'core': 'core', 'frontend': 'frontend', 'fabric': 'fabric', 'backend': 'backend'}[directory]
     files = (rtl / "filelist.f").read_text().splitlines()
     assert files and all("DV" not in name and not name.startswith("ref_") for name in files)
     assert not list(rtl.glob("*DV*.sv")) and not list(rtl.glob("ref_*.sv"))
     header = (rtl / (top + ".sv")).read_text().split(");", 1)[0]
     assert "trace" not in header.lower()
-    if top in ("DitDahA1Core", "DitDahA1Frontend"):
+    if top in ("DitDahA1Core", "DitDahA1Frontend", "DitDahA1Backend"):
         assert "axi_" not in header
+    if top == 'DitDahA1Backend':
+        assert set(files) == {'DitDahA1' + name + '.sv' for name in ('Backend', 'Decode', 'Issue', 'Execute', 'Commit', 'Gpr', 'Csr', 'Lsu')}
+        assert (rtl / (top + '.sv')).read_bytes() == Path('result/verify/axi512/rtl', top + '.sv').read_bytes()
     if top == 'DitDahA1MemoryFabric':
         assert set(files) == {name + '.sv' for name in (top, 'DitDahA1MemoryArbiter', 'DitDahA1Memory', 'DitDahA1Axi')}
         integrated = Path('result/verify/axi512/rtl')
@@ -31,7 +34,8 @@ directory.mkdir(exist_ok=True)
 parameters = json.loads(Path('result/production/ditdah_a1_config.json').read_text())['parameters']
 for index, (top, overrides, diagnostic) in enumerate((
         ('DitDahA1', {'iCacheBytes': 8192}, 'RTL supports uncached memory'),
-        ('DitDahA1Core', {'issueWidth': 2}, 'Core supports single issue'),
+        ('DitDahA1Core', {'issueWidth': 2}, 'Backend supports single issue'),
+        ('DitDahA1Backend', {'issueWidth': 2}, 'Backend supports single issue'),
         ('DitDahA1Frontend', {'resetVector': '2'}, 'Frontend requires a word-aligned resetVector'),
         ('DitDahA1MemoryFabric', {'axiDataBits': 96}, 'axiDataBits must be'),
         ('DitDahA1MemoryFabric', {'memoryRegions': [{'base': '0', 'size': '16'}, {'base': '8', 'size': '8'}]}, 'Memory regions must not overlap'))):
