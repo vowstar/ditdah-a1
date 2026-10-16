@@ -37,13 +37,13 @@ def configuration(width):
                 memoryRegions=regions)
 
 
-def compile_tb(rtl, directory, width, pa, top='core_tb', source=None):
+def compile_tb(rtl, directory, width, pa, top='core_tb', source=None, extra_files=()):
     source = source or Path('test/core_tb.sv').resolve()
     files = [(rtl / name).resolve() for name in (rtl / 'filelist.f').read_text().splitlines()]
     run(['verilator', '--binary', '--timing', '--assert', '-j', '2', '--top-module', top,
          '-Wno-TIMESCALEMOD', '-Wno-WIDTHTRUNC', '-Wno-WIDTHEXPAND',
          f'-DAXI_BITS={width}', f'-DPA_BITS={pa}', '-I' + str(rtl.resolve()),
-         '--Mdir', str((directory / 'obj').resolve()), *files, source], directory / 'compile.log')
+         '--Mdir', str((directory / 'obj').resolve()), *files, *extra_files, source], directory / 'compile.log')
     return (directory / 'obj' / ('V' + top)).resolve()
 
 
@@ -91,9 +91,11 @@ def check_fetches(lines, config, faults):
     return dict(accepted=accepted, completed=completed, discarded=sum(fetched.values()) + sum(failed.values()))
 
 
-def compare(binary, directory, config):
+def compare(binary, directory, config, transport='axi'):
     base = int(config['resetVector'])
     coverage = [0] * 6
+    coverage_names = (('awBeforeW', 'wBeforeAw', 'awWithW', 'arStall', 'awStall', 'wStall') if transport == 'axi'
+                      else ('overlap', 'instructionStall', 'dataStall', 'responseDelay', 'permissionReject', 'tagWrap'))
     count = 0
     reports = []
     pipeline_max, dependency_stalls = 0, 0
@@ -126,6 +128,10 @@ def compare(binary, directory, config):
             data_bus = [event for event in bus if event[0] != 'fetch']
             expected_bus = [event for event in model.bus if event[0] != 'fetch']
             assert data_bus == expected_bus, f'{name}: unexpected data accesses\nactual {data_bus}\nexpected {expected_bus}'
+            if transport == 'memory':
+                requests = [(v[1], int(v[2], 16), int(v[3]), int(v[4], 16)) for line in lines
+                            if line.startswith('REQUEST ') for v in [line.split()] if v[1] != 'fetch']
+                assert requests == [r for r in model.requests if r[0] != 'fetch'], f'{name}: unexpected Core requests'
             fetches = check_fetches(lines, config, program.faults)
             if name == 'pipeline_redirect':
                 fault = program.faults['fetch']
@@ -142,10 +148,10 @@ def compare(binary, directory, config):
             count += len(actual)
             reports.append(dict(test=name, seed=seed, events=len(actual), busTransactions=len(bus), fetches=fetches))
         print(f'  {name}: {len(expected)} events, three bus schedules', flush=True)
-    assert all(coverage), f'AXI scheduling coverage missing: {coverage}'
+    assert all(coverage), f'{transport} coverage missing: {dict(zip(coverage_names, coverage))}'
     assert pipeline_max >= 2 and dependency_stalls, f'Pipeline coverage missing: {pipeline_max}, {dependency_stalls}'
     return dict(events=count, cases=reports, pipelineCoverage=dict(maxOccupancy=pipeline_max, dependencyStalls=dependency_stalls),
-                busCoverage=dict(zip(('awBeforeW', 'wBeforeAw', 'awWithW', 'arStall', 'awStall', 'wStall'), coverage)))
+                **{('busCoverage' if transport == 'axi' else 'portCoverage'): dict(zip(coverage_names, coverage))})
 
 
 def main():
@@ -169,6 +175,7 @@ def main():
             print(f'Generating AXI{width} RTL', flush=True)
             run(['build-ditdah-a1', '--trace', '--config', config_path, '--output', rtl], directory / 'build.log')
         manifest = json.loads((rtl / 'ditdah_a1_config.json').read_text())
+        assert manifest['top'] == 'DitDahA1' and manifest['validationScope'] == 'system'
         assert manifest.get('sourceHashes'), 'Generated RTL has no source provenance'
         for name, digest in manifest['sourceHashes'].items():
             assert hashlib.sha256(Path(name).read_bytes()).hexdigest() == digest, f'Stale RTL source: {name}'
@@ -183,7 +190,24 @@ def main():
                                         'decode dependencies', 'memory arbitration and response ownership',
                                         'memory permissions and transfer attributes', 'AXI request and response handling']
         report.update(axiDataBits=width, physicalAddressBits=config['physicalAddressBits'])
+        core = directory / 'core'
+        core.mkdir(exist_ok=True)
+        core_config = dict(config, axiDataBits=256, iCacheBytes=8192)
+        core_input = core / 'input.json'
+        core_input.write_text(json.dumps(core_config, indent=2) + '\n')
+        if not args.use_generated:
+            run(['build-ditdah-a1', '--top', 'DitDahA1Core', '--trace', '--config', core_input, '--output', core / 'rtl'], core / 'build.log')
+        core_manifest = json.loads((core / 'rtl/ditdah_a1_config.json').read_text())
+        assert core_manifest['top'] == 'DitDahA1Core' and core_manifest['validationScope'] == 'core'
+        assert all(core_manifest['parameters'][k] == v for k, v in core_config.items()), 'Stale Core configuration'
+        assert core_manifest['sourceHashes'] == manifest['sourceHashes'], 'Stale Core sources'
+        assert not (core / 'rtl/DitDahA1Axi.sv').exists(), 'AXI dependency in standalone Core'
+        binary = compile_tb(core / 'rtl', core, width, config['physicalAddressBits'], 'memory_tb',
+                            Path('test/memory_tb.sv').resolve(), [(rtl / 'DitDahA1Memory.sv').resolve()])
+        report['core'] = compare(binary, core, core_manifest['parameters'], 'memory')
         summary['configurations'].append(report)
+    frontend_config = dict(configuration(128), issueWidth=2, axiDataBits=512, iCacheBytes=8192)
+    Path('result/frontend-input.json').write_text(json.dumps(frontend_config, indent=2) + '\n')
     summary['sourceHashes'] = {str(p): hashlib.sha256(p.read_bytes()).hexdigest()
                               for p in sorted(Path('ditdah_a1/src').glob('*.scala'))}
     for name, digest in test_hashes.items():

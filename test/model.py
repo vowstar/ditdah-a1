@@ -26,12 +26,14 @@ class Model:
                                                0xf11, 0xf12, 0xf13, 0xf14)}
         self.csrs[0x300] = 0x1800
         self.bus = []
+        self.requests = []
         self.order = 0
 
     def access(self, address, size, kind, data=0):
         cause = {'fetch': 1, 'read': 5, 'write': 7}[kind]
         if address % size:
             raise Fault({'fetch': 0, 'read': 4, 'write': 6}[kind], address)
+        self.requests.append((kind, address, size, data if kind == 'write' else 0))
         permission = {'fetch': 'executable', 'read': 'readable', 'write': 'writable'}[kind]
         allowed = any(int(r['base']) <= address and address + size <= int(r['base']) + int(r['size'])
                       and r[permission] for r in self.config['memoryRegions'])

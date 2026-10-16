@@ -33,7 +33,10 @@ def main():
     scratch = scratch if scratch.is_dir() and os.access(scratch, os.W_OK) else None
     with tempfile.TemporaryDirectory(prefix="ditdah-a1-", dir=scratch) as directory:
         work = Path(directory)
-        command = ["configure-ditdah-a1", "--rtl", "--output", str(work / "manifest.json")]
+        scope = {"DitDahA1Core": "core", "DitDahA1Frontend": "frontend"}.get(args.top, "system")
+        command = ["configure-ditdah-a1", "--output", str(work / "manifest.json")]
+        if scope == "system":
+            command += ["--rtl"]
         if args.config:
             command += ["--config", str(args.config.resolve())]
         subprocess.run(command, check=True)
@@ -41,6 +44,7 @@ def main():
         trace = manifest["parameters"]["enableTrace"] if args.trace is None else args.trace
         manifest["parameters"]["enableTrace"] = trace
         manifest["top"] = args.top
+        manifest["validationScope"] = scope
         manifest["sourceHashes"] = hashes
         parameter = work / "parameter.json"
         parameter.write_text(json.dumps(manifest["parameters"]))
