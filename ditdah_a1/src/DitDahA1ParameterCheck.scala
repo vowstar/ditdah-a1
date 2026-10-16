@@ -35,6 +35,12 @@ object DitDahA1ParameterCheck:
     val rtl = DitDahA1Parameter.uncached
     rtl.validateRtl()
     rtl.copy(axiDataBits = 64).validateRtl()
+    rtl.copy(issueWidth = 2).validateFrontend()
+    rejects { rtl.copy(resetVector = 2).validateFrontend() }
+    rtl.copy(axiDataBits = 256).validateCore()
+    rtl.copy(iCacheBytes = 8192).validateCore()
+    rejects { rtl.copy(issueWidth = 2).validateCore() }
+    rejects { rtl.copy(resetVector = 2).validateCore() }
     rejects { baseline.validateRtl() }
     rejects { rtl.copy(issueWidth = 2).validateRtl() }
     rejects { rtl.copy(resetVector = 2).validateRtl() }

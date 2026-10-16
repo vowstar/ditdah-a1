@@ -179,6 +179,7 @@ def main():
         print(f'Checking AXI{width}', flush=True)
         report = compare(binary, directory, manifest['parameters'])
         report['interfaceContracts'] = ['fetch cancellation and identity', 'LSU authorization and completion',
+                                        'frontend sequencing and redirects',
                                         'decode dependencies', 'memory arbitration and response ownership',
                                         'memory permissions and transfer attributes', 'AXI request and response handling']
         report.update(axiDataBits=width, physicalAddressBits=config['physicalAddressBits'])

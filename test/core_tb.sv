@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: 2026 Huang Rui <vowstar@gmail.com>
 // SPDX-License-Identifier: MIT
 `timescale 1ns/1ps
+`define CORE_TRACE dut.core.dV
 module core_tb;
   localparam integer DW = `AXI_BITS;
   localparam integer PA = `PA_BITS;
@@ -75,9 +76,9 @@ module core_tb;
       if (arvalid && !arready) ar_stall <= ar_stall + 1;
       if (awvalid && !awready) aw_stall <= aw_stall + 1;
       if (wvalid && !wready) w_stall <= w_stall + 1;
-      if (dut.dV.pipelineOccupancy > 4) $fatal(1, "Pipeline occupancy");
-      if (dut.dV.pipelineOccupancy > pipeline_max) pipeline_max <= dut.dV.pipelineOccupancy;
-      if (dut.dV.pipelineStall) dependency_stalls <= dependency_stalls + 1;
+      if (`CORE_TRACE.pipelineOccupancy > 4) $fatal(1, "Pipeline occupancy");
+      if (`CORE_TRACE.pipelineOccupancy > pipeline_max) pipeline_max <= `CORE_TRACE.pipelineOccupancy;
+      if (`CORE_TRACE.pipelineStall) dependency_stalls <= dependency_stalls + 1;
       if (arvalid && arready) begin
         if (64'(araddr) < base_address || 64'(araddr) >= base_address + 65536) $fatal(1, "Truncated or unexpected read address");
         if (arid != 0 || arlen != 0 || arburst != 1 || arlock || arcache != 0 || arqos != 0) $fatal(1, "Read attributes");
@@ -142,13 +143,13 @@ module core_tb;
         aw_held <= 0;
         w_held <= 0;
       end
-      if (dut.dV.traceValid) begin
-        if (dut.dV.traceRdWrite && dut.dV.traceRd == 0) $fatal(1, "x0 write");
+      if (`CORE_TRACE.traceValid) begin
+        if (`CORE_TRACE.traceRdWrite && `CORE_TRACE.traceRd == 0) $fatal(1, "x0 write");
         $display("TRACE %016h %016h %08h %016h %02h %01h %016h %01h %016h %016h",
-          dut.dV.traceOrder, dut.dV.tracePc, dut.dV.traceInstruction, dut.dV.traceNextPc,
-          dut.dV.traceRd, dut.dV.traceRdWrite, dut.dV.traceValue, dut.dV.traceTrap,
-          dut.dV.traceCause, dut.dV.traceTval);
-        if (!dut.dV.traceTrap && dut.dV.tracePc == stop_pc) begin
+          `CORE_TRACE.traceOrder, `CORE_TRACE.tracePc, `CORE_TRACE.traceInstruction, `CORE_TRACE.traceNextPc,
+          `CORE_TRACE.traceRd, `CORE_TRACE.traceRdWrite, `CORE_TRACE.traceValue, `CORE_TRACE.traceTrap,
+          `CORE_TRACE.traceCause, `CORE_TRACE.traceTval);
+        if (!`CORE_TRACE.traceTrap && `CORE_TRACE.tracePc == stop_pc) begin
           $display("COVER %0d %0d %0d %0d %0d %0d", aw_first, w_first, together, ar_stall, aw_stall, w_stall);
           $display("PIPELINE %0d %0d", pipeline_max, dependency_stalls);
           $display("PASS");

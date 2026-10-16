@@ -127,3 +127,18 @@ class DitDahA1Probe(parameter: DitDahA1Parameter) extends DVBundle[DitDahA1Param
   val tval = ProbeRead(UInt(64), dv)
   val pipelineOccupancy = ProbeRead(UInt(3), dv)
   val pipelineStall = ProbeRead(Bool(), dv)
+
+class DitDahA1CoreIO(parameter: DitDahA1Parameter) extends HWBundle(parameter):
+  val clock = Flipped(Clock())
+  val reset = Flipped(Reset())
+  val instruction = Aligned(new MemoryPort)
+  val data = Aligned(new MemoryPort)
+  val status = Aligned(new StatusBundle)
+
+class DitDahA1FrontendIO(parameter: DitDahA1Parameter) extends HWBundle(parameter):
+  val clock = Flipped(Clock())
+  val reset = Flipped(Reset())
+  val redirect = Flipped(Bool())
+  val redirectPc = Flipped(UInt(64))
+  val output = Aligned(new Decoupled(new FetchPacket))
+  val memory = Aligned(new MemoryPort)

@@ -286,6 +286,44 @@ def axi_contract(width):
     return body
 
 
+def frontend_contract(parameters):
+    base = int(parameters['resetVector'])
+    return f'''
+    check(memory_request_valid && memory_request_bits_address == 64'h{base:x} && memory_request_bits_tag == 0, "Initial frontend request");
+    repeat (3) tick();
+    memory_request_ready = 1; tick(); memory_request_ready = 0;
+    memory_response_valid = 1; memory_response_bits_tag = 0;
+    memory_response_bits_data = 64'h12345037;
+    tick(); memory_response_valid = 0;
+    repeat (3) begin
+      check(output_valid && output_bits_pc == 64'h{base:x} && output_bits_tag == 0 && output_bits_length == 4 && output_bits_instruction == 32'h12345037, "Frontend result hold");
+      tick();
+    end
+    output_ready = 1; tick(); output_ready = 0;
+    tick();
+    check(memory_request_valid && memory_request_bits_address == 64'h{base+4:x} && memory_request_bits_tag == 1, "Sequential frontend PC");
+    redirect = 1; redirectPc = 64'h{base+0x100:x}; tick(); redirect = 0;
+    repeat (3) begin
+      check(memory_request_valid && memory_request_bits_address == 64'h{base+4:x} && memory_request_bits_tag == 1, "Redirect request stability");
+      tick();
+    end
+    memory_request_ready = 1; tick(); memory_request_ready = 0;
+    memory_response_valid = 1; memory_response_bits_fault = 1; memory_response_bits_tag = 1;
+    tick(); memory_response_valid = 0; memory_response_bits_fault = 0;
+    check(!output_valid, "Late cancelled fault escaped");
+    tick(); tick();
+    check(memory_request_valid && memory_request_bits_address == 64'h{base+0x100:x} && memory_request_bits_tag == 2, "Redirect target request");
+    memory_request_ready = 1; tick(); memory_request_ready = 0;
+    memory_response_valid = 1; memory_response_bits_tag = 2;
+    tick(); memory_response_valid = 0;
+    check(output_valid && output_bits_pc == 64'h{base+0x100:x}, "Redirect target delivery");
+    output_ready = 1; redirect = 1; redirectPc = 64'h{base+0x200:x};
+    tick(); output_ready = 0; redirect = 0;
+    tick();
+    check(memory_request_valid && memory_request_bits_address == 64'h{base+0x200:x} && memory_request_bits_tag == 3, "Redirect priority over output consumption");
+'''
+
+
 def bench(module, body):
     header = module.read_text().split(');', 1)[0].split('(', 1)[1]
     declarations, connections, names = [], [], []
@@ -324,6 +362,7 @@ def verify(rtl, directory):
     directory.mkdir(parents=True, exist_ok=True)
     parameters = json.loads((rtl / 'ditdah_a1_config.json').read_text())['parameters']
     for name, body in (('DitDahA1Fetch', FETCH), ('DitDahA1Lsu', LSU),
+                       ('DitDahA1Frontend', frontend_contract(parameters)),
                        ('DitDahA1Decode', decode_contract()),
                        ('DitDahA1MemoryArbiter', ARBITER),
                        ('DitDahA1Memory', memory_contract(parameters)),
@@ -332,7 +371,9 @@ def verify(rtl, directory):
         test = directory / (name + '_tb.sv')
         test.write_text(bench(module, body))
         binary = directory / name
-        subprocess.run(['iverilog', '-g2012', '-s', 'contract_tb', '-o', str(binary), str(module), str(test)], check=True)
+        dependencies = [rtl / 'DitDahA1Fetch.sv'] if name == 'DitDahA1Frontend' else []
+        subprocess.run(['iverilog', '-g2012', '-s', 'contract_tb', '-o', str(binary),
+                        str(module), *map(str, dependencies), str(test)], check=True)
         result = subprocess.run(['vvp', str(binary)], capture_output=True, text=True, timeout=30)
         (directory / (name + '.log')).write_text(result.stdout + result.stderr)
         assert result.returncode == 0 and 'PASS' in result.stdout, result.stdout + result.stderr

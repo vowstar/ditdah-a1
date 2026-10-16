@@ -15,6 +15,8 @@ rtl:
 verify-signoff: config check
 	python3 test/verify.py
 	build-ditdah-a1 --output result/production
+	build-ditdah-a1 --top DitDahA1Core --output result/core
+	build-ditdah-a1 --top DitDahA1Frontend --output result/frontend
 	python3 test/check_production.py
 
 clean:

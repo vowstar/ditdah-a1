@@ -30,7 +30,7 @@ object DitDahA1Execute extends Generator[DitDahA1Parameter, DitDahA1UnitLayers, 
     val imm = d.immediate
     val addImm = (a + imm).asBits.bits(63, 0).asUInt
     val pcImm = (insn.pc + imm).asBits.bits(63, 0).asUInt
-    val sequential = (insn.pc + 4.U(64)).asBits.bits(63, 0).asUInt
+    val sequential = (insn.pc + insn.length).asBits.bits(63, 0).asUInt
     io.input.ready := io.output.ready
     io.output.valid := io.input.valid
     io.csrAddress := insn.instruction.asBits.bits(31, 20).asUInt
