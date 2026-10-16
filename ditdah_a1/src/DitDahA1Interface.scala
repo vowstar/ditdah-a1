@@ -142,3 +142,10 @@ class DitDahA1FrontendIO(parameter: DitDahA1Parameter) extends HWBundle(paramete
   val redirectPc = Flipped(UInt(64))
   val output = Aligned(new Decoupled(new FetchPacket))
   val memory = Aligned(new MemoryPort)
+
+class DitDahA1MemoryFabricIO(parameter: DitDahA1Parameter) extends HWBundle(parameter):
+  val clock = Flipped(Clock())
+  val reset = Flipped(Reset())
+  val instruction = Flipped(new MemoryPort)
+  val data = Flipped(new MemoryPort)
+  val axi = Aligned(new AxiBundle(parameter))

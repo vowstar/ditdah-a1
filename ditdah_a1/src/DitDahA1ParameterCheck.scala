@@ -44,7 +44,7 @@ object DitDahA1ParameterCheck:
     rejects { baseline.validateRtl() }
     rejects { rtl.copy(issueWidth = 2).validateRtl() }
     rejects { rtl.copy(resetVector = 2).validateRtl() }
-    rejects { rtl.copy(axiDataBits = 256).validateRtl() }
+    for width <- Seq(64, 128, 256, 512) do rtl.copy(axiDataBits = width).validateRtl()
     rejects { rtl.copy(memoryRegions = Seq(MemoryRegion(), MemoryRegion())).validateRtl() }
     rejects { MemoryRegion(device = true); () }
     assert(DitDahA1Config.parameter(ujson.Obj("resetAddress" -> "4")).resetVector == 4)

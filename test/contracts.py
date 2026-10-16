@@ -251,7 +251,7 @@ def axi_contract(width):
     for size in range(4):
         byte_count = 1 << size
         mask = (1 << byte_count) - (2 if byte_count > 1 else 1)
-        for lane in sorted({0, bus_bytes - byte_count}):
+        for lane in range(0, bus_bytes, byte_count):
             for write in (0, 1):
                 tag += 1
                 body += f'''    memory_request_bits_address = 64'h{0x1000 + lane:x};
@@ -324,6 +324,63 @@ def frontend_contract(parameters):
 '''
 
 
+def fabric_contract(parameters):
+    base, width = int(parameters['resetVector']), parameters['axiDataBits']
+    data_address, instruction_address = base + 0x238, base + 0x104
+    data_value, instruction_value = 0x8877665544332211, 0x12345037
+    data_shift = data_address % (width // 8) * 8
+    instruction_shift = instruction_address % (width // 8) * 8
+    return f'''
+    instruction_request_bits_address = 64'h{instruction_address:x};
+    instruction_request_bits_size = 2; instruction_request_bits_fetch = 1;
+    instruction_request_bits_tag = 17; instruction_request_valid = 1;
+    data_request_bits_address = 64'h{data_address:x}; data_request_bits_size = 3;
+    data_request_bits_tag = 34; data_request_valid = 1;
+    check(data_request_ready && !instruction_request_ready, "Concurrent-client arbitration");
+    tick(); data_request_valid = 0;
+    while (!axi_ar_valid) tick();
+    repeat (3) begin
+      check(axi_ar_bits_addr == 'h{data_address:x} && axi_ar_bits_prot == 1 && !instruction_response_valid, "Data ownership under AXI backpressure"); tick();
+    end
+    axi_ar_ready = 1; tick(); axi_ar_ready = 0;
+    axi_r_bits_data = 'h{data_value << data_shift:x}; axi_r_bits_last = 1; axi_r_valid = 1;
+    tick(); axi_r_valid = 0;
+    repeat (3) begin
+      check(data_response_valid && data_response_bits_tag == 34 && data_response_bits_data == 64'h{data_value:x} && !data_response_bits_fault && !instruction_response_valid && !axi_ar_valid, "Held data completion retains owner"); tick();
+    end
+    data_response_ready = 1; tick(); data_response_ready = 0;
+    check(instruction_request_ready, "Instruction client did not recover");
+    tick(); instruction_request_valid = 0;
+    while (!axi_ar_valid) tick();
+    check(axi_ar_bits_addr == 'h{instruction_address:x} && axi_ar_bits_prot == 5, "Instruction ownership");
+    axi_ar_ready = 1; tick(); axi_ar_ready = 0;
+    axi_r_bits_data = 'h{instruction_value << instruction_shift:x}; axi_r_valid = 1;
+    tick(); axi_r_valid = 0;
+    repeat (3) begin
+      check(instruction_response_valid && instruction_response_bits_tag == 17 && instruction_response_bits_data == 64'h{instruction_value:x} && !instruction_response_bits_fault && !data_response_valid, "Held instruction completion retains owner"); tick();
+    end
+    instruction_response_ready = 1; tick(); instruction_response_ready = 0;
+    data_request_bits_address = 64'h{base + 0x6000:x}; data_request_bits_tag = 51; data_request_valid = 1;
+    tick(); data_request_valid = 0;
+    while (!data_response_valid) begin
+      check(!axi_ar_valid && !axi_aw_valid && !axi_w_valid, "Denied request reached AXI"); tick();
+    end
+    repeat (3) begin
+      check(data_response_valid && data_response_bits_fault && data_response_bits_tag == 51 && !axi_ar_valid && !axi_aw_valid && !axi_w_valid, "Denied completion ownership"); tick();
+    end
+    data_response_ready = 1; tick(); data_response_ready = 0;
+    data_request_bits_address = 64'h{data_address:x}; data_request_bits_tag = 68; data_request_valid = 1;
+    tick(); data_request_valid = 0;
+    while (!axi_ar_valid) tick();
+    axi_ar_ready = 1; tick(); axi_ar_ready = 0;
+    axi_r_bits_resp = 2; axi_r_valid = 1; tick(); axi_r_valid = 0;
+    repeat (3) begin
+      check(data_response_valid && data_response_bits_fault && data_response_bits_tag == 68 && !instruction_response_valid, "Bus fault completion ownership"); tick();
+    end
+    data_response_ready = 1; tick(); data_response_ready = 0;
+'''
+
+
 def bench(module, body):
     header = module.read_text().split(');', 1)[0].split('(', 1)[1]
     declarations, connections, names = [], [], []
@@ -353,7 +410,7 @@ def bench(module, body):
             + body.replace('check(', '`CHECK(') + '''
     $display("PASS"); $finish;
   end
-  initial begin #10000; $fatal(1, "Timeout"); end
+  initial begin #100000; $fatal(1, "Timeout"); end
 endmodule
 ''')
 
@@ -366,12 +423,15 @@ def verify(rtl, directory):
                        ('DitDahA1Decode', decode_contract()),
                        ('DitDahA1MemoryArbiter', ARBITER),
                        ('DitDahA1Memory', memory_contract(parameters)),
-                       ('DitDahA1Axi', axi_contract(parameters['axiDataBits']))):
+                       ('DitDahA1Axi', axi_contract(parameters['axiDataBits'])),
+                       ('DitDahA1MemoryFabric', fabric_contract(parameters))):
         module = rtl / (name + '.sv')
         test = directory / (name + '_tb.sv')
         test.write_text(bench(module, body))
         binary = directory / name
         dependencies = [rtl / 'DitDahA1Fetch.sv'] if name == 'DitDahA1Frontend' else []
+        if name == 'DitDahA1MemoryFabric':
+            dependencies = [rtl / (child + '.sv') for child in ('DitDahA1MemoryArbiter', 'DitDahA1Memory', 'DitDahA1Axi')]
         subprocess.run(['iverilog', '-g2012', '-s', 'contract_tb', '-o', str(binary),
                         str(module), *map(str, dependencies), str(test)], check=True)
         result = subprocess.run(['vvp', str(binary)], capture_output=True, text=True, timeout=30)

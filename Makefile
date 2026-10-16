@@ -17,6 +17,7 @@ verify-signoff: config check
 	build-ditdah-a1 --output result/production
 	build-ditdah-a1 --top DitDahA1Core --output result/core
 	build-ditdah-a1 --top DitDahA1Frontend --config result/frontend-input.json --output result/frontend
+	build-ditdah-a1 --top DitDahA1MemoryFabric --config result/fabric-input.json --output result/fabric
 	python3 test/check_production.py
 
 clean:

@@ -20,7 +20,8 @@ and precise synchronous exceptions. The generated configuration manifest lists t
 The complete target ISA is not implemented.
 Caches, MMU, dual issue, and coherence remain design targets.
 Frontend owns PC sequencing and handles redirects; Core contains decode through retirement.
-Core exposes separate instruction/data memory ports; the top connects physical-region checks and AXI.
+Core exposes separate instruction/data memory ports; the physical fabric owns arbitration, region checks, and AXI.
+AXI data width is configurable to 64/128/256/512 bits; scalar requests remain at most eight bytes.
 
 ## Development
 
@@ -37,14 +38,14 @@ make verify-signoff
 `nix build` produces a validated configuration package.
 `configure-ditdah-a1 --config input.json --output result/config.json` validates a supplied configuration.
 `build-ditdah-a1 --config input.json --output result/rtl` generates supported RTL configurations.
-Use `--top DitDahA1Core` or `--top DitDahA1Frontend` to generate either boundary independently.
+Use `--top DitDahA1Core`, `DitDahA1Frontend`, or `DitDahA1MemoryFabric` for independent generation.
 Component builds validate their own domain; whole-system generation rejects unimplemented features.
 The manifest records the selected top and validation scope; unrelated parameters do not enable hardware features.
 Add `--trace` to retain the separate DV bind files.
 The default physical map is 64 KiB of RAM at zero; configure regions for the intended system.
 
 `make verify-signoff` checks standalone Core and AXI integration against the same instruction model,
-tests interface and component-configuration contracts, and lints the three production tops.
+tests interface and component-configuration contracts, and lints the four production tops.
 This checks the implemented instruction subset, not full ISA compliance or physical signoff.
 
 Pipeline depth, issue width, and cache sizes are specifications rather than model-number fields.

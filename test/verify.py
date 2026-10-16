@@ -156,7 +156,7 @@ def compare(binary, directory, config, transport='axi'):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--width', type=int, choices=(64, 128), action='append')
+    parser.add_argument('--width', type=int, choices=(64, 128, 256, 512), action='append')
     parser.add_argument('--use-generated', action='store_true')
     args = parser.parse_args()
     summary_path = Path('result/verify/summary.json')
@@ -164,7 +164,8 @@ def main():
     test_hashes = {str(p): hashlib.sha256(p.read_bytes()).hexdigest()
                    for p in sorted(Path('test').glob('*')) if p.suffix in ('.py', '.sv')}
     summary = {'scope': 'implemented scalar subset; simulation and assertions', 'configurations': []}
-    for width in args.width or (64, 128):
+    core_profiles = {}
+    for width in args.width or (64, 128, 256, 512):
         directory = Path(f'result/verify/axi{width}')
         directory.mkdir(parents=True, exist_ok=True)
         config = configuration(width)
@@ -188,11 +189,17 @@ def main():
         report['interfaceContracts'] = ['fetch cancellation and identity', 'LSU authorization and completion',
                                         'frontend sequencing and redirects',
                                         'decode dependencies', 'memory arbitration and response ownership',
-                                        'memory permissions and transfer attributes', 'AXI request and response handling']
+                                        'memory permissions and transfer attributes', 'AXI request and response handling',
+                                        'physical fabric ownership, backpressure, and faults']
         report.update(axiDataBits=width, physicalAddressBits=config['physicalAddressBits'])
+        summary['configurations'].append(report)
         core = directory / 'core'
-        core.mkdir(exist_ok=True)
         core_config = dict(config, axiDataBits=256, iCacheBytes=8192)
+        core_key = json.dumps(core_config, sort_keys=True)
+        if core_key in core_profiles:
+            report['coreReuse'] = core_profiles[core_key]
+            continue
+        core.mkdir(exist_ok=True)
         core_input = core / 'input.json'
         core_input.write_text(json.dumps(core_config, indent=2) + '\n')
         if not args.use_generated:
@@ -205,9 +212,11 @@ def main():
         binary = compile_tb(core / 'rtl', core, width, config['physicalAddressBits'], 'memory_tb',
                             Path('test/memory_tb.sv').resolve(), [(rtl / 'DitDahA1Memory.sv').resolve()])
         report['core'] = compare(binary, core, core_manifest['parameters'], 'memory')
-        summary['configurations'].append(report)
+        core_profiles[core_key] = str(core)
     frontend_config = dict(configuration(128), issueWidth=2, axiDataBits=512, iCacheBytes=8192)
     Path('result/frontend-input.json').write_text(json.dumps(frontend_config, indent=2) + '\n')
+    fabric_config = dict(frontend_config, resetVector='2', hartCount=8, virtualAddressBits=48, pmpEntries=16)
+    Path('result/fabric-input.json').write_text(json.dumps(fabric_config, indent=2) + '\n')
     summary['sourceHashes'] = {str(p): hashlib.sha256(p.read_bytes()).hexdigest()
                               for p in sorted(Path('ditdah_a1/src').glob('*.scala'))}
     for name, digest in test_hashes.items():

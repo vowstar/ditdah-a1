@@ -50,7 +50,6 @@ case class DitDahA1Parameter(
     require(hartCount == 1, "RTL supports one hart")
     require(virtualAddressBits == 0 && pmpEntries == 0, "RTL supports Bare addressing without PMP")
     require(iCacheBytes == 0 && dCacheBytes == 0 && l2CacheBytes == 0, "RTL supports uncached memory")
-    require(Set(64, 128).contains(axiDataBits), "RTL supports 64-bit or 128-bit AXI")
     require(memoryRegions.exists(r => r.executable && resetVector >= r.base && resetVector + 4 <= r.base + r.size), "Reset vector must be in executable memory")
 
   val xlen: Int = 64
