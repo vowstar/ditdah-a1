@@ -8,7 +8,8 @@ import re
 import random
 import subprocess
 
-from programs import addi, csr, sd, mul
+from programs import addi, csr, sd, mul, ld
+from model import Model, pmp_allowed
 
 
 FETCH = r'''
@@ -551,19 +552,183 @@ endmodule
 ''')
 
 
+def pmp_contract(parameters):
+    pa = parameters['physicalAddressBits']
+    width = pa - 2
+    rng = random.Random(2026)
+    tests = []
+    for index in (0, 7, 8, 15):
+        for config in (0, 8, 16, 24, 128, 136, 144, 152, 153, 154, 156, 159):
+            for address in (0xffc, 0x1000, 0x1004, 0x1008, (1 << pa) - 4, (1 << 64) - 4):
+                configs, addresses = [0] * 16, [0] * 16
+                configs[index], addresses[index] = config, 0x401
+                if index:
+                    addresses[index - 1] = 0x400
+                tests.append((configs, addresses, address, 3, 'read'))
+    for _ in range(320):
+        configs = [rng.randrange(256) & 0x9f for _ in range(16)]
+        addresses = [rng.choice((0, 0x400 + rng.randrange(16), (1 << width) - 1)) for _ in range(16)]
+        tests.append((configs, addresses, rng.choice((0, 0x1000 + rng.randrange(64), (1 << pa) - 8)),
+                      rng.randrange(4), rng.choice(('fetch', 'read', 'write'))))
+    body = ''
+    for configs, addresses, address, size, kind in tests:
+        config = sum(v << (i * 8) for i, v in enumerate(configs))
+        points = sum(v << (i * width) for i, v in enumerate(addresses))
+        expected = int(pmp_allowed(configs, addresses, address, 1 << size, kind, pa))
+        body += f'''    state_config = 128'h{config:x}; state_address = {16 * width}'h{points:x};
+    address = 64'h{address:x}; size = {size}; fetch = {int(kind == 'fetch')}; write = {int(kind == 'write')};
+    check(allowed == {expected}, "PMP priority, range and permissions");
+'''
+    return body
+
+
+def csr_contract(parameters):
+    model = Model(parameters, {}, {})
+    body = ''
+
+    def access(address, value=0, write=False):
+        nonlocal body
+        legal = int(address in model.csrs)
+        body += f'''    readAddress = 12'h{address:x}; writeAddress = 12'h{address:x}; writeData = 64'h{value:x}; write = 0;
+    check(legal == {legal} && readData == 64'h{model.csrs.get(address, 0):x}, "CSR read and legality");
+'''
+        if write:
+            assert legal
+            model.write_csr(address, value)
+            body += f'''    write = 1; tick(); write = 0;
+    check(readData == 64'h{model.csrs[address]:x}, "PMP CSR WARL and locking");
+'''
+        configs = sum(model.pmp_config(i) << (i * 8) for i in range(16))
+        addresses = sum(model.csrs[0x3b0 + i] << (i * (parameters['physicalAddressBits'] - 2)) for i in range(16))
+        body += f'    check(pmp_config == 128\'h{configs:x} && pmp_address == {16 * (parameters["physicalAddressBits"] - 2)}\'h{addresses:x}, "PMP state distribution");\n'
+
+    for index in range(16):
+        access(0x3b0 + index, ((1 << 64) - 1) ^ (index * 8), True)
+    for address in (0x3a0, 0x3a2):
+        access(address, 0x6262626262626262, True)
+    for address in (*range(0x3a1, 0x3b0, 2), 0x3a4, 0x3ef):
+        access(address)
+    access(0x3a4, (1 << 64) - 1, True)
+    access(0x3ef, (1 << 64) - 1, True)
+    access(0x3a0, 0x8900, True)
+    access(0x3b0, 0, True)
+    access(0x3b1, 0, True)
+    access(0x3a0, 0x80, True)
+    access(0x3b0, 0, True)
+    access(0x3a0, 0, True)
+    access(0x3a2, 0x8900000000000000, True)
+    access(0x3be, 0, True)
+    access(0x3bf, 0, True)
+    body += '    reset = 1; tick(); reset = 0; tick();\n'
+    model = Model(parameters, {}, {})
+    access(0x3a0)
+    access(0x3b0, 0x401, True)
+    return body
+
+
+def protection_contract(fetch):
+    prefix = '    reset = 1; tick(); reset = 0; tick();\n    pmp_config = 128\'h98; pmp_address = \'h40;\n'
+    if fetch:
+        return prefix + '''
+    output_ready = 0; memory_response_valid = 0; memory_request_ready = 0;
+    request_bits_pc = 'h100; request_valid = 1; tick(); request_valid = 0;
+    repeat (3) begin
+      check(output_valid && output_bits_fault && output_bits_cause == 1 && output_bits_tval == 'h100 && !memory_request_valid, "Denied fetch escaped"); tick();
+    end
+    output_ready = 1; tick(); output_ready = 0;
+    pmp_config = 0; request_valid = 1; tick(); request_valid = 0; pmp_config = 'h98;
+    repeat (3) begin check(memory_request_valid, "Policy update withdrew a presented fetch"); tick(); end
+    cancel = 1; tick(); cancel = 0;
+    memory_request_ready = 1; tick(); memory_request_ready = 0;
+    memory_response_valid = 1; tick(); memory_response_valid = 0; tick();
+    check(!output_valid && request_ready, "Old authorized fetch did not drain");
+'''
+    return prefix + '''
+    input_bits_instruction_fault = 0; input_bits_address = 'h100; input_bits_load = 1; input_bits_store = 0;
+    input_valid = 1; tick(); input_valid = 0;
+    repeat (3) begin
+      check(output_valid && output_bits_instruction_fault && output_bits_instruction_cause == 5 && !memory_request_valid, "Denied load escaped"); tick();
+    end
+    output_ready = 1; tick(); output_ready = 0;
+    input_bits_store = 1; input_bits_load = 0; storeAllowed = 1;
+    input_valid = 1; tick(); input_valid = 0;
+    check(output_valid && output_bits_instruction_cause == 7 && output_bits_instruction_tval == 'h100 && !memory_request_valid, "Denied store escaped");
+    output_ready = 1; tick(); output_ready = 0;
+    pmp_config = 0; input_bits_store = 0; input_bits_load = 1;
+    input_valid = 1; tick(); input_valid = 0; pmp_config = 'h98;
+    repeat (3) begin check(memory_request_valid, "Policy update withdrew a presented load"); tick(); end
+    memory_request_ready = 1; tick(); memory_request_ready = 0;
+    memory_response_bits_tag = input_bits_instruction_tag; memory_response_valid = 1;
+    tick(); memory_response_valid = 0; output_ready = 1; tick();
+'''
+
+
+def backend_protection_contract():
+    def send(words, pc):
+        return ''.join(f'''
+    instruction_bits_pc = 'h{pc + 4 * i:x}; instruction_bits_instruction = 'h{word:x};
+    instruction_bits_tag = {i}; instruction_valid = 1;
+    while (!instruction_ready) tick(); tick(); instruction_valid = 0;
+''' for i, word in enumerate(words))
+
+    body = ''
+    for younger in (ld(4, 0), sd(2, 0), mul(4, 2, 2)):
+        body += '''
+    reset = 1; tick(); reset = 0; tick();
+    data_request_ready = 0; data_response_valid = 0; data_response_bits_fault = 0;
+    begin
+      integer redirects;
+      redirects = 0;
+      fork
+        begin
+          repeat (64) begin
+            if (redirect) begin
+              check(!status_trap && redirectPc == 'h10c, "PMP update restart");
+              redirects = redirects + 1;
+            end
+            check(!data_request_valid, "Younger access escaped PMP update"); tick();
+          end
+        end
+        begin
+''' + send((0x10b7, addi(2, 0, 0x99), csr(0, 0x3a0, 2), younger), 0x100) + '''
+        end
+      join
+      check(redirects == 1, "Missing or repeated PMP update redirect");
+    end
+''' + send((sd(4, 1),), 0x200) + '''
+    while (!data_request_valid) tick();
+    check(data_request_bits_data == 0 && data_request_bits_address == 'h1000, "Younger multiply wrote a destination");
+    data_request_ready = 1; tick(); data_request_ready = 0;
+    data_response_bits_tag = data_request_bits_tag; data_response_valid = 1;
+    tick(); data_response_valid = 0; repeat (8) tick();
+''' + send((csr(5, 0x3a0, 0, True), sd(5, 1)), 0x300) + '''
+    while (!data_request_valid) begin check(!redirect, "PMP read restarted execution"); tick(); end
+    check(data_request_bits_data == 'h99, "PMP read lost its owner or value");
+    data_request_ready = 1; tick(); data_request_ready = 0;
+    data_response_bits_tag = data_request_bits_tag; data_response_valid = 1;
+    tick(); data_response_valid = 0; repeat (8) tick();
+'''
+    return body
+
+
 def verify(rtl, directory):
     directory.mkdir(parents=True, exist_ok=True)
     parameters = json.loads((rtl / 'ditdah_a1_config.json').read_text())['parameters']
     verified = []
-    for name, body in (('DitDahA1Fetch', FETCH), ('DitDahA1Lsu', LSU),
+    enabled = parameters['pmpEntries'] != 0
+    suites = (('DitDahA1Fetch', FETCH + (protection_contract(True) if enabled else '')),
+                       ('DitDahA1Lsu', LSU + (protection_contract(False) if enabled else '')),
                        ('DitDahA1Multiply', multiply_contract()),
                        ('DitDahA1Frontend', frontend_contract(parameters)),
                        ('DitDahA1Decode', decode_contract()),
-                       ('DitDahA1Backend', backend_contract()),
+                       ('DitDahA1Backend', backend_contract() + (backend_protection_contract() if enabled else '')),
                        ('DitDahA1MemoryArbiter', ARBITER),
                        ('DitDahA1Memory', memory_contract(parameters)),
                        ('DitDahA1Axi', axi_contract(parameters['axiDataBits'])),
-                       ('DitDahA1MemoryFabric', fabric_contract(parameters))):
+                       ('DitDahA1MemoryFabric', fabric_contract(parameters)))
+    if enabled:
+        suites += (('DitDahA1Pmp', pmp_contract(parameters)), ('DitDahA1Csr', csr_contract(parameters)))
+    for name, body in suites:
         module = rtl / (name + '.sv')
         test = directory / (name + '_tb.sv')
         test.write_text(bench(module, body))
@@ -573,6 +738,8 @@ def verify(rtl, directory):
             dependencies = [rtl / (child + '.sv') for child in ('DitDahA1MemoryArbiter', 'DitDahA1Memory', 'DitDahA1Axi')]
         if name == 'DitDahA1Backend':
             dependencies = [rtl / ('DitDahA1' + child + '.sv') for child in ('Decode', 'Issue', 'Execute', 'Multiply', 'Commit', 'Gpr', 'Csr', 'Lsu')]
+        if enabled and name in ('DitDahA1Fetch', 'DitDahA1Lsu', 'DitDahA1Frontend', 'DitDahA1Backend'):
+            dependencies.append(rtl / 'DitDahA1Pmp.sv')
         subprocess.run(['iverilog', '-g2012', '-s', 'contract_tb', '-o', str(binary),
                         str(module), *map(str, dependencies), str(test)], check=True)
         result = subprocess.run(['vvp', str(binary)], capture_output=True, text=True, timeout=30)

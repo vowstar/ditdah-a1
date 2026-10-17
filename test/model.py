@@ -9,6 +9,30 @@ def signed(value, bits):
     return (value & ((1 << (bits - 1)) - 1)) - (value & (1 << (bits - 1)))
 
 
+def pmp_allowed(configs, addresses, address, size, kind, pa):
+    if address < 0 or address + size > 1 << pa:
+        return False
+    for index, config in enumerate(configs):
+        mode = (config >> 3) & 3
+        if not mode:
+            continue
+        if mode == 1:
+            low, high = (addresses[index - 1] * 4 if index else 0), addresses[index] * 4
+        else:
+            width = 4
+            if mode == 3:
+                width, value = 8, addresses[index]
+                while value & 1:
+                    width *= 2
+                    value >>= 1
+            low = addresses[index] * 4 & -width
+            high = low + width
+        matches = [low <= byte < high for byte in range(address, address + size)]
+        if any(matches):
+            return all(matches) and (not config & 128 or bool(config & {'fetch': 4, 'read': 1, 'write': 2}[kind]))
+    return True
+
+
 class Fault(Exception):
     def __init__(self, cause, value):
         self.cause, self.value = cause, value
@@ -25,6 +49,9 @@ class Model:
                                                0x341, 0x342, 0x343, 0x344,
                                                0xf11, 0xf12, 0xf13, 0xf14)}
         self.csrs[0x300] = 0x1800
+        if config['pmpEntries']:
+            self.csrs.update({address: 0 for address in (*range(0x3a0, 0x3b0, 2), *range(0x3b0, 0x3f0))})
+        self.local_fetch_faults = set()
         self.bus = []
         self.requests = []
         self.order = 0
@@ -33,6 +60,13 @@ class Model:
         cause = {'fetch': 1, 'read': 5, 'write': 7}[kind]
         if address % size:
             raise Fault({'fetch': 0, 'read': 4, 'write': 6}[kind], address)
+        if self.config['pmpEntries'] and not pmp_allowed(
+                [self.pmp_config(i) for i in range(self.config['pmpEntries'])],
+                [self.csrs[0x3b0 + i] for i in range(self.config['pmpEntries'])],
+                address, size, kind, self.config['physicalAddressBits']):
+            if kind == 'fetch':
+                self.local_fetch_faults.add(self.order)
+            raise Fault(cause, address)
         self.requests.append((kind, address, size, data if kind == 'write' else 0))
         permission = {'fetch': 'executable', 'read': 'readable', 'write': 'writable'}[kind]
         allowed = any(int(r['base']) <= address and address + size <= int(r['base']) + int(r['size'])
@@ -48,6 +82,9 @@ class Model:
             return 0
         return sum(self.memory.get(address + i, 0) << (8 * i) for i in range(size))
 
+    def pmp_config(self, index):
+        return (self.csrs[0x3a0 + (index // 8) * 2] >> ((index % 8) * 8)) & 255
+
     def write_csr(self, address, value):
         if address == 0x300:
             self.csrs[address] = 0x1800 | (value & 0x88)
@@ -55,6 +92,22 @@ class Model:
             self.csrs[address] = value & ~3
         elif address in (0x340, 0x342, 0x343):
             self.csrs[address] = value
+        elif 0x3a0 <= address < 0x3b0:
+            for slot in range(8):
+                index = (address - 0x3a0) * 4 + slot
+                if index < self.config['pmpEntries'] and not self.pmp_config(index) & 128:
+                    field = (value >> (slot * 8)) & 0x9f
+                    if not field & 1:
+                        field &= ~2
+                    self.csrs[address] = (self.csrs[address] & ~(255 << (slot * 8))) | (field << (slot * 8))
+        elif 0x3b0 <= address < 0x3f0:
+            index = address - 0x3b0
+            if index < self.config['pmpEntries']:
+                locked = self.pmp_config(index) & 128
+                if index + 1 < self.config['pmpEntries']:
+                    locked |= (self.pmp_config(index + 1) & 0x98) == 0x88
+                if not locked:
+                    self.csrs[address] = value & ((1 << (self.config['physicalAddressBits'] - 2)) - 1)
 
     def step(self):
         pc, insn = self.pc, 0

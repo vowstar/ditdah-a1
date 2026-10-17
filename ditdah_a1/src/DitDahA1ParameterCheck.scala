@@ -17,7 +17,11 @@ object DitDahA1ParameterCheck:
     assert(DitDahA1Config.parameter(ujson.read(encoded)) == highAddress)
     assert(DitDahA1Config.parameter(DitDahA1Config.document(highAddress)) == highAddress)
     assert(DitDahA1Config.document(highAddress)("target")("xlen").num == 64)
-    assert(baseline.copy(hartCount = 8).productName == "DitDah-A1")
+    for count <- Seq(1, 2, 3, 8, 15, 16) do
+      val selected = baseline.copy(hartCount = count)
+      assert(DitDahA1Config.parameter(DitDahA1Config.document(selected)) == selected)
+    assert(DitDahA1Config.document(baseline)("target")("maxHartCount").num == 16)
+    assert(!DitDahA1Config.document(baseline.copy(pmpEntries = 64))("implementation").obj.contains("pmpEntries"))
     assert(DitDahA1Config.document(baseline)("target")("isa").str == "RV64GCB")
     assert(baseline.copy(l2CacheBytes = 0).l2CacheBytes == 0)
     assert(baseline.copy(virtualAddressBits = 48).virtualAddressBits == 48)
@@ -26,7 +30,7 @@ object DitDahA1ParameterCheck:
     rejects { baseline.copy(resetVector = BigInt(1) << 56); () }
     rejects { baseline.copy(virtualAddressBits = 32); () }
     rejects { baseline.copy(hartCount = 0); () }
-    rejects { baseline.copy(hartCount = 9); () }
+    rejects { baseline.copy(hartCount = 17); () }
     rejects { baseline.copy(iCacheBytes = 12288); () }
     rejects { baseline.copy(l2CacheBytes = 65536); () }
     rejects { baseline.copy(axiDataBits = 96); () }
@@ -57,7 +61,12 @@ object DitDahA1ParameterCheck:
     rejects { DitDahA1Config.parameter(ujson.Obj("memoryRegions" -> ujson.Arr(ujson.Obj("execute" -> false)))); () }
     rejects { rtl.copy(hartCount = 2).validateRtl() }
     rejects { rtl.copy(virtualAddressBits = 39).validateRtl() }
-    rejects { rtl.copy(pmpEntries = 1).validateRtl() }
+    rtl.copy(pmpEntries = 16).validateRtl()
+    for count <- 2 to 16 do rejects { rtl.copy(hartCount = count).validateRtl() }
+    rejects { rtl.copy(pmpEntries = 1); () }
+    rejects { rtl.copy(pmpEntries = 64).validateRtl() }
+    rejects { rtl.copy(pmpEntries = 64).validateFrontend() }
+    rejects { rtl.copy(pmpEntries = 64).validateBackend() }
     rejects { rtl.copy(iCacheBytes = 8192).validateRtl() }
     rejects { rtl.copy(memoryRegions = Seq.empty).validateRtl() }
     rejects { rtl.copy(memoryRegions = Seq(MemoryRegion(executable = false))).validateRtl() }

@@ -47,7 +47,7 @@ def compile_tb(rtl, directory, width, pa, top='core_tb', source=None, extra_file
     return (directory / 'obj' / ('V' + top)).resolve()
 
 
-def check_fetches(lines, config, faults):
+def check_fetches(lines, config, faults, local_faults=()):
     def allowed(address):
         return address % 4 == 0 and address + 4 <= 1 << config['physicalAddressBits'] and any(
             int(region['base']) <= address and address + 4 <= int(region['base']) + int(region['size'])
@@ -82,7 +82,7 @@ def check_fetches(lines, config, faults):
             pc, instruction, trap, cause = trace[1], trace[2], trace[7], trace[8]
             reachable.add(trace[3])
             if trap and cause == 1:
-                if allowed(pc):
+                if trace[0] not in local_faults and allowed(pc):
                     assert failed[pc], f'Fetch fault without failed response: {line}'
                     failed[pc] -= 1
             else:
@@ -99,7 +99,7 @@ def compare(binary, directory, config, transport='axi'):
     count = 0
     reports = []
     pipeline_max, dependency_stalls = 0, 0
-    for name, program in cases(base):
+    for name, program in cases(base, config['pmpEntries'] != 0):
         image = directory / (name + '.hex')
         image.write_text('\n'.join(f'{program.memory.get(base + i, 0):02x}' for i in range(65536)) + '\n')
         model = Model(config, program.memory, program.faults)
@@ -132,7 +132,7 @@ def compare(binary, directory, config, transport='axi'):
                 requests = [(v[1], int(v[2], 16), int(v[3]), int(v[4], 16)) for line in lines
                             if line.startswith('REQUEST ') for v in [line.split()] if v[1] != 'fetch']
                 assert requests == [r for r in model.requests if r[0] != 'fetch'], f'{name}: unexpected Core requests'
-            fetches = check_fetches(lines, config, program.faults)
+            fetches = check_fetches(lines, config, program.faults, model.local_fetch_faults)
             if name == 'pipeline_redirect':
                 fault = program.faults['fetch']
                 assert any(line.startswith(f'FETCH {fault:016x} 2 ') for line in lines), 'Wrong-path fetch fault was not exercised'
@@ -158,6 +158,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--width', type=int, choices=(64, 128, 256, 512), action='append')
     parser.add_argument('--use-generated', action='store_true')
+    parser.add_argument('--pmp-entries', type=int, choices=(0, 16))
     args = parser.parse_args()
     summary_path = Path('result/verify/summary.json')
     summary_path.unlink(missing_ok=True)
@@ -165,10 +166,13 @@ def main():
                    for p in sorted(Path('test').glob('*')) if p.suffix in ('.py', '.sv')}
     summary = {'scope': 'implemented scalar subset; simulation and assertions', 'configurations': []}
     core_profiles = {}
-    for width in args.width or (64, 128, 256, 512):
-        directory = Path(f'result/verify/axi{width}')
+    profiles = [(width, entries) for entries in ((args.pmp_entries,) if args.pmp_entries is not None else (0, 16))
+                for width in args.width or (64, 128, 256, 512) if entries == 0 or width in (64, 512)]
+    for width, entries in profiles:
+        directory = Path(f'result/verify/{"pmp16-" if entries else ""}axi{width}')
         directory.mkdir(parents=True, exist_ok=True)
         config = configuration(width)
+        config['pmpEntries'] = entries
         config_path = directory / 'input.json'
         config_path.write_text(json.dumps(config, indent=2) + '\n')
         rtl = directory / 'rtl'
@@ -187,7 +191,7 @@ def main():
         print(f'Checking AXI{width}', flush=True)
         report = compare(binary, directory, manifest['parameters'])
         report['interfaceContracts'] = interface_contracts
-        report.update(axiDataBits=width, physicalAddressBits=config['physicalAddressBits'])
+        report.update(axiDataBits=width, physicalAddressBits=config['physicalAddressBits'], pmpEntries=entries)
         summary['configurations'].append(report)
         core = directory / 'core'
         core_config = dict(config, axiDataBits=256, iCacheBytes=8192)
@@ -211,9 +215,9 @@ def main():
         core_profiles[core_key] = str(core)
     frontend_config = dict(configuration(128), issueWidth=2, axiDataBits=512, iCacheBytes=8192)
     Path('result/frontend-input.json').write_text(json.dumps(frontend_config, indent=2) + '\n')
-    fabric_config = dict(frontend_config, resetVector='2', hartCount=8, virtualAddressBits=48, pmpEntries=16)
+    fabric_config = dict(frontend_config, resetVector='2', hartCount=16, virtualAddressBits=48, pmpEntries=16)
     Path('result/fabric-input.json').write_text(json.dumps(fabric_config, indent=2) + '\n')
-    backend_config = dict(fabric_config, issueWidth=1)
+    backend_config = dict(fabric_config, issueWidth=1, pmpEntries=0)
     Path('result/backend-input.json').write_text(json.dumps(backend_config, indent=2) + '\n')
     summary['sourceHashes'] = {str(p): hashlib.sha256(p.read_bytes()).hexdigest()
                               for p in sorted(Path('ditdah_a1/src').glob('*.scala'))}

@@ -63,6 +63,10 @@ class MemoryPort extends Bundle:
   val request = Aligned(new Decoupled(new MemoryRequest))
   val response = Flipped(new Decoupled(new MemoryResponse))
 
+class PmpState(parameter: DitDahA1Parameter) extends Bundle:
+  val config = Aligned(UInt(parameter.pmpEntries * 8))
+  val address = Aligned(UInt(parameter.pmpEntries * (parameter.physicalAddressBits - 2)))
+
 class FetchRequest extends Bundle:
   val pc = Aligned(UInt(64))
   val tag = Aligned(UInt(8))
@@ -136,6 +140,7 @@ class DitDahA1CoreIO(parameter: DitDahA1Parameter) extends HWBundle(parameter):
   val status = Aligned(new StatusBundle)
 
 class DitDahA1FrontendIO(parameter: DitDahA1Parameter) extends HWBundle(parameter):
+  val pmp = Option.when(parameter.pmpEntries != 0)(Flipped(new PmpState(parameter)))
   val clock = Flipped(Clock())
   val reset = Flipped(Reset())
   val redirect = Flipped(Bool())
@@ -151,6 +156,7 @@ class DitDahA1MemoryFabricIO(parameter: DitDahA1Parameter) extends HWBundle(para
   val axi = Aligned(new AxiBundle(parameter))
 
 class DitDahA1BackendIO(parameter: DitDahA1Parameter) extends HWBundle(parameter):
+  val pmp = Option.when(parameter.pmpEntries != 0)(Aligned(new PmpState(parameter)))
   val clock = Flipped(Clock())
   val reset = Flipped(Reset())
   val instruction = Flipped(new Decoupled(new FetchPacket))

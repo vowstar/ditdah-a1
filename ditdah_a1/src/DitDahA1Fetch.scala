@@ -8,6 +8,7 @@ import me.jiuyang.zaozi.reftpe.*
 import me.jiuyang.zaozi.valuetpe.*
 
 class DitDahA1FetchIO(parameter: DitDahA1Parameter) extends HWBundle(parameter):
+  val pmp = Option.when(parameter.pmpEntries != 0)(Flipped(new PmpState(parameter)))
   val clock = Flipped(Clock())
   val reset = Flipped(Reset())
   val request = Flipped(new Decoupled(new FetchRequest))
@@ -27,6 +28,14 @@ object DitDahA1Fetch extends Generator[DitDahA1Parameter, DitDahA1UnitLayers, Di
     val killed = RegInit(false.B)
     val request = io.memory.request
     val response = io.memory.response
+    val permitted = if parameter.pmpEntries == 0 then true.B else
+      val pmp = DitDahA1Pmp.instantiate(parameter)
+      pmp.io.state :<= io.pmp.get
+      pmp.io.address := io.request.bits.pc
+      pmp.io.size := 2.U(3)
+      pmp.io.write := false.B
+      pmp.io.fetch := true.B
+      pmp.io.allowed
     io.request.ready := (state === 0.U(2)) & !io.cancel
     io.output.valid := (state === 3.U(2)) & !killed & !io.cancel
     io.output.bits :<= packet
@@ -49,8 +58,16 @@ object DitDahA1Fetch extends Generator[DitDahA1Parameter, DitDahA1UnitLayers, Di
       packet.tval := 0.U(64)
       killed := false.B
       state := 1.U(2)
+      if parameter.pmpEntries != 0 then
+        when(!permitted) {
+          packet.fault := true.B
+          packet.cause := 1.U(64)
+          packet.tval := io.request.bits.pc
+          state := 3.U(2)
+        }
       when(io.request.bits.pc.asBits.bits(1, 0) =/= 0.B(2)) {
         packet.fault := true.B
+        if parameter.pmpEntries != 0 then packet.cause := 0.U(64)
         packet.tval := io.request.bits.pc
         state := 3.U(2)
       }

@@ -30,10 +30,11 @@ object DitDahA1Config:
       "implementation" -> ujson.Obj(
         "instructions" -> ujson.Arr.from(DitDahA1Isa.instructions),
         "privilege" -> "M", "issueWidth" -> 1, "maxInflight" -> parameter.maxInflight,
+        "hartCount" -> 1,
         "translation" -> "Bare", "isaComplete" -> false
       ),
       "target" -> ujson.Obj(
-        "isa" -> "RV64GCB",
+        "isa" -> "RV64GCB", "maxHartCount" -> 16,
         "xlen" -> parameter.xlen,
         "registerCount" -> parameter.registerCount,
         "issueWidth" -> 2,

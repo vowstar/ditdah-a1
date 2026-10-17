@@ -20,6 +20,7 @@ object DitDahA1Core extends Generator[DitDahA1Parameter, DitDahA1Layers, DitDahA
     frontend.io.reset := io.reset
     backend.io.clock := io.clock
     backend.io.reset := io.reset
+    if parameter.pmpEntries != 0 then frontend.io.pmp.get :<= backend.io.pmp.get
     backend.io.instruction :<>= frontend.io.output
     frontend.io.redirect := backend.io.redirect
     frontend.io.redirectPc := backend.io.redirectPc
@@ -68,6 +69,9 @@ object DitDahA1Backend extends Generator[DitDahA1Parameter, DitDahA1Layers, DitD
     val gpr = DitDahA1Gpr.instantiate(parameter)
     val csr = DitDahA1Csr.instantiate(parameter)
     val lsu = DitDahA1Lsu.instantiate(parameter)
+    if parameter.pmpEntries != 0 then
+      io.pmp.get :<= csr.io.pmp.get
+      lsu.io.pmp.get :<= csr.io.pmp.get
     gpr.io.clock := io.clock
     gpr.io.reset := io.reset
     csr.io.clock := io.clock
@@ -95,7 +99,10 @@ object DitDahA1Backend extends Generator[DitDahA1Parameter, DitDahA1Layers, DitD
     val retire = commit.io.output
     val retired = retire.valid & retire.ready
     val sequentialPc = (retire.bits.instruction.pc + retire.bits.instruction.length).asBits.bits(63, 0).asUInt
-    val redirect = retired & (retire.bits.instruction.fault | retire.bits.mret | (retire.bits.nextPc =/= sequentialPc))
+    val pmpUpdate = if parameter.pmpEntries == 0 then false.B else
+      retire.bits.csrWrite & (((retire.bits.csrAddress >= 0x3a0.U(12)) & (retire.bits.csrAddress <= 0x3ae.U(12))) |
+        ((retire.bits.csrAddress >= 0x3b0.U(12)) & (retire.bits.csrAddress <= 0x3ef.U(12))))
+    val redirect = retired & (retire.bits.instruction.fault | retire.bits.mret | pmpUpdate | (retire.bits.nextPc =/= sequentialPc))
     val commitReady = !commitValid | retired
     val memoryOperation = (resultPacket.load | resultPacket.store) & !resultPacket.instruction.fault
     val resultAdvance = resultValid & (!memoryOperation | (memoryPending & lsu.io.output.valid)) & commitReady & !redirect
@@ -218,6 +225,7 @@ object DitDahA1Frontend extends Generator[DitDahA1Parameter, DitDahA1UnitLayers,
     val pc = RegInit(parameter.resetVector.U(64))
     val tag = RegInit(0.U(8))
     val fetch = DitDahA1Fetch.instantiate(parameter)
+    if parameter.pmpEntries != 0 then fetch.io.pmp.get :<= io.pmp.get
     fetch.io.clock := io.clock
     fetch.io.reset := io.reset
     fetch.io.request.valid := !io.redirect

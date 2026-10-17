@@ -45,6 +45,9 @@ def main():
         manifest["parameters"]["enableTrace"] = trace
         manifest["top"] = args.top
         manifest["validationScope"] = scope
+        manifest["implementation"]["hartCount"] = int(args.top in ("DitDahA1", "DitDahA1Core"))
+        manifest["implementation"]["pmpEntries"] = 0 if scope == "fabric" else manifest["parameters"]["pmpEntries"]
+        manifest["implementation"]["pmpState"] = bool(manifest["implementation"]["pmpEntries"] and args.top in ("DitDahA1", "DitDahA1Core", "DitDahA1Backend"))
         manifest["sourceHashes"] = hashes
         parameter = work / "parameter.json"
         parameter.write_text(json.dumps(manifest["parameters"]))

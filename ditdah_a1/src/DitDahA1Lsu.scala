@@ -8,6 +8,7 @@ import me.jiuyang.zaozi.reftpe.*
 import me.jiuyang.zaozi.valuetpe.*
 
 class DitDahA1LsuIO(parameter: DitDahA1Parameter) extends HWBundle(parameter):
+  val pmp = Option.when(parameter.pmpEntries != 0)(Flipped(new PmpState(parameter)))
   val clock = Flipped(Clock())
   val reset = Flipped(Reset())
   val input = Flipped(new Decoupled(new ResultPacket))
@@ -26,6 +27,14 @@ object DitDahA1Lsu extends Generator[DitDahA1Parameter, DitDahA1UnitLayers, DitD
     val packet = Reg(new ResultPacket)
     val request = io.memory.request
     val response = io.memory.response
+    val permitted = if parameter.pmpEntries == 0 then true.B else
+      val pmp = DitDahA1Pmp.instantiate(parameter)
+      pmp.io.state :<= io.pmp.get
+      pmp.io.address := io.input.bits.address
+      pmp.io.size := 3.U(3)
+      pmp.io.write := io.input.bits.store
+      pmp.io.fetch := false.B
+      pmp.io.allowed
     io.input.ready := (state === 0.U(2)) & (io.input.bits.instruction.fault | !io.input.bits.store | io.storeAllowed)
     io.output.valid := state === 3.U(2)
     io.output.bits :<= packet
@@ -41,6 +50,13 @@ object DitDahA1Lsu extends Generator[DitDahA1Parameter, DitDahA1UnitLayers, DitD
     when(io.input.valid & io.input.ready) {
       packet :<= io.input.bits
       state := 1.U(2)
+      if parameter.pmpEntries != 0 then
+        when(!io.input.bits.instruction.fault & !permitted) {
+          packet.instruction.fault := true.B
+          packet.instruction.cause := io.input.bits.store.?(7.U(64), 5.U(64))
+          packet.instruction.tval := io.input.bits.address
+          state := 3.U(2)
+        }
       when(!io.input.bits.instruction.fault & (io.input.bits.address.asBits.bits(2, 0) =/= 0.B(3))) {
         packet.instruction.fault := true.B
         packet.instruction.cause := io.input.bits.store.?(6.U(64), 4.U(64))

@@ -75,7 +75,7 @@ class Program:
         return self
 
 
-def cases(base):
+def cases(base, protection=False):
     p = Program(base)
     p.emit(addi(0, 0, 127), addi(2, 0, -1), (0x80000 << 12) | (3 << 7) | 0x37,
            add(4, 2, 3), addi(5, 0, 7))
@@ -177,3 +177,41 @@ def cases(base):
            sd(4, 11), mul(6, 0, 4), sd(6, 11, 8),
            mul(7, 2, 3) | (1 << 12), mul(7, 2, 3) | (4 << 12), mul(7, 2, 3) | 8)
     yield 'multiply', p.finish()
+    if protection:
+        yield from pmp_cases(base)
+
+
+def pmp_cases(base):
+    for name in ('permissions', 'tor_lock', 'partial', 'fetch', 'update'):
+        p = Program(base)
+        constant_offset = 0x3000
+
+        def constant(rd, value):
+            nonlocal constant_offset
+            for byte in range(8):
+                p.memory[base + constant_offset + byte] = (value >> (byte * 8)) & 255
+            p.address(rd, constant_offset)
+            p.emit(ld(rd, rd))
+            constant_offset += 8
+
+        p.address(10, 0x1000)
+        point = 0x200 if name == 'update' else 0x1004 if name == 'partial' else 0x1000
+        constant(2, ((base + point) >> 2) | (1 if name in ('permissions', 'fetch') else 0))
+        p.emit(csr(0, 0x3b0, 2))
+        if name == 'tor_lock':
+            constant(2, (base + 0x1020) >> 2)
+            p.emit(csr(0, 0x3b1, 2))
+        constant(3, 0x8900 if name == 'tor_lock' else 0x10 if name == 'partial' else 0x90 if name == 'update' else 0x99)
+        if name == 'update':
+            p.address(1, 0x1fc)
+            p.emit(jalr(0, 1))
+            p.offset = 0x1fc
+        p.emit(csr(4, 0x3a0, 3))
+        if name in ('fetch', 'update'):
+            p.emit(jalr(0, 10) if name == 'fetch' else sd(2, 10), mul(5, 2, 3))
+        else:
+            p.emit(ld(5, 10), sd(2, 10), ld(6, 10))
+            p.emit(csr(7, 0x3b0, 0), csr(8, 0x3b1, 0), csr(9, 0x3a0, 0))
+            p.emit(csr(11, 0x3b0, 0, True), csr(12, 0x3b1, 0, True), csr(13, 0x3a0, 0, True))
+            p.emit(csr(14, 0x3a1, 0, True), csr(15, 0x3a4, 0, True), csr(16, 0x3ef, 0, True))
+        yield 'pmp_' + name, p.finish(fixed_return=name in ('fetch', 'update'))

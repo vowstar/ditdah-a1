@@ -19,8 +19,14 @@ verify-signoff: config check
 	build-ditdah-a1 --top DitDahA1Frontend --config result/frontend-input.json --output result/frontend
 	build-ditdah-a1 --top DitDahA1MemoryFabric --config result/fabric-input.json --output result/fabric
 	build-ditdah-a1 --top DitDahA1Backend --config result/backend-input.json --output result/backend
+	build-ditdah-a1 --config result/verify/pmp16-axi512/input.json --output result/production-pmp16
+	build-ditdah-a1 --top DitDahA1Core --config result/verify/pmp16-axi512/input.json --output result/core-pmp16
+	build-ditdah-a1 --top DitDahA1Frontend --config result/verify/pmp16-axi512/input.json --output result/frontend-pmp16
+	build-ditdah-a1 --top DitDahA1Backend --config result/verify/pmp16-axi512/input.json --output result/backend-pmp16
 	python3 test/check_production.py
 	python3 test/formal.py
+	python3 test/formal.py --rtl result/production-pmp16 --output result/formal/pmp16
+	python3 test/formal.py --rtl result/verify/pmp16-axi64/rtl --output result/formal/pmp16-pa32 --modules Pmp
 
 clean:
 	rm -rf result

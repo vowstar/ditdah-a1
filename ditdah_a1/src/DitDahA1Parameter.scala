@@ -21,7 +21,7 @@ case class DitDahA1Parameter(
 ) extends Parameter:
   private def powerOfTwo(value: Int): Boolean = value > 0 && (value & (value - 1)) == 0
 
-  require(hartCount >= 1 && hartCount <= 8, "hartCount must be between 1 and 8")
+  require(hartCount >= 1 && hartCount <= 16, "hartCount must be between 1 and 16")
   require(physicalAddressBits >= 32 && physicalAddressBits <= 56, "physicalAddressBits must be between 32 and 56")
   require(Set(0, 39, 48).contains(virtualAddressBits), "virtualAddressBits must select Bare, Sv39 or Sv48")
   require(resetVector >= 0 && resetVector < (BigInt(1) << physicalAddressBits), "resetVector must fit the physical address space")
@@ -30,7 +30,7 @@ case class DitDahA1Parameter(
   require(dCacheBytes == 0 || (powerOfTwo(dCacheBytes) && dCacheBytes >= 8192 && dCacheBytes <= 65536), "dCacheBytes must be a power of two between 8192 and 65536")
   require(l2CacheBytes == 0 || (powerOfTwo(l2CacheBytes) && l2CacheBytes >= 131072 && l2CacheBytes <= 8388608), "l2CacheBytes must be zero or a power of two between 131072 and 8388608")
   require(Set(64, 128, 256, 512).contains(axiDataBits), "axiDataBits must be 64, 128, 256, or 512")
-  require(pmpEntries >= 0 && pmpEntries <= 64, "pmpEntries must be between 0 and 64")
+  require(Set(0, 16, 64).contains(pmpEntries), "pmpEntries must be 0, 16 or 64")
 
   require(Set(1, 2).contains(issueWidth), "issueWidth must be 1 or 2")
   memoryRegions.foreach(r => require(r.base + r.size <= (BigInt(1) << physicalAddressBits), "Memory region exceeds physical address space"))
@@ -39,19 +39,24 @@ case class DitDahA1Parameter(
   }
 
   def validateFrontend(): Unit =
+    validateProtection()
     require((resetVector & 3) == 0, "Frontend requires a word-aligned resetVector")
 
   def validateBackend(): Unit =
+    validateProtection()
     require(issueWidth == 1, "Backend supports single issue")
 
   def validateCore(): Unit =
     validateFrontend()
     validateBackend()
 
+  def validateProtection(): Unit =
+    require(pmpEntries == 0 || pmpEntries == 16, "RTL supports zero or sixteen PMP entries")
+
   def validateRtl(): Unit =
     validateCore()
     require(hartCount == 1, "RTL supports one hart")
-    require(virtualAddressBits == 0 && pmpEntries == 0, "RTL supports Bare addressing without PMP")
+    require(virtualAddressBits == 0, "RTL supports Bare addressing")
     require(iCacheBytes == 0 && dCacheBytes == 0 && l2CacheBytes == 0, "RTL supports uncached memory")
     require(memoryRegions.exists(r => r.executable && resetVector >= r.base && resetVector + 4 <= r.base + r.size), "Reset vector must be in executable memory")
 
