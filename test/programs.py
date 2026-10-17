@@ -13,6 +13,10 @@ def add(rd, a, b):
     return (b << 20) | (a << 15) | (rd << 7) | 0x33
 
 
+def mul(rd, a, b):
+    return add(rd, a, b) | (1 << 25)
+
+
 def ld(rd, base, offset=0):
     return ((offset & 4095) << 20) | (base << 15) | (3 << 12) | (rd << 7) | 3
 
@@ -157,3 +161,19 @@ def cases(base):
     p.emit(ld(3, 10), addi(3, 3, 1), sd(3, 10), addi(2, 2, -1), beq(2, 0, 8))
     p.emit(jal(0, loop - p.offset))
     yield 'pipeline_reuse', p.finish()
+
+    p = Program(base)
+    p.address(10, 0x1000)
+    p.address(11, 0x1800)
+    edges = (0, 1, 2, (1 << 64) - 1, 1 << 63, (1 << 63) - 1, 1 << 32, 0xaaaaaaaa55555555)
+    pairs = [(a, b) for a in edges for b in edges]
+    pairs += [(rng.getrandbits(64), rng.getrandbits(64)) for _ in range(32)]
+    for index, (a, b) in enumerate(pairs):
+        for offset, value in ((0, a), (8, b)):
+            for byte in range(8):
+                p.memory[base + 0x1000 + index * 16 + offset + byte] = (value >> (byte * 8)) & 255
+        p.emit(ld(2, 10, index * 16), ld(3, 10, index * 16 + 8), mul(4, 2, 3), sd(4, 11, index * 8))
+    p.emit(mul(2, 2, 3), add(4, 2, 2), mul(4, 4, 4), mul(0, 2, 3), addi(5, 0, 9),
+           sd(4, 11), mul(6, 0, 4), sd(6, 11, 8),
+           mul(7, 2, 3) | (1 << 12), mul(7, 2, 3) | (4 << 12), mul(7, 2, 3) | 8)
+    yield 'multiply', p.finish()

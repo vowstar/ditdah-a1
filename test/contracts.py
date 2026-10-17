@@ -5,9 +5,10 @@
 from pathlib import Path
 import json
 import re
+import random
 import subprocess
 
-from programs import addi, csr, sd
+from programs import addi, csr, sd, mul
 
 
 FETCH = r'''
@@ -193,6 +194,7 @@ def decode_contract():
              (0x0072b423, 1, 1, 0), (0x34029373, 1, 0, 1),
              (0x3402a373, 1, 0, 1), (0x00000073, 0, 0, 0),
              (0x30200073, 0, 0, 0), (0xffffffff, 0, 0, 0))
+    cases += ((mul(6, 5, 7), 1, 1, 1), (mul(6, 5, 7) | (1 << 12), 0, 0, 0))
     body = '    input_valid = 1; output_ready = 1;\n'
     for word, rs1, rs2, rd in cases:
         serial = int(word in (0x34029373, 0x3402a373, 0x30200073))
@@ -383,6 +385,86 @@ def fabric_contract(parameters):
 '''
 
 
+def multiply_contract():
+    edges = (0, 1, 2, (1 << 64) - 1, 1 << 63, (1 << 63) - 1, 1 << 32, 0xaaaaaaaa55555555)
+    rng = random.Random(2026)
+    pairs = [(a, b) for a in edges for b in edges]
+    pairs += [(rng.getrandbits(64), rng.getrandbits(64)) for _ in range(32)]
+    body = ''
+    for a, b in pairs:
+        body += f'''
+    input_bits_operand1 = 64'h{a:x}; input_bits_operand2 = 64'h{b:x}; input_valid = 1;
+    check(input_ready && !output_valid, "Multiply resource reuse"); tick();
+    input_bits_operand1 = ~input_bits_operand1; input_bits_operand2 = ~input_bits_operand2;
+    for (integer cycles = 0; !output_valid; cycles++) begin
+      check(!input_ready && cycles < 64, "Multiply acceptance or completion bound"); tick();
+    end
+    input_valid = 0;
+    repeat (3) begin
+      check(!input_ready && output_valid && output_bits == 64'h{(a * b) & ((1 << 64) - 1):x}, "Multiply value and held completion"); tick();
+    end
+    output_ready = 1; tick(); output_ready = 0;
+'''
+    return body
+
+
+def backend_multiply_contract():
+    def send(words, pc, tag):
+        return ''.join(f'''
+    instruction_bits_pc = 'h{pc + 4 * index:x}; instruction_bits_instruction = 'h{word:x};
+    instruction_bits_tag = {tag + index}; instruction_valid = 1;
+    while (!instruction_ready) tick(); tick(); instruction_valid = 0;
+''' for index, word in enumerate(words))
+
+    reset = '''
+    reset = 1; tick(); reset = 0; tick();
+    data_request_ready = 0; data_response_valid = 0; data_response_bits_fault = 0;
+'''
+    setup = send((addi(2, 0, -1), addi(3, 0, -1)), 0x100, 1) + '    repeat (8) tick();\n'
+    complete = '''
+    data_request_ready = 1; tick(); data_request_ready = 0;
+    data_response_bits_tag = data_request_bits_tag; data_response_valid = 1;
+    tick(); data_response_valid = 0; repeat (8) tick();
+'''
+    body = reset + setup + send((sd(3, 0), mul(4, 2, 3), addi(5, 4, 1)), 0x180, 10)
+    body += '''
+    while (!data_request_valid) tick();
+    while (!dut.multiply.output_valid) tick();
+    repeat (3) begin
+      check(data_request_valid && data_request_bits_write && data_request_bits_tag == 10 &&
+        dut.executePending && dut.issuedValid && !dut.multiply.input_valid &&
+        dut.multiply.output_valid && dut.multiply.output_bits == 1, "Blocked multiply retains owner and destination"); tick();
+    end
+''' + complete + send((sd(5, 0),), 0x200, 20) + '''
+    while (!data_request_valid) tick();
+    check(data_request_bits_write && data_request_bits_data == 2, "Dependent instruction used a stale multiply result");
+''' + complete
+    for held in (False, True):
+        body += reset + setup
+        words = (0x00003303 if held else 0x73, mul(4, 2, 3), sd(2, 0))
+        body += send(words, 0x180, 10)
+        if held:
+            body += '''
+    while (!data_request_valid || dut.multiply.multiplier != 7) tick();
+    check(dut.executePending && !dut.multiply.output_valid, "Fault response did not precede multiply completion");
+    data_request_ready = 1; tick(); data_request_ready = 0;
+    data_response_bits_tag = 10; data_response_bits_fault = 1; data_response_valid = 1;
+    tick(); data_response_valid = 0; data_response_bits_fault = 0;
+'''
+        body += f'''
+    while (!redirect) begin check(!data_request_valid, "Younger store escaped before redirect"); tick(); end
+    check(dut.executePending && dut.multiply.{'valid' if held else 'busy'}, "Redirect did not overlap the multiply operation");
+    tick();
+    check(!dut.issuedValid && !data_request_valid, "Redirect retained a younger effect");
+'''
+        body += send((addi(5, 4, 7), sd(5, 0)), 0x200, 20) + '''
+    while (!data_request_valid) tick();
+    check(data_request_bits_write && data_request_bits_data == 7 && data_request_bits_tag == 21,
+      "Cancelled multiply wrote its destination or polluted slot reuse");
+''' + complete
+    return body
+
+
 def backend_contract():
     words = [(2 << 12) | (1 << 7) | 0x37, addi(2, 0, 42), sd(2, 1), 0x73, sd(2, 1, 8)]
     body = '    instruction_bits_length = 4;\n'
@@ -432,7 +514,7 @@ def backend_contract():
     data_request_ready = 1; tick(); data_request_ready = 0;
     data_response_bits_tag = 8; data_response_valid = 1; tick(); data_response_valid = 0;
     repeat (6) begin check(!data_request_valid && !redirect, "Unexpected backend effect"); tick(); end
-'''
+''' + backend_multiply_contract()
 
 
 def bench(module, body):
@@ -472,7 +554,9 @@ endmodule
 def verify(rtl, directory):
     directory.mkdir(parents=True, exist_ok=True)
     parameters = json.loads((rtl / 'ditdah_a1_config.json').read_text())['parameters']
+    verified = []
     for name, body in (('DitDahA1Fetch', FETCH), ('DitDahA1Lsu', LSU),
+                       ('DitDahA1Multiply', multiply_contract()),
                        ('DitDahA1Frontend', frontend_contract(parameters)),
                        ('DitDahA1Decode', decode_contract()),
                        ('DitDahA1Backend', backend_contract()),
@@ -488,10 +572,12 @@ def verify(rtl, directory):
         if name == 'DitDahA1MemoryFabric':
             dependencies = [rtl / (child + '.sv') for child in ('DitDahA1MemoryArbiter', 'DitDahA1Memory', 'DitDahA1Axi')]
         if name == 'DitDahA1Backend':
-            dependencies = [rtl / ('DitDahA1' + child + '.sv') for child in ('Decode', 'Issue', 'Execute', 'Commit', 'Gpr', 'Csr', 'Lsu')]
+            dependencies = [rtl / ('DitDahA1' + child + '.sv') for child in ('Decode', 'Issue', 'Execute', 'Multiply', 'Commit', 'Gpr', 'Csr', 'Lsu')]
         subprocess.run(['iverilog', '-g2012', '-s', 'contract_tb', '-o', str(binary),
                         str(module), *map(str, dependencies), str(test)], check=True)
         result = subprocess.run(['vvp', str(binary)], capture_output=True, text=True, timeout=30)
         (directory / (name + '.log')).write_text(result.stdout + result.stderr)
         assert result.returncode == 0 and 'PASS' in result.stdout, result.stdout + result.stderr
         print(f'  {name} interface contracts passed', flush=True)
+        verified.append(name)
+    return verified

@@ -74,6 +74,8 @@ class Model:
                 value, write = a + immediate, True
             elif opcode == 0x33 and funct3 == 0 and insn >> 25 == 0:
                 value, write = a + b, True
+            elif opcode == 0x33 and funct3 == 0 and insn >> 25 == 1:
+                value, write = a * b, True
             elif opcode == 0x63 and funct3 == 0:
                 displacement = signed(((insn >> 31) << 12) | (((insn >> 7) & 1) << 11)
                                       | (((insn >> 25) & 63) << 5) | (((insn >> 8) & 15) << 1), 13)

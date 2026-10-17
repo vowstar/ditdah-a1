@@ -19,7 +19,7 @@ for directory, top in (("production", "DitDahA1"), ("core", "DitDahA1Core"),
     if top in ("DitDahA1Core", "DitDahA1Frontend", "DitDahA1Backend"):
         assert "axi_" not in header
     if top == 'DitDahA1Backend':
-        assert set(files) == {'DitDahA1' + name + '.sv' for name in ('Backend', 'Decode', 'Issue', 'Execute', 'Commit', 'Gpr', 'Csr', 'Lsu')}
+        assert set(files) == {'DitDahA1' + name + '.sv' for name in ('Backend', 'Decode', 'Issue', 'Execute', 'Multiply', 'Commit', 'Gpr', 'Csr', 'Lsu')}
         assert (rtl / (top + '.sv')).read_bytes() == Path('result/verify/axi512/rtl', top + '.sv').read_bytes()
     if top == 'DitDahA1MemoryFabric':
         assert set(files) == {name + '.sv' for name in (top, 'DitDahA1MemoryArbiter', 'DitDahA1Memory', 'DitDahA1Axi')}

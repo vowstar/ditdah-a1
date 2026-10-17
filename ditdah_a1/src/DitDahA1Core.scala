@@ -59,9 +59,11 @@ object DitDahA1Backend extends Generator[DitDahA1Parameter, DitDahA1Layers, DitD
     val resultPacket = Reg(new ResultPacket)
     val commitPacket = Reg(new ResultPacket)
     val memoryPending = RegInit(false.B)
+    val executePending = RegInit(false.B)
     val decode = DitDahA1Decode.instantiate(parameter)
     val issue = DitDahA1Issue.instantiate(parameter)
     val execute = DitDahA1Execute.instantiate(parameter)
+    val multiply = DitDahA1Multiply.instantiate(parameter)
     val commit = DitDahA1Commit.instantiate(parameter)
     val gpr = DitDahA1Gpr.instantiate(parameter)
     val csr = DitDahA1Csr.instantiate(parameter)
@@ -72,9 +74,12 @@ object DitDahA1Backend extends Generator[DitDahA1Parameter, DitDahA1Layers, DitD
     csr.io.reset := io.reset
     lsu.io.clock := io.clock
     lsu.io.reset := io.reset
+    multiply.io.clock := io.clock
+    multiply.io.reset := io.reset
     decode.io.input :<>= io.instruction
     issue.io.input.bits :<= decodedPacket
     execute.io.input.bits :<= issuedPacket
+    multiply.io.input.bits :<= issuedPacket
     gpr.io.raddr1 := issue.io.raddr1
     gpr.io.raddr2 := issue.io.raddr2
     issue.io.rdata1 := gpr.io.rdata1
@@ -94,8 +99,11 @@ object DitDahA1Backend extends Generator[DitDahA1Parameter, DitDahA1Layers, DitD
     val commitReady = !commitValid | retired
     val memoryOperation = (resultPacket.load | resultPacket.store) & !resultPacket.instruction.fault
     val resultAdvance = resultValid & (!memoryOperation | (memoryPending & lsu.io.output.valid)) & commitReady & !redirect
-    execute.io.input.valid := issuedValid & !redirect
+    val isMultiply = (issuedPacket.decoded.operation === DitDahA1Isa.Mul.U(4)) & !issuedPacket.decoded.instruction.fault
+    multiply.io.input.valid := issuedValid & isMultiply & !executePending & !redirect
+    execute.io.input.valid := issuedValid & (!isMultiply | (executePending & multiply.io.output.valid)) & !redirect
     execute.io.output.ready := (!resultValid | resultAdvance) & !redirect
+    multiply.io.output.ready := !issuedValid | (isMultiply & execute.io.output.ready)
     val executed = execute.io.output.valid & execute.io.output.ready
     val destinations = Seq(
       (issuedValid & issuedPacket.decoded.writesRd, issuedPacket.decoded.rd),
@@ -107,7 +115,7 @@ object DitDahA1Backend extends Generator[DitDahA1Parameter, DitDahA1Layers, DitD
     }.reduce(_ | _)
     val stalled = dependency | (decodedPacket.serializing & (issuedValid | resultValid | commitValid))
     issue.io.input.valid := decodedValid & !stalled & !redirect
-    issue.io.output.ready := (!issuedValid | executed) & !redirect
+    issue.io.output.ready := (!issuedValid | executed) & !executePending & !redirect
     val issued = issue.io.output.valid & issue.io.output.ready
     decode.io.output.ready := (!decodedValid | issued) & !redirect
     val decoded = decode.io.output.valid & decode.io.output.ready
@@ -139,7 +147,15 @@ object DitDahA1Backend extends Generator[DitDahA1Parameter, DitDahA1Layers, DitD
       when(memoryPending) { commitPacket :<= lsu.io.output.bits }
       resultValid := false.B
     }
-    when(executed) { resultPacket :<= execute.io.output.bits; resultValid := true.B; issuedValid := false.B }
+    when(executed) {
+      resultPacket :<= execute.io.output.bits
+      when(isMultiply) { resultPacket.value := multiply.io.output.bits }
+      resultValid := true.B
+      issuedValid := false.B
+    }
+    // Accepted arithmetic drains before the issued slot is reused.
+    when(multiply.io.input.valid & multiply.io.input.ready) { executePending := true.B }
+    when(multiply.io.output.valid & multiply.io.output.ready) { executePending := false.B }
     when(issued) { issuedPacket :<= issue.io.output.bits; issuedValid := true.B; decodedValid := false.B }
     when(decoded) { decodedPacket :<= decode.io.output.bits; decodedValid := true.B }
     when(lsu.io.input.valid & lsu.io.input.ready) { memoryPending := true.B }

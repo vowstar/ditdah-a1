@@ -16,7 +16,8 @@ Hart count and cache sizes describe configurations of the same model.
 | Integration | Burst-capable AXI4 and JTAG debug |
 
 The executable RTL has one RV64 hart, M mode, an overlapped single-issue pipeline, uncached AXI4,
-and precise synchronous exceptions. The generated configuration manifest lists the 13 implemented instructions.
+and precise synchronous exceptions. The generated configuration manifest lists the 14 implemented instructions.
+MUL uses an iterative resource; accepted operations retain their instruction owner through completion or cancellation draining.
 The complete target ISA is not implemented.
 Caches, MMU, dual issue, and coherence remain design targets.
 Core composes Frontend and Backend; Frontend owns PC sequencing and Backend owns execution and retirement.
@@ -47,8 +48,11 @@ Add `--trace` to retain the separate DV bind files.
 The default physical map is 64 KiB of RAM at zero; configure regions for the intended system.
 
 `make verify-signoff` checks standalone Core and AXI integration against the same instruction model,
-tests interface and component-configuration contracts, and lints the five production tops.
+tests interface and component-configuration contracts, lints the five production tops, and proves execution/transaction safety.
+Formal checks cover Fetch cancellation, multiply ownership and zero/unit operands, and Backend ownership with an abstract resource.
+They include reachable scenarios and mutations that must fail; general multiply results are checked by simulation.
 This checks the implemented instruction subset, not full ISA compliance or physical signoff.
+Use `make verify-signoff VERIFY_ARGS=--use-generated` to reuse RTL whose recorded sources and configuration still match.
 
 Pipeline depth, issue width, and cache sizes are specifications rather than model-number fields.
 Major architecture generations use 1, 2, and 3. Release versions track maintenance separately.
@@ -62,3 +66,4 @@ E, R, A, and P identify embedded, real-time, application, and performance-orient
 - [Zaozi](https://github.com/xinpian-tech/zaozi): hardware description framework and pinned development tools.
 - [RISC-V specifications](https://riscv.org/specifications/ratified/): instruction and privilege contracts.
 - [LLVM](https://github.com/llvm/llvm-project) and [CIRCT](https://github.com/llvm/circt): compiler toolchain.
+- [YosysHQ](https://github.com/YosysHQ): synthesis and formal verification tools.

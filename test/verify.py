@@ -182,16 +182,11 @@ def main():
             assert hashlib.sha256(Path(name).read_bytes()).hexdigest() == digest, f'Stale RTL source: {name}'
         for key, value in config.items():
             assert manifest['parameters'][key] == value, f'Stale RTL configuration: {key}'
-        verify_contracts(rtl, directory / 'contracts')
+        interface_contracts = verify_contracts(rtl, directory / 'contracts')
         binary = compile_tb(rtl, directory, width, config['physicalAddressBits'])
         print(f'Checking AXI{width}', flush=True)
         report = compare(binary, directory, manifest['parameters'])
-        report['interfaceContracts'] = ['fetch cancellation and identity', 'LSU authorization and completion',
-                                        'frontend sequencing and redirects',
-                                        'backend instruction packets, hazards, and precise traps',
-                                        'decode dependencies', 'memory arbitration and response ownership',
-                                        'memory permissions and transfer attributes', 'AXI request and response handling',
-                                        'physical fabric ownership, backpressure, and faults']
+        report['interfaceContracts'] = interface_contracts
         report.update(axiDataBits=width, physicalAddressBits=config['physicalAddressBits'])
         summary['configurations'].append(report)
         core = directory / 'core'

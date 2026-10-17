@@ -118,8 +118,8 @@
         devShells.default = pkgs.mkShell {
           buildInputs = [
             configure elaborate build pkgs.scala-cli pkgs.circt-install pkgs.mlir-install
-            pkgs.jextract pkgs.verilator pkgs.iverilog pkgs.yosys
-            (pkgs.python313.withPackages (ps: [ ps.pytest ]))
+            pkgs.jextract pkgs.verilator pkgs.iverilog pkgs.yosys pkgs.sby pkgs.z3
+            (pkgs.python313.withPackages (ps: [ ps.pytest ps.click ]))
           ];
           env = {
             ZAOZI_JAR = jar;

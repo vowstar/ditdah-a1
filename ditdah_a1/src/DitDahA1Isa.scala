@@ -4,7 +4,7 @@ package com.vowstar.ditdah.a1
 
 object DitDahA1Isa:
   val instructions = Seq("lui", "auipc", "addi", "add", "beq", "jal", "jalr",
-    "ld", "sd", "csrrw", "csrrs", "ecall", "mret")
+    "ld", "sd", "csrrw", "csrrs", "ecall", "mret", "mul")
   val Illegal = 0
   val Lui = 1
   val Auipc = 2
@@ -19,3 +19,4 @@ object DitDahA1Isa:
   val Csrrs = 11
   val Ecall = 12
   val Mret = 13
+  val Mul = 14
