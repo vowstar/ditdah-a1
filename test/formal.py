@@ -7,6 +7,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import subprocess
 
 import click
@@ -456,6 +457,83 @@ def interrupt_cases(parameters):
             ('InterruptBackend', backend, '_csr_interruptPending & ~memoryPending', '_csr_interruptPending')]
 
 
+def arbiter_case(parameters):
+    count = 2 * parameters['hartCount']
+    bits = (count - 1).bit_length()
+    fields = ('address', 'data', 'size', 'mask', 'tag', 'write', 'fetch')
+    payload = lambda prefix: '{' + ', '.join(prefix + '_bits_' + field for field in fields) + '}'
+    vector = lambda suffix: '{' + ', '.join(f'ports_{i}_{suffix}' for i in reversed(range(count))) + '}'
+    body = f'''
+  reg past_valid = 0;
+  reg pending, sent, wrapped;
+  reg [{bits-1}:0] expected_owner;
+  reg [148:0] captured;
+  (* anyconst *) reg [{bits-1}:0] watched;
+  reg [{bits}:0] bypassed;
+  wire [{count-1}:0] requests = {vector('request_valid')};
+  wire [{count-1}:0] ready = {vector('request_ready')};
+  wire [{count-1}:0] responses = {vector('response_valid')};
+  wire [{count-1}:0] consumers = {vector('response_ready')};
+  wire [{count-1}:0] accepted = requests & ready;
+  wire completed = downstream_response_valid && downstream_response_ready;
+  wire [{bits}:0] distance = watched >= next ? watched - next : {count} + watched - next;
+  always @(posedge clock) begin
+    past_valid <= 1;
+    assume(watched < {count});
+    if (!past_valid) assume(reset);
+    else assume(!reset);
+    if (reset) begin pending <= 0; sent <= 0; bypassed <= 0; wrapped <= 0; end
+    else begin
+      assume(!downstream_response_valid || sent);
+      if ($past(!reset && downstream_response_valid && !downstream_response_ready)) begin
+        assume(downstream_response_valid);
+        assume($stable({{downstream_response_bits_data, downstream_response_bits_fault, downstream_response_bits_tag}}));
+      end
+      assert($onehot0(accepted) && $onehot0(responses));
+      assert(pending == (state != 0) && sent == (state == 2));
+      assert(next < {count});
+      if (!pending && |requests) assert(|accepted);
+      if (pending) begin
+        assert(ready == 0 && expected_owner == owner);
+        assert(downstream_request_valid == !sent);
+      end
+      if (downstream_request_valid) assert(pending && !sent && {payload('downstream_request')} == captured);
+      if (downstream_request_valid && downstream_request_ready) sent <= 1;
+      assert(downstream_response_ready == (sent && consumers[expected_owner]));
+      assert(responses == ((sent && downstream_response_valid) ? ({count}'d1 << expected_owner) : 0));
+      if (completed) begin
+        assert(pending && sent);
+        pending <= 0; sent <= 0;
+        if (expected_owner == {count-1}) wrapped <= 1;
+      end
+      if (!requests[watched] || accepted[watched]) bypassed <= 0;
+      else if (completed && expected_owner != watched) bypassed <= bypassed + 1;
+      assert(bypassed < {count});
+      if (requests[watched]) assert({{1'b0, bypassed}} + {{1'b0, distance}} < {count});
+      cover(&requests && |accepted);
+      cover(downstream_request_valid && !downstream_request_ready);
+      cover(downstream_response_valid && !downstream_response_ready);
+      cover(completed && expected_owner == {count-1});
+      cover(wrapped && accepted[0]);
+      cover(bypassed == {count-1} && accepted[watched]);
+'''
+    for i in range(count):
+        prefix = f'ports_{i}_request'
+        body += f'''
+      if ($past(!reset && {prefix}_valid && !{prefix}_ready)) begin
+        assume({prefix}_valid);
+      end
+      if (accepted[{i}]) begin
+        assert(!pending); pending <= 1; expected_owner <= {i}; captured <= {payload(prefix)};
+      end
+      if (ports_{i}_response_valid) assert({{ports_{i}_response_bits_data, ports_{i}_response_bits_fault, ports_{i}_response_bits_tag}} ==
+        {{downstream_response_bits_data, downstream_response_bits_fault, downstream_response_bits_tag}});
+'''
+    body += '    end\n  end\n'
+    return ('MemoryArbiter', body, 'assign ports_0_response_valid =',
+            "assign ports_0_response_valid = downstream_response_valid |")
+
+
 def verify(rtl, directory, modules=None):
     directory.mkdir(parents=True, exist_ok=True)
     summary = directory / 'summary.json'
@@ -475,13 +553,18 @@ def verify(rtl, directory, modules=None):
             ('Fetch', FETCH, '& ~killed & ~cancel', '& ~cancel'),
             ('Multiply', MULTIPLY, '~busy & ~valid', '~valid'),
             ('Backend', BACKEND, '(~issuedValid | executed) & ~executePending & ~redirect_0', '(~issuedValid | executed) & ~redirect_0'))
+    cases = [*cases, arbiter_case(manifest['parameters'])]
     if manifest['parameters'].get('enableInterrupts'):
         cases = [*cases, *interrupt_cases(manifest['parameters'])]
     assert not modules or set(modules) <= {case[0] for case in cases}, 'Unsupported proof selection'
     for name, body, before, after in cases:
+        if name == 'MemoryArbiter' and not modules and (enabled or manifest['parameters']['enableInterrupts']):
+            continue
         if modules and name not in modules and not (name.startswith('Pmp') and 'Pmp' in modules):
             continue
         unit = name.removeprefix('Interrupt')
+        if unit == 'Csr':
+            body += "\n  always @* if (readAddress == 12'hf14) assert(legal && readData == {60'd0, hartId});\n"
         module = 'DitDahA1' + ('Pmp' if name == 'PmpDecode' else unit)
         if name == 'PmpInterval':
             module = 'formal_interval'
@@ -490,11 +573,10 @@ def verify(rtl, directory, modules=None):
             files = dict(sources) if unit == 'Backend' else {module + '.sv': sources[module + '.sv']}
         if enabled and unit in ('Fetch', 'Lsu', 'Backend'):
             files['DitDahA1Pmp.sv'] = license + header(sources['DitDahA1Pmp.sv']) + '\n(* anyseq *) reg permit;\nassign allowed = permit;\nendmodule\n'
-        if unit in ('Backend', 'Multiply', 'Csr') or enabled:
+        if unit in ('Backend', 'Multiply', 'Csr', 'MemoryArbiter') or enabled:
             if unit == 'Backend':
                 files['DitDahA1Multiply.sv'] = license + header(sources['DitDahA1Multiply.sv']) + RESOURCE + 'endmodule\n'
             if name == 'InterruptBackend':
-                import re
                 observed = files[module + '.sv']
                 for port in ('trapPc', 'trapCause', 'trapValue', 'we', 'write'):
                     pattern = rf'\.{port}\s*\(([^()]*)\)'
@@ -512,6 +594,10 @@ def verify(rtl, directory, modules=None):
         if name == 'InterruptBackend':
             checks += [('mutation-pc', '? resumePc', "? 64'h0"),
                        ('mutation-write', 'formal_write =', "formal_write = 1'h1 |")]
+        if unit == 'MemoryArbiter':
+            advance = re.findall(r'next <= [^;]+;', sources[module + '.sv'])[-1]
+            checks += [('mutation-release', 'downstream_response_valid & downstream_response_ready_0', 'downstream_response_valid'),
+                       ('mutation-priority', advance, "next <= '0;")]
         for mode, before, after in checks:
             mutating = mode.startswith('mutation')
             work = directory / f'{name.lower()}-{mode}'
@@ -535,6 +621,20 @@ def verify(rtl, directory, modules=None):
 '''
                     prefix = prefix.replace("64'h100", f"64'h{int(manifest['parameters']['resetVector']):x}")
                     text = text.replace('endmodule', prefix + '\nendmodule', 1)
+                if unit == 'MemoryArbiter' and mode != 'prove' and filename == module + '.sv':
+                    guidance = ''.join(f'    assume(ports_{i}_request_valid);\n' + ''.join(
+                        f"    assume(ports_{i}_request_bits_{field} == 0);\n"
+                        for field in ('address', 'data', 'size', 'mask', 'tag', 'write', 'fetch'))
+                        for i in range(2 * manifest['parameters']['hartCount']))
+                    guidance += f'''    assume(downstream_request_ready == (witness_age != 1));
+    assume(downstream_response_valid == sent);
+    assume(consumers == (witness_age == 3 ? 0 : {2 * manifest['parameters']['hartCount']}'d{(1 << (2 * manifest['parameters']['hartCount'])) - 1}));
+'''
+                    text = text.replace('endmodule', '''  reg [2:0] witness_age = 0;
+  always @(posedge clock) if (reset) witness_age <= 0;
+  else if (witness_age != 7) witness_age <= witness_age + 1;
+  always @* begin
+''' + guidance + '  end\nendmodule', 1)
                 if mutating and filename == module + '.sv':
                     assert text.count(before) == (2 if name == 'Csr' else 1), (name, before)
                     text = text.replace(before, after, 1)
@@ -547,9 +647,10 @@ def verify(rtl, directory, modules=None):
             witness_option = 'aigsmt z3\n' if engine == 'abc pdr' else ''
             preparation = (f'hierarchy -check -top {top}\nproc\nflatten\nopt_expr -keepdc\nopt_clean\nwreduce\nopt_clean\ncheck'
                            if name.startswith('Pmp') else f'prep -top {top} -flatten')
+            depth = 6 * manifest['parameters']['hartCount'] + 8 if unit == 'MemoryArbiter' else 72 if task == 'cover' else 1 if name.startswith('Pmp') else (3 if task == 'prove' else 8) if unit == 'Csr' else 4 if name == 'Multiply' and task == 'prove' else 24
             config = f'''[options]
 mode {task}
-depth {72 if task == 'cover' else 1 if name.startswith('Pmp') else (3 if task == 'prove' else 8) if unit == 'Csr' else 4 if name == 'Multiply' and task == 'prove' else 24}
+depth {depth}
 timeout {timeout}
 {witness_option}[engines]
 {engine}
@@ -585,8 +686,10 @@ read -formal -sv {' '.join(files)}
         assumptions='initial reset, then no reset except CSR proofs; Fetch responses require accepted requests and stable blocked payloads; enabled control proofs abstract combinational authorization',
         pmpComposition='Pmp uses independently proved PmpInterval identities and PmpDecode request spans; no table-value restrictions' if 'Pmp' in proved else None,
         backendAbstraction='arbitrary multiply result and completion delay under the separately proved resource protocol',
+        arbitration='one retained request and owner; at most 2N-1 other completions while continuously requesting; no bound on external service delay' if 'MemoryArbiter' in proved else None,
         interruptProgress='with eligibility held, successful matching data response reaches interrupt entry or priority synchronous trap within three cycles; memory service itself is external' if any(r['propertyGroup'] == 'InterruptBackend' for r in reports) else None,
         witnessGuidance='InterruptBackend cover/mutations use ADDI and mie/mstatus initialization, then ADDI/MUL/SD/illegal packets at aligned fixed PCs and tag zero; unrestricted proof' if any(r['propertyGroup'] == 'InterruptBackend' for r in reports) else None,
+        arbiterWitnessGuidance='cover/mutations hold all requesters valid with zero payloads, one request stall and one response stall then immediate service; unrestricted proof' if 'MemoryArbiter' in proved else None,
         configurations=manifest['parameters'], sourceHashes=manifest['sourceHashes'],
         rtlHashes={p: hashlib.sha256(text.encode()).hexdigest() for p, text in sources.items()},
         checkerHash=checker_hash, tools=tools, reports=reports), indent=2) + '\n')
@@ -596,6 +699,6 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--rtl', type=Path, default=Path('result/production'))
     parser.add_argument('--output', type=Path, default=Path('result/formal'))
-    parser.add_argument('--modules', nargs='+', choices=('Fetch', 'Multiply', 'Backend', 'Pmp', 'PmpDecode', 'PmpInterval', 'Csr', 'Lsu', 'InterruptCsr', 'InterruptBackend'))
+    parser.add_argument('--modules', nargs='+', choices=('Fetch', 'Multiply', 'Backend', 'Pmp', 'PmpDecode', 'PmpInterval', 'Csr', 'Lsu', 'InterruptCsr', 'InterruptBackend', 'MemoryArbiter'))
     args = parser.parse_args()
     verify(args.rtl, args.output, args.modules)

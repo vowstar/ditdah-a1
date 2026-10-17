@@ -15,7 +15,7 @@ Hart count and cache sizes describe configurations of the same model.
 | Multiprocessing | One to sixteen harts with hardware cache coherence |
 | Integration | Burst-capable AXI4 and JTAG debug |
 
-The executable RTL has one RV64 hart, M mode, an overlapped single-issue pipeline, uncached AXI4,
+The executable RTL has one to sixteen RV64 harts, M mode, an overlapped single-issue pipeline, uncached AXI4,
 and precise synchronous exceptions. The generated configuration manifest lists the 14 implemented instructions.
 PMP is configurable to zero or sixteen entries per hart; the default uncached configuration omits it.
 Machine software, timer, and external interrupts are optional synchronous level inputs.
@@ -25,8 +25,8 @@ Caches, MMU, dual issue, and coherence remain design targets.
 Core composes Frontend and Backend; Frontend owns PC sequencing and Backend owns execution and retirement.
 Non-fault Backend packets contain four-byte instructions and word-aligned PCs; producers supply fetch faults.
 Core exposes separate instruction/data memory ports; the physical fabric owns arbitration, region checks, and AXI.
+Harts share one outstanding physical transaction with round-robin arbitration and retained response ownership.
 AXI data width is configurable to 64/128/256/512 bits; scalar requests remain at most eight bytes.
-Hart-count descriptions accept 1..16; executable system RTL still requires one hart.
 
 ## Development
 
@@ -51,12 +51,15 @@ Add `--trace` to retain the separate DV bind files.
 The default physical map is 64 KiB of RAM at zero; configure regions for the intended system.
 Set `pmpEntries` to 16 to enable protection; successful PMP writes restart younger execution while accepted fetches drain.
 Set `enableInterrupts` to true for precise machine interrupt entry and return; platform logic owns interrupt sources.
+System interrupt inputs are indexed by hart; each hart has independent CSR and PMP state.
+All harts share the reset vector and read their index from `mhartid`; standalone Core and Backend integrations must hold `hartId` constant.
 
 `make verify-signoff` checks standalone Core and AXI integration against the same instruction model,
 tests interface and component-configuration contracts, lints the five production tops, and proves execution/transaction safety.
 Formal checks cover Fetch cancellation, multiply ownership and zero/unit operands, and Backend ownership with an abstract resource.
 Enabled configurations additionally check PMP decisions, CSR locks, and cancellation/ownership with abstract authorization.
 Interrupt checks cover CSR eligibility, saved PC, transaction ownership, and independently modeled architectural events.
+Multicore checks use per-hart instruction models and shared memory ordered by bus service; arbiter proofs check ownership and bounded overtaking.
 They include reachable scenarios and mutations that must fail; general multiply results are checked by simulation.
 This checks the implemented instruction subset, not full ISA compliance or physical signoff.
 Use `make verify-signoff VERIFY_ARGS=--use-generated` to reuse RTL whose recorded sources and configuration still match.

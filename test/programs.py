@@ -252,3 +252,51 @@ def interrupt_cases(base, protection):
             p.emit(addi(22, 22, 4), csr(0, 0x341, 22), 0x30200073)
         p.interrupts = dict(mode={8: 4, 9: 1, 10: 5, 11: 7}.get(mode, mode), mask=7 if mode == 0 else 1 << ((mode - 1) % 3), target=target)
         yield 'interrupt_' + name, p
+
+
+def multicore_cases(base, harts, protection=False, interrupts=False):
+    for name in ('exchange', *(('protection',) if protection else ()), *(('interrupt',) if interrupts else ())):
+        p = Program(base)
+        p.emit(csr(2, 0xf14, 0, True), addi(3, 0, 64), mul(3, 2, 3))
+        p.address(10, 0x1000)
+        p.emit(add(10, 10, 3), addi(4, 2, 1), sd(4, 10), addi(5, 0, harts), beq(4, 5, 12),
+               addi(6, 4, 0), jal(0, 8), addi(6, 0, 0), addi(7, 0, 64), mul(7, 6, 7))
+        p.address(11, 0x1000)
+        p.emit(add(11, 11, 7))
+        loop = p.offset
+        p.emit(ld(8, 11), beq(8, 0, loop - p.offset - 4))
+        p.emit(addi(9, 0, 8))
+        loop = p.offset
+        p.emit(sd(9, 10, 8), ld(12, 10, 8), addi(9, 9, -1), beq(9, 0, 8), jal(0, loop - p.offset - 16))
+        p.address(13, 0x5100)
+        p.emit(sd(4, 13), ld(14, 13), jal(0, 8), sd(0, 13))
+        if name == 'protection':
+            p.emit(beq(2, 0, 8), jal(0, 36))
+            constant = (base + 0x1800) >> 2
+            for i in range(8):
+                p.memory[base + 0x3000 + i] = (constant >> (8 * i)) & 255
+            p.address(15, 0x3000)
+            p.emit(ld(15, 15), csr(0, 0x3b0, 15), addi(16, 0, 0x99), csr(0, 0x3a0, 16))
+            p.emit(csr(17, 0x3a0, 0, True), csr(18, 0x3b0, 0, True))
+            p.address(15, 0x1800)
+            p.emit(sd(4, 15), ld(19, 15))
+        elif name == 'interrupt':
+            p.emit(addi(15, 0, -1), csr(0, 0x304, 15), addi(15, 0, 8), csr(0, 0x300, 15))
+            target = base + p.offset
+            p.emit(sd(4, 10, 16), ld(19, 10, 16), mul(19, 19, 4), *[addi(19, 19, 1) for _ in range(8)])
+            p.interrupts = dict(mode=7, mask=4, target=target, hart=harts - 1)
+        else:
+            p.emit(beq(2, 0, 8), jal(0, 16))
+            p.address(15, 0x1800)
+            p.faults['read'] = base + 0x1800
+            p.emit(ld(19, 15))
+        p.emit(csr(17, 0xf14, 0, True))
+        if name != 'interrupt':
+            p.emit(csr(18, 0xf14, 0), csr(19, 0xf14, 0, True))
+        p.finish()
+        if name == 'interrupt':
+            p.offset = 0x800
+            p.emit(csr(20, 0x342, 0, True), csr(21, 0x343, 0, True), csr(22, 0x341, 0, True), addi(23, 23, 1))
+            p.address(25, 0x5008)
+            p.emit(sd(0, 25), 0x30200073)
+        yield name, p

@@ -14,6 +14,7 @@ class DitDahA1CsrIO(parameter: DitDahA1Parameter) extends HWBundle(parameter):
   val pmp = Option.when(parameter.pmpEntries != 0)(Aligned(new PmpState(parameter)))
   val clock = Flipped(Clock())
   val reset = Flipped(Reset())
+  val hartId = Flipped(UInt(4))
   val readAddress = Flipped(UInt(12))
   val readData = Aligned(UInt(64))
   val legal = Aligned(Bool())
@@ -49,6 +50,7 @@ object DitDahA1Csr extends Generator[DitDahA1Parameter, DitDahA1UnitLayers, DitD
     Seq(0x301, 0x304, 0x344, 0xf11, 0xf12, 0xf13, 0xf14).foreach { address =>
       when(io.readAddress === address.U(12)) { io.legal := true.B }
     }
+    when(io.readAddress === 0xf14.U(12)) { io.readData := io.hartId }
     Seq((0x305, mtvec), (0x340, mscratch), (0x341, mepc), (0x342, mcause), (0x343, mtval)).foreach { case (address, register) =>
       when(io.readAddress === address.U(12)) { io.readData := register; io.legal := true.B }
       when(io.write & (io.writeAddress === address.U(12))) {

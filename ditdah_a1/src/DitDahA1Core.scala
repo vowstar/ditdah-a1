@@ -20,6 +20,7 @@ object DitDahA1Core extends Generator[DitDahA1Parameter, DitDahA1Layers, DitDahA
     frontend.io.reset := io.reset
     backend.io.clock := io.clock
     backend.io.reset := io.reset
+    backend.io.hartId := io.hartId
     if parameter.enableInterrupts then backend.io.interrupts.get :<= io.interrupts.get
     if parameter.pmpEntries != 0 then frontend.io.pmp.get :<= backend.io.pmp.get
     backend.io.instruction :<>= frontend.io.output
@@ -78,6 +79,7 @@ object DitDahA1Backend extends Generator[DitDahA1Parameter, DitDahA1Layers, DitD
     gpr.io.reset := io.reset
     csr.io.clock := io.clock
     csr.io.reset := io.reset
+    csr.io.hartId := io.hartId
     if parameter.enableInterrupts then csr.io.interrupts.get :<= io.interrupts.get
     lsu.io.clock := io.clock
     lsu.io.reset := io.reset

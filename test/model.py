@@ -39,16 +39,18 @@ class Fault(Exception):
 
 
 class Model:
-    def __init__(self, config, memory, faults):
+    def __init__(self, config, memory, faults, hart_id=0, access=None):
         self.config = config
         self.memory = dict(memory)
         self.faults = faults
+        self.external_access = access
         self.pc = int(config['resetVector'])
         self.registers = [0] * 32
         self.csrs = {address: 0 for address in (0x300, 0x301, 0x304, 0x305, 0x340,
                                                0x341, 0x342, 0x343, 0x344,
                                                0xf11, 0xf12, 0xf13, 0xf14)}
         self.csrs[0x300] = 0x1800
+        self.csrs[0xf14] = hart_id
         if config['pmpEntries']:
             self.csrs.update({address: 0 for address in (*range(0x3a0, 0x3b0, 2), *range(0x3b0, 0x3f0))})
         self.local_fetch_faults = set()
@@ -74,6 +76,8 @@ class Model:
         if not allowed:
             raise Fault(cause, address)
         self.bus.append((kind, address, size, data if kind == 'write' else 0))
+        if kind != 'fetch' and self.external_access is not None:
+            return self.external_access(address, size, kind, data)
         if address == self.faults.get(kind):
             raise Fault(cause, address)
         if kind == 'write':

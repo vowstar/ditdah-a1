@@ -116,11 +116,12 @@ class InterruptBundle extends Bundle:
   val timer = Aligned(Bool())
   val external = Aligned(Bool())
 class DitDahA1IO(parameter: DitDahA1Parameter) extends HWBundle(parameter):
-  val interrupts = Option.when(parameter.enableInterrupts)(Flipped(new InterruptBundle))
+  val interrupts = Option.when(parameter.enableInterrupts)(Flipped(Vec(parameter.hartCount, new InterruptBundle)))
   val clock = Flipped(Clock())
   val reset = Flipped(Reset())
   val axi = Aligned(new AxiBundle(parameter))
   val status = Aligned(new StatusBundle)
+class DitDahA1SystemProbe(parameter: DitDahA1Parameter) extends DVBundle[DitDahA1Parameter, DitDahA1Layers](parameter)
 class DitDahA1Probe(parameter: DitDahA1Parameter) extends DVBundle[DitDahA1Parameter, DitDahA1Layers](parameter):
   private def dv = layers("DV")
   val valid = ProbeRead(Bool(), dv)
@@ -138,6 +139,7 @@ class DitDahA1Probe(parameter: DitDahA1Parameter) extends DVBundle[DitDahA1Param
   val pipelineStall = ProbeRead(Bool(), dv)
 
 class DitDahA1CoreIO(parameter: DitDahA1Parameter) extends HWBundle(parameter):
+  val hartId = Flipped(UInt(4))
   val interrupts = Option.when(parameter.enableInterrupts)(Flipped(new InterruptBundle))
   val clock = Flipped(Clock())
   val reset = Flipped(Reset())
@@ -157,11 +159,12 @@ class DitDahA1FrontendIO(parameter: DitDahA1Parameter) extends HWBundle(paramete
 class DitDahA1MemoryFabricIO(parameter: DitDahA1Parameter) extends HWBundle(parameter):
   val clock = Flipped(Clock())
   val reset = Flipped(Reset())
-  val instruction = Flipped(new MemoryPort)
-  val data = Flipped(new MemoryPort)
+  val instruction = Flipped(Vec(parameter.hartCount, new MemoryPort))
+  val data = Flipped(Vec(parameter.hartCount, new MemoryPort))
   val axi = Aligned(new AxiBundle(parameter))
 
 class DitDahA1BackendIO(parameter: DitDahA1Parameter) extends HWBundle(parameter):
+  val hartId = Flipped(UInt(4))
   val interrupts = Option.when(parameter.enableInterrupts)(Flipped(new InterruptBundle))
   val pmp = Option.when(parameter.pmpEntries != 0)(Aligned(new PmpState(parameter)))
   val clock = Flipped(Clock())

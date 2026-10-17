@@ -1,10 +1,43 @@
 // SPDX-FileCopyrightText: 2026 Huang Rui <vowstar@gmail.com>
 // SPDX-License-Identifier: MIT
 `timescale 1ns/1ps
-`define CORE_TRACE dut.core.backend.dV
+`define CORE_TRACE traces[0]
 module core_tb;
   localparam integer DW = `AXI_BITS;
   localparam integer PA = `PA_BITS;
+  localparam integer HARTS = `HARTS;
+  // Multicore programs allow 256 transactions per hart and 128 cycles per transaction.
+  localparam integer TRANSACTION_LIMIT = HARTS == 1 ? 4096 : 256 * HARTS;
+  localparam integer CYCLE_LIMIT = HARTS == 1 ? 50000 : TRANSACTION_LIMIT * 128;
+  typedef struct packed {
+    logic traceValid;
+    logic [63:0] traceOrder, tracePc;
+    logic [31:0] traceInstruction;
+    logic [63:0] traceNextPc;
+    logic [4:0] traceRd;
+    logic traceRdWrite;
+    logic [63:0] traceValue;
+    logic traceTrap;
+    logic [63:0] traceCause, traceTval;
+    logic [2:0] pipelineOccupancy;
+    logic pipelineStall;
+  } trace_t;
+  typedef struct packed {
+    logic [63:0] address, data;
+    logic [2:0] size;
+    logic [7:0] mask, tag;
+    logic write, fetch;
+  } core_request_t;
+  typedef struct packed { logic [63:0] data; logic fault; logic [7:0] tag; } core_response_t;
+  trace_t traces[HARTS];
+  core_request_t requests[2*HARTS];
+  core_response_t responses[2*HARTS];
+  wire [2*HARTS-1:0] request_valid, request_ready, response_valid, response_ready;
+  wire [HARTS-1:0] multiply_busy;
+  logic [HARTS-1:0] finished = 0;
+  integer bus_owner = 0, active_source = -1, completed_transactions = 0;
+  logic [7:0] accepted_tag;
+  `include "core_bindings.svh"
   logic clock = 0;
   logic reset = 1;
   always #5 clock = ~clock;
@@ -34,13 +67,15 @@ module core_tb;
     .axi_w_valid(wvalid), .axi_w_ready(wready), .axi_w_bits_data(wdata),
     .axi_w_bits_strb(wstrb), .axi_w_bits_last(wlast),
     .axi_b_valid(bvalid), .axi_b_ready(bready), .axi_b_bits_resp(bresp), .axi_b_bits_id(1'b0),
-`ifdef ENABLE_INTERRUPTS
-    .interrupts_software(irq_levels[0]), .interrupts_timer(irq_levels[1]), .interrupts_external(irq_levels[2]),
-`endif
+    `include "core_ports.svh"
     .status_trap(status_trap), .status_busy(status_busy), .status_sleep(status_sleep)
   );
 `ifdef ENABLE_INTERRUPTS
   logic [2:0] irq_levels;
+  wire [2:0] irq_by_hart[HARTS];
+  integer irq_hart;
+  initial if (!$value$plusargs("IRQ_HART=%d", irq_hart)) irq_hart = 0;
+  for (genvar h = 0; h < HARTS; h++) assign irq_by_hart[h] = h == irq_hart ? irq_levels : 0;
   logic irq_activate, irq_ack = 0, irq_retired = 0;
   integer irq_mode;
   logic [63:0] irq_target;
@@ -51,12 +86,12 @@ module core_tb;
     2: irq_activate = aw_held && !w_held;
     3: irq_activate = w_held && !aw_held;
     4: irq_activate = read_pending && !read_fetch;
-    5: irq_activate = read_pending && read_fetch && read_address == irq_target && `CORE_TRACE.pipelineOccupancy == 0;
-    6: irq_activate = dut.core.backend.multiply.busy;
+    5: irq_activate = read_pending && read_fetch && read_address == irq_target && traces[irq_hart].pipelineOccupancy == 0;
+    6: irq_activate = multiply_busy[irq_hart];
     7: irq_activate = irq_retired;
     default: irq_activate = 0;
   endcase
-  always @(posedge clock) irq_retired <= !reset && `CORE_TRACE.traceValid && `CORE_TRACE.tracePc == irq_target;
+  always @(posedge clock) irq_retired <= !reset && traces[irq_hart].traceValid && traces[irq_hart].tracePc == irq_target;
   always @(posedge clock) irq_ack <= !reset && aw_held && w_held && !write_pending && !bvalid && write_address == base_address + 'h5008;
 `endif
   byte unsigned memory [0:65535];
@@ -101,18 +136,16 @@ module core_tb;
   always @(posedge clock) begin
     if (!reset) begin
       cycles <= cycles + 1;
-      if (cycles > 50000) $fatal(1, "Timeout");
+      if (cycles > CYCLE_LIMIT) $fatal(1, "Timeout");
       if (arvalid && !arready) ar_stall <= ar_stall + 1;
       if (awvalid && !awready) aw_stall <= aw_stall + 1;
       if (wvalid && !wready) w_stall <= w_stall + 1;
-      if (`CORE_TRACE.pipelineOccupancy > 4) $fatal(1, "Pipeline occupancy");
-      if (`CORE_TRACE.pipelineOccupancy > pipeline_max) pipeline_max <= `CORE_TRACE.pipelineOccupancy;
-      if (`CORE_TRACE.pipelineStall) dependency_stalls <= dependency_stalls + 1;
       if (arvalid && arready) begin
         if (64'(araddr) < base_address || 64'(araddr) >= base_address + 65536) $fatal(1, "Truncated or unexpected read address");
         if (arid != 0 || arlen != 0 || arburst != 1 || arlock || arcache != 0 || arqos != 0) $fatal(1, "Read attributes");
         if (arprot != 1 && arprot != 5) $fatal(1, "Read privilege");
         if (arsize != (arprot[2] ? 2 : 3) || (araddr & ((1 << arsize) - 1)) != 0) $fatal(1, "Read alignment");
+        if (HARTS > 1) $write("HART %0d ", bus_owner / 2);
         $display("BUS %s %016h %0d %016h", arprot[2] ? "fetch" : "read", 64'(araddr), 1 << arsize, 64'b0);
         read_pending <= 1;
         read_address <= 64'(araddr);
@@ -133,9 +166,14 @@ module core_tb;
         end
       end
       if (rvalid && rready) begin
-        if (read_fetch)
+        if (HARTS > 1)
+          $display("HART %0d READ %016h %01h %016h", bus_owner / 2, read_address, rresp,
+            64'(rdata >> (8 * (read_address % (DW/8)))) & (read_fetch ? 64'hffffffff : '1));
+        if (read_fetch) begin
+          if (HARTS > 1) $write("HART %0d ", bus_owner / 2);
           $display("FETCH %016h %01h %08h", read_address, rresp,
             32'(rdata >> (8 * (read_address % (DW/8)))));
+        end
         rvalid <= 0;
       end
       if (awvalid && awready) begin
@@ -155,6 +193,7 @@ module core_tb;
       if (awvalid && awready && wvalid && wready) together <= together + 1;
       if (aw_held && w_held && !write_pending && !bvalid) begin
         if (write_mask != (DW/8)'(255 << (write_address % (DW/8)))) $fatal(1, "Write strobes");
+        if (HARTS > 1) $write("HART %0d ", bus_owner / 2);
         $display("BUS write %016h 8 %016h", write_address, 64'(write_data >> (8 * (write_address % (DW/8)))));
         if (write_address != fault_write)
           for (integer i = 0; i < DW/8; i++)
@@ -175,22 +214,51 @@ module core_tb;
         aw_held <= 0;
         w_held <= 0;
       end
-      if (`CORE_TRACE.traceValid) begin
+      for (integer h = 0; h < HARTS; h++) begin
+        if (traces[h].pipelineOccupancy > 4) $fatal(1, "Pipeline occupancy");
+        if (traces[h].pipelineOccupancy > pipeline_max) pipeline_max <= traces[h].pipelineOccupancy;
+        if (traces[h].pipelineStall) dependency_stalls <= dependency_stalls + 1;
+        if (traces[h].traceValid) begin
 `ifdef ENABLE_INTERRUPTS
-        $display("IRQ %01h", irq_levels);
+          if (HARTS > 1) $write("HART %0d ", h);
+          $display("IRQ %01h", irq_by_hart[h]);
 `endif
-
-        if (`CORE_TRACE.traceRdWrite && `CORE_TRACE.traceRd == 0) $fatal(1, "x0 write");
-        $display("TRACE %016h %016h %08h %016h %02h %01h %016h %01h %016h %016h",
-          `CORE_TRACE.traceOrder, `CORE_TRACE.tracePc, `CORE_TRACE.traceInstruction, `CORE_TRACE.traceNextPc,
-          `CORE_TRACE.traceRd, `CORE_TRACE.traceRdWrite, `CORE_TRACE.traceValue, `CORE_TRACE.traceTrap,
-          `CORE_TRACE.traceCause, `CORE_TRACE.traceTval);
-        if (!`CORE_TRACE.traceTrap && `CORE_TRACE.tracePc == stop_pc) begin
-          $display("COVER %0d %0d %0d %0d %0d %0d", aw_first, w_first, together, ar_stall, aw_stall, w_stall);
-          $display("PIPELINE %0d %0d", pipeline_max, dependency_stalls);
-          $display("PASS");
-          $finish;
+          if (traces[h].traceRdWrite && traces[h].traceRd == 0) $fatal(1, "x0 write");
+          if (HARTS > 1) $write("HART %0d ", h);
+          $display("TRACE %016h %016h %08h %016h %02h %01h %016h %01h %016h %016h",
+            traces[h].traceOrder, traces[h].tracePc, traces[h].traceInstruction, traces[h].traceNextPc,
+            traces[h].traceRd, traces[h].traceRdWrite, traces[h].traceValue, traces[h].traceTrap,
+            traces[h].traceCause, traces[h].traceTval);
+          if (!traces[h].traceTrap && traces[h].tracePc == stop_pc) finished[h] = 1;
         end
+      end
+      if (&finished) begin
+        $display("COVER %0d %0d %0d %0d %0d %0d", aw_first, w_first, together, ar_stall, aw_stall, w_stall);
+        $display("PIPELINE %0d %0d", pipeline_max, dependency_stalls);
+        $display("PASS"); $finish;
+      end
+    end
+  end
+  always @(posedge clock) if (!reset) begin
+    for (integer source = 0; source < 2*HARTS; source++) begin
+      if (request_valid[source] && request_ready[source]) begin
+        if (active_source != -1) $fatal(1, "Overlapping accepted sources");
+        active_source = source;
+        accepted_tag = requests[source].tag;
+        bus_owner <= source;
+        if (HARTS > 1) $display("HART %0d REQUEST %s %016h %0d %016h %02h", source / 2,
+          source % 2 == 0 ? "fetch" : (requests[source].write ? "write" : "read"),
+          requests[source].address, 1 << requests[source].size, requests[source].write ? requests[source].data : 64'b0,
+          requests[source].tag);
+      end
+      if (response_valid[source] && response_ready[source]) begin
+        if (active_source != source || responses[source].tag != accepted_tag)
+          $fatal(1, "Response source or tag");
+        active_source = -1;
+        completed_transactions = completed_transactions + 1;
+        if (completed_transactions > TRANSACTION_LIMIT) $fatal(1, "Transaction budget");
+        if (HARTS > 1) $display("HART %0d RESPONSE %0d %016h %01h %02h", source / 2, source % 2,
+          responses[source].data, responses[source].fault, responses[source].tag);
       end
     end
   end

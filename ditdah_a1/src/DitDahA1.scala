@@ -8,37 +8,29 @@ import me.jiuyang.zaozi.reftpe.*
 import me.jiuyang.zaozi.valuetpe.*
 
 @generator
-object DitDahA1Module extends Generator[DitDahA1Parameter, DitDahA1Layers, DitDahA1IO, DitDahA1Probe]:
+object DitDahA1Module extends Generator[DitDahA1Parameter, DitDahA1Layers, DitDahA1IO, DitDahA1SystemProbe]:
   override def moduleName(parameter: DitDahA1Parameter): String = "DitDahA1"
   def architecture(parameter: DitDahA1Parameter) =
     parameter.validateRtl()
     val io = summon[Interface[DitDahA1IO]]
-    val probe = summon[ProbeInterface[DitDahA1Probe]]
-    val core = DitDahA1Core.instantiate(parameter)
+    val cores = Seq.tabulate(parameter.hartCount) { hart =>
+      given sourcecode.Name.Machine = sourcecode.Name.Machine(s"core_$hart")
+      DitDahA1Core.instantiate(parameter)
+    }
     val fabric = DitDahA1MemoryFabric.instantiate(parameter)
-    core.io.clock := io.clock
-    core.io.reset := io.reset
-    if parameter.enableInterrupts then core.io.interrupts.get :<= io.interrupts.get
+    for (core, hart) <- cores.zipWithIndex do
+      core.io.clock := io.clock
+      core.io.reset := io.reset
+      core.io.hartId := hart.U(4)
+      if parameter.enableInterrupts then core.io.interrupts.get :<= io.interrupts.get(hart)
+      fabric.io.instruction(hart) :<>= core.io.instruction
+      fabric.io.data(hart) :<>= core.io.data
     fabric.io.clock := io.clock
     fabric.io.reset := io.reset
-    fabric.io.instruction :<>= core.io.instruction
-    fabric.io.data :<>= core.io.data
     io.axi :<>= fabric.io.axi
-    io.status :<= core.io.status
-    layer("DV"):
-      probe.valid <== core.probe.valid
-      probe.order <== core.probe.order
-      probe.pc <== core.probe.pc
-      probe.instruction <== core.probe.instruction
-      probe.nextPc <== core.probe.nextPc
-      probe.rd <== core.probe.rd
-      probe.rdWrite <== core.probe.rdWrite
-      probe.value <== core.probe.value
-      probe.trap <== core.probe.trap
-      probe.cause <== core.probe.cause
-      probe.tval <== core.probe.tval
-      probe.pipelineOccupancy <== core.probe.pipelineOccupancy
-      probe.pipelineStall <== core.probe.pipelineStall
+    io.status.trap := cores.map[Referable[Bool]](_.io.status.trap).reduce(_ | _)
+    io.status.busy := cores.map[Referable[Bool]](_.io.status.busy).reduce(_ | _)
+    io.status.sleep := cores.map[Referable[Bool]](_.io.status.sleep).reduce(_ & _)
 
 @generator
 object DitDahA1MemoryFabric extends Generator[DitDahA1Parameter, DitDahA1UnitLayers, DitDahA1MemoryFabricIO, DitDahA1UnitProbe]:
@@ -54,8 +46,9 @@ object DitDahA1MemoryFabric extends Generator[DitDahA1Parameter, DitDahA1UnitLay
     memory.io.reset := io.reset
     axi.io.clock := io.clock
     axi.io.reset := io.reset
-    arbiter.io.instruction :<>= io.instruction
-    arbiter.io.data :<>= io.data
+    for hart <- 0 until parameter.hartCount do
+      arbiter.io.ports(2 * hart) :<>= io.instruction(hart)
+      arbiter.io.ports(2 * hart + 1) :<>= io.data(hart)
     memory.io.upstream :<>= arbiter.io.downstream
     axi.io.memory :<>= memory.io.downstream
     io.axi :<>= axi.io.axi

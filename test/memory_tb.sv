@@ -28,7 +28,7 @@ module memory_tb;
   always #5 clock = ~clock;
   memory_port core_port[2](), physical_port[2]();
   logic status_trap, status_busy, status_sleep;
-  DitDahA1Core dut(.clock(clock), .reset(reset), `PORT(instruction, core_port[0]),
+  DitDahA1Core dut(.clock(clock), .reset(reset), .hartId(4'b0), `PORT(instruction, core_port[0]),
     `PORT(data, core_port[1]),
 `ifdef ENABLE_INTERRUPTS
     .interrupts_software(irq_levels[0]), .interrupts_timer(irq_levels[1]), .interrupts_external(irq_levels[2]),

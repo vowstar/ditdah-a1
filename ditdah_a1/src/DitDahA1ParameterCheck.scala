@@ -17,7 +17,7 @@ object DitDahA1ParameterCheck:
     assert(DitDahA1Config.parameter(ujson.read(encoded)) == highAddress)
     assert(DitDahA1Config.parameter(DitDahA1Config.document(highAddress)) == highAddress)
     assert(DitDahA1Config.document(highAddress)("target")("xlen").num == 64)
-    for count <- Seq(1, 2, 3, 8, 15, 16) do
+    for count <- 1 to 16 do
       val selected = baseline.copy(hartCount = count)
       assert(DitDahA1Config.parameter(DitDahA1Config.document(selected)) == selected)
     assert(DitDahA1Config.document(baseline)("target")("maxHartCount").num == 16)
@@ -37,7 +37,7 @@ object DitDahA1ParameterCheck:
     rejects { baseline.copy(pmpEntries = 65); () }
     rejects { DitDahA1Config.parameter(ujson.Obj("unused" -> 1)); () }
     val rtl = DitDahA1Parameter.uncached
-    rtl.validateRtl()
+    for count <- 1 to 16 do rtl.copy(hartCount = count).validateRtl()
     assert(!rtl.enableInterrupts)
     for entries <- Seq(0, 16) do
       val enabled = rtl.copy(enableInterrupts = true, pmpEntries = entries)
@@ -64,10 +64,8 @@ object DitDahA1ParameterCheck:
     assert(DitDahA1Config.document(rtl)("parameters")("memoryRegions")(0)("readable").bool)
     assert(DitDahA1Config.document(rtl)("implementation")("maxInflight").num == 5)
     rejects { DitDahA1Config.parameter(ujson.Obj("memoryRegions" -> ujson.Arr(ujson.Obj("execute" -> false)))); () }
-    rejects { rtl.copy(hartCount = 2).validateRtl() }
     rejects { rtl.copy(virtualAddressBits = 39).validateRtl() }
     rtl.copy(pmpEntries = 16).validateRtl()
-    for count <- 2 to 16 do rejects { rtl.copy(hartCount = count).validateRtl() }
     rejects { rtl.copy(pmpEntries = 1); () }
     rejects { rtl.copy(pmpEntries = 64).validateRtl() }
     rejects { rtl.copy(pmpEntries = 64).validateFrontend() }

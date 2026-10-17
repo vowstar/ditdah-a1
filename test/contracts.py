@@ -140,51 +140,34 @@ LSU = r'''
 '''
 
 
-ARBITER = r'''
-    instruction_request_valid = 1;
-    instruction_request_bits_address = 64'h100;
-    instruction_request_bits_size = 2;
-    instruction_request_bits_fetch = 1;
-    instruction_request_bits_tag = 8'h31;
-    data_request_valid = 1;
-    data_request_bits_address = 64'h1008;
-    data_request_bits_data = 64'hfedcba9876543210;
-    data_request_bits_size = 3;
-    data_request_bits_mask = 8'hff;
-    data_request_bits_write = 1;
-    data_request_bits_tag = 8'h72;
-    check(data_request_ready && !instruction_request_ready, "Data arbitration priority");
-    tick(); data_request_valid = 0;
-    data_request_bits_address = 0; data_request_bits_tag = 0;
+def arbiter_contract(parameters):
+    count = 2 * parameters['hartCount']
+    body = ''.join(f"    ports_{i}_request_valid = 1; ports_{i}_response_ready = 1;\n"
+                   f"    ports_{i}_request_bits_address = {0x100 + 8*i};\n"
+                   f"    ports_{i}_request_bits_data = {0x1000 + i};\n"
+                   f"    ports_{i}_request_bits_tag = 7; ports_{i}_request_bits_size = 3;\n"
+                   f"    ports_{i}_request_bits_mask = 255; ports_{i}_request_bits_write = {i % 2};\n"
+                   f"    ports_{i}_request_bits_fetch = {1-i % 2};\n" for i in range(count))
+    no_ready = ' && '.join(f'!ports_{i}_request_ready' for i in range(count))
+    for owner in list(range(count)) * 2:
+        ready = ' && '.join(f'ports_{i}_request_ready == {int(i == owner)}' for i in range(count))
+        response = ' && '.join(f'ports_{i}_response_valid == {int(i == owner)}' for i in range(count))
+        body += f'''    check({ready}, "Round-robin service order"); tick();
+    ports_{owner}_request_valid = 0; ports_{owner}_request_bits_address = 0;
     repeat (3) begin
-      check(downstream_request_valid && downstream_request_bits_address == 64'h1008 && downstream_request_bits_tag == 8'h72 && downstream_request_bits_data == 64'hfedcba9876543210 && downstream_request_bits_mask == 8'hff && !instruction_request_ready && !data_request_ready, "Captured arbitration request hold");
-      tick();
+      check(downstream_request_valid && downstream_request_bits_address == {0x100+8*owner} && downstream_request_bits_data == {0x1000+owner} && downstream_request_bits_tag == 7 && downstream_request_bits_size == 3 && downstream_request_bits_mask == 255 && downstream_request_bits_write == {owner % 2} && downstream_request_bits_fetch == {1-owner % 2} && {no_ready}, "Captured request survives contention and backpressure"); tick();
     end
+    ports_{owner}_request_bits_address = {0x100+8*owner}; ports_{owner}_request_valid = 1;
     downstream_request_ready = 1; tick(); downstream_request_ready = 0;
-    downstream_response_valid = 1;
-    downstream_response_bits_data = 64'h1234;
-    downstream_response_bits_tag = 8'h72;
-    instruction_response_ready = 1;
+    downstream_response_valid = 1; downstream_response_bits_data = {0x2000+owner};
+    downstream_response_bits_tag = 7; downstream_response_bits_fault = {owner % 2};
+    ports_{owner}_response_ready = 0;
     repeat (3) begin
-      check(data_response_valid && data_response_bits_tag == 8'h72 && data_response_bits_data == 64'h1234 && !instruction_response_valid && !downstream_response_ready && !instruction_request_ready, "Data response ownership under backpressure");
-      tick();
+      check({response} && !downstream_response_ready && {no_ready} && ports_{owner}_response_bits_data == {0x2000+owner} && ports_{owner}_response_bits_tag == 7 && ports_{owner}_response_bits_fault == {owner % 2}, "Retained response owner with colliding tags"); tick();
     end
-    data_response_ready = 1; tick(); downstream_response_valid = 0;
-    check(instruction_request_ready, "Instruction request recovery");
-    tick(); instruction_request_valid = 0;
-    check(downstream_request_valid && downstream_request_bits_address == 64'h100 && downstream_request_bits_tag == 8'h31 && downstream_request_bits_fetch, "Instruction request routing");
-    downstream_request_ready = 1; tick(); downstream_request_ready = 0;
-    data_request_valid = 1;
-    instruction_response_ready = 0;
-    downstream_response_valid = 1;
-    downstream_response_bits_tag = 8'h31;
-    downstream_response_bits_fault = 1;
-    repeat (3) begin
-      check(instruction_response_valid && instruction_response_bits_tag == 8'h31 && instruction_response_bits_fault && !data_response_valid && !downstream_response_ready && !data_request_ready, "Instruction response ownership under backpressure");
-      tick();
-    end
-    instruction_response_ready = 1; tick(); downstream_response_valid = 0;
+    ports_{owner}_response_ready = 1; tick(); downstream_response_valid = 0;
 '''
+    return body
 
 
 def decode_contract():
@@ -335,14 +318,14 @@ def fabric_contract(parameters):
     data_value, instruction_value = 0x8877665544332211, 0x12345037
     data_shift = data_address % (width // 8) * 8
     instruction_shift = instruction_address % (width // 8) * 8
-    return f'''
+    body = f'''
     instruction_request_bits_address = 64'h{instruction_address:x};
     instruction_request_bits_size = 2; instruction_request_bits_fetch = 1;
-    instruction_request_bits_tag = 17; instruction_request_valid = 1;
+    instruction_request_bits_tag = 17; instruction_request_valid = 0;
     data_request_bits_address = 64'h{data_address:x}; data_request_bits_size = 3;
     data_request_bits_tag = 34; data_request_valid = 1;
-    check(data_request_ready && !instruction_request_ready, "Concurrent-client arbitration");
-    tick(); data_request_valid = 0;
+    check(data_request_ready && !instruction_request_ready, "Initial data request ownership");
+    tick(); data_request_valid = 0; instruction_request_valid = 1;
     while (!axi_ar_valid) tick();
     repeat (3) begin
       check(axi_ar_bits_addr == 'h{data_address:x} && axi_ar_bits_prot == 1 && !instruction_response_valid, "Data ownership under AXI backpressure"); tick();
@@ -365,7 +348,7 @@ def fabric_contract(parameters):
       check(instruction_response_valid && instruction_response_bits_tag == 17 && instruction_response_bits_data == 64'h{instruction_value:x} && !instruction_response_bits_fault && !data_response_valid, "Held instruction completion retains owner"); tick();
     end
     instruction_response_ready = 1; tick(); instruction_response_ready = 0;
-    data_request_bits_address = 64'h{base + 0x6000:x}; data_request_bits_tag = 51; data_request_valid = 1;
+    data_request_bits_address = 64'h{1 << parameters['physicalAddressBits']:x}; data_request_bits_tag = 51; data_request_valid = 1;
     tick(); data_request_valid = 0;
     while (!data_response_valid) begin
       check(!axi_ar_valid && !axi_aw_valid && !axi_w_valid, "Denied request reached AXI"); tick();
@@ -384,6 +367,7 @@ def fabric_contract(parameters):
     end
     data_response_ready = 1; tick(); data_response_ready = 0;
 '''
+    return body.replace('instruction_', f"instruction_{parameters['hartCount']-1}_").replace('data_request_', 'data_0_request_').replace('data_response_', 'data_0_response_')
 
 
 def multiply_contract():
@@ -785,7 +769,7 @@ def backend_protection_contract():
     return body
 
 
-def verify(rtl, directory):
+def verify(rtl, directory, modules=None):
     directory.mkdir(parents=True, exist_ok=True)
     parameters = json.loads((rtl / 'ditdah_a1_config.json').read_text())['parameters']
     verified = []
@@ -797,16 +781,23 @@ def verify(rtl, directory):
                        ('DitDahA1Decode', decode_contract()),
                        ('DitDahA1Backend', backend_contract() + (backend_protection_contract() if enabled else '') +
                         (backend_interrupt_contract() if parameters['enableInterrupts'] else '')),
-                       ('DitDahA1MemoryArbiter', ARBITER),
+                       ('DitDahA1MemoryArbiter', arbiter_contract(parameters)),
                        ('DitDahA1Memory', memory_contract(parameters)),
                        ('DitDahA1Axi', axi_contract(parameters['axiDataBits'])),
                        ('DitDahA1MemoryFabric', fabric_contract(parameters)))
     if enabled:
         suites += (('DitDahA1Pmp', pmp_contract(parameters)),)
-    if enabled or parameters['enableInterrupts']:
-        suites += (('DitDahA1Csr', (csr_contract(parameters) if enabled else '') +
-                    (interrupt_csr_contract(parameters) if parameters['enableInterrupts'] else '')),)
+    identity = ''.join(f'''    hartId = {hart}; readAddress = 'hf14;
+    check(legal && readData == {hart}, "Hart identity");
+    writeAddress = 'hf14; writeData = '1; write = 1; tick(); write = 0;
+    check(readData == {hart}, "Hart identity is read-only");
+''' for hart in range(16)) + '    hartId = 0;\n'
+    suites += (('DitDahA1Csr', identity + (csr_contract(parameters) if enabled else '') +
+                (interrupt_csr_contract(parameters) if parameters['enableInterrupts'] else '')),)
+    assert not modules or set(modules) <= {name for name, _ in suites}, 'Unsupported contract selection'
     for name, body in suites:
+        if modules and name not in modules:
+            continue
         module = rtl / (name + '.sv')
         test = directory / (name + '_tb.sv')
         test.write_text(bench(module, body))
