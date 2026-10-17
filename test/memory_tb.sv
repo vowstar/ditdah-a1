@@ -21,6 +21,7 @@ endinterface
   .P``_request_bits_fetch(B.request.fetch), .P``_response_ready(B.response_ready), \
   .P``_response_valid(B.response_valid), .P``_response_bits_data(B.response.data), \
   .P``_response_bits_fault(B.response.fault), .P``_response_bits_tag(B.response.tag)
+`undef CORE_TRACE
 `define CORE_TRACE dut.backend.dV
 module memory_tb;
   logic clock = 0, reset = 1;
@@ -28,7 +29,30 @@ module memory_tb;
   memory_port core_port[2](), physical_port[2]();
   logic status_trap, status_busy, status_sleep;
   DitDahA1Core dut(.clock(clock), .reset(reset), `PORT(instruction, core_port[0]),
-    `PORT(data, core_port[1]), .status_trap(status_trap), .status_busy(status_busy), .status_sleep(status_sleep));
+    `PORT(data, core_port[1]),
+`ifdef ENABLE_INTERRUPTS
+    .interrupts_software(irq_levels[0]), .interrupts_timer(irq_levels[1]), .interrupts_external(irq_levels[2]),
+`endif
+    .status_trap(status_trap), .status_busy(status_busy), .status_sleep(status_sleep));
+`ifdef ENABLE_INTERRUPTS
+  logic [2:0] irq_levels;
+  logic irq_activate, irq_ack = 0, irq_retired = 0;
+  integer irq_mode;
+  logic [63:0] irq_target;
+  interrupt_driver interrupts(clock, reset, irq_activate, irq_ack, irq_levels, irq_mode, irq_target);
+  always_comb case (irq_mode)
+    0: irq_activate = 1;
+    1, 2, 3: irq_activate = core_port[1].request_valid && core_port[1].request.write;
+    4: irq_activate = service[1].pending && !service[1].captured.write;
+    5: irq_activate = service[0].pending && service[0].captured.address == irq_target && `CORE_TRACE.pipelineOccupancy == 0;
+    6: irq_activate = dut.backend.multiply.busy;
+    7: irq_activate = irq_retired;
+    default: irq_activate = 0;
+  endcase
+  always @(posedge clock) irq_retired <= !reset && `CORE_TRACE.traceValid && `CORE_TRACE.tracePc == irq_target;
+  always @(posedge clock) irq_ack <= !reset && physical_port[1].request_valid && physical_port[1].request_ready &&
+    physical_port[1].request.write && physical_port[1].request.address == base_address + 'h5008;
+`endif
   byte unsigned memory [0:65535];
   string image;
   logic [63:0] base_address, stop_pc, fault_fetch, fault_read, fault_write;
@@ -60,8 +84,13 @@ module memory_tb;
     request_t captured;
     logic [7:0] owner_tag;
     integer delay = 0, stalls = 0, delayed = 0, rejected = 0, wraps = 0, requests = 0;
-    always @(negedge clock)
+    always @(negedge clock) begin
       physical_port[p].request_ready = !reset && !pending && !physical_port[p].response_valid && random_state[p];
+`ifdef ENABLE_INTERRUPTS
+      if (p == 1 && interrupts.mask != 0 && !interrupts.started && irq_mode >= 1 && irq_mode <= 3)
+        physical_port[p].request_ready = 0;
+`endif
+    end
     always @(posedge clock) if (!reset) begin
       if (core_port[p].request_valid && !core_port[p].request_ready) stalls <= stalls + 1;
       if (core_port[p].request_valid && core_port[p].request_ready) begin
@@ -86,6 +115,9 @@ module memory_tb;
         captured <= physical_port[p].request;
         pending <= 1;
         delay <= p == 0 ? integer'(random_state[5:4]) : 32 + integer'(random_state[7:4]);
+`ifdef ENABLE_INTERRUPTS
+        if (p == 0 && irq_mode == 5 && physical_port[p].request.address == irq_target) delay <= 48;
+`endif
         physical_port[p].response.tag <= physical_port[p].request.tag;
         physical_port[p].response.fault <= physical_port[p].request.address == (p == 0 ? fault_fetch : (physical_port[p].request.write ? fault_write : fault_read));
         $display("BUS %s %016h %0d %016h", p == 0 ? "fetch" : (physical_port[p].request.write ? "write" : "read"),
@@ -123,6 +155,10 @@ module memory_tb;
     if (`CORE_TRACE.pipelineOccupancy > pipeline_max) pipeline_max <= `CORE_TRACE.pipelineOccupancy;
     if (`CORE_TRACE.pipelineStall) dependency_stalls <= dependency_stalls + 1;
     if (`CORE_TRACE.traceValid) begin
+`ifdef ENABLE_INTERRUPTS
+        $display("IRQ %01h", irq_levels);
+`endif
+
       if (`CORE_TRACE.traceRdWrite && `CORE_TRACE.traceRd == 0) $fatal(1, "x0 write");
       $display("TRACE %016h %016h %08h %016h %02h %01h %016h %01h %016h %016h",
         `CORE_TRACE.traceOrder, `CORE_TRACE.tracePc, `CORE_TRACE.traceInstruction, `CORE_TRACE.traceNextPc,

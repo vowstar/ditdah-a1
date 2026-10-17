@@ -34,8 +34,31 @@ module core_tb;
     .axi_w_valid(wvalid), .axi_w_ready(wready), .axi_w_bits_data(wdata),
     .axi_w_bits_strb(wstrb), .axi_w_bits_last(wlast),
     .axi_b_valid(bvalid), .axi_b_ready(bready), .axi_b_bits_resp(bresp), .axi_b_bits_id(1'b0),
+`ifdef ENABLE_INTERRUPTS
+    .interrupts_software(irq_levels[0]), .interrupts_timer(irq_levels[1]), .interrupts_external(irq_levels[2]),
+`endif
     .status_trap(status_trap), .status_busy(status_busy), .status_sleep(status_sleep)
   );
+`ifdef ENABLE_INTERRUPTS
+  logic [2:0] irq_levels;
+  logic irq_activate, irq_ack = 0, irq_retired = 0;
+  integer irq_mode;
+  logic [63:0] irq_target;
+  interrupt_driver interrupts(clock, reset, irq_activate, irq_ack, irq_levels, irq_mode, irq_target);
+  always_comb case (irq_mode)
+    0: irq_activate = 1;
+    1: irq_activate = awvalid || wvalid;
+    2: irq_activate = aw_held && !w_held;
+    3: irq_activate = w_held && !aw_held;
+    4: irq_activate = read_pending && !read_fetch;
+    5: irq_activate = read_pending && read_fetch && read_address == irq_target && `CORE_TRACE.pipelineOccupancy == 0;
+    6: irq_activate = dut.core.backend.multiply.busy;
+    7: irq_activate = irq_retired;
+    default: irq_activate = 0;
+  endcase
+  always @(posedge clock) irq_retired <= !reset && `CORE_TRACE.traceValid && `CORE_TRACE.tracePc == irq_target;
+  always @(posedge clock) irq_ack <= !reset && aw_held && w_held && !write_pending && !bvalid && write_address == base_address + 'h5008;
+`endif
   byte unsigned memory [0:65535];
   string image;
   logic [63:0] base_address, stop_pc, fault_fetch, fault_read, fault_write;
@@ -68,6 +91,12 @@ module core_tb;
     arready = !reset && !read_pending && !rvalid && random_state[0];
     awready = !reset && !aw_held && !bvalid && random_state[1];
     wready = !reset && !w_held && !bvalid && random_state[2];
+`ifdef ENABLE_INTERRUPTS
+    if (interrupts.mask != 0 && !interrupts.started) begin
+      if (irq_mode == 1 || irq_mode == 3) awready = 0;
+      if (irq_mode == 1 || irq_mode == 2) wready = 0;
+    end
+`endif
   end
   always @(posedge clock) begin
     if (!reset) begin
@@ -89,6 +118,9 @@ module core_tb;
         read_address <= 64'(araddr);
         read_fetch <= arprot[2];
         read_delay <= arprot[2] ? integer'(random_state[5:4]) : 32 + integer'(random_state[7:4]);
+`ifdef ENABLE_INTERRUPTS
+        if (irq_mode == 5 && 64'(araddr) == irq_target) read_delay <= 48;
+`endif
       end
       if (read_pending && !rvalid) begin
         if (read_delay > 0) read_delay <= read_delay - 1;
@@ -144,6 +176,10 @@ module core_tb;
         w_held <= 0;
       end
       if (`CORE_TRACE.traceValid) begin
+`ifdef ENABLE_INTERRUPTS
+        $display("IRQ %01h", irq_levels);
+`endif
+
         if (`CORE_TRACE.traceRdWrite && `CORE_TRACE.traceRd == 0) $fatal(1, "x0 write");
         $display("TRACE %016h %016h %08h %016h %02h %01h %016h %01h %016h %016h",
           `CORE_TRACE.traceOrder, `CORE_TRACE.tracePc, `CORE_TRACE.traceInstruction, `CORE_TRACE.traceNextPc,
@@ -165,3 +201,30 @@ module core_tb;
   assert property (@(posedge clock) disable iff (reset)
     wvalid && !wready |=> wvalid && $stable({wdata, wstrb, wlast}));
 endmodule
+
+`ifdef ENABLE_INTERRUPTS
+module interrupt_driver(input logic clock, reset, activate, acknowledge,
+  output logic [2:0] levels = 0, output integer mode, output logic [63:0] target);
+  integer mask, waited = 0;
+  logic started = 0;
+  initial begin
+    if (!$value$plusargs("IRQ_MASK=%d", mask)) mask = 0;
+    if (!$value$plusargs("IRQ_MODE=%d", mode)) mode = -1;
+    if (!$value$plusargs("IRQ_TARGET=%h", target)) target = 0;
+  end
+  always @(negedge clock) if (!reset) begin
+    if (!started && activate && mask != 0) begin
+      levels = 3'(mask); started = 1;
+      $display("IRQ_START %0d", mode);
+    end
+    if (acknowledge) begin
+      if (levels[2]) levels[2] = 0;
+      else if (levels[0]) levels[0] = 0;
+      else levels[1] = 0;
+      waited = 0;
+    end
+    if (levels != 0) waited = waited + 1;
+    if (waited > 1000) $fatal(1, "Held interrupt was not acknowledged");
+  end
+endmodule
+`endif

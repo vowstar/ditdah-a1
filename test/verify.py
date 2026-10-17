@@ -40,9 +40,12 @@ def configuration(width):
 def compile_tb(rtl, directory, width, pa, top='core_tb', source=None, extra_files=()):
     source = source or Path('test/core_tb.sv').resolve()
     files = [(rtl / name).resolve() for name in (rtl / 'filelist.f').read_text().splitlines()]
+    interrupts = json.loads((rtl / 'ditdah_a1_config.json').read_text())['parameters']['enableInterrupts']
+    if interrupts and top == 'memory_tb':
+        extra_files = [*extra_files, Path('test/core_tb.sv').resolve()]
     run(['verilator', '--binary', '--timing', '--assert', '-j', '2', '--top-module', top,
          '-Wno-TIMESCALEMOD', '-Wno-WIDTHTRUNC', '-Wno-WIDTHEXPAND',
-         f'-DAXI_BITS={width}', f'-DPA_BITS={pa}', '-I' + str(rtl.resolve()),
+         f'-DAXI_BITS={width}', f'-DPA_BITS={pa}', *(['-DENABLE_INTERRUPTS'] if interrupts else []), '-I' + str(rtl.resolve()),
          '--Mdir', str((directory / 'obj').resolve()), *files, *extra_files, source], directory / 'compile.log')
     return (directory / 'obj' / ('V' + top)).resolve()
 
@@ -81,6 +84,8 @@ def check_fetches(lines, config, faults, local_faults=()):
             trace = tuple(int(value, 16) for value in fields[1:])
             pc, instruction, trap, cause = trace[1], trace[2], trace[7], trace[8]
             reachable.add(trace[3])
+            if trap and cause >> 63:
+                continue
             if trap and cause == 1:
                 if trace[0] not in local_faults and allowed(pc):
                     assert failed[pc], f'Fetch fault without failed response: {line}'
@@ -99,12 +104,14 @@ def compare(binary, directory, config, transport='axi'):
     count = 0
     reports = []
     pipeline_max, dependency_stalls = 0, 0
-    for name, program in cases(base, config['pmpEntries'] != 0):
+    for name, program in cases(base, config['pmpEntries'] != 0, config['enableInterrupts']):
         image = directory / (name + '.hex')
         image.write_text('\n'.join(f'{program.memory.get(base + i, 0):02x}' for i in range(65536)) + '\n')
         model = Model(config, program.memory, program.faults)
         expected = []
         for _ in range(2000):
+            if hasattr(program, 'interrupts'):
+                break
             record = model.step()
             expected.append(record)
             if not record[7] and record[1] == program.stop:
@@ -116,9 +123,38 @@ def compare(binary, directory, config, transport='axi'):
             command = [binary, f'+IMAGE={image.resolve()}', f'+BASE={base:x}',
                        f'+STOP={program.stop:x}', f'+SEED={seed}']
             command.extend(f'+FAULT_{kind.upper()}={address:x}' for kind, address in program.faults.items())
+            if hasattr(program, 'interrupts'):
+                command.extend(f'+IRQ_{key.upper()}={value:x}' if key == 'target' else f'+IRQ_{key.upper()}={value}'
+                               for key, value in program.interrupts.items())
             run(command, log)
             lines = log.read_text().splitlines()
             assert 'PASS' in lines, f'{name}: simulation did not complete'
+            if hasattr(program, 'interrupts'):
+                model = Model(config, program.memory, program.faults)
+                expected, causes, deferred = [], [], 0
+                for line in lines:
+                    fields = line.split()
+                    if fields[:1] == ['IRQ']:
+                        model.set_interrupts(int(fields[1], 16))
+                    elif fields[:1] == ['TRACE']:
+                        observed = tuple(int(v, 16) for v in fields[1:])
+                        pending = model.interrupt_cause()
+                        record = model.interrupt() if observed[8] >> 63 else model.step()
+                        if pending and not record[8] >> 63 and not record[7]:
+                            deferred += 1
+                            assert deferred <= 1 and record[2] & 127 in (3, 0x23), f'{name}: interrupt deferred beyond its memory owner'
+                        else:
+                            deferred = 0
+                        if record[8] >> 63:
+                            causes.append(record[8] & 63)
+                        expected.append(record)
+                wanted_causes = [bit for index, bit in ((2, 11), (0, 3), (1, 7)) if program.interrupts['mask'] & (1 << index)]
+                assert causes == wanted_causes, f'{name}: interrupt delivery or priority {causes} != {wanted_causes}'
+                start = next((i for i, line in enumerate(lines) if line.startswith('IRQ_START ')), None)
+                assert start is not None, f'{name}: stimulus never activated'
+                if program.interrupts['mode'] == 7:
+                    assert any(line.startswith('TRACE ') and int(line.split()[2], 16) == program.interrupts['target']
+                               and int(line.split()[8], 16) == 0 for line in lines[:start]), f'{name}: target did not retire before interrupt assertion'
             actual = [tuple(int(v, 16) for v in line.split()[1:]) for line in lines if line.startswith('TRACE ')]
             bus = [(v[1], int(v[2], 16), int(v[3]), int(v[4], 16))
                    for line in lines if line.startswith('BUS ') for v in [line.split()]]
@@ -158,6 +194,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--width', type=int, choices=(64, 128, 256, 512), action='append')
     parser.add_argument('--use-generated', action='store_true')
+    parser.add_argument('--interrupts', action='store_true', help='Run only enabled interrupt profiles')
     parser.add_argument('--pmp-entries', type=int, choices=(0, 16))
     args = parser.parse_args()
     summary_path = Path('result/verify/summary.json')
@@ -166,13 +203,17 @@ def main():
                    for p in sorted(Path('test').glob('*')) if p.suffix in ('.py', '.sv')}
     summary = {'scope': 'implemented scalar subset; simulation and assertions', 'configurations': []}
     core_profiles = {}
-    profiles = [(width, entries) for entries in ((args.pmp_entries,) if args.pmp_entries is not None else (0, 16))
+    profiles = [(width, entries, False) for entries in ((args.pmp_entries,) if args.pmp_entries is not None else (0, 16))
                 for width in args.width or (64, 128, 256, 512) if entries == 0 or width in (64, 512)]
-    for width, entries in profiles:
-        directory = Path(f'result/verify/{"pmp16-" if entries else ""}axi{width}')
+    if args.interrupts:
+        profiles = []
+    profiles += [(width, entries, True) for width, entries in ((64, 0), (512, 16))
+                 if (not args.width or width in args.width) and (args.pmp_entries is None or entries == args.pmp_entries)]
+    for width, entries, interrupts in profiles:
+        directory = Path(f'result/verify/{"irq-" if interrupts else ""}{"pmp16-" if entries else ""}axi{width}')
         directory.mkdir(parents=True, exist_ok=True)
         config = configuration(width)
-        config['pmpEntries'] = entries
+        config.update(pmpEntries=entries, enableInterrupts=interrupts)
         config_path = directory / 'input.json'
         config_path.write_text(json.dumps(config, indent=2) + '\n')
         rtl = directory / 'rtl'
@@ -191,7 +232,7 @@ def main():
         print(f'Checking AXI{width}', flush=True)
         report = compare(binary, directory, manifest['parameters'])
         report['interfaceContracts'] = interface_contracts
-        report.update(axiDataBits=width, physicalAddressBits=config['physicalAddressBits'], pmpEntries=entries)
+        report.update(axiDataBits=width, physicalAddressBits=config['physicalAddressBits'], pmpEntries=entries, enableInterrupts=interrupts)
         summary['configurations'].append(report)
         core = directory / 'core'
         core_config = dict(config, axiDataBits=256, iCacheBytes=8192)
@@ -213,11 +254,11 @@ def main():
                             Path('test/memory_tb.sv').resolve(), [(rtl / 'DitDahA1Memory.sv').resolve()])
         report['core'] = compare(binary, core, core_manifest['parameters'], 'memory')
         core_profiles[core_key] = str(core)
-    frontend_config = dict(configuration(128), issueWidth=2, axiDataBits=512, iCacheBytes=8192)
+    frontend_config = dict(configuration(128), issueWidth=2, axiDataBits=512, iCacheBytes=8192, enableInterrupts=True)
     Path('result/frontend-input.json').write_text(json.dumps(frontend_config, indent=2) + '\n')
     fabric_config = dict(frontend_config, resetVector='2', hartCount=16, virtualAddressBits=48, pmpEntries=16)
     Path('result/fabric-input.json').write_text(json.dumps(fabric_config, indent=2) + '\n')
-    backend_config = dict(fabric_config, issueWidth=1, pmpEntries=0)
+    backend_config = dict(fabric_config, issueWidth=1, pmpEntries=0, enableInterrupts=False)
     Path('result/backend-input.json').write_text(json.dumps(backend_config, indent=2) + '\n')
     summary['sourceHashes'] = {str(p): hashlib.sha256(p.read_bytes()).hexdigest()
                               for p in sorted(Path('ditdah_a1/src').glob('*.scala'))}

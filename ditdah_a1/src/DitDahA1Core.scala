@@ -20,6 +20,7 @@ object DitDahA1Core extends Generator[DitDahA1Parameter, DitDahA1Layers, DitDahA
     frontend.io.reset := io.reset
     backend.io.clock := io.clock
     backend.io.reset := io.reset
+    if parameter.enableInterrupts then backend.io.interrupts.get :<= io.interrupts.get
     if parameter.pmpEntries != 0 then frontend.io.pmp.get :<= backend.io.pmp.get
     backend.io.instruction :<>= frontend.io.output
     frontend.io.redirect := backend.io.redirect
@@ -61,6 +62,7 @@ object DitDahA1Backend extends Generator[DitDahA1Parameter, DitDahA1Layers, DitD
     val commitPacket = Reg(new ResultPacket)
     val memoryPending = RegInit(false.B)
     val executePending = RegInit(false.B)
+    val resumePc = Option.when(parameter.enableInterrupts)(RegInit(parameter.resetVector.U(64)))
     val decode = DitDahA1Decode.instantiate(parameter)
     val issue = DitDahA1Issue.instantiate(parameter)
     val execute = DitDahA1Execute.instantiate(parameter)
@@ -76,6 +78,7 @@ object DitDahA1Backend extends Generator[DitDahA1Parameter, DitDahA1Layers, DitD
     gpr.io.reset := io.reset
     csr.io.clock := io.clock
     csr.io.reset := io.reset
+    if parameter.enableInterrupts then csr.io.interrupts.get :<= io.interrupts.get
     lsu.io.clock := io.clock
     lsu.io.reset := io.reset
     multiply.io.clock := io.clock
@@ -91,7 +94,12 @@ object DitDahA1Backend extends Generator[DitDahA1Parameter, DitDahA1Layers, DitD
     execute.io.csrValue := csr.io.readData
     execute.io.csrLegal := csr.io.legal
     csr.io.readAddress := execute.io.csrAddress
-    commit.io.input.valid := commitValid
+    // Completed data operations keep ownership until their architectural event.
+    val takeInterrupt = if parameter.enableInterrupts then
+      csr.io.interruptPending.get & !memoryPending & !(commitValid & (commitPacket.load | commitPacket.store | commitPacket.instruction.fault))
+    else false.B
+    val interruptCause = if parameter.enableInterrupts then csr.io.interruptCause.get else 0.U(64)
+    commit.io.input.valid := (if parameter.enableInterrupts then commitValid & !takeInterrupt else commitValid)
     commit.io.input.bits :<= commitPacket
     commit.io.output.ready := true.B
     commit.io.trapVector := csr.io.trapVector
@@ -102,7 +110,9 @@ object DitDahA1Backend extends Generator[DitDahA1Parameter, DitDahA1Layers, DitD
     val pmpUpdate = if parameter.pmpEntries == 0 then false.B else
       retire.bits.csrWrite & (((retire.bits.csrAddress >= 0x3a0.U(12)) & (retire.bits.csrAddress <= 0x3ae.U(12))) |
         ((retire.bits.csrAddress >= 0x3b0.U(12)) & (retire.bits.csrAddress <= 0x3ef.U(12))))
-    val redirect = retired & (retire.bits.instruction.fault | retire.bits.mret | pmpUpdate | (retire.bits.nextPc =/= sequentialPc))
+    val redirect = if parameter.enableInterrupts then
+      takeInterrupt | (retired & (retire.bits.instruction.fault | retire.bits.mret | pmpUpdate | (retire.bits.nextPc =/= sequentialPc)))
+    else retired & (retire.bits.instruction.fault | retire.bits.mret | pmpUpdate | (retire.bits.nextPc =/= sequentialPc))
     val commitReady = !commitValid | retired
     val memoryOperation = (resultPacket.load | resultPacket.store) & !resultPacket.instruction.fault
     val resultAdvance = resultValid & (!memoryOperation | (memoryPending & lsu.io.output.valid)) & commitReady & !redirect
@@ -143,6 +153,16 @@ object DitDahA1Backend extends Generator[DitDahA1Parameter, DitDahA1Layers, DitD
     csr.io.trapCause := retire.bits.instruction.cause
     csr.io.trapValue := retire.bits.instruction.tval
     csr.io.mret := retired & retire.bits.mret
+    if parameter.enableInterrupts then
+      when(retired) { resumePc.get := retire.bits.nextPc }
+      when(takeInterrupt) {
+        resumePc.get := csr.io.trapVector
+        io.redirectPc := csr.io.trapVector
+        csr.io.trap := true.B
+        csr.io.trapPc := resumePc.get
+        csr.io.trapCause := interruptCause
+        csr.io.trapValue := 0.U(64)
+      }
     io.status.trap := csr.io.trap
     io.status.busy := true.B
     io.status.sleep := false.B
@@ -189,8 +209,8 @@ object DitDahA1Backend extends Generator[DitDahA1Parameter, DitDahA1Layers, DitD
       val pipelineStall = Wire(Bool())
       pipelineOccupancy := (decodedValid.?(1.U(3), 0.U(3)) + issuedValid.?(1.U(3), 0.U(3)) + resultValid.?(1.U(3), 0.U(3)) + commitValid.?(1.U(3), 0.U(3))).asBits.bits(2, 0).asUInt
       pipelineStall := decodedValid & stalled
-      traceValid := retired
-      when(retired) { traceOrder := (traceOrder + 1.U(64)).asBits.bits(63, 0).asUInt }
+      traceValid := (if parameter.enableInterrupts then retired | takeInterrupt else retired)
+      when(if parameter.enableInterrupts then retired | takeInterrupt else retired) { traceOrder := (traceOrder + 1.U(64)).asBits.bits(63, 0).asUInt }
       tracePc := retire.bits.instruction.pc
       traceInstruction := retire.bits.instruction.instruction
       traceNextPc := retire.bits.nextPc
@@ -200,6 +220,18 @@ object DitDahA1Backend extends Generator[DitDahA1Parameter, DitDahA1Layers, DitD
       traceTrap := retire.bits.instruction.fault
       traceCause := retire.bits.instruction.cause
       traceTval := retire.bits.instruction.tval
+      if parameter.enableInterrupts then
+        when(takeInterrupt) {
+          tracePc := resumePc.get
+          traceInstruction := 0.U(32)
+          traceNextPc := csr.io.trapVector
+          traceRd := 0.U(5)
+          traceRdWrite := false.B
+          traceValue := 0.U(64)
+          traceTrap := true.B
+          traceCause := interruptCause
+          traceTval := 0.U(64)
+        }
       probe.valid <== traceValid
       probe.order <== traceOrder
       probe.pc <== tracePc

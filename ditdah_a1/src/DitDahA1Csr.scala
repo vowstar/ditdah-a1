@@ -8,6 +8,9 @@ import me.jiuyang.zaozi.reftpe.*
 import me.jiuyang.zaozi.valuetpe.*
 
 class DitDahA1CsrIO(parameter: DitDahA1Parameter) extends HWBundle(parameter):
+  val interrupts = Option.when(parameter.enableInterrupts)(Flipped(new InterruptBundle))
+  val interruptPending = Option.when(parameter.enableInterrupts)(Aligned(Bool()))
+  val interruptCause = Option.when(parameter.enableInterrupts)(Aligned(UInt(64)))
   val pmp = Option.when(parameter.pmpEntries != 0)(Aligned(new PmpState(parameter)))
   val clock = Flipped(Clock())
   val reset = Flipped(Reset())
@@ -63,6 +66,24 @@ object DitDahA1Csr extends Generator[DitDahA1Parameter, DitDahA1UnitLayers, DitD
       mtval := io.trapValue
       status := status.asBits.bit(3).?(0x80.U(64), 0.U(64))
     }
+    if parameter.enableInterrupts then
+      val enables = RegInit(0.U(3))
+      val inputs = io.interrupts.get
+      val levels = inputs.external.asBits ## inputs.timer.asBits ## inputs.software.asBits
+      val pending = enables.asBits & levels
+      io.interruptPending.get := status.asBits.bit(3) & (pending =/= 0.B(3))
+      io.interruptCause.get := pending.bit(2).?(BigInt("800000000000000b", 16).U(64),
+        pending.bit(0).?(BigInt("8000000000000003", 16).U(64), BigInt("8000000000000007", 16).U(64)))
+      Seq((0x304, enables.asBits), (0x344, levels)).foreach { case (address, bits) =>
+        when(io.readAddress === address.U(12)) {
+          io.readData := (0.B(52) ## bits.bits(2, 2) ## 0.B(3) ## bits.bits(1, 1) ##
+            0.B(3) ## bits.bits(0, 0) ## 0.B(3)).asUInt
+        }
+      }
+      when(io.write & (io.writeAddress === 0x304.U(12))) {
+        val bits = io.writeData.asBits
+        enables := (bits.bits(11, 11) ## bits.bits(7, 7) ## bits.bits(3, 3)).asUInt
+      }
     if parameter.pmpEntries != 0 then
       val width = parameter.physicalAddressBits - 2
       val config = Seq.fill(parameter.pmpEntries)(RegInit(0.U(6)))

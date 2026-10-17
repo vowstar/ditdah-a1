@@ -23,10 +23,15 @@ verify-signoff: config check
 	build-ditdah-a1 --top DitDahA1Core --config result/verify/pmp16-axi512/input.json --output result/core-pmp16
 	build-ditdah-a1 --top DitDahA1Frontend --config result/verify/pmp16-axi512/input.json --output result/frontend-pmp16
 	build-ditdah-a1 --top DitDahA1Backend --config result/verify/pmp16-axi512/input.json --output result/backend-pmp16
+	build-ditdah-a1 --config result/verify/irq-pmp16-axi512/input.json --output result/production-irq
+	build-ditdah-a1 --top DitDahA1Core --config result/verify/irq-pmp16-axi512/input.json --output result/core-irq
+	build-ditdah-a1 --top DitDahA1Backend --config result/verify/irq-pmp16-axi512/input.json --output result/backend-irq
 	python3 test/check_production.py
 	python3 test/formal.py
 	python3 test/formal.py --rtl result/production-pmp16 --output result/formal/pmp16
 	python3 test/formal.py --rtl result/verify/pmp16-axi64/rtl --output result/formal/pmp16-pa32 --modules Pmp
+	python3 test/formal.py --rtl result/production-irq --output result/formal/irq --modules InterruptCsr InterruptBackend
+	python3 test/formal.py --rtl result/verify/irq-axi64/rtl --output result/formal/irq-pa32 --modules InterruptCsr InterruptBackend
 
 clean:
 	rm -rf result

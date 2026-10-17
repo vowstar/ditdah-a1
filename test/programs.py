@@ -75,7 +75,7 @@ class Program:
         return self
 
 
-def cases(base, protection=False):
+def cases(base, protection=False, interrupts=False):
     p = Program(base)
     p.emit(addi(0, 0, 127), addi(2, 0, -1), (0x80000 << 12) | (3 << 7) | 0x37,
            add(4, 2, 3), addi(5, 0, 7))
@@ -179,6 +179,8 @@ def cases(base, protection=False):
     yield 'multiply', p.finish()
     if protection:
         yield from pmp_cases(base)
+    if interrupts:
+        yield from interrupt_cases(base, protection)
 
 
 def pmp_cases(base):
@@ -215,3 +217,38 @@ def pmp_cases(base):
             p.emit(csr(11, 0x3b0, 0, True), csr(12, 0x3b1, 0, True), csr(13, 0x3a0, 0, True))
             p.emit(csr(14, 0x3a1, 0, True), csr(15, 0x3a4, 0, True), csr(16, 0x3ef, 0, True))
         yield 'pmp_' + name, p.finish(fixed_return=name in ('fetch', 'update'))
+
+
+def interrupt_cases(base, protection):
+    names = ('priority', 'store_blocked', 'address_first', 'data_first', 'read_pending', 'fetch_pending',
+             'multiply', 'pmp_restart', 'read_fault', 'write_fault', 'fetch_fault', 'branch')
+    for mode, name in enumerate(names):
+        if mode == 7 and not protection:
+            continue
+        p = Program(base)
+        p.address(10, 0x5000)
+        p.address(11, 0x5008)
+        p.emit(addi(2, 0, -1), csr(0, 0x304, 2), csr(3, 0x344, 0, True),
+               csr(4, 0x344, 0), csr(5, 0x344, 0, True), addi(3, 0, 8), csr(0, 0x300, 3))
+        target = base + p.offset
+        if mode == 7:
+            p.emit(csr(0, 0x3a0, 0))
+        if mode == 11:
+            p.emit(jal(0, 8), sd(2, 10))
+        if mode == 10:
+            p.faults['fetch'] = target
+        if mode in (8, 9):
+            p.faults['read' if mode == 8 else 'write'] = base + 0x5000
+        p.emit(sd(2, 10), ld(4, 10), mul(6, 2, 2), addi(7, 6, 3), jal(0, 8), sd(7, 10))
+        p.emit(*[addi(8, 8, 1) for _ in range(16)])
+        p.finish()
+        p.offset = 0x800
+        p.emit(csr(24, 0x300, 0, True), csr(20, 0x342, 0, True), csr(21, 0x343, 0, True),
+               csr(22, 0x341, 0, True), csr(25, 0x344, 0, True), addi(23, 23, 1))
+        if mode in (8, 9, 10):
+            p.emit(addi(26, 0, {8: 5, 9: 7, 10: 1}[mode]), beq(20, 26, 12))
+        p.emit(sd(0, 11), 0x30200073)
+        if mode in (8, 9, 10):
+            p.emit(addi(22, 22, 4), csr(0, 0x341, 22), 0x30200073)
+        p.interrupts = dict(mode={8: 4, 9: 1, 10: 5, 11: 7}.get(mode, mode), mask=7 if mode == 0 else 1 << ((mode - 1) % 3), target=target)
+        yield 'interrupt_' + name, p

@@ -18,6 +18,7 @@ object DitDahA1Module extends Generator[DitDahA1Parameter, DitDahA1Layers, DitDa
     val fabric = DitDahA1MemoryFabric.instantiate(parameter)
     core.io.clock := io.clock
     core.io.reset := io.reset
+    if parameter.enableInterrupts then core.io.interrupts.get :<= io.interrupts.get
     fabric.io.clock := io.clock
     fabric.io.reset := io.reset
     fabric.io.instruction :<>= core.io.instruction

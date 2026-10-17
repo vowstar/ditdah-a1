@@ -82,12 +82,32 @@ class Model:
             return 0
         return sum(self.memory.get(address + i, 0) << (8 * i) for i in range(size))
 
+    def set_interrupts(self, levels):
+        self.csrs[0x344] = sum(((levels >> index) & 1) << bit for index, bit in enumerate((3, 7, 11)))
+
+    def interrupt_cause(self):
+        pending = self.csrs[0x304] & self.csrs[0x344] if self.csrs[0x300] & 8 else 0
+        return next(((1 << 63) | bit for bit in (11, 3, 7) if pending & (1 << bit)), 0)
+
+    def interrupt(self):
+        cause = self.interrupt_cause()
+        assert cause, 'Interrupt without independently eligible source'
+        pc, target = self.pc, self.csrs[0x305]
+        self.csrs[0x341], self.csrs[0x342], self.csrs[0x343] = pc, cause, 0
+        self.csrs[0x300] = 0x1800 | ((self.csrs[0x300] & 8) << 4)
+        self.pc = target
+        record = (self.order, pc, 0, target, 0, 0, 0, 1, cause, 0)
+        self.order += 1
+        return record
+
     def pmp_config(self, index):
         return (self.csrs[0x3a0 + (index // 8) * 2] >> ((index % 8) * 8)) & 255
 
     def write_csr(self, address, value):
         if address == 0x300:
             self.csrs[address] = 0x1800 | (value & 0x88)
+        elif address == 0x304 and self.config.get('enableInterrupts', False):
+            self.csrs[address] = value & 0x888
         elif address in (0x305, 0x341):
             self.csrs[address] = value & ~3
         elif address in (0x340, 0x342, 0x343):

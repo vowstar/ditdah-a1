@@ -38,6 +38,11 @@ object DitDahA1ParameterCheck:
     rejects { DitDahA1Config.parameter(ujson.Obj("unused" -> 1)); () }
     val rtl = DitDahA1Parameter.uncached
     rtl.validateRtl()
+    assert(!rtl.enableInterrupts)
+    for entries <- Seq(0, 16) do
+      val enabled = rtl.copy(enableInterrupts = true, pmpEntries = entries)
+      enabled.validateRtl()
+      assert(DitDahA1Config.parameter(DitDahA1Config.document(enabled)) == enabled)
     rtl.copy(axiDataBits = 64).validateRtl()
     rtl.copy(issueWidth = 2).validateFrontend()
     rejects { rtl.copy(resetVector = 2).validateFrontend() }

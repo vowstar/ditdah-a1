@@ -18,6 +18,7 @@ Hart count and cache sizes describe configurations of the same model.
 The executable RTL has one RV64 hart, M mode, an overlapped single-issue pipeline, uncached AXI4,
 and precise synchronous exceptions. The generated configuration manifest lists the 14 implemented instructions.
 PMP is configurable to zero or sixteen entries per hart; the default uncached configuration omits it.
+Machine software, timer, and external interrupts are optional synchronous level inputs.
 MUL uses an iterative resource; accepted operations retain their instruction owner through completion or cancellation draining.
 The complete target ISA is not implemented.
 Caches, MMU, dual issue, and coherence remain design targets.
@@ -49,11 +50,13 @@ The manifest records the selected top and validation scope; unrelated parameters
 Add `--trace` to retain the separate DV bind files.
 The default physical map is 64 KiB of RAM at zero; configure regions for the intended system.
 Set `pmpEntries` to 16 to enable protection; successful PMP writes restart younger execution while accepted fetches drain.
+Set `enableInterrupts` to true for precise machine interrupt entry and return; platform logic owns interrupt sources.
 
 `make verify-signoff` checks standalone Core and AXI integration against the same instruction model,
 tests interface and component-configuration contracts, lints the five production tops, and proves execution/transaction safety.
 Formal checks cover Fetch cancellation, multiply ownership and zero/unit operands, and Backend ownership with an abstract resource.
 Enabled configurations additionally check PMP decisions, CSR locks, and cancellation/ownership with abstract authorization.
+Interrupt checks cover CSR eligibility, saved PC, transaction ownership, and independently modeled architectural events.
 They include reachable scenarios and mutations that must fail; general multiply results are checked by simulation.
 This checks the implemented instruction subset, not full ISA compliance or physical signoff.
 Use `make verify-signoff VERIFY_ARGS=--use-generated` to reuse RTL whose recorded sources and configuration still match.

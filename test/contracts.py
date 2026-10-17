@@ -518,6 +518,49 @@ def backend_contract():
 ''' + backend_multiply_contract()
 
 
+def backend_interrupt_contract():
+    body = ''
+    for mode in range(4):
+        memory = mode != 0
+        body += '''
+    reset = 1; tick(); reset = 0; tick();
+    interrupts_software = 0; interrupts_timer = 0; interrupts_external = 0;
+    instruction_valid = 0; instruction_bits_fault = 0; instruction_bits_length = 4;
+    data_request_ready = 0; data_response_valid = 0; data_response_bits_fault = 0;
+'''
+        for index, word in enumerate((addi(1, 0, 0x400), csr(0, 0x305, 1), addi(2, 0, -1),
+                                      csr(0, 0x304, 2), addi(3, 0, 8), csr(0, 0x300, 3))):
+            body += f"    instruction_bits_pc = 'h{0x100 + index * 4:x}; instruction_bits_instruction = 'h{word:x}; instruction_valid = 1;\n    while (!instruction_ready) tick(); tick(); instruction_valid = 0; repeat (8) tick();\n"
+        if memory:
+            body += f"    instruction_bits_pc = 'h200; instruction_bits_instruction = 'h{sd(2, 1):x}; instruction_bits_tag = 22; instruction_valid = 1;\n    while (!instruction_ready) tick(); tick(); instruction_valid = 0;\n"
+            body += '''
+    while (!data_request_valid) tick();
+''' + ('    interrupts_external = 1;\n' if mode == 1 else '') + '''
+    repeat (4) begin check(data_request_valid && !redirect, "Interrupt withdrew a presented store"); tick(); end
+    data_request_ready = 1; tick(); data_request_ready = 0;
+    repeat (4) begin check(!redirect, "Interrupt abandoned a store response"); tick(); end
+''' + ('    interrupts_external = 1;\n' if mode == 2 else '') + '''
+    data_response_valid = 1; data_response_bits_tag = 22; tick(); data_response_valid = 0;
+'''
+            if mode == 3:
+                body += '''
+    while (!dut.commitValid) tick(); interrupts_external = 1;
+    check(!redirect, "Completed memory owner must retire before interrupt"); tick();
+'''
+        else:
+            body += '    interrupts_external = 1; #1;\n'
+        body += f'''
+    for (integer waited = 0; !redirect; waited++) begin
+      check(waited < 4, "Interrupt delivery after owner completion"); tick();
+    end
+    check(status_trap && redirectPc == 'h400 && !instruction_ready && !data_request_valid, "Interrupt entry side effects");
+    tick(); interrupts_external = 0;
+    check(dut.csr.returnPc == 'h{0x204 if memory else 0x118:x}, "Interrupt architectural resume PC");
+    repeat (4) begin check(!redirect, "Repeated entry while globally masked"); tick(); end
+'''
+    return body
+
+
 def bench(module, body):
     header = module.read_text().split(');', 1)[0].split('(', 1)[1]
     declarations, connections, names = [], [], []
@@ -626,6 +669,37 @@ def csr_contract(parameters):
     return body
 
 
+def interrupt_csr_contract(parameters):
+    body = '    reset = 1; tick(); reset = 0; tick();\n'
+    model = Model(parameters, {}, {})
+    for enabled in range(8):
+        mask = sum(((enabled >> i) & 1) << bit for i, bit in enumerate((3, 7, 11)))
+        body += f"    write = 1; writeAddress = 'h304; writeData = 64'h{mask | 0xfffffffffffff777:x}; tick(); write = 0; readAddress = 'h304;\n    check(readData == 'h{mask:x}, \"Interrupt enable WARL\");\n"
+        model.write_csr(0x304, mask)
+        for global_enable in (0, 8):
+            model.write_csr(0x300, global_enable)
+            body += f"    write = 1; writeAddress = 'h300; writeData = {global_enable}; tick(); write = 0;\n"
+            for levels in range(8):
+                model.set_interrupts(levels)
+                cause = model.interrupt_cause()
+                body += f"    interrupts_software = {levels & 1}; interrupts_timer = {(levels >> 1) & 1}; interrupts_external = {levels >> 2}; readAddress = 'h344;\n"
+                body += f"    check(readData == 'h{model.csrs[0x344]:x} && interruptPending == {int(bool(cause))}, \"Interrupt levels and eligibility\");\n"
+                if cause:
+                    body += f"    check(interruptCause == 64'h{cause:x}, \"Interrupt priority\");\n"
+                body += f"    write = 1; writeAddress = 'h344; writeData = 0; tick(); write = 0;\n    check(readData == 'h{model.csrs[0x344]:x}, \"Read-only pending levels\");\n"
+    return body + '''
+    trap = 1; trapPc = 'h123; trapCause = 64'h800000000000000b; trapValue = 0; tick(); trap = 0;
+    readAddress = 'h300; check(readData == 'h1880 && !interruptPending, "Entry masks interrupts");
+    readAddress = 'h341; check(readData == 'h120, "Trap PC alignment");
+    readAddress = 'h342; check(readData == 64'h800000000000000b, "Interrupt cause flag");
+    readAddress = 'h343; check(readData == 0, "Interrupt trap value");
+    mret = 1; tick(); mret = 0; readAddress = 'h300;
+    check(readData == 'h1888 && interruptPending, "Return reevaluates held sources");
+    interrupts_software = 0; interrupts_timer = 0; interrupts_external = 0;
+    check(!interruptPending, "Source deassertion");
+'''
+
+
 def protection_contract(fetch):
     prefix = '    reset = 1; tick(); reset = 0; tick();\n    pmp_config = 128\'h98; pmp_address = \'h40;\n'
     if fetch:
@@ -721,13 +795,17 @@ def verify(rtl, directory):
                        ('DitDahA1Multiply', multiply_contract()),
                        ('DitDahA1Frontend', frontend_contract(parameters)),
                        ('DitDahA1Decode', decode_contract()),
-                       ('DitDahA1Backend', backend_contract() + (backend_protection_contract() if enabled else '')),
+                       ('DitDahA1Backend', backend_contract() + (backend_protection_contract() if enabled else '') +
+                        (backend_interrupt_contract() if parameters['enableInterrupts'] else '')),
                        ('DitDahA1MemoryArbiter', ARBITER),
                        ('DitDahA1Memory', memory_contract(parameters)),
                        ('DitDahA1Axi', axi_contract(parameters['axiDataBits'])),
                        ('DitDahA1MemoryFabric', fabric_contract(parameters)))
     if enabled:
-        suites += (('DitDahA1Pmp', pmp_contract(parameters)), ('DitDahA1Csr', csr_contract(parameters)))
+        suites += (('DitDahA1Pmp', pmp_contract(parameters)),)
+    if enabled or parameters['enableInterrupts']:
+        suites += (('DitDahA1Csr', (csr_contract(parameters) if enabled else '') +
+                    (interrupt_csr_contract(parameters) if parameters['enableInterrupts'] else '')),)
     for name, body in suites:
         module = rtl / (name + '.sv')
         test = directory / (name + '_tb.sv')

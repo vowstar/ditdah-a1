@@ -111,7 +111,12 @@ class StatusBundle extends Bundle:
   val trap = Aligned(Bool())
   val busy = Aligned(Bool())
   val sleep = Aligned(Bool())
+class InterruptBundle extends Bundle:
+  val software = Aligned(Bool())
+  val timer = Aligned(Bool())
+  val external = Aligned(Bool())
 class DitDahA1IO(parameter: DitDahA1Parameter) extends HWBundle(parameter):
+  val interrupts = Option.when(parameter.enableInterrupts)(Flipped(new InterruptBundle))
   val clock = Flipped(Clock())
   val reset = Flipped(Reset())
   val axi = Aligned(new AxiBundle(parameter))
@@ -133,6 +138,7 @@ class DitDahA1Probe(parameter: DitDahA1Parameter) extends DVBundle[DitDahA1Param
   val pipelineStall = ProbeRead(Bool(), dv)
 
 class DitDahA1CoreIO(parameter: DitDahA1Parameter) extends HWBundle(parameter):
+  val interrupts = Option.when(parameter.enableInterrupts)(Flipped(new InterruptBundle))
   val clock = Flipped(Clock())
   val reset = Flipped(Reset())
   val instruction = Aligned(new MemoryPort)
@@ -156,6 +162,7 @@ class DitDahA1MemoryFabricIO(parameter: DitDahA1Parameter) extends HWBundle(para
   val axi = Aligned(new AxiBundle(parameter))
 
 class DitDahA1BackendIO(parameter: DitDahA1Parameter) extends HWBundle(parameter):
+  val interrupts = Option.when(parameter.enableInterrupts)(Flipped(new InterruptBundle))
   val pmp = Option.when(parameter.pmpEntries != 0)(Aligned(new PmpState(parameter)))
   val clock = Flipped(Clock())
   val reset = Flipped(Reset())

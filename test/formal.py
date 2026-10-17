@@ -360,6 +360,102 @@ def protection_cases(parameters):
             ('Backend', backend, '| _commit_output_bits_csrWrite\n', "| 1'h0 & _commit_output_bits_csrWrite\n")]
 
 
+def interrupt_cases(parameters):
+    csr = r'''
+  reg irq_past = 0;
+  wire [2:0] irq_levels = {interrupts_external, interrupts_timer, interrupts_software};
+  wire [2:0] irq_enabled = enables & irq_levels;
+  always @(posedge clock) begin
+    irq_past <= 1;
+    if (!irq_past) assume(reset);
+    if (irq_past) begin
+      if ($past(reset)) assert(enables == 0 && status == 0);
+      else begin
+        assert(enables == ($past(write && writeAddress == 12'h304) ?
+          {$past(writeData[11]), $past(writeData[7]), $past(writeData[3])} : $past(enables)));
+        if ($past(trap)) begin
+          assert(mepc == ($past(trapPc) & ~64'd3));
+          assert(mcause == $past(trapCause) && mtval == $past(trapValue));
+          assert(!status[3] && status[7] == $past(status[3]));
+        end else if ($past(mret)) assert(status[3] == $past(status[7]) && status[7]);
+        else if ($past(write && writeAddress == 12'h300)) assert(status == ($past(writeData) & 64'h88));
+      end
+      assert(interruptPending == (status[3] && irq_enabled != 0));
+      if (interruptPending) assert(interruptCause == (64'h8000000000000000 |
+        (irq_enabled[2] ? 64'd11 : irq_enabled[0] ? 64'd3 : 64'd7)));
+      if (readAddress == 12'h304) assert(legal && readData ==
+        (({61'd0, enables} & 1) << 3 | ({61'd0, enables} & 2) << 6 | ({61'd0, enables} & 4) << 9));
+      if (readAddress == 12'h344) assert(legal && readData ==
+        (({61'd0, irq_levels} & 1) << 3 | ({61'd0, irq_levels} & 2) << 6 | ({61'd0, irq_levels} & 4) << 9));
+      cover(interruptPending && interruptCause[3:0] == 11 && irq_levels == 7);
+      cover(interruptPending && interruptCause[3:0] == 3);
+      cover(interruptPending && interruptCause[3:0] == 7);
+      cover(irq_levels != 0 && !status[3] && readAddress == 12'h344);
+      cover($past(mret && !reset) && interruptPending);
+    end
+  end
+'''
+    backend = BACKEND + f'''
+  reg irq_memory_owned = 0;
+  reg [1:0] irq_service_age = 0;
+  reg [63:0] irq_memory_pc;
+  reg [7:0] irq_memory_tag;
+  wire irq_memory_commit = commitValid && (commitPacket_load || commitPacket_store);
+  always @(posedge clock) begin
+    if (reset) begin irq_memory_owned <= 0; irq_service_age <= 0; end
+    else begin
+      if (data_response_valid && data_response_ready && !data_response_bits_fault &&
+          data_response_bits_tag == irq_memory_tag && _csr_interruptPending) irq_service_age <= 1;
+      else if (irq_service_age != 0) irq_service_age <= irq_service_age + 1;
+      if (!_csr_interruptPending || takeInterrupt_layerCapture) irq_service_age <= 0;
+      if (irq_service_age == 3 && _csr_interruptPending)
+        assert(takeInterrupt_layerCapture || (commit_output_valid_layerCapture && commitPacket_instruction_fault));
+      if (lsu_input_valid && _lsu_input_ready) begin
+        assert(!irq_memory_owned);
+        irq_memory_owned <= 1;
+        irq_memory_pc <= resultPacket_instruction_pc;
+        irq_memory_tag <= resultPacket_instruction_tag;
+      end
+      if (commit_output_valid_layerCapture && irq_memory_commit && irq_memory_owned) begin
+        assert(commitPacket_instruction_pc == irq_memory_pc && commitPacket_instruction_tag == irq_memory_tag);
+        irq_memory_owned <= 0;
+      end
+      if (takeInterrupt_layerCapture) begin
+        assert(_csr_interruptPending && !irq_memory_owned && !memoryPending && !irq_memory_commit);
+        assert(!commit_output_valid_layerCapture && !formal_we && !formal_write);
+        assert(redirect_0 && status_trap && !lsu_input_valid && !data_request_valid);
+        assert(formal_trapPc == resumePc && formal_trapCause == csr_interruptCause_layerCapture && formal_trapValue == 0);
+        assert(redirectPc == csr_trapVector_layerCapture);
+      end
+      if (commitValid && commitPacket_instruction_fault) assert(!takeInterrupt_layerCapture);
+      if (_csr_interruptPending && !memoryPending && !irq_memory_commit && !(commitValid && commitPacket_instruction_fault))
+        assert(takeInterrupt_layerCapture);
+      if (past_valid && $past(!reset && data_request_valid && !data_request_ready)) begin
+        assert(data_request_valid);
+        assert($stable({{data_request_bits_address, data_request_bits_data, data_request_bits_tag,
+          data_request_bits_mask, data_request_bits_size, data_request_bits_write, data_request_bits_fetch}}));
+      end
+      if (past_valid) begin
+        if ($past(reset)) assert(resumePc == 64'h{int(parameters['resetVector']):x});
+        else if ($past(takeInterrupt_layerCapture)) begin
+          assert(resumePc == $past(csr_trapVector_layerCapture));
+          assert(!decodedValid && !issuedValid && !resultValid && !commitValid);
+        end else if ($past(commit_output_valid_layerCapture)) assert(resumePc == $past(commit_output_bits_nextPc_layerCapture));
+        else assert($stable(resumePc));
+      end
+      cover(_csr_interruptPending && memoryPending && data_request_valid && !data_request_ready);
+      cover(_csr_interruptPending && irq_memory_commit && !memoryPending);
+      cover(takeInterrupt_layerCapture && !decodedValid && !issuedValid && !resultValid && !commitValid);
+      cover(takeInterrupt_layerCapture && executePending);
+      cover(takeInterrupt_layerCapture && $past(commit_output_valid_layerCapture && irq_memory_commit));
+      cover(irq_service_age == 3 && takeInterrupt_layerCapture);
+    end
+  end
+'''
+    return [('InterruptCsr', csr, 'status[3]\n    &', "1'h1\n    &"),
+            ('InterruptBackend', backend, '_csr_interruptPending & ~memoryPending', '_csr_interruptPending')]
+
+
 def verify(rtl, directory, modules=None):
     directory.mkdir(parents=True, exist_ok=True)
     summary = directory / 'summary.json'
@@ -379,45 +475,82 @@ def verify(rtl, directory, modules=None):
             ('Fetch', FETCH, '& ~killed & ~cancel', '& ~cancel'),
             ('Multiply', MULTIPLY, '~busy & ~valid', '~valid'),
             ('Backend', BACKEND, '(~issuedValid | executed) & ~executePending & ~redirect_0', '(~issuedValid | executed) & ~redirect_0'))
+    if manifest['parameters'].get('enableInterrupts'):
+        cases = [*cases, *interrupt_cases(manifest['parameters'])]
     assert not modules or set(modules) <= {case[0] for case in cases}, 'Unsupported proof selection'
     for name, body, before, after in cases:
         if modules and name not in modules and not (name.startswith('Pmp') and 'Pmp' in modules):
             continue
-        module = 'DitDahA1' + ('Pmp' if name == 'PmpDecode' else name)
+        unit = name.removeprefix('Interrupt')
+        module = 'DitDahA1' + ('Pmp' if name == 'PmpDecode' else unit)
         if name == 'PmpInterval':
             module = 'formal_interval'
             files = {module + '.sv': license + 'module formal_interval(input [64:0] low, high, input [63:0] address, input [2:0] size);\nendmodule\n'}
         else:
-            files = dict(sources) if name == 'Backend' else {module + '.sv': sources[module + '.sv']}
-        if enabled and name in ('Fetch', 'Lsu', 'Backend'):
+            files = dict(sources) if unit == 'Backend' else {module + '.sv': sources[module + '.sv']}
+        if enabled and unit in ('Fetch', 'Lsu', 'Backend'):
             files['DitDahA1Pmp.sv'] = license + header(sources['DitDahA1Pmp.sv']) + '\n(* anyseq *) reg permit;\nassign allowed = permit;\nendmodule\n'
-        if name in ('Backend', 'Multiply') or enabled:
-            if name == 'Backend':
+        if unit in ('Backend', 'Multiply', 'Csr') or enabled:
+            if unit == 'Backend':
                 files['DitDahA1Multiply.sv'] = license + header(sources['DitDahA1Multiply.sv']) + RESOURCE + 'endmodule\n'
+            if name == 'InterruptBackend':
+                import re
+                observed = files[module + '.sv']
+                for port in ('trapPc', 'trapCause', 'trapValue', 'we', 'write'):
+                    pattern = rf'\.{port}\s*\(([^()]*)\)'
+                    connections = re.findall(pattern, observed)
+                    assert len(connections) == 1, (port, connections)
+                    observed = re.sub(pattern, f'.{port}(formal_{port})', observed)
+                    body += f'\n  wire {"[63:0] " if port.startswith("trap") else ""}formal_{port} = {connections[0]};\n'
+                files[module + '.sv'] = observed
             files[module + '.sv'] = files[module + '.sv'].replace('endmodule', body + '\nendmodule', 1)
             top = module
         else:
             top = 'formal_top'
             files['wrapper.sv'] = license + header(files[module + '.sv']).replace(module, top, 1) + f'\n  {module} dut (.*);\n' + body + 'endmodule\n'
-        for mode in ('prove', 'cover', 'mutation'):
+        checks = [('prove', before, after), ('cover', before, after), ('mutation', before, after)]
+        if name == 'InterruptBackend':
+            checks += [('mutation-pc', '? resumePc', "? 64'h0"),
+                       ('mutation-write', 'formal_write =', "formal_write = 1'h1 |")]
+        for mode, before, after in checks:
+            mutating = mode.startswith('mutation')
             work = directory / f'{name.lower()}-{mode}'
             work.mkdir(exist_ok=True)
             for filename, text in files.items():
-                if mode == 'mutation' and filename == module + '.sv':
+                if name == 'InterruptBackend' and mode != 'prove' and filename == module + '.sv':
+                    # Legal initialization narrows witness search, never the safety proof.
+                    prefix = '''
+  reg [1:0] setup_count = 0;
+  always @(posedge clock) if (!reset) begin
+    assume(!instruction_bits_fault && instruction_bits_length == 4 && instruction_bits_tag == 0);
+    assume(instruction_bits_pc == 64'h100 + {62'd0, setup_count} * 4);
+    if (setup_count != 3) begin
+      assume(instruction_valid);
+      assume(instruction_bits_instruction == (setup_count == 0 ? 32'h00800093 :
+        setup_count == 1 ? 32'h30409073 : 32'h30009073));
+      if (instruction_ready) setup_count <= setup_count + 1;
+    end else assume(instruction_bits_instruction == 32'h02108133 || instruction_bits_instruction == 32'h00103023 ||
+      instruction_bits_instruction == 32'h00000113 || instruction_bits_instruction == 0);
+  end
+'''
+                    prefix = prefix.replace("64'h100", f"64'h{int(manifest['parameters']['resetVector']):x}")
+                    text = text.replace('endmodule', prefix + '\nendmodule', 1)
+                if mutating and filename == module + '.sv':
                     assert text.count(before) == (2 if name == 'Csr' else 1), (name, before)
                     text = text.replace(before, after, 1)
                 (work / filename).write_text(text)
-            task = 'bmc' if mode == 'mutation' else mode
+            task = 'bmc' if mutating else mode
             if mode == 'mutation' and name == 'Fetch':
                 task = 'prove'
-            engine = 'abc pdr' if task == 'prove' and name not in ('Multiply', 'Pmp', 'PmpDecode', 'PmpInterval', 'Csr') else 'smtbmc z3'
+            engine = 'abc pdr' if task == 'prove' and unit not in ('Multiply', 'Pmp', 'PmpDecode', 'PmpInterval', 'Csr') else 'smtbmc z3'
+            timeout = 180 if name == 'InterruptBackend' and task == 'cover' else 60
             witness_option = 'aigsmt z3\n' if engine == 'abc pdr' else ''
             preparation = (f'hierarchy -check -top {top}\nproc\nflatten\nopt_expr -keepdc\nopt_clean\nwreduce\nopt_clean\ncheck'
                            if name.startswith('Pmp') else f'prep -top {top} -flatten')
             config = f'''[options]
 mode {task}
-depth {72 if task == 'cover' else 1 if name.startswith('Pmp') else (3 if task == 'prove' else 8) if name == 'Csr' else 4 if name == 'Multiply' and task == 'prove' else 24}
-timeout 60
+depth {72 if task == 'cover' else 1 if name.startswith('Pmp') else (3 if task == 'prove' else 8) if unit == 'Csr' else 4 if name == 'Multiply' and task == 'prove' else 24}
+timeout {timeout}
 {witness_option}[engines]
 {engine}
 [script]
@@ -427,14 +560,14 @@ read -formal -sv {' '.join(files)}
 ''' + '\n'.join(files) + '\n'
             (work / 'check.sby').write_text(config)
             with (work / 'run.log').open('w') as log:
-                result = subprocess.run(['sby', '-f', '-d', 'proof', 'check.sby'], cwd=work, env=proof_env, stdout=log, stderr=subprocess.STDOUT, timeout=90)
+                result = subprocess.run(['sby', '-f', '-d', 'proof', 'check.sby'], cwd=work, env=proof_env, stdout=log, stderr=subprocess.STDOUT, timeout=timeout + 30)
             assert 'multiple conflicting drivers' not in (work / 'run.log').read_text(), 'Conflicting proof drivers'
             status_file = work / 'proof/status'
             assert status_file.exists(), (work / 'run.log').read_text()[-3000:]
             status = status_file.read_text().split()[0]
-            expected = 'FAIL' if mode == 'mutation' else 'PASS'
-            assert status == expected and result.returncode == (2 if mode == 'mutation' else 0), (name, mode, status, work)
-            if mode == 'mutation':
+            expected = 'FAIL' if mutating else 'PASS'
+            assert status == expected and result.returncode == (2 if mutating else 0), (name, mode, status, work)
+            if mutating:
                 assert list((work / 'proof/engine_0').glob('trace*.vcd')), 'Missing mutation counterexample'
             reports.append(dict(module=module, propertyGroup=name, mode=mode, status=status, engine=engine,
                                 assertions=body.count('assert('), covers=body.count('cover(')))
@@ -446,11 +579,14 @@ read -formal -sv {' '.join(files)}
     if 'Pmp' in proved:
         assert {'PmpInterval', 'PmpDecode'} <= proved, 'Missing PMP composition prerequisites'
     summary.write_text(json.dumps(dict(
-        scope=('PMP interval/decode/decision composition, CSR locking and transaction safety' if enabled else
+        scope=('machine interrupt state and precise event/transaction ownership' if any(r['propertyGroup'].startswith('Interrupt') for r in reports) else
+               'PMP interval/decode/decision composition, CSR locking and transaction safety' if enabled else
                'transaction and execution safety; zero/unit multiply identities; bounded completion'),
         assumptions='initial reset, then no reset except CSR proofs; Fetch responses require accepted requests and stable blocked payloads; enabled control proofs abstract combinational authorization',
         pmpComposition='Pmp uses independently proved PmpInterval identities and PmpDecode request spans; no table-value restrictions' if 'Pmp' in proved else None,
         backendAbstraction='arbitrary multiply result and completion delay under the separately proved resource protocol',
+        interruptProgress='with eligibility held, successful matching data response reaches interrupt entry or priority synchronous trap within three cycles; memory service itself is external' if any(r['propertyGroup'] == 'InterruptBackend' for r in reports) else None,
+        witnessGuidance='InterruptBackend cover/mutations use ADDI and mie/mstatus initialization, then ADDI/MUL/SD/illegal packets at aligned fixed PCs and tag zero; unrestricted proof' if any(r['propertyGroup'] == 'InterruptBackend' for r in reports) else None,
         configurations=manifest['parameters'], sourceHashes=manifest['sourceHashes'],
         rtlHashes={p: hashlib.sha256(text.encode()).hexdigest() for p, text in sources.items()},
         checkerHash=checker_hash, tools=tools, reports=reports), indent=2) + '\n')
@@ -460,6 +596,6 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--rtl', type=Path, default=Path('result/production'))
     parser.add_argument('--output', type=Path, default=Path('result/formal'))
-    parser.add_argument('--modules', nargs='+', choices=('Fetch', 'Multiply', 'Backend', 'Pmp', 'PmpDecode', 'PmpInterval', 'Csr', 'Lsu'))
+    parser.add_argument('--modules', nargs='+', choices=('Fetch', 'Multiply', 'Backend', 'Pmp', 'PmpDecode', 'PmpInterval', 'Csr', 'Lsu', 'InterruptCsr', 'InterruptBackend'))
     args = parser.parse_args()
     verify(args.rtl, args.output, args.modules)

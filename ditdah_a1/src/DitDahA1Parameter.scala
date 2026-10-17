@@ -16,6 +16,7 @@ case class DitDahA1Parameter(
   axiDataBits: Int = 128,
   pmpEntries: Int = 16,
   issueWidth: Int = 1,
+  enableInterrupts: Boolean = false,
   enableTrace: Boolean = false,
   memoryRegions: Seq[MemoryRegion] = Seq(MemoryRegion())
 ) extends Parameter:
