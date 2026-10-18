@@ -13,6 +13,7 @@ class DitDahA1PmpIO(parameter: DitDahA1Parameter) extends HWBundle(parameter):
   val size = Flipped(UInt(3))
   val write = Flipped(Bool())
   val fetch = Flipped(Bool())
+  val atomic = Flipped(Bool())
   val allowed = Aligned(Bool())
 
 @generator
@@ -53,7 +54,7 @@ object DitDahA1Pmp extends Generator[DitDahA1Parameter, DitDahA1UnitLayers, DitD
         base := napotBase
         limit := (napotBase + mask + 1.U(65)).asBits.bits(64, 0).asUInt
       }
-      val permission = io.fetch.?(config.bit(2), io.write.?(config.bit(1), config.bit(0)))
+      val permission = io.atomic.?(config.bit(0) & config.bit(1), io.fetch.?(config.bit(2), io.write.?(config.bit(1), config.bit(0))))
       when((mode =/= 0.U(2)) & (limit > base) & (start < limit) & (end > base)) {
         allowed := (start >= base) & (end <= limit) & (!config.bit(7) | permission)
       }

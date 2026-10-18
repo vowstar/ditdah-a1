@@ -34,6 +34,7 @@ object DitDahA1Lsu extends Generator[DitDahA1Parameter, DitDahA1UnitLayers, DitD
       pmp.io.size := 3.U(3)
       pmp.io.write := io.input.bits.store
       pmp.io.fetch := false.B
+      pmp.io.atomic := io.input.bits.load & io.input.bits.store
       pmp.io.allowed
     io.input.ready := (state === 0.U(2)) & (io.input.bits.instruction.fault | !io.input.bits.store | io.storeAllowed)
     io.output.valid := state === 3.U(2)
@@ -46,6 +47,7 @@ object DitDahA1Lsu extends Generator[DitDahA1Parameter, DitDahA1UnitLayers, DitD
     request.bits.tag := packet.instruction.tag
     request.bits.write := packet.store
     request.bits.fetch := false.B
+    request.bits.atomic := packet.load & packet.store
     response.ready := state === 2.U(2)
     when(io.input.valid & io.input.ready) {
       packet :<= io.input.bits

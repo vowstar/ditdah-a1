@@ -35,6 +35,7 @@ object DitDahA1Fetch extends Generator[DitDahA1Parameter, DitDahA1UnitLayers, Di
       pmp.io.size := 2.U(3)
       pmp.io.write := false.B
       pmp.io.fetch := true.B
+      pmp.io.atomic := false.B
       pmp.io.allowed
     io.request.ready := (state === 0.U(2)) & !io.cancel
     io.output.valid := (state === 3.U(2)) & !killed & !io.cancel
@@ -47,6 +48,7 @@ object DitDahA1Fetch extends Generator[DitDahA1Parameter, DitDahA1UnitLayers, Di
     request.bits.tag := packet.tag
     request.bits.fetch := true.B
     request.bits.write := false.B
+    request.bits.atomic := false.B
     response.ready := state === 2.U(2)
     when(io.request.valid & io.request.ready) {
       packet.pc := io.request.bits.pc

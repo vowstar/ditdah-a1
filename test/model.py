@@ -10,6 +10,7 @@ def signed(value, bits):
 
 
 def pmp_allowed(configs, addresses, address, size, kind, pa):
+    permission = {'fetch': 4, 'read': 1, 'write': 2, 'atomic': 3}[kind]
     if address < 0 or address + size > 1 << pa:
         return False
     for index, config in enumerate(configs):
@@ -29,7 +30,7 @@ def pmp_allowed(configs, addresses, address, size, kind, pa):
             high = low + width
         matches = [low <= byte < high for byte in range(address, address + size)]
         if any(matches):
-            return all(matches) and (not config & 128 or bool(config & {'fetch': 4, 'read': 1, 'write': 2}[kind]))
+            return all(matches) and (not config & 128 or config & permission == permission)
     return True
 
 
@@ -59,9 +60,9 @@ class Model:
         self.order = 0
 
     def access(self, address, size, kind, data=0):
-        cause = {'fetch': 1, 'read': 5, 'write': 7}[kind]
+        cause = {'fetch': 1, 'read': 5, 'write': 7, 'atomic': 7}[kind]
         if address % size:
-            raise Fault({'fetch': 0, 'read': 4, 'write': 6}[kind], address)
+            raise Fault({'fetch': 0, 'read': 4, 'write': 6, 'atomic': 6}[kind], address)
         if self.config['pmpEntries'] and not pmp_allowed(
                 [self.pmp_config(i) for i in range(self.config['pmpEntries'])],
                 [self.csrs[0x3b0 + i] for i in range(self.config['pmpEntries'])],
@@ -69,22 +70,25 @@ class Model:
             if kind == 'fetch':
                 self.local_fetch_faults.add(self.order)
             raise Fault(cause, address)
-        self.requests.append((kind, address, size, data if kind == 'write' else 0))
-        permission = {'fetch': 'executable', 'read': 'readable', 'write': 'writable'}[kind]
+        self.requests.append((kind, address, size, data if kind in ('write', 'atomic') else 0))
+        permission = {'fetch': 'executable', 'read': 'readable', 'write': 'writable', 'atomic': 'atomic'}[kind]
         allowed = any(int(r['base']) <= address and address + size <= int(r['base']) + int(r['size'])
-                      and r[permission] for r in self.config['memoryRegions'])
+                      and r.get(permission, False) and (kind != 'atomic' or (r['readable'] and r['writable'] and not r['device']))
+                      for r in self.config['memoryRegions'])
         if not allowed:
             raise Fault(cause, address)
-        self.bus.append((kind, address, size, data if kind == 'write' else 0))
+        self.bus.append((kind, address, size, data if kind in ('write', 'atomic') else 0))
         if kind != 'fetch' and self.external_access is not None:
             return self.external_access(address, size, kind, data)
-        if address == self.faults.get(kind):
+        if address == self.faults.get(kind) or (kind == 'atomic' and address in [self.faults.get(k) for k in ('read', 'write', 'exclusive')]):
             raise Fault(cause, address)
-        if kind == 'write':
+        old = sum(self.memory.get(address + i, 0) << (8 * i) for i in range(size))
+        if kind in ('write', 'atomic'):
+            data = (old + data) & MASK if kind == 'atomic' else data
             for i in range(size):
                 self.memory[address + i] = (data >> (8 * i)) & 255
-            return 0
-        return sum(self.memory.get(address + i, 0) << (8 * i) for i in range(size))
+            return old if kind == 'atomic' else 0
+        return old
 
     def set_interrupts(self, levels):
         self.csrs[0x344] = sum(((levels >> index) & 1) << bit for index, bit in enumerate((3, 7, 11)))
@@ -169,6 +173,8 @@ class Model:
             elif opcode == 0x23 and funct3 == 3:
                 offset = signed(((insn >> 25) << 5) | ((insn >> 7) & 31), 12)
                 self.access((a + offset) & MASK, 8, 'write', b)
+            elif opcode == 0x2f and funct3 == 3 and insn >> 27 == 0:
+                value, write = self.access(a, 8, 'atomic', b), True
             elif opcode == 0x73 and funct3 in (1, 2):
                 address = insn >> 20
                 update = funct3 == 1 or rs1 != 0

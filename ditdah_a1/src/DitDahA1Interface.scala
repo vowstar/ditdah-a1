@@ -55,6 +55,7 @@ class MemoryRequest extends Bundle:
   val tag = Aligned(UInt(8))
   val write = Aligned(Bool())
   val fetch = Aligned(Bool())
+  val atomic = Aligned(Bool())
 class MemoryResponse extends Bundle:
   val data = Aligned(UInt(64))
   val fault = Aligned(Bool())

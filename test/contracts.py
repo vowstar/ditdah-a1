@@ -137,6 +137,27 @@ LSU = r'''
     input_bits_instruction_tval = 64'hffffffff;
     input_valid = 1; tick(); input_valid = 0;
     check(output_valid && output_bits_instruction_cause == 2 && !memory_request_valid, "Faulting operation accessed memory");
+
+    reset = 1; tick(); reset = 0; tick();
+    input_bits_instruction_fault = 0; input_bits_address = 'h1080;
+    input_bits_load = 1; input_bits_store = 1; storeAllowed = 0;
+    input_bits_storeData = 13; input_bits_rd = 9; input_bits_rdWrite = 1;
+    input_valid = 1;
+    repeat (3) begin check(!input_ready && !memory_request_valid, "Unauthorized atomic operation"); tick(); end
+    storeAllowed = 1; tick(); input_valid = 0; storeAllowed = 0;
+    repeat (3) begin
+      check(memory_request_valid && memory_request_bits_atomic && memory_request_bits_write && !memory_request_bits_fetch && memory_request_bits_data == 13 && memory_request_bits_mask == 255 && memory_request_bits_size == 3, "Atomic request retention"); tick();
+    end
+    memory_request_ready = 1; tick(); memory_request_ready = 0;
+    repeat (3) begin check(!output_valid && !memory_request_valid, "Atomic completion waits for final response"); tick(); end
+    memory_response_bits_data = 7; memory_response_bits_fault = 0;
+    memory_response_bits_tag = input_bits_instruction_tag; memory_response_valid = 1;
+    tick(); memory_response_valid = 0;
+    repeat (3) begin
+      check(output_valid && !output_bits_instruction_fault && output_bits_rd == 9 && output_bits_rdWrite && output_bits_value == 7, "Atomic old-value writeback"); tick();
+    end
+    output_ready = 1; tick(); output_ready = 0;
+    input_bits_load = 0; input_bits_store = 0;
 '''
 
 
@@ -147,7 +168,7 @@ def arbiter_contract(parameters):
                    f"    ports_{i}_request_bits_data = {0x1000 + i};\n"
                    f"    ports_{i}_request_bits_tag = 7; ports_{i}_request_bits_size = 3;\n"
                    f"    ports_{i}_request_bits_mask = 255; ports_{i}_request_bits_write = {i % 2};\n"
-                   f"    ports_{i}_request_bits_fetch = {1-i % 2};\n" for i in range(count))
+                   f"    ports_{i}_request_bits_fetch = {1-i % 2}; ports_{i}_request_bits_atomic = {i % 2};\n" for i in range(count))
     no_ready = ' && '.join(f'!ports_{i}_request_ready' for i in range(count))
     for owner in list(range(count)) * 2:
         ready = ' && '.join(f'ports_{i}_request_ready == {int(i == owner)}' for i in range(count))
@@ -155,7 +176,7 @@ def arbiter_contract(parameters):
         body += f'''    check({ready}, "Round-robin service order"); tick();
     ports_{owner}_request_valid = 0; ports_{owner}_request_bits_address = 0;
     repeat (3) begin
-      check(downstream_request_valid && downstream_request_bits_address == {0x100+8*owner} && downstream_request_bits_data == {0x1000+owner} && downstream_request_bits_tag == 7 && downstream_request_bits_size == 3 && downstream_request_bits_mask == 255 && downstream_request_bits_write == {owner % 2} && downstream_request_bits_fetch == {1-owner % 2} && {no_ready}, "Captured request survives contention and backpressure"); tick();
+      check(downstream_request_valid && downstream_request_bits_address == {0x100+8*owner} && downstream_request_bits_data == {0x1000+owner} && downstream_request_bits_tag == 7 && downstream_request_bits_size == 3 && downstream_request_bits_mask == 255 && downstream_request_bits_write == {owner % 2} && downstream_request_bits_fetch == {1-owner % 2} && downstream_request_bits_atomic == {owner % 2} && {no_ready}, "Captured request survives contention and backpressure"); tick();
     end
     ports_{owner}_request_bits_address = {0x100+8*owner}; ports_{owner}_request_valid = 1;
     downstream_request_ready = 1; tick(); downstream_request_ready = 0;
@@ -179,6 +200,7 @@ def decode_contract():
              (0x3402a373, 1, 0, 1), (0x00000073, 0, 0, 0),
              (0x30200073, 0, 0, 0), (0xffffffff, 0, 0, 0))
     cases += ((mul(6, 5, 7), 1, 1, 1), (mul(6, 5, 7) | (1 << 12), 0, 0, 0))
+    cases += tuple((0x0072b32f | (ordering << 25), 1, 1, 1) for ordering in range(4))
     body = '    input_valid = 1; output_ready = 1;\n'
     for word, rs1, rs2, rd in cases:
         serial = int(word in (0x34029373, 0x3402a373, 0x30200073))
@@ -196,22 +218,32 @@ def memory_contract(parameters):
     cases = ((0x1000, 0, 1, 0, 1, True), (0x1002, 1, 1, 0, 2, True),
              (0x1004, 2, 0, 0, 0, True), (0x1008, 3, 1, 0, 0xff, True),
              (0x4000, 3, 0, 0, 0, True), (0x4000, 3, 1, 0, 0xff, False),
-             (0x5000, 2, 0, 1, 0, False), (0x7000, 3, 0, 0, 0, False),
+             (0x5000, 2, 0, 1, 0, False), (0x7000, 3, 0, 0, 0, True),
              (0x1000, 4, 0, 0, 0, False), (0x1001, 3, 0, 0, 0, False),
              (0x1000, 1, 1, 0, 0, False), (0x1000, 1, 1, 0, 4, False),
              (1 << parameters['physicalAddressBits'], 3, 0, 0, 0, False),
              (0x8000, 2, 0, 1, 0, True), (0x8000, 2, 0, 0, 0, False))
+    cases = tuple((*case[:-1], 0, case[-1]) for case in cases)
+    ram_atomic = any(r.get('atomic', False) and int(r['base']) <= base + 0x1000 < int(r['base']) + int(r['size'])
+                     for r in parameters['memoryRegions'])
+    cases += ((0x1000, 3, 1, 0, 255, 1, ram_atomic),
+              (0x1000, 3, 0, 0, 255, 1, False), (0x1000, 3, 1, 1, 255, 1, False),
+              (0x1000, 2, 1, 0, 15, 1, False), (0x1000, 3, 1, 0, 127, 1, False),
+              (0x1001, 3, 1, 0, 255, 1, False), (0x4000, 3, 1, 0, 255, 1, False),
+              (0x5000, 3, 1, 0, 255, 1, False), (0x7000, 3, 1, 0, 255, 1, False),
+              (0x8000, 3, 1, 0, 255, 1, False))
     body = ''
-    for tag, (offset, size, write, fetch, mask, allowed) in enumerate(cases, 1):
+    for tag, (offset, size, write, fetch, mask, atomic, allowed) in enumerate(cases, 1):
         body += f'''    upstream_request_bits_address = 64'h{base + offset:x};
     upstream_request_bits_size = {size}; upstream_request_bits_write = {write};
     upstream_request_bits_fetch = {fetch}; upstream_request_bits_mask = {mask};
+    upstream_request_bits_atomic = {atomic};
     upstream_request_bits_tag = {tag}; upstream_request_valid = 1;
     check(downstream_request_valid == {int(allowed)} && upstream_request_ready == {int(not allowed)}, "Memory permission and shape {tag}");
 '''
         if allowed:
             body += f'''    repeat (3) begin
-      check(downstream_request_valid && downstream_request_bits_tag == {tag} && !upstream_request_ready, "Memory request backpressure {tag}");
+      check(downstream_request_valid && downstream_request_bits_tag == {tag} && downstream_request_bits_atomic == {atomic} && !upstream_request_ready, "Memory request backpressure {tag}");
       tick();
     end
     downstream_request_ready = 1; tick(); downstream_request_ready = 0;
@@ -270,6 +302,69 @@ def axi_contract(width):
       tick();
     end
     memory_response_ready = 1; tick(); memory_response_ready = 0;
+'''
+    return body + axi_atomic_contract(width)
+
+
+def axi_atomic_contract(width):
+    lane = width // 8 - 8
+    shift = lane * 8
+    body = ''
+    cases = ((1, 0, 1, 0, 0, False), (1, 0, 1, 0, 2, False),
+             (0, 0, 1, 0, 0, False), (2, 0, 1, 0, 0, False),
+             (3, 0, 1, 0, 0, False), (1, 1, 1, 0, 0, False),
+             (1, 0, 2, 0, 0, False), (1, 0, 3, 0, 0, False),
+             (1, 0, 1, 1, 0, False), (1, 0, 0, 1, 0, False),
+             (1, 0, 1, 0, 0, True))
+    for index, (read_resp, read_id, write_resp, write_id, retries, malformed) in enumerate(cases):
+        body += f'''
+    memory_request_bits_atomic = 1; memory_request_bits_write = 1;
+    memory_request_bits_address = 'h{0x1000 + lane:x}; memory_request_bits_size = 3;
+    memory_request_bits_mask = 255; memory_request_bits_data = 5; memory_request_bits_tag = 201;
+    memory_request_valid = 1; tick(); memory_request_valid = 0;
+    memory_request_bits_atomic = 0; memory_request_bits_data = 99; memory_request_bits_address = 0;
+'''
+        fault = read_resp != 1 or read_id != 0 or write_resp != 1 or write_id != 0 or malformed
+        for attempt in range(retries + 1):
+            old = ((1 << 64) - 3 + attempt * 11) & ((1 << 64) - 1)
+            value = (old + 5) & ((1 << 64) - 1)
+            body += f'''
+    repeat (3) begin
+      check(axi_ar_valid && !axi_aw_valid && !axi_w_valid && !memory_response_valid && !memory_request_ready && axi_ar_bits_lock && axi_ar_bits_addr == 'h{0x1000 + lane:x} && axi_ar_bits_id == 0 && axi_ar_bits_len == 0 && axi_ar_bits_size == 3, "Exclusive read ownership"); tick();
+    end
+    axi_ar_ready = 1; tick(); axi_ar_ready = 0;
+    repeat (2) begin check(axi_r_ready && !memory_response_valid && !axi_aw_valid, "Exclusive read response wait"); tick(); end
+    axi_r_valid = 1; axi_r_bits_resp = {read_resp}; axi_r_bits_id = {read_id};
+    axi_r_bits_data = 'h{old << shift:x}; axi_r_bits_last = {int(not malformed)};
+    tick(); axi_r_valid = 0;
+'''
+            if malformed:
+                body += '''
+    repeat (3) begin check(axi_r_ready && !axi_aw_valid && !axi_w_valid && !memory_response_valid, "Malformed exclusive read drains"); tick(); end
+    axi_r_valid = 1; axi_r_bits_last = 1; tick(); axi_r_valid = 0;
+'''
+            if read_resp == 1 and read_id == 0 and not malformed:
+                body += f'''
+    repeat (3) begin
+      check(axi_aw_valid && axi_w_valid && !axi_ar_valid && !memory_response_valid && !memory_request_ready && axi_aw_bits_lock && axi_aw_bits_addr == 'h{0x1000 + lane:x} && axi_aw_bits_id == 0 && axi_aw_bits_len == 0 && axi_aw_bits_size == 3 && axi_w_bits_data == 'h{value << shift:x} && axi_w_bits_strb == 'h{255 << lane:x} && axi_w_bits_last, "Exclusive sum and captured operand"); tick();
+    end
+'''
+                first, second = ('aw', 'w') if (index + attempt) % 2 else ('w', 'aw')
+                body += f'''
+    axi_{first}_ready = 1; tick(); axi_{first}_ready = 0;
+    repeat (3) begin check(!axi_{first}_valid && axi_{second}_valid && !axi_b_ready && !memory_response_valid, "Independent exclusive write handshakes"); tick(); end
+    axi_{second}_ready = 1; tick(); axi_{second}_ready = 0;
+    repeat (2) begin check(axi_b_ready && !memory_response_valid && !axi_ar_valid, "Exclusive write response wait"); tick(); end
+    axi_b_valid = 1; axi_b_bits_resp = {0 if attempt < retries else write_resp}; axi_b_bits_id = {write_id};
+    tick(); axi_b_valid = 0;
+'''
+        body += f'''
+    repeat (3) begin
+      check(memory_response_valid && memory_response_bits_fault == {int(fault)} && memory_response_bits_tag == 201 && {'1' if fault else f"memory_response_bits_data == 64'h{old:x}"} && !memory_request_ready && !axi_ar_valid && !axi_aw_valid && !axi_w_valid, "Atomic final response ownership"); tick();
+    end
+    memory_response_ready = 1; tick(); memory_response_ready = 0;
+    check(memory_request_ready && !memory_response_valid, "Atomic slot reuse");
+    axi_r_bits_id = 0; axi_b_bits_id = 0; axi_r_bits_resp = 0; axi_b_bits_resp = 0;
 '''
     return body
 
@@ -592,18 +687,20 @@ def pmp_contract(parameters):
                 if index:
                     addresses[index - 1] = 0x400
                 tests.append((configs, addresses, address, 3, 'read'))
+                tests.append((configs, addresses, address, 3, 'atomic'))
     for _ in range(320):
         configs = [rng.randrange(256) & 0x9f for _ in range(16)]
         addresses = [rng.choice((0, 0x400 + rng.randrange(16), (1 << width) - 1)) for _ in range(16)]
         tests.append((configs, addresses, rng.choice((0, 0x1000 + rng.randrange(64), (1 << pa) - 8)),
-                      rng.randrange(4), rng.choice(('fetch', 'read', 'write'))))
+                      rng.randrange(4), rng.choice(('fetch', 'read', 'write', 'atomic'))))
     body = ''
     for configs, addresses, address, size, kind in tests:
         config = sum(v << (i * 8) for i, v in enumerate(configs))
         points = sum(v << (i * width) for i, v in enumerate(addresses))
-        expected = int(pmp_allowed(configs, addresses, address, 1 << size, kind, pa))
+        kinds = ('read', 'write') if kind == 'atomic' else (kind,)
+        expected = int(all(pmp_allowed(configs, addresses, address, 1 << size, access, pa) for access in kinds))
         body += f'''    state_config = 128'h{config:x}; state_address = {16 * width}'h{points:x};
-    address = 64'h{address:x}; size = {size}; fetch = {int(kind == 'fetch')}; write = {int(kind == 'write')};
+    address = 64'h{address:x}; size = {size}; fetch = {int(kind == 'fetch')}; write = {int(kind in ('write', 'atomic'))}; atomic = {int(kind == 'atomic')};
     check(allowed == {expected}, "PMP priority, range and permissions");
 '''
     return body

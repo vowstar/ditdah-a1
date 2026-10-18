@@ -44,12 +44,13 @@ object DitDahA1Decode extends Generator[DitDahA1Parameter, DitDahA1UnitLayers, D
     when((opcode === 0x67.B(7)) & (funct3 === 0.B(3))) { out.operation := DitDahA1Isa.Jalr.U(4) }
     when((opcode === 0x03.B(7)) & (funct3 === 3.B(3))) { out.operation := DitDahA1Isa.Ld.U(4) }
     when((opcode === 0x23.B(7)) & (funct3 === 3.B(3))) { out.operation := DitDahA1Isa.Sd.U(4); out.immediate := immS }
+    when((opcode === 0x2f.B(7)) & (funct3 === 3.B(3)) & (insn.bits(31, 27) === 0.B(5))) { out.operation := DitDahA1Isa.AmoaddD.U(4); out.immediate := 0.U(64) }
     when((opcode === 0x73.B(7)) & (funct3 === 1.B(3))) { out.operation := DitDahA1Isa.Csrrw.U(4) }
     when((opcode === 0x73.B(7)) & (funct3 === 2.B(3))) { out.operation := DitDahA1Isa.Csrrs.U(4) }
     when(insn === 0x00000073L.B(32)) { out.operation := DitDahA1Isa.Ecall.U(4) }
     when(insn === 0x30200073L.B(32)) { out.operation := DitDahA1Isa.Mret.U(4) }
     val operation = out.operation
-    val both = (operation === DitDahA1Isa.Add.U(4)) | (operation === DitDahA1Isa.Mul.U(4)) | (operation === DitDahA1Isa.Beq.U(4)) | (operation === DitDahA1Isa.Sd.U(4))
+    val both = (operation === DitDahA1Isa.Add.U(4)) | (operation === DitDahA1Isa.Mul.U(4)) | (operation === DitDahA1Isa.Beq.U(4)) | (operation === DitDahA1Isa.Sd.U(4)) | (operation === DitDahA1Isa.AmoaddD.U(4))
     out.usesRs1 := !in.fault & (both | (operation === DitDahA1Isa.Addi.U(4)) | (operation === DitDahA1Isa.Jalr.U(4)) | (operation === DitDahA1Isa.Ld.U(4)) | (operation === DitDahA1Isa.Csrrw.U(4)) | (operation === DitDahA1Isa.Csrrs.U(4)))
     out.usesRs2 := !in.fault & both
     out.writesRd := !in.fault & (operation =/= DitDahA1Isa.Illegal.U(4)) & (operation =/= DitDahA1Isa.Beq.U(4)) & (operation =/= DitDahA1Isa.Sd.U(4)) & (operation =/= DitDahA1Isa.Ecall.U(4)) & (operation =/= DitDahA1Isa.Mret.U(4))

@@ -11,7 +11,7 @@ from pathlib import Path
 import subprocess
 
 from contracts import verify as verify_contracts
-from model import Fault, Model
+from model import Fault, Model, MASK
 from programs import cases, multicore_cases
 
 
@@ -30,9 +30,10 @@ def configuration(width):
             (0x4000, 0x1000, True, False, True, False),
             (0x5000, 0x1000, True, True, False, True),
             (0x6000, 0x1000, False, False, False, False),
+            (0x7000, 0x1000, True, True, False, False),
             (0x8000, 0x1000, False, False, True, False)):
         regions.append(dict(base=str(base + offset), size=str(size), readable=read,
-                            writable=write, executable=execute, device=device))
+                            writable=write, executable=execute, device=device, atomic=offset == 0))
     return dict(resetVector=str(base), axiDataBits=width, physicalAddressBits=32 if width == 64 else 56,
                 virtualAddressBits=0, iCacheBytes=0, dCacheBytes=0, l2CacheBytes=0, pmpEntries=0,
                 memoryRegions=regions)
@@ -58,7 +59,7 @@ def compile_tb(rtl, directory, width, pa, top='core_tb', source=None, extra_file
                 for channel in ('request', 'response'):
                     for field in ('valid', 'ready'):
                         bindings.append(f'assign {channel}_{field}[{index}] = {core}.{port}_{channel}_{field};')
-                    for field in (('address', 'data', 'size', 'mask', 'tag', 'write', 'fetch') if channel == 'request' else ('data', 'fault', 'tag')):
+                    for field in (('address', 'data', 'size', 'mask', 'tag', 'write', 'fetch', 'atomic') if channel == 'request' else ('data', 'fault', 'tag')):
                         bindings.append(f'assign {channel}s[{index}].{field} = {core}.{port}_{channel}_bits_{field};')
             if interrupts:
                 ports += [f'.interrupts_{hart}_{name}(irq_by_hart[{hart}][{index}]),'
@@ -147,6 +148,7 @@ def compare(binary, directory, config, transport='axi'):
             command = [binary, f'+IMAGE={image.resolve()}', f'+BASE={base:x}',
                        f'+STOP={program.stop:x}', f'+SEED={seed}']
             command.extend(f'+FAULT_{kind.upper()}={address:x}' for kind, address in program.faults.items())
+            command += [f'+{key.upper()}={getattr(program, key, 0)}' for key in ('exclusive_failures', 'interference')]
             if hasattr(program, 'interrupts'):
                 command.extend(f'+IRQ_{key.upper()}={value:x}' if key == 'target' else f'+IRQ_{key.upper()}={value}'
                                for key, value in program.interrupts.items())
@@ -166,7 +168,7 @@ def compare(binary, directory, config, transport='axi'):
                         record = model.interrupt() if observed[8] >> 63 else model.step()
                         if pending and not record[8] >> 63 and not record[7]:
                             deferred += 1
-                            assert deferred <= 1 and record[2] & 127 in (3, 0x23), f'{name}: interrupt deferred beyond its memory owner'
+                            assert deferred <= 1 and record[2] & 127 in (3, 0x23, 0x2f), f'{name}: interrupt deferred beyond its memory owner'
                         else:
                             deferred = 0
                         if record[8] >> 63:
@@ -187,7 +189,10 @@ def compare(binary, directory, config, transport='axi'):
                 assert observed == wanted, f'{name} trace {index}:\nactual {observed}\nexpected {wanted}'
             data_bus = [event for event in bus if event[0] != 'fetch']
             expected_bus = [event for event in model.bus if event[0] != 'fetch']
-            assert data_bus == expected_bus, f'{name}: unexpected data accesses\nactual {data_bus}\nexpected {expected_bus}'
+            if transport == 'axi' and 'atomic' in name:
+                check_multicore(lines, config, program, name)
+            else:
+                assert data_bus == expected_bus, f'{name}: unexpected data accesses\nactual {data_bus}\nexpected {expected_bus}'
             if transport == 'memory':
                 requests = [(v[1], int(v[2], 16), int(v[3]), int(v[4], 16)) for line in lines
                             if line.startswith('REQUEST ') for v in [line.split()] if v[1] != 'fetch']
@@ -216,9 +221,10 @@ def compare(binary, directory, config, transport='axi'):
 
 def check_multicore(lines, config, program, name):
     covers = [list(map(int, line.split()[1:])) for line in lines if line.startswith('COVER ')]
-    assert len(covers) == 1 and len(covers[0]) == 6 and all(covers[0]), 'Missing AXI scheduling coverage'
     harts, base = config['hartCount'], int(config['resetVector'])
+    assert len(covers) == 1 and len(covers[0]) == 6 and (harts == 1 or all(covers[0])), 'Missing AXI scheduling coverage'
     memory, active = dict(program.memory), None
+    failures = getattr(program, 'exclusive_failures', 0)
     models = [Model(config, program.memory, program.faults, hart_id=h) for h in range(harts)]
     pending, finished, per_hart = [None] * harts, set(), [[] for _ in range(harts)]
     collisions, tags, sources, events, effects = set(), {}, set(), 0, Counter()
@@ -232,22 +238,23 @@ def check_multicore(lines, config, program, name):
     for model in models:
         model.external_access = no_service
 
-    def service(hart, event):
+    def service(hart, event, atomic_fault=False):
         assert pending[hart] is None, 'Second memory operation before retirement'
         accesses = []
 
         def access(address, size, kind, data):
-            wanted = kind, address, size, data if kind == 'write' else 0
+            wanted = kind, address, size, data if kind in ('write', 'atomic') else 0
             assert event == wanted, f'{name}: data service {event} != independent instruction {wanted}'
             accesses.append(wanted)
-            if address == program.faults.get(kind):
+            if atomic_fault or address == program.faults.get(kind):
                 raise Fault(5 if kind == 'read' else 7, address)
-            if kind == 'write':
+            old = sum(memory.get(address + byte, 0) << (byte * 8) for byte in range(size))
+            if kind in ('write', 'atomic'):
+                value = (old + data) & MASK if kind == 'atomic' else data
                 for byte in range(size):
-                    memory[address + byte] = (data >> (byte * 8)) & 255
+                    memory[address + byte] = (value >> (byte * 8)) & 255
                 effects[hart, address] += 1
-                return 0
-            return sum(memory.get(address + byte, 0) << (byte * 8) for byte in range(size))
+            return 0 if kind == 'write' else old
 
         models[hart].external_access = access
         pending[hart] = models[hart].step()
@@ -256,13 +263,16 @@ def check_multicore(lines, config, program, name):
 
     for line in lines:
         fields = line.split()
-        if fields[:1] != ['HART']:
+        if fields[:1] == ['HART']:
+            hart, fields = int(fields[1]), fields[2:]
+        elif harts == 1 and fields and fields[0] in ('REQUEST', 'BUS', 'READ', 'WRITE', 'INTERFERE', 'RESPONSE', 'FETCH', 'IRQ', 'TRACE'):
+            hart = 0
+        else:
             continue
-        hart, fields = int(fields[1]), fields[2:]
         assert 0 <= hart < harts
         per_hart[hart].append(' '.join(fields))
         kind = fields[0]
-        assert kind in ('REQUEST', 'BUS', 'READ', 'RESPONSE', 'FETCH', 'IRQ', 'TRACE'), 'Unknown hart event'
+        assert kind in ('REQUEST', 'BUS', 'READ', 'WRITE', 'INTERFERE', 'RESPONSE', 'FETCH', 'IRQ', 'TRACE'), 'Unknown hart event'
         if kind == 'REQUEST':
             assert active is None, 'Overlapping source ownership'
             event = fields[1], int(fields[2], 16), int(fields[3]), int(fields[4], 16)
@@ -275,6 +285,17 @@ def check_multicore(lines, config, program, name):
             tags[tag] = hart
         elif kind == 'BUS':
             event = fields[1], int(fields[2], 16), int(fields[3]), int(fields[4], 16)
+            if event[0] in ('exclusive_read', 'exclusive_write'):
+                assert active and active['hart'] == hart and active['event'][0] == 'atomic'
+                _, address, size, addend = active['event']
+                assert event[1:3] == (address, size) and size == 8
+                if event[0] == 'exclusive_read':
+                    assert active.get('phase') in (None, 'retry') and event[3] == 0
+                    active.update(bus=True, phase='read')
+                else:
+                    assert active['phase'] == 'write' and event[3] == (active['old'] + addend) & MASK
+                    active['phase'] = 'response'
+                continue
             assert active and active['hart'] == hart and active['event'] == event and not active['bus']
             active['bus'] = True
             if event[0] == 'write':
@@ -284,12 +305,39 @@ def check_multicore(lines, config, program, name):
             assert active and active['hart'] == hart and active['bus'] and active['response'] is None
             access, address, size, _ = active['event']
             expected = sum(memory.get(address + byte, 0) << (byte * 8) for byte in range(size))
+            if access == 'atomic':
+                assert active['phase'] == 'read'
+                response = 2 if address == program.faults.get('read') else 0 if address == program.faults.get('exclusive') else 1
+                assert tuple(int(v, 16) for v in fields[1:]) == (address, response, expected)
+                active.update(old=expected, phase='write' if response == 1 else 'complete')
+                if response != 1:
+                    service(hart, active['event'], atomic_fault=True)
+                    active['response'] = (expected, 1)
+                continue
             fault = address == program.faults.get(access)
             assert tuple(int(v, 16) for v in fields[1:]) == (address, 2 if fault else 0, expected)
             if access == 'read':
                 overtaken += sum(record is not None for h, record in enumerate(pending) if h != hart)
                 service(hart, active['event'])
             active['response'] = (expected, int(fault))
+        elif kind == 'INTERFERE':
+            assert active and active['hart'] == hart and active['phase'] == 'response' and failures > 0
+            address, value = (int(v, 16) for v in fields[1:])
+            assert address == active['event'][1] and value == (active['old'] + program.interference) & MASK
+            for byte in range(8):
+                memory[address + byte] = (value >> (8 * byte)) & 255
+            failures -= 1
+            active['phase'] = 'interference'
+        elif kind == 'WRITE':
+            assert active and active['hart'] == hart and active['phase'] in ('response', 'interference')
+            address, response = (int(v, 16) for v in fields[1:])
+            assert address == active['event'][1]
+            fault = address == program.faults.get('write')
+            assert response == (2 if fault else 0 if active['phase'] == 'interference' else 1)
+            active['phase'] = 'retry' if response == 0 else 'complete'
+            if response:
+                service(hart, active['event'], atomic_fault=fault)
+                active['response'] = (active['old'], int(fault))
         elif kind == 'RESPONSE':
             assert active and active['hart'] == hart, 'Response to the wrong hart'
             channel, data, fault, tag = (int(v, 16) for v in fields[1:])
@@ -313,6 +361,7 @@ def check_multicore(lines, config, program, name):
             observed = tuple(int(v, 16) for v in fields[1:])
             eligible, owned = models[hart].interrupt_cause(), pending[hart] is not None
             if pending[hart] is not None:
+                assert active is None or active['hart'] != hart or active['event'][0] == 'fetch', 'Memory operation retired before its response'
                 wanted, pending[hart] = pending[hart], None
             elif observed[8] >> 63:
                 wanted = models[hart].interrupt()
@@ -333,13 +382,24 @@ def check_multicore(lines, config, program, name):
                 finished.add(hart)
     assert finished == set(range(harts)) and all(record is None for record in pending)
     assert active is None or active['event'][0] == 'fetch', 'Unretired data access at completion'
-    assert sources == set(range(2 * harts)) and collisions, 'Missing source or cross-hart tag collision'
-    assert concurrent['trapDuringPeerService'] and concurrent['redirectDuringPeerService'], 'Missing concurrent trap or redirect'
-    assert interrupts == (Counter({harts - 1: 1}) if name == 'interrupt' else Counter()), 'Interrupt isolation'
+    assert failures == 0, 'Exclusive failure stimulus was not consumed'
+    if harts > 1:
+        assert sources == set(range(2 * harts)) and collisions, 'Missing source or cross-hart tag collision'
+        if 'atomic' not in name:
+            assert concurrent['trapDuringPeerService'] and concurrent['redirectDuringPeerService'], 'Missing concurrent trap or redirect'
+    assert interrupts == (Counter({getattr(program, 'interrupts', {}).get('hart', 0): 1}) if hasattr(program, 'interrupts') else Counter()), 'Interrupt isolation'
+    if harts > 1 and 'atomic' in name:
+        word = lambda address: sum(memory.get(address + byte, 0) << (8 * byte) for byte in range(8))
+        assert word(base + 0x1800) == 4 * harts + 14, 'Lost or duplicate atomic update'
+        old = [word(base + 0x2000 + hart * 64 + i * 8) for hart in range(harts) for i in range(4)]
+        assert sorted(old) == list(range(14, 14 + 4 * harts)), 'Atomic old-value uniqueness'
     for hart, model in enumerate(models):
-        assert model.registers[8] == (hart + 1) % harts + 1, 'Mailbox exchange did not complete'
-        assert model.registers[12] == 1 and effects[hart, base + 0x5100] == 1, 'Private data or device effect'
-        assert model.registers[17] == hart and (name == 'interrupt' or model.registers[19] == hart), 'Hart identity or read-only CSR'
+        if harts > 1 and 'atomic' in name:
+            assert model.registers[18] == harts * (harts + 1) // 2, 'Release/acquire publication'
+        elif harts > 1:
+            assert model.registers[8] == (hart + 1) % harts + 1, 'Mailbox exchange did not complete'
+            assert model.registers[12] == 1 and effects[hart, base + 0x5100] == 1, 'Private data or device effect'
+            assert model.registers[17] == hart and (name == 'interrupt' or model.registers[19] == hart), 'Hart identity or read-only CSR'
         if name == 'protection':
             assert effects[hart, base + 0x1800] == int(hart != 0), 'PMP isolation'
         check_fetches(per_hart[hart], config, program.faults, model.local_fetch_faults)
@@ -358,6 +418,7 @@ def compare_multicore(binary, directory, config):
             log = directory / f'{name}-{seed}.log'
             command = [binary, f'+IMAGE={image.resolve()}', f'+BASE={base:x}', f'+STOP={program.stop:x}', f'+SEED={seed}']
             command += [f'+FAULT_{kind.upper()}={address:x}' for kind, address in program.faults.items()]
+            command += [f'+{key.upper()}={getattr(program, key, 0)}' for key in ('exclusive_failures', 'interference')]
             if hasattr(program, 'interrupts'):
                 command += [f'+IRQ_{key.upper()}={value:x}' if key == 'target' else f'+IRQ_{key.upper()}={value}'
                             for key, value in program.interrupts.items()]
@@ -382,8 +443,9 @@ def main():
     args.output.mkdir(parents=True, exist_ok=True)
     summary_path = args.output / 'summary.json'
     summary_path.unlink(missing_ok=True)
-    test_hashes = {str(p): hashlib.sha256(p.read_bytes()).hexdigest()
-                   for p in sorted(Path('test').glob('*')) if p.suffix in ('.py', '.sv')}
+    test_hashes = {str(p): hashlib.sha256(p.read_bytes()).hexdigest() for name in
+                   ('verify.py', 'contracts.py', 'model.py', 'programs.py', 'core_tb.sv', 'memory_tb.sv')
+                   for p in (Path('test') / name,)}
     summary = {'scope': 'implemented scalar subset; simulation and assertions', 'configurations': []}
     core_profiles = {}
     profiles = [(width, entries, False) for entries in ((args.pmp_entries,) if args.pmp_entries is not None else (0, 16))
@@ -439,7 +501,7 @@ def main():
         core_profiles[core_key] = str(core)
     if args.multicore_only:
         for harts, width, entries, interrupts in ((2, 64, 0, False), (2, 512, 16, True),
-                                                  (3, 64, 16, True), (16, 512, 0, False)):
+                                                  (3, 64, 16, True), (16, 512, 16, True)):
             if (args.harts and harts not in args.harts) or (args.width and width not in args.width):
                 continue
             if args.pmp_entries is not None and entries != args.pmp_entries:

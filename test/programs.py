@@ -25,6 +25,10 @@ def sd(rs, base, offset=0):
     return (((offset & 4095) >> 5) << 25) | (rs << 20) | (base << 15) | (3 << 12) | ((offset & 31) << 7) | 0x23
 
 
+def amoadd(rd, base, rs, aqrl=0):
+    return (aqrl << 25) | (rs << 20) | (base << 15) | (3 << 12) | (rd << 7) | 0x2f
+
+
 def csr(rd, address, rs, set_bits=False):
     return (address << 20) | (rs << 15) | ((2 if set_bits else 1) << 12) | (rd << 7) | 0x73
 
@@ -109,7 +113,7 @@ def cases(base, protection=False, interrupts=False):
            addi(1, 0, 1), beq(0, 1, 2), beq(0, 0, 2), jal(6, 2))
     p.address(10, 0x1002)
     p.emit(jalr(7, 10), ld(4, 10), sd(1, 10))
-    for offset in (0x4000, 0x6000, 0x7000):
+    for offset in (0x4000, 0x6000, 0x7000, 0x9000):
         p.address(10, offset)
         p.emit(sd(1, 10), ld(4, 10))
     p.emit(addi(10, 0, -8), ld(4, 10), sd(1, 10))
@@ -177,14 +181,40 @@ def cases(base, protection=False, interrupts=False):
            sd(4, 11), mul(6, 0, 4), sd(6, 11, 8),
            mul(7, 2, 3) | (1 << 12), mul(7, 2, 3) | (4 << 12), mul(7, 2, 3) | 8)
     yield 'multiply', p.finish()
+    yield from atomic_cases(base)
     if protection:
         yield from pmp_cases(base)
     if interrupts:
         yield from interrupt_cases(base, protection)
 
 
+def atomic_cases(base):
+    p = Program(base)
+    p.address(10, 0x1000)
+    p.emit(addi(2, 0, -1), sd(2, 10), addi(2, 0, 1))
+    for aqrl in range(4):
+        p.emit(sd(2, 10, 8), amoadd(3, 10, 2, aqrl), ld(4, 10), ld(5, 10, 8), add(6, 3, 4))
+    p.emit(amoadd(0, 10, 2), amoadd(7, 10, 0, 2), amoadd(2, 10, 2, 3), amoadd(10, 10, 2, 1))
+    yield 'atomic_ordering', p.finish()
+    p = Program(base)
+    for offset in (0x4000, 0x5000, 0x6000, 0x7000, 0x9000, 0x1002):
+        p.address(10, offset)
+        p.emit(amoadd(3, 10, 1))
+    p.emit(addi(10, 0, -8), amoadd(3, 10, 1), amoadd(3, 10, 1) | (1 << 27), amoadd(3, 10, 1) ^ (1 << 12))
+    yield 'atomic_denied', p.finish()
+    for kind in ('read', 'write', 'exclusive', 'retry'):
+        p = Program(base)
+        p.address(10, 0x1000)
+        p.emit(addi(2, 0, 7), amoadd(3, 10, 2, 3), addi(4, 3, 1))
+        if kind == 'retry':
+            p.exclusive_failures, p.interference = 2, 0
+        else:
+            p.faults[kind] = base + 0x1000
+        yield 'atomic_' + ('retry' if kind == 'retry' else 'fault_' + kind), p.finish()
+
+
 def pmp_cases(base):
-    for name in ('permissions', 'tor_lock', 'partial', 'fetch', 'update'):
+    for name in ('permissions', 'tor_lock', 'partial', 'fetch', 'update', 'atomic_readonly', 'atomic_none'):
         p = Program(base)
         constant_offset = 0x3000
 
@@ -203,13 +233,15 @@ def pmp_cases(base):
         if name == 'tor_lock':
             constant(2, (base + 0x1020) >> 2)
             p.emit(csr(0, 0x3b1, 2))
-        constant(3, 0x8900 if name == 'tor_lock' else 0x10 if name == 'partial' else 0x90 if name == 'update' else 0x99)
+        constant(3, 0x8900 if name == 'tor_lock' else 0x10 if name == 'partial' else 0x90 if name == 'update' else 0x98 if name == 'atomic_none' else 0x99)
         if name == 'update':
             p.address(1, 0x1fc)
             p.emit(jalr(0, 1))
             p.offset = 0x1fc
         p.emit(csr(4, 0x3a0, 3))
-        if name in ('fetch', 'update'):
+        if name.startswith('atomic_'):
+            p.emit(amoadd(5, 10, 2, 3), ld(6, 10))
+        elif name in ('fetch', 'update'):
             p.emit(jalr(0, 10) if name == 'fetch' else sd(2, 10), mul(5, 2, 3))
         else:
             p.emit(ld(5, 10), sd(2, 10), ld(6, 10))
@@ -221,16 +253,18 @@ def pmp_cases(base):
 
 def interrupt_cases(base, protection):
     names = ('priority', 'store_blocked', 'address_first', 'data_first', 'read_pending', 'fetch_pending',
-             'multiply', 'pmp_restart', 'read_fault', 'write_fault', 'fetch_fault', 'branch')
+             'multiply', 'pmp_restart', 'read_fault', 'write_fault', 'fetch_fault', 'branch', 'atomic')
     for mode, name in enumerate(names):
         if mode == 7 and not protection:
             continue
         p = Program(base)
-        p.address(10, 0x5000)
+        p.address(10, 0x1000 if name == 'atomic' else 0x5000)
         p.address(11, 0x5008)
         p.emit(addi(2, 0, -1), csr(0, 0x304, 2), csr(3, 0x344, 0, True),
                csr(4, 0x344, 0), csr(5, 0x344, 0, True), addi(3, 0, 8), csr(0, 0x300, 3))
         target = base + p.offset
+        if name == 'atomic':
+            p.emit(amoadd(9, 10, 2, 3))
         if mode == 7:
             p.emit(csr(0, 0x3a0, 0))
         if mode == 11:
@@ -250,11 +284,12 @@ def interrupt_cases(base, protection):
         p.emit(sd(0, 11), 0x30200073)
         if mode in (8, 9, 10):
             p.emit(addi(22, 22, 4), csr(0, 0x341, 22), 0x30200073)
-        p.interrupts = dict(mode={8: 4, 9: 1, 10: 5, 11: 7}.get(mode, mode), mask=7 if mode == 0 else 1 << ((mode - 1) % 3), target=target)
+        p.interrupts = dict(mode={8: 4, 9: 1, 10: 5, 11: 7, 12: 8}.get(mode, mode), mask=7 if mode == 0 else 1 << ((mode - 1) % 3), target=target)
         yield 'interrupt_' + name, p
 
 
 def multicore_cases(base, harts, protection=False, interrupts=False):
+    yield from atomic_multicore_cases(base, harts, interrupts)
     for name in ('exchange', *(('protection',) if protection else ()), *(('interrupt',) if interrupts else ())):
         p = Program(base)
         p.emit(csr(2, 0xf14, 0, True), addi(3, 0, 64), mul(3, 2, 3))
@@ -295,6 +330,36 @@ def multicore_cases(base, harts, protection=False, interrupts=False):
             p.emit(csr(18, 0xf14, 0), csr(19, 0xf14, 0, True))
         p.finish()
         if name == 'interrupt':
+            p.offset = 0x800
+            p.emit(csr(20, 0x342, 0, True), csr(21, 0x343, 0, True), csr(22, 0x341, 0, True), addi(23, 23, 1))
+            p.address(25, 0x5008)
+            p.emit(sd(0, 25), 0x30200073)
+        yield name, p
+
+
+def atomic_multicore_cases(base, harts, interrupts):
+    for name in ('atomic', *(('atomic_interrupt',) if interrupts else ())):
+        p = Program(base)
+        p.emit(csr(2, 0xf14, 0, True), addi(3, 0, 64), mul(3, 2, 3), addi(4, 2, 1), addi(5, 0, 1))
+        p.address(10, 0x1800)
+        p.address(11, 0x2000)
+        p.emit(add(11, 11, 3))
+        if name == 'atomic_interrupt':
+            p.emit(addi(15, 0, -1), csr(0, 0x304, 15), addi(15, 0, 8), csr(0, 0x300, 15))
+            p.interrupts = dict(mode=8, mask=4, target=base + p.offset, hart=harts - 1)
+        for iteration in range(4):
+            if iteration == 3:
+                p.emit(sd(4, 11, 32))
+            p.emit(amoadd(6, 10, 5, iteration), sd(6, 11, iteration * 8))
+        p.emit(addi(7, 0, 4 * harts + 14))
+        loop = p.offset
+        p.emit(amoadd(6, 10, 0, 2), beq(6, 7, 8), jal(0, loop - p.offset - 8))
+        p.address(12, 0x2020)
+        for peer in range(harts):
+            p.emit(ld(17, 12, peer * 64), add(18, 18, 17))
+        p.exclusive_failures, p.interference = 2, 7
+        p.finish()
+        if name == 'atomic_interrupt':
             p.offset = 0x800
             p.emit(csr(20, 0x342, 0, True), csr(21, 0x343, 0, True), csr(22, 0x341, 0, True), addi(23, 23, 1))
             p.address(25, 0x5008)

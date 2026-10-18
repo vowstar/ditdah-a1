@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: 2026 Huang Rui <vowstar@gmail.com>
 # SPDX-License-Identifier: MIT
 
-.PHONY: config check rtl verify-signoff clean
+.PHONY: config check rtl verify-signoff verify-simulation verify-production verify-formal clean
 
 HART_COUNTS ?= 2 3 15 16
 
@@ -14,9 +14,13 @@ check:
 rtl:
 	build-ditdah-a1
 
-verify-signoff: config check
+verify-signoff: verify-formal
+
+verify-simulation: config check
 	python3 test/verify.py $(VERIFY_ARGS)
 	python3 test/verify.py --multicore-only --output result/multicore $(foreach count,$(filter-out 15,$(HART_COUNTS)),--harts $(count))
+
+verify-production: verify-simulation
 	build-ditdah-a1 --output result/production
 	build-ditdah-a1 --top DitDahA1Core --output result/core
 	build-ditdah-a1 --top DitDahA1Frontend --config result/frontend-input.json --output result/frontend
@@ -31,9 +35,11 @@ verify-signoff: config check
 	build-ditdah-a1 --top DitDahA1Backend --config result/verify/irq-pmp16-axi512/input.json --output result/backend-irq
 	for count in $(HART_COUNTS); do build-ditdah-a1 --config result/harts$$count-input.json --output result/production-harts$$count || exit $$?; done
 	python3 test/check_production.py --harts $(HART_COUNTS)
+
+verify-formal: verify-production
 	python3 test/formal.py
 	python3 test/formal.py --rtl result/production-pmp16 --output result/formal/pmp16
-	python3 test/formal.py --rtl result/verify/pmp16-axi64/rtl --output result/formal/pmp16-pa32 --modules Pmp
+	python3 test/formal.py --rtl result/verify/pmp16-axi64/rtl --output result/formal/pmp16-pa32 --modules Pmp Axi
 	python3 test/formal.py --rtl result/production-irq --output result/formal/irq --modules InterruptCsr InterruptBackend
 	python3 test/formal.py --rtl result/verify/irq-axi64/rtl --output result/formal/irq-pa32 --modules InterruptCsr InterruptBackend
 	for count in $(HART_COUNTS); do python3 test/formal.py --rtl result/production-harts$$count --output result/formal/harts$$count --modules MemoryArbiter || exit $$?; done

@@ -22,7 +22,7 @@ for directory, top in (*tops, *((directory + '-pmp16', top) for directory, top i
     count = int(directory.split('-harts')[1]) if '-harts' in directory else 1
     component = directory.split('-')[0]
     assert manifest['validationScope'] == {'production': 'system', 'core': 'core', 'frontend': 'frontend', 'fabric': 'fabric', 'backend': 'backend'}[component]
-    interrupts = directory.endswith('-irq') or (count in (2, 3) and '-harts' in directory)
+    interrupts = directory.endswith('-irq') or '-harts' in directory
     enabled = directory.endswith('-pmp16') or interrupts
     assert manifest['implementation']['machineInterrupts'] == interrupts
     assert manifest['implementation']['pmpEntries'] == (16 if enabled else 0)

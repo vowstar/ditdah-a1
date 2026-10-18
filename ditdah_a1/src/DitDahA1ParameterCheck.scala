@@ -58,6 +58,12 @@ object DitDahA1ParameterCheck:
     for width <- Seq(64, 128, 256, 512) do rtl.copy(axiDataBits = width).validateRtl()
     rejects { rtl.copy(memoryRegions = Seq(MemoryRegion(), MemoryRegion())).validateRtl() }
     rejects { MemoryRegion(device = true); () }
+    assert(!MemoryRegion().atomic)
+    val atomic = rtl.copy(memoryRegions = Seq(MemoryRegion(atomic = true)))
+    assert(DitDahA1Config.parameter(DitDahA1Config.document(atomic)) == atomic)
+    rejects { MemoryRegion(atomic = true, readable = false); () }
+    rejects { MemoryRegion(atomic = true, writable = false); () }
+    rejects { MemoryRegion(atomic = true, device = true, executable = false); () }
     assert(DitDahA1Config.parameter(ujson.Obj("resetAddress" -> "4")).resetVector == 4)
     rejects { DitDahA1Config.parameter(ujson.Obj("resetAddress" -> 4, "resetVector" -> 8)); () }
     assert(DitDahA1Config.document(rtl)("parameters")("resetVector").str == "0")

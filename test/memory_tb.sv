@@ -5,7 +5,7 @@ typedef struct packed {
   logic [63:0] address, data;
   logic [2:0] size;
   logic [7:0] mask, tag;
-  logic write, fetch;
+  logic write, fetch, atomic;
 } request_t;
 typedef struct packed { logic [63:0] data; logic fault; logic [7:0] tag; } response_t;
 interface memory_port;
@@ -18,7 +18,7 @@ endinterface
   .P``_request_bits_address(B.request.address), .P``_request_bits_data(B.request.data), \
   .P``_request_bits_size(B.request.size), .P``_request_bits_mask(B.request.mask), \
   .P``_request_bits_tag(B.request.tag), .P``_request_bits_write(B.request.write), \
-  .P``_request_bits_fetch(B.request.fetch), .P``_response_ready(B.response_ready), \
+  .P``_request_bits_fetch(B.request.fetch), .P``_request_bits_atomic(B.request.atomic), .P``_response_ready(B.response_ready), \
   .P``_response_valid(B.response_valid), .P``_response_bits_data(B.response.data), \
   .P``_response_bits_fault(B.response.fault), .P``_response_bits_tag(B.response.tag)
 `undef CORE_TRACE
@@ -47,6 +47,7 @@ module memory_tb;
     5: irq_activate = service[0].pending && service[0].captured.address == irq_target && `CORE_TRACE.pipelineOccupancy == 0;
     6: irq_activate = dut.backend.multiply.busy;
     7: irq_activate = irq_retired;
+    8: irq_activate = service[1].pending && service[1].captured.atomic;
     default: irq_activate = 0;
   endcase
   always @(posedge clock) irq_retired <= !reset && `CORE_TRACE.traceValid && `CORE_TRACE.tracePc == irq_target;
@@ -55,7 +56,7 @@ module memory_tb;
 `endif
   byte unsigned memory [0:65535];
   string image;
-  logic [63:0] base_address, stop_pc, fault_fetch, fault_read, fault_write;
+  logic [63:0] base_address, stop_pc, fault_fetch, fault_read, fault_write, fault_exclusive;
   logic [31:0] random_state;
   logic [1:0] core_pending = 0;
   integer cycles = 0, overlap = 0, pipeline_max = 0, dependency_stalls = 0;
@@ -67,6 +68,7 @@ module memory_tb;
     if (!$value$plusargs("FAULT_FETCH=%h", fault_fetch)) fault_fetch = '1;
     if (!$value$plusargs("FAULT_READ=%h", fault_read)) fault_read = '1;
     if (!$value$plusargs("FAULT_WRITE=%h", fault_write)) fault_write = '1;
+    if (!$value$plusargs("FAULT_EXCLUSIVE=%h", fault_exclusive)) fault_exclusive = '1;
     for (integer i = 0; i < 65536; i++) memory[i] = 0;
     $readmemh(image, memory);
     repeat (3) @(negedge clock);
@@ -82,6 +84,7 @@ module memory_tb;
       `PORT(upstream, core_port[p]), `PORT(downstream, physical_port[p]));
     logic pending = 0;
     request_t captured;
+    logic [63:0] atomic_data, atomic_sum;
     logic [7:0] owner_tag;
     integer delay = 0, stalls = 0, delayed = 0, rejected = 0, wraps = 0, requests = 0;
     always @(negedge clock) begin
@@ -96,13 +99,14 @@ module memory_tb;
       if (core_port[p].request_valid && core_port[p].request_ready) begin
         if (core_pending[p]) $fatal(1, "Overlapping requests on one port");
         if (core_port[p].request.fetch != (p == 0) || core_port[p].request.size != (p == 0 ? 2 : 3) ||
-            core_port[p].request.mask != (core_port[p].request.write ? 255 : 0) || (p == 0 && core_port[p].request.write)) $fatal(1, "Core request attributes");
+            core_port[p].request.mask != (core_port[p].request.write ? 255 : 0) || (p == 0 && (core_port[p].request.write || core_port[p].request.atomic)) ||
+            (core_port[p].request.atomic && !core_port[p].request.write)) $fatal(1, "Core request attributes");
         core_pending[p] <= 1;
         owner_tag <= core_port[p].request.tag;
         requests <= requests + 1;
         if (p == 0 && requests != 0 && core_port[p].request.tag == 0) wraps <= wraps + 1;
         if (!physical_port[p].request_valid) rejected <= rejected + 1;
-        $display("REQUEST %s %016h %0d %016h", p == 0 ? "fetch" : (core_port[p].request.write ? "write" : "read"),
+        $display("REQUEST %s %016h %0d %016h", core_port[p].request.atomic ? "atomic" : (p == 0 ? "fetch" : (core_port[p].request.write ? "write" : "read")),
           core_port[p].request.address, 1 << core_port[p].request.size, core_port[p].request.write ? core_port[p].request.data : 64'b0);
       end
       if (core_port[p].response_valid && core_port[p].response_ready) begin
@@ -119,17 +123,24 @@ module memory_tb;
         if (p == 0 && irq_mode == 5 && physical_port[p].request.address == irq_target) delay <= 48;
 `endif
         physical_port[p].response.tag <= physical_port[p].request.tag;
-        physical_port[p].response.fault <= physical_port[p].request.address == (p == 0 ? fault_fetch : (physical_port[p].request.write ? fault_write : fault_read));
-        $display("BUS %s %016h %0d %016h", p == 0 ? "fetch" : (physical_port[p].request.write ? "write" : "read"),
+        physical_port[p].response.fault <= physical_port[p].request.address == (p == 0 ? fault_fetch : (physical_port[p].request.write ? fault_write : fault_read)) ||
+          (physical_port[p].request.atomic && (physical_port[p].request.address == fault_read || physical_port[p].request.address == fault_exclusive));
+        $display("BUS %s %016h %0d %016h", physical_port[p].request.atomic ? "atomic" : (p == 0 ? "fetch" : (physical_port[p].request.write ? "write" : "read")),
           physical_port[p].request.address, 1 << physical_port[p].request.size, physical_port[p].request.write ? physical_port[p].request.data : 64'b0);
-        if (physical_port[p].request.write && physical_port[p].request.address != fault_write)
+        atomic_data = 0;
+        if (physical_port[p].request.atomic)
+          for (integer i = 0; i < 8; i++) atomic_data[i*8 +: 8] = memory[integer'(physical_port[p].request.address - base_address) + i];
+        atomic_sum = atomic_data + physical_port[p].request.data;
+        if (physical_port[p].request.write && physical_port[p].request.address != fault_write &&
+            (!physical_port[p].request.atomic || (physical_port[p].request.address != fault_read && physical_port[p].request.address != fault_exclusive)))
           for (integer i = 0; i < 8; i++)
-            if (physical_port[p].request.mask[i]) memory[integer'(physical_port[p].request.address - base_address) + i] <= physical_port[p].request.data[i*8 +: 8];
+            if (physical_port[p].request.mask[i]) memory[integer'(physical_port[p].request.address - base_address) + i] <=
+              physical_port[p].request.atomic ? atomic_sum[i*8 +: 8] : physical_port[p].request.data[i*8 +: 8];
       end
       if (pending) begin
         if (delay > 0) begin delay <= delay - 1; delayed <= delayed + 1; end
         else begin
-          physical_port[p].response.data <= 0;
+          physical_port[p].response.data <= captured.atomic ? atomic_data : 0;
           if (!captured.write)
             for (integer i = 0; i < (1 << captured.size); i++)
               physical_port[p].response.data[i*8 +: 8] <= memory[integer'(captured.address - base_address) + i];

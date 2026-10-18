@@ -42,7 +42,7 @@ object DitDahA1Axi extends Generator[DitDahA1Parameter, DitDahA1UnitLayers, DitD
       channel.bits.len := 0.U(8)
       channel.bits.size := request.size
       channel.bits.burst := 1.U(2)
-      channel.bits.lock := false.B
+      channel.bits.lock := request.atomic
       channel.bits.cache := 0.U(4)
       channel.bits.prot := request.fetch.?(5.U(3), 1.U(3))
       channel.bits.qos := 0.U(4)
@@ -53,7 +53,8 @@ object DitDahA1Axi extends Generator[DitDahA1Parameter, DitDahA1UnitLayers, DitD
     val laneBits = Integer.numberOfTrailingZeros(parameter.axiDataBits / 8)
     val lane = request.address.asBits.bits(laneBits - 1, 0).asUInt
     val byteShift = (lane.asBits ## 0.B(3)).asUInt
-    w.bits.data := (request.data << byteShift).asBits.bits(parameter.axiDataBits - 1, 0).asUInt
+    val writeData = request.atomic.?((data + request.data).asBits.bits(63, 0).asUInt, request.data)
+    w.bits.data := (writeData << byteShift).asBits.bits(parameter.axiDataBits - 1, 0).asUInt
     w.bits.strb := (request.mask << lane).asBits.bits(parameter.axiDataBits / 8 - 1, 0).asUInt
     val shiftedReadData = (r.bits.data >> byteShift).asBits.bits(63, 0).asUInt
     val readData = Wire(UInt(64))
@@ -64,6 +65,7 @@ object DitDahA1Axi extends Generator[DitDahA1Parameter, DitDahA1UnitLayers, DitD
     b.ready := state === 3.U(3)
     when(io.memory.request.valid & io.memory.request.ready) {
       request :<= io.memory.request.bits
+      request.write := io.memory.request.bits.write & !io.memory.request.bits.atomic
       awDone := false.B
       wDone := false.B
       fault := false.B
@@ -76,11 +78,22 @@ object DitDahA1Axi extends Generator[DitDahA1Parameter, DitDahA1UnitLayers, DitD
     when((state === 1.U(3)) & request.write & (awDone | (aw.valid & aw.ready)) & (wDone | (w.valid & w.ready))) { state := 3.U(3) }
     when(r.valid & r.ready) {
       data := readData
-      fault := fault | (r.bits.resp =/= 0.U(2)) | (r.bits.id =/= 0.U(1)) | !r.bits.last
-      when(r.bits.last) { state := 4.U(3) }
+      val readFault = fault | (r.bits.resp =/= request.atomic.?(1.U(2), 0.U(2))) | (r.bits.id =/= 0.U(1)) | !r.bits.last
+      fault := readFault
+      when(r.bits.last) {
+        when(request.atomic & !readFault) { request.write := true.B; state := 1.U(3) }
+          .otherwise { state := 4.U(3) }
+      }
     }
     when(b.valid & b.ready) {
-      fault := (b.bits.resp =/= 0.U(2)) | (b.bits.id =/= 0.U(1))
-      state := 4.U(3)
+      when(request.atomic & (b.bits.resp === 0.U(2)) & (b.bits.id === 0.U(1))) {
+        request.write := false.B
+        awDone := false.B
+        wDone := false.B
+        state := 1.U(3)
+      }.otherwise {
+        fault := (b.bits.resp =/= request.atomic.?(1.U(2), 0.U(2))) | (b.bits.id =/= 0.U(1))
+        state := 4.U(3)
+      }
     }
     when(io.memory.response.valid & io.memory.response.ready) { state := 0.U(3) }

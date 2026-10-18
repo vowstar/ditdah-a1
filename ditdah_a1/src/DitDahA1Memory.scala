@@ -28,21 +28,26 @@ object DitDahA1Memory extends Generator[DitDahA1Parameter, DitDahA1UnitLayers, D
     val request = up.request.bits
     val allowed = Wire(Bool())
     allowed := false.B
+    val atomicShape = request.write & !request.fetch & (request.size === 3.U(3)) & (request.mask === 255.U(8))
     for size <- 0 to 3 do
       val bytes = 1 << size
       val aligned = if size == 0 then true.B else request.address.asBits.bits(size - 1, 0).asUInt === 0.U(size)
       val validMask = (request.mask =/= 0.U(8)) & ((request.mask.asBits & (255 ^ ((1 << bytes) - 1)).B(8)).asUInt === 0.U(8))
-      when((request.size === size.U(3)) & aligned & (!request.write | validMask)) {
+      when((request.size === size.U(3)) & aligned & (!request.write | validMask) & (!request.atomic | atomicShape)) {
         for region <- parameter.memoryRegions do
           val inRegion = (request.address >= region.base.U(64)) & (request.address <= (region.base + region.size - bytes).U(64))
           when(inRegion) {
-            when(request.fetch) {
-              if region.executable && !region.device then when(!request.write) { allowed := true.B }
+            when(request.atomic) {
+              if region.atomic && region.readable && region.writable && !region.device then allowed := true.B
             }.otherwise {
-              when(request.write) {
-                if region.writable then allowed := true.B
+              when(request.fetch) {
+                if region.executable && !region.device then when(!request.write) { allowed := true.B }
               }.otherwise {
-                if region.readable then allowed := true.B
+                when(request.write) {
+                  if region.writable then allowed := true.B
+                }.otherwise {
+                  if region.readable then allowed := true.B
+                }
               }
             }
           }

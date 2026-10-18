@@ -39,8 +39,8 @@ object DitDahA1Execute extends Generator[DitDahA1Parameter, DitDahA1UnitLayers, 
     out.rdWrite := d.writesRd
     out.value := 0.U(64)
     out.nextPc := sequential
-    out.load := op === Ld.U(4)
-    out.store := op === Sd.U(4)
+    out.load := (op === Ld.U(4)) | (op === AmoaddD.U(4))
+    out.store := (op === Sd.U(4)) | (op === AmoaddD.U(4))
     out.address := addImm
     out.storeData := b
     out.csrAddress := io.csrAddress
