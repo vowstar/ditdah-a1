@@ -13,6 +13,8 @@ class DitDahA1ExecuteIO(parameter: DitDahA1Parameter) extends HWBundle(parameter
   val csrAddress = Aligned(UInt(12))
   val csrValue = Flipped(UInt(64))
   val csrLegal = Flipped(Bool())
+  val privilege = Flipped(UInt(2))
+  val wfiLegal = Flipped(Bool())
 
 @generator
 object DitDahA1Execute extends Generator[DitDahA1Parameter, DitDahA1UnitLayers, DitDahA1ExecuteIO, DitDahA1UnitProbe]:
@@ -24,6 +26,8 @@ object DitDahA1Execute extends Generator[DitDahA1Parameter, DitDahA1UnitLayers, 
     val d = in.decoded
     val insn = d.instruction
     val op = d.operation
+    val machine = if parameter.enableUserMode then io.privilege === 3.U(2) else true.B
+    val wfiLegal = if parameter.enableUserMode then io.wfiLegal else true.B
     val out = io.output.bits
     val a = in.operand1
     val b = in.operand2
@@ -101,14 +105,16 @@ object DitDahA1Execute extends Generator[DitDahA1Parameter, DitDahA1UnitLayers, 
     when(taken) { out.nextPc := target }
     when(jump) { out.value := sequential }
     when(!insn.fault) {
-      when((op === Illegal.U(operationBits)) | (csr & (!io.csrLegal | (out.csrWrite & (io.csrAddress.asBits.bits(11, 10) === 3.B(2)))))) {
+      when((op === Illegal.U(operationBits)) | ((op === Mret.U(operationBits)) & !machine) |
+        ((op === Wfi.U(operationBits)) & !wfiLegal) |
+        (csr & (!io.csrLegal | (out.csrWrite & (io.csrAddress.asBits.bits(11, 10) === 3.B(2)))))) {
         out.instruction.fault := true.B
         out.instruction.cause := 2.U(64)
         out.instruction.tval := insn.instruction
       }
       when(op === Ecall.U(operationBits)) {
         out.instruction.fault := true.B
-        out.instruction.cause := 11.U(64)
+        out.instruction.cause := machine.?(11.U(64), 8.U(64))
         out.instruction.tval := 0.U(64)
       }
       when(taken & (target.asBits.bits(1, 0) =/= 0.B(2))) {

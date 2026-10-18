@@ -14,6 +14,7 @@ class DitDahA1PmpIO(parameter: DitDahA1Parameter) extends HWBundle(parameter):
   val write = Flipped(Bool())
   val fetch = Flipped(Bool())
   val atomic = Flipped(Bool())
+  val privilege = Flipped(UInt(2))
   val allowed = Aligned(Bool())
 
 @generator
@@ -33,7 +34,8 @@ object DitDahA1Pmp extends Generator[DitDahA1Parameter, DitDahA1UnitLayers, DitD
     }
     val points = addresses.map(encoded => (encoded.asBits.bits(61, 0) ## 0.B(2)).asUInt)
     val allowed = Wire(Bool())
-    allowed := true.B
+    val machine = if parameter.enableUserMode then io.privilege === 3.U(2) else true.B
+    allowed := machine
     for index <- (0 until parameter.pmpEntries).reverse do
       val config = io.state.config.asBits.bits(index * 8 + 7, index * 8)
       val mode = config.bits(4, 3).asUInt
@@ -56,6 +58,6 @@ object DitDahA1Pmp extends Generator[DitDahA1Parameter, DitDahA1UnitLayers, DitD
       }
       val permission = io.atomic.?(config.bit(0) & config.bit(1), io.fetch.?(config.bit(2), io.write.?(config.bit(1), config.bit(0))))
       when((mode =/= 0.U(2)) & (limit > base) & (start < limit) & (end > base)) {
-        allowed := (start >= base) & (end <= limit) & (!config.bit(7) | permission)
+        allowed := (start >= base) & (end <= limit) & ((machine & !config.bit(7)) | permission)
       }
     io.allowed := allowed & (io.size <= 3.U(3)) & (end <= (BigInt(1) << parameter.physicalAddressBits).U(65))

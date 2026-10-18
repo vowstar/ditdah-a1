@@ -11,6 +11,8 @@ import shutil
 import subprocess
 import sys
 
+from build_software import load_configuration
+
 REVISION = 'dccb09599635bdff17633fa7e9dab014b91dce90'
 
 
@@ -62,6 +64,8 @@ def main():
     parser.add_argument('--console-base', type=lambda value: int(value, 0), required=True)
     parser.add_argument('--timebase-hz', type=int, required=True)
     parser.add_argument('--qemu', action='store_true')
+    parser.add_argument('--harts', type=int, choices=range(1, 17))
+    parser.add_argument('--icache-bytes', type=int, choices=(0, 8192, 16384, 32768, 65536))
     args = parser.parse_args()
     output = args.output.resolve()
     output.mkdir(parents=True, exist_ok=True)
@@ -70,9 +74,8 @@ def main():
     upstream = args.zephyr_base.resolve()
     assert subprocess.check_output(['git', '-C', str(upstream), 'rev-parse', 'HEAD'], text=True).strip() == REVISION
     subprocess.run(['git', '-C', str(upstream), 'diff', '--exit-code', 'HEAD'], check=True, stdout=subprocess.DEVNULL)
+    config, configuration_sources = load_configuration(args)
     configuration_bytes = args.config.read_bytes()
-    document = json.loads(configuration_bytes)
-    config = document.get('parameters', document)
     harts, base = config['hartCount'], int(config['resetVector'])
     assert 1 <= harts <= 16 and args.timebase_hz > 0 and config['enableInterrupts']
     assert config['localInterruptBase'] is not None and config['pmpEntries'] in (0, 16)
@@ -82,8 +85,8 @@ def main():
     assert any(r['device'] and r['writable'] and not r['executable'] and not r['atomic'] and
                int(r['base']) <= console and console + 4 * harts <= int(r['base']) + int(r['size']) for r in config['memoryRegions'])
     source = Path('software/zephyr').resolve()
-    paths = sorted(p for p in source.rglob('*') if p.is_file()) + [Path(__file__).resolve()]
-    hashes = {str(p.relative_to(Path.cwd())): digest(p) for p in paths}
+    paths = sorted(p for p in source.rglob('*') if p.is_file()) + [Path(__file__).resolve(), Path('scripts/build_software.py').resolve()]
+    hashes = {**configuration_sources, **{str(p.relative_to(Path.cwd())): digest(p) for p in paths}}
     dts = output / ('platform.overlay' if args.qemu else 'platform.dtsi')
     dts.write_text(platform(config, ram, console, args.timebase_hz, args.qemu))
     profile = output / 'profile.conf'

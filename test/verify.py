@@ -4,9 +4,12 @@
 
 import argparse
 from collections import Counter, deque
+from concurrent.futures import ProcessPoolExecutor
 import hashlib
 import importlib.util
+from itertools import chain
 import json
+import os
 import re
 from pathlib import Path
 import subprocess
@@ -21,7 +24,10 @@ def run(command, log, cwd=None, timeout=600):
     with log.open('w') as stream:
         result = subprocess.run(list(map(str, command)), cwd=cwd, stdout=stream, stderr=subprocess.STDOUT, timeout=timeout)
     if result.returncode:
-        raise RuntimeError(f'{command[0]} failed; see {log}\n' + log.read_text()[-10000:])
+        with log.open('rb') as stream:
+            stream.seek(max(0, log.stat().st_size - 10000))
+            tail = stream.read().decode(errors='replace')
+        raise RuntimeError(f'{command[0]} failed; see {log}\n' + tail)
 
 
 def configuration(width):
@@ -85,7 +91,7 @@ def compile_tb(rtl, directory, width, pa, top='core_tb', source=None, extra_file
                 for channel in ('request', 'response'):
                     for field in ('valid', 'ready'):
                         bindings.append(f'assign {channel}_{field}[{index}] = {core}.{port}_{channel}_{field};')
-                    for field in (('address', 'data', 'size', 'mask', 'tag', 'write', 'fetch', 'atomic', 'atomicOperation', 'scEligible') if channel == 'request' else ('data', 'fault', 'tag')):
+                    for field in (('address', 'data', 'size', 'mask', 'tag', 'write', 'fetch', 'atomic', 'atomicOperation', 'scEligible', 'privileged') if channel == 'request' else ('data', 'fault', 'tag')):
                         bindings.append(f'assign {channel}s[{index}].{field} = {core}.{port}_{channel}_bits_{field};')
             if interrupts:
                 ports += [f'.interrupts_{hart}_{name}(irq_by_hart[{hart}][{index}]),'
@@ -122,15 +128,30 @@ def compile_tb(rtl, directory, width, pa, top='core_tb', source=None, extra_file
     (directory / 'platform_observers.svh').write_text('\n'.join(platform) + '\n')
     if interrupts and top == 'memory_tb':
         extra_files = [*extra_files, Path('test/core_tb.sv').resolve()]
-    run(['verilator', '--binary', '--timing', '--assert', '-j', '2', '--top-module', top,
+    command = ['verilator', '--binary', '--timing', '--assert', '-j', '2', '--top-module', top,
          '-Wno-TIMESCALEMOD', '-Wno-WIDTHTRUNC', '-Wno-WIDTHEXPAND',
          f'-DAXI_BITS={width}', f'-DPA_BITS={pa}', f'-DHARTS={harts}', '-I' + str(directory.resolve()), *(['-DENABLE_INTERRUPTS'] if interrupts else []), '-I' + str(rtl.resolve()),
          *(['-DICACHE'] if parameters['iCacheBytes'] else []),
          *(['-DLOCAL_INTERRUPTS'] if local_base is not None else []),
          *(['-DSOFTWARE'] if software else []),
          *([f'-DMEMORY_BYTES={software["memoryBytes"]}', f'-DTIME_TICK_CYCLES={software["timeTickCycles"]}'] if software else []),
-         '--Mdir', str((directory / 'obj').resolve()), *files, *extra_files, source], directory / 'compile.log')
-    return (directory / 'obj' / ('V' + top)).resolve()
+         '--Mdir', str((directory / 'obj').resolve()), *files, *extra_files, source]
+    binary, stamp = (directory / 'obj' / ('V' + top)).resolve(), directory / 'compile-inputs.json'
+    inputs = [*files, *extra_files, source, rtl / 'filelist.f', rtl / 'ditdah_a1_config.json', *directory.glob('*.svh')]
+    hashes = {str(path): hashlib.sha256(Path(path).read_bytes()).hexdigest() for path in inputs}
+    tools = {name: subprocess.check_output([name, '--version'], text=True).splitlines()[0]
+             for name in ('verilator', os.environ.get('CXX', 'g++'), 'make')}
+    identity = dict(command=list(map(str, command)), inputs=hashes, tools=tools,
+                    environment=hashlib.sha256(json.dumps(dict(os.environ), sort_keys=True).encode()).hexdigest())
+    if stamp.exists() and binary.exists():
+        previous = json.loads(stamp.read_text())
+        if previous.get('inputs') == identity and previous.get('binaryHash') == hashlib.sha256(binary.read_bytes()).hexdigest():
+            return binary
+    stamp.unlink(missing_ok=True)
+    run(command, directory / 'compile.log')
+    assert all(hashlib.sha256(Path(path).read_bytes()).hexdigest() == digest for path, digest in hashes.items()), 'Inputs changed during compilation'
+    stamp.write_text(json.dumps(dict(inputs=identity, binaryHash=hashlib.sha256(binary.read_bytes()).hexdigest()), indent=2) + '\n')
+    return binary
 
 
 def log_lines(source):
@@ -141,13 +162,21 @@ def log_lines(source):
         yield from source
 
 
-def check_fetches(lines, config, faults, local_faults=()):
+def fetch_checker(config, faults, local_faults, architectural=None, buffered=()):
+    if architectural is None:
+        entries = []
+        while entry := (yield):
+            entries.append(entry)
+            if entry[1][0] == 'ARCH_REQUEST':
+                break
+        if entry is None:
+            entries.append(None)
+        return (yield from fetch_checker(config, faults, local_faults, entry is not None, iter(entries)))
     def allowed(address):
         return address % 4 == 0 and address + 4 <= 1 << config['physicalAddressBits'] and any(
             int(region['base']) <= address and address + 4 <= int(region['base']) + int(region['size'])
             and region['executable'] for region in config['memoryRegions'])
 
-    architectural = any(line.startswith('ARCH_REQUEST ') for line in lines)
     pending, requests, demand = None, {}, None
     arch_accepted, arch_completed, arch_wraps = 0, 0, 0
     fetched, failed = Counter(), Counter()
@@ -161,8 +190,14 @@ def check_fetches(lines, config, faults, local_faults=()):
 
     reachable = {int(config['resetVector'])}
     accepted, completed = 0, 0
-    for line in lines:
-        fields = line.split()
+    buffered, missing = iter(buffered), object()
+    while True:
+        entry = next(buffered, missing)
+        if entry is missing:
+            entry = yield
+        if entry is None:
+            break
+        line, fields = entry
         if fields[:1] == ['ARCH_REQUEST']:
             address, tag = (int(value, 16) for value in fields[1:])
             assert not requests and pending is None and address in reachable, 'Unexpected architectural fetch identity or control flow'
@@ -237,6 +272,17 @@ def check_fetches(lines, config, faults, local_faults=()):
                 discarded=sum(fetched.values()) + sum(failed.values()))
 
 
+def check_fetches(lines, config, faults, local_faults=()):
+    checker = fetch_checker(config, faults, local_faults)
+    next(checker)
+    for line in lines:
+        checker.send((line, line.split()))
+    try:
+        checker.send(None)
+    except StopIteration as result:
+        return result.value
+
+
 def check_fetch_oracle():
     config, word = configuration(64), 0x0400006f
     request = 'ARCH_REQUEST 0 0'
@@ -270,6 +316,26 @@ def check_fetch_oracle():
     return list(rejected)
 
 
+def check_access_privileges(lines, modes, requests, privileges, required):
+    expected = iter(privilege == 3 for request, privilege in zip(requests, privileges) if request[0] != 'fetch')
+    mode, demand, retired, pending = 3, 3, 0, None
+    for line in lines:
+        fields = line.split()
+        if fields[:1] == ['ARCH_REQUEST']:
+            demand = mode
+        elif fields[:1] == ['REQUEST']:
+            assert pending is None or not required, 'Missing accepted access privilege'
+            pending = demand == 3 if fields[1] == 'fetch' else next(expected)
+        elif fields[:1] == ['ACCESS_PRIVILEGE']:
+            assert pending is not None and int(fields[1], 16) == pending, 'Accepted access privilege differs from architectural context'
+            pending = None
+        elif fields[:1] == ['TRACE']:
+            retired += 1
+            mode = modes[retired]
+    assert pending is None or not required, 'Missing final accepted access privilege'
+    assert not required or next(expected, None) is None, 'Missing architectural data request privilege'
+
+
 def compare(binary, directory, config, transport='axi', selected=()):
     base = int(config['resetVector'])
     coverage = [0] * 6
@@ -278,16 +344,17 @@ def compare(binary, directory, config, transport='axi', selected=()):
     count = 0
     reports = []
     pipeline_max, dependency_stalls = 0, 0
-    for name, program in cases(base, config['pmpEntries'] != 0, config['enableInterrupts']):
+    for name, program in cases(base, config['pmpEntries'] != 0, config['enableInterrupts'], config.get('enableUserMode', False), local_interrupt_base(config)):
         if selected and name not in selected:
             continue
         image = directory / (name + '.hex')
         image.write_text('\n'.join(f'{program.memory.get(base + i, 0):02x}' for i in range(65536)) + '\n')
         model = Model(config, program.memory, program.faults)
-        expected, expected_atomics = [], []
+        expected, expected_atomics, expected_modes = [], [], [3]
         def advance():
             first = len(model.requests)
             record = model.step()
+            expected_modes.append(getattr(model, 'privilege', 3))
             if any(event[0] == 'atomic' for event in model.requests[first:]):
                 expected_atomics.append((model.atomic_operation, int(model.sc_eligible)))
             return record
@@ -314,7 +381,7 @@ def compare(binary, directory, config, transport='axi', selected=()):
             assert 'PASS' in lines, f'{name}: simulation did not complete'
             if hasattr(program, 'interrupts'):
                 model = Model(config, program.memory, program.faults)
-                expected, expected_atomics, causes, deferred = [], [], [], 0
+                expected, expected_atomics, causes, deferred, expected_modes = [], [], [], 0, [3]
                 for line in lines:
                     fields = line.split()
                     if fields[:1] == ['IRQ']:
@@ -323,6 +390,8 @@ def compare(binary, directory, config, transport='axi', selected=()):
                         observed = tuple(int(v, 16) for v in fields[1:])
                         pending = model.interrupt_cause()
                         record = model.interrupt() if observed[8] >> 63 else advance()
+                        if observed[8] >> 63:
+                            expected_modes.append(getattr(model, 'privilege', 3))
                         if pending and not record[8] >> 63 and not record[7]:
                             deferred += 1
                             assert deferred <= 1 and record[2] & 127 in (3, 0x23, 0x2f), f'{name}: interrupt deferred beyond its memory owner'
@@ -355,6 +424,8 @@ def compare(binary, directory, config, transport='axi', selected=()):
                 requests = [(v[1], int(v[2], 16), int(v[3]), int(v[4], 16)) for line in lines
                             if line.startswith('REQUEST ') for v in [line.split()] if v[1] != 'fetch']
                 assert requests == [r for r in model.requests if r[0] != 'fetch'], f'{name}: unexpected Core requests'
+            if config.get('enableUserMode') or any(line.startswith('ACCESS_PRIVILEGE ') for line in lines):
+                check_access_privileges(lines, expected_modes, model.requests, model.request_privileges, config.get('enableUserMode', False))
             fetches = check_fetches(lines, config, program.faults, model.local_fetch_faults)
             if name == 'pipeline_redirect':
                 fault = program.faults['fetch']
@@ -383,24 +454,29 @@ def compare(binary, directory, config, transport='axi', selected=()):
                 **{('busCoverage' if transport == 'axi' else 'portCoverage'): dict(zip(coverage_names, coverage))})
 
 
-def check_multicore(lines, config, program, name, atomic_metadata=False):
-    covers = [list(map(int, line.split()[1:])) for line in log_lines(lines) if line.startswith('COVER ')]
+def check_multicore(lines, config, program, name, atomic_metadata=False, software_output=False):
     harts, base = config['hartCount'], int(config['resetVector'])
-    assert len(covers) == 1 and len(covers[0]) == 6 and (harts == 1 or all(covers[0])), 'Missing AXI scheduling coverage'
+    covers, results, passed = [], [], False
     memory, active = dict(program.memory), None
     failures = getattr(program, 'exclusive_failures', 0)
-    models = [Model(config, program.memory, program.faults, hart_id=h) for h in range(harts)]
+    models = [Model(config, {}, program.faults, hart_id=h) for h in range(harts)]
     local_base = local_interrupt_base(config)
     device = LocalInterrupts(local_base, harts) if local_base is not None else None
     software = getattr(program, 'software', None)
     console, console_events, successful_stores = [bytearray() for _ in range(harts)], deque(), Counter()
     for model in models:
         model.memory = memory
-    pending, finished, per_hart = [None] * harts, set(), [[] for _ in range(harts)]
+    pending, finished = [None] * harts, set()
+    fetch_privileges, retired_privileges = [3] * harts, [3] * harts
+    fetch_checks = [fetch_checker(config, program.faults, model.local_fetch_faults) for model in models]
+    for checker in fetch_checks:
+        next(checker)
     collisions, tags, sources, events, effects = set(), {}, set(), 0, Counter()
     interrupts, causes, overtaken = Counter(), Counter(), 0
     deferred = [0] * harts
     waiting, sleep_cycles, wake = [False] * harts, [0] * harts, [False] * harts
+    wait_started, waiting_mask, wake_mask = [0] * harts, 0, 0
+    interrupt_dirty, previous_external, previous_time, next_timer, expected_levels = True, None, 0, 0, 0
     concurrent = Counter()
     monitor, reservation_max, sc_results = ExclusiveMonitor(), 0, Counter()
     observed_reservations = None
@@ -413,11 +489,12 @@ def check_multicore(lines, config, program, name, atomic_metadata=False):
         model.external_access = no_service
 
     def service(hart, event, atomic_fault=False, local=False):
+        nonlocal interrupt_dirty
         assert pending[hart] is None, 'Second memory operation before retirement'
         accesses, response = [], None
 
         def access(address, size, kind, data):
-            nonlocal response
+            nonlocal response, interrupt_dirty
             wanted = kind, address, size, data if kind in ('write', 'atomic') else 0
             assert event == wanted, f'{name}: data service {event} != independent instruction {wanted}'
             accesses.append(wanted)
@@ -435,6 +512,7 @@ def check_multicore(lines, config, program, name, atomic_metadata=False):
                     raise
                 response = (value, 0)
                 if kind == 'write':
+                    interrupt_dirty = True
                     effects[hart, address] += 1
                     monitor.write(address, size)
                 return value
@@ -466,20 +544,42 @@ def check_multicore(lines, config, program, name, atomic_metadata=False):
 
     for line in log_lines(lines):
         fields = line.split()
+        if fields[:1] == ['COVER']:
+            covers.append(list(map(int, fields[1:])))
+            continue
+        if fields[:1] == ['RESULT']:
+            results.append((int(fields[1]), int(fields[2], 16)))
+            continue
+        if fields == ['PASS']:
+            passed = True
+            continue
         if fields[:1] == ['CYCLE']:
             assert device is not None, 'Unexpected platform event'
             cycle, tick = int(fields[1]), int(fields[2], 16)
             external, effective, sleeping = (int(value, 16) for value in fields[3:])
             device.begin_cycle(cycle, tick)
             assert tick == int(cycle % (software['timeTickCycles'] if software else 1) == 0), 'Platform timebase divider mismatch'
-            for hart in range(harts):
-                levels = device.levels(hart) | ((external >> (3 * hart)) & 7)
-                assert (effective >> (3 * hart)) & 7 == levels, f'Platform interrupt mismatch at cycle {cycle}, hart {hart}'
-                models[hart].set_interrupts(levels)
-                assert bool(sleeping & (1 << hart)) == waiting[hart], f'Architectural wait mismatch at cycle {cycle}, hart {hart}'
-                sleep_cycles[hart] += waiting[hart]
-                wake[hart] = bool(models[hart].csrs[0x304] & models[hart].csrs[0x344])
-                waiting[hart] &= not wake[hart]
+            if interrupt_dirty or external != previous_external or device.time < previous_time or device.time >= next_timer:
+                expected_levels, wake_mask = 0, 0
+                for hart, model in enumerate(models):
+                    levels = device.levels(hart) | ((external >> (3 * hart)) & 7)
+                    expected_levels |= levels << (3 * hart)
+                    model.set_interrupts(levels)
+                    wake[hart] = bool(model.csrs[0x304] & model.csrs[0x344])
+                    wake_mask |= int(wake[hart]) << hart
+                next_timer = min((value for value in device.compare if value > device.time), default=MASK + 1)
+                interrupt_dirty, previous_external = False, external
+            previous_time = device.time
+            assert effective == expected_levels, f'Platform interrupt mismatch at cycle {cycle}'
+            assert sleeping == waiting_mask, f'Architectural wait mismatch at cycle {cycle}'
+            waking = waiting_mask & wake_mask
+            waiting_mask &= ~waking
+            while waking:
+                bit = waking & -waking
+                hart = bit.bit_length() - 1
+                sleep_cycles[hart] += cycle - wait_started[hart] + 1
+                waiting[hart] = False
+                waking ^= bit
             continue
         if fields[:1] == ['CONSOLE']:
             assert software and console_events and console_events.popleft() == (int(fields[1]), int(fields[2], 16)), 'Console byte without matching software service'
@@ -494,22 +594,26 @@ def check_multicore(lines, config, program, name, atomic_metadata=False):
             continue
         if fields[:1] == ['HART']:
             hart, fields = int(fields[1]), fields[2:]
-        elif harts == 1 and fields and fields[0] in ('REQUEST', 'ATOMIC', 'BUS', 'READ', 'WRITE', 'INTERFERE', 'RESPONSE', 'FETCH', 'IRQ', 'TRACE', 'ARCH_REQUEST', 'ARCH_FETCH', 'ARCH_CANCEL', 'LOCAL_REQUEST', 'LOCAL_RESPONSE'):
+        elif harts == 1 and fields and fields[0] in ('REQUEST', 'ACCESS_PRIVILEGE', 'ATOMIC', 'BUS', 'READ', 'WRITE', 'INTERFERE', 'RESPONSE', 'FETCH', 'IRQ', 'TRACE', 'ARCH_REQUEST', 'ARCH_FETCH', 'ARCH_CANCEL', 'LOCAL_REQUEST', 'LOCAL_RESPONSE'):
             hart = 0
         else:
             continue
         assert 0 <= hart < harts
-        per_hart[hart].append(' '.join(fields))
         kind = fields[0]
+        if kind != 'TRACE':
+            fetch_checks[hart].send((line, fields))
         if kind in ('ARCH_REQUEST', 'ARCH_FETCH', 'ARCH_CANCEL'):
+            if kind == 'ARCH_REQUEST':
+                fetch_privileges[hart] = retired_privileges[hart]
             assert kind != 'ARCH_REQUEST' or not waiting[hart], 'New architectural fetch while waiting'
             continue
-        assert kind in ('REQUEST', 'ATOMIC', 'BUS', 'READ', 'WRITE', 'INTERFERE', 'RESPONSE', 'FETCH', 'IRQ', 'TRACE', 'LOCAL_REQUEST', 'LOCAL_RESPONSE'), 'Unknown hart event'
+        assert kind in ('REQUEST', 'ACCESS_PRIVILEGE', 'ATOMIC', 'BUS', 'READ', 'WRITE', 'INTERFERE', 'RESPONSE', 'FETCH', 'IRQ', 'TRACE', 'LOCAL_REQUEST', 'LOCAL_RESPONSE'), 'Unknown hart event'
         if kind == 'REQUEST':
             assert active is None, 'Overlapping source ownership'
             event = fields[1], int(fields[2], 16), int(fields[3]), int(fields[4], 16)
             tag = int(fields[5], 16)
-            active = dict(hart=hart, event=event, tag=tag, bus=False, response=None)
+            privilege = fetch_privileges[hart] if event[0] == 'fetch' else models[hart].data_privilege() if hasattr(models[hart], 'data_privilege') else 3
+            active = dict(hart=hart, event=event, tag=tag, bus=False, response=None, expectedPrivileged=privilege == 3)
             if event[0] == 'atomic':
                 instruction = sum(memory.get(models[hart].pc + byte, 0) << (8 * byte) for byte in range(4))
                 operation = instruction >> 27
@@ -521,6 +625,10 @@ def check_multicore(lines, config, program, name, atomic_metadata=False):
             if tag in tags and tags[tag] != hart:
                 collisions.add(tag)
             tags[tag] = hart
+        elif kind == 'ACCESS_PRIVILEGE':
+            assert active and active['hart'] == hart and not active.get('privilegeMetadata'), 'Unowned access privilege'
+            assert int(fields[1], 16) == active['expectedPrivileged'], 'Accepted access privilege differs from architectural context'
+            active['privilegeMetadata'] = True
         elif kind == 'ATOMIC':
             assert active and active['hart'] == hart and active['event'][0] == 'atomic' and not active.get('atomicMetadata')
             assert tuple(int(value, 16) for value in fields[1:]) == (active['operation'], int(active['eligible'])), 'Atomic request metadata differs from instruction/local LR pair'
@@ -613,6 +721,7 @@ def check_multicore(lines, config, program, name, atomic_metadata=False):
         elif kind == 'RESPONSE':
             transactions += 1
             assert active and active['hart'] == hart, 'Response to the wrong hart'
+            assert not config.get('enableUserMode') or active.get('privilegeMetadata'), 'Missing accepted access privilege'
             channel, data, fault, tag = (int(v, 16) for v in fields[1:])
             assert channel == int(active['event'][0] != 'fetch') and tag == active['tag']
             if not active['bus']:
@@ -661,17 +770,36 @@ def check_multicore(lines, config, program, name, atomic_metadata=False):
                 assert owned and deferred[hart] == 1, 'Interrupt deferred beyond its memory owner'
             else:
                 deferred[hart] = 0
+            fetch_checks[hart].send((line, fields))
+            models[hart].requests.clear()
+            models[hart].bus.clear()
+            if hasattr(models[hart], 'request_privileges'):
+                models[hart].request_privileges.clear()
+            retired_privileges[hart] = getattr(models[hart], 'privilege', 3)
             assert observed == wanted, f'{name} hart {hart}:\nactual {observed}\nexpected {wanted}'
+            wake[hart] = bool(models[hart].csrs[0x304] & models[hart].csrs[0x344])
+            wake_mask = (wake_mask & ~(1 << hart)) | (int(wake[hart]) << hart)
             if wanted[7]:
                 waiting[hart] = False
             elif wanted[2] == 0x10500073:
                 waiting[hart] = config['enableInterrupts'] and not wake[hart]
+                if waiting[hart]:
+                    wait_started[hart] = device.cycle + 1 if device is not None else 0
+            waiting_mask = (waiting_mask & ~(1 << hart)) | (int(waiting[hart]) << hart)
             events += 1
             if active is not None and active['hart'] != hart:
                 concurrent['trapDuringPeerService'] += int(bool(wanted[7]))
                 concurrent['redirectDuringPeerService'] += int(wanted[3] != wanted[1] + 4)
             if not wanted[7] and wanted[1] == program.stop:
                 finished.add(hart)
+    assert len(covers) == 1 and len(covers[0]) == 6 and (harts == 1 or all(covers[0])), 'Missing AXI scheduling coverage'
+    if software_output:
+        assert passed, 'Software simulation did not finish'
+        assert results == [(hart, 1) for hart in range(harts)], 'Test memory did not contain per-hart success'
+    if device is not None:
+        for hart in range(harts):
+            if waiting[hart]:
+                sleep_cycles[hart] += device.cycle - wait_started[hart] + 1
     assert finished == set(range(harts)) and all(record is None for record in pending)
     assert active is None or active['event'][0] == 'fetch', 'Unretired data access at completion'
     assert failures == 0, 'Exclusive failure stimulus was not consumed'
@@ -727,15 +855,18 @@ def check_multicore(lines, config, program, name, atomic_metadata=False):
             assert model.registers[19] == tasks * (tasks + 1) // 2, 'Distributed work checksum'
         elif harts > 1 and 'atomic' in name and not hasattr(program, 'lrsc'):
             assert model.registers[18] == harts * (harts + 1) // 2, 'Release/acquire publication'
-        elif harts > 1 and not hasattr(program, 'lrsc'):
+        elif harts > 1 and not hasattr(program, 'lrsc') and not name.startswith('user_'):
             assert model.registers[8] == (hart + 1) % harts + 1, 'Mailbox exchange did not complete'
             assert model.registers[12] == 1 and effects[hart, base + 0x5100] == 1, 'Private data or device effect'
             assert model.registers[17] == hart and (name == 'interrupt' or model.registers[19] == hart), 'Hart identity or read-only CSR'
         if name == 'protection':
             assert effects[hart, base + 0x1800] == int(hart != 0), 'PMP isolation'
-        check_fetches(per_hart[hart], config, program.faults, model.local_fetch_faults)
+        try:
+            fetch_checks[hart].send(None)
+        except StopIteration:
+            pass
     assert not console_events, 'Console service was not printed'
-    return dict(events=events, activeHarts=len(finished), sources=sorted(sources),
+    return dict(**(dict(results=results) if software_output else {}), events=events, activeHarts=len(finished), sources=sorted(sources),
                 cycles=elapsed_cycles, transactions=transactions, axiTransactions=axi_transactions,
                 collidingTags=len(collisions), readsBeforePeerRetirement=overtaken, concurrency=dict(concurrent),
                 platformCycles=device.cycle + 1 if device is not None else 0,
@@ -752,7 +883,11 @@ def compare_multicore(binary, directory, config, selected=(), platform=False):
     reports = []
     programs = ((name, platform_program(base, harts, local_interrupt_base(config), wait=name == 'platform_wait'))
                 for name in ('platform', 'platform_wait')) if platform else multicore_cases(
-        base, harts, bool(config['pmpEntries']), config['enableInterrupts'])
+        base, harts, bool(config['pmpEntries']), config['enableInterrupts'], config.get('enableUserMode', False))
+    if platform and config.get('enableUserMode'):
+        programs = chain(programs,
+            ((name, program) for name, program in multicore_cases(base, harts, bool(config['pmpEntries']), config['enableInterrupts'], True) if name == 'user_isolation'),
+            ((name, program) for name, program in cases(base, bool(config['pmpEntries']), config['enableInterrupts'], True, local_interrupt_base(config)) if name == 'user_device'))
     for name, program in programs:
         if selected and name not in selected:
             continue
@@ -771,7 +906,7 @@ def compare_multicore(binary, directory, config, selected=(), platform=False):
             lines = log.read_text().splitlines()
             assert 'PASS' in lines, f'{name}: incomplete multicore run'
             reports.append(dict(test=name, seed=seed, **check_multicore(lines, config, program, name, atomic_metadata=True)))
-        if harts > 1 and 'atomic' not in name and not hasattr(program, 'synchronization') and not platform:
+        if harts > 1 and 'atomic' not in name and not hasattr(program, 'synchronization') and not platform and not name.startswith('user_'):
             concurrent = Counter()
             for report in reports[first:]:
                 concurrent.update(report['concurrency'])
@@ -914,13 +1049,18 @@ def test_source_hashes():
 
 
 def check_software_output(lines, config, program, console):
-    assert 'PASS' in log_lines(lines), 'Software simulation did not finish'
-    report = check_multicore(lines, config, program, 'software', atomic_metadata=True)
-    harts = config['hartCount']
-    results = [(int(fields[1]), int(fields[2], 16)) for line in log_lines(lines) for fields in (line.split(),) if fields[:1] == ['RESULT']]
-    assert results == [(hart, 1) for hart in range(harts)], 'Test memory did not contain per-hart success'
+    report = check_multicore(lines, config, program, 'software', atomic_metadata=True, software_output=True)
     assert Counter(console.read_text().splitlines()) == Counter(f'[hart {hart}] {line}' for hart, text in enumerate(program.software['expectedConsole']) for line in text.splitlines()), 'Console log differs from software bytes'
-    return dict(results=results, **report)
+    return report
+
+
+def software_schedule(task):
+    binary, image, output, config, program, seed, transaction_limit, cycle_limit, timeout = task
+    console, log = output / f'console-{seed}.log', output / f'software-{seed}.log'
+    run([binary, f'+IMAGE={image.resolve()}', f'+BASE={int(config["resetVector"]):x}', f'+STOP={program.stop:x}', f'+SEED={seed}',
+         f'+CONSOLE_BASE={program.software["console"]:x}', f'+CONSOLE_LOG={console.resolve()}',
+         f'+RESULTS={program.software["results"]:x}', f'+TRANSACTIONS={transaction_limit}', f'+CYCLE_LIMIT={cycle_limit}'], log, timeout=timeout)
+    return dict(seed=seed, consoleLog=str(console), **check_software_output(log, config, program, console))
 
 
 def verify_software(args):
@@ -952,14 +1092,10 @@ def verify_software(args):
     base, harts = int(config['resetVector']), config['hartCount']
     image = args.output / 'software.hex'
     image.write_text('\n'.join(f'{program.memory.get(base + i, 0):02x}' for i in range(profile['memoryBytes'])) + '\n')
-    reports = []
-    for seed in (1, 17, 2026):
-        console, log = args.output / f'console-{seed}.log', args.output / f'software-{seed}.log'
-        run([binary, f'+IMAGE={image.resolve()}', f'+BASE={base:x}', f'+STOP={program.stop:x}', f'+SEED={seed}',
-             f'+CONSOLE_BASE={program.software["console"]:x}', f'+CONSOLE_LOG={console.resolve()}',
-             f'+RESULTS={program.software["results"]:x}', f'+TRANSACTIONS={transaction_limit}', f'+CYCLE_LIMIT={cycle_limit}'], log, timeout=software_timeout)
-        report = check_software_output(log, manifest['parameters'], program, console)
-        reports.append(dict(seed=seed, consoleLog=str(console), **report))
+    tasks = [(binary, image, args.output, manifest['parameters'], program, seed, transaction_limit, cycle_limit, software_timeout)
+             for seed in args.seeds]
+    with ProcessPoolExecutor(max_workers=min(args.jobs, len(tasks))) as executor:
+        reports = list(executor.map(software_schedule, tasks))
     hashes = {**manifest['sourceHashes'], **test_hashes, **software['sourceHashes']}
     assert all(hashlib.sha256(Path(name).read_bytes()).hexdigest() == digest for name, digest in hashes.items()), 'Sources changed during software verification'
     assert hashlib.sha256(args.elf.read_bytes()).hexdigest() == software['imageHash'], 'Image changed during software verification'
@@ -970,7 +1106,7 @@ def verify_software(args):
         hartCount=harts, axiDataBits=config['axiDataBits'], clockHz=100000000, timebaseHz=profile['timebaseHz'],
         cyclesPerTimeTick=profile['timeTickCycles'], transactionLimit=transaction_limit, cycleLimit=cycle_limit,
         idleCycles=profile['idleCycles'], wallSecondsPerSchedule=software_timeout, cases=reports), indent=2) + '\n')
-    print(f'{harts}-hart ELF software and console passed three bus schedules', flush=True)
+    print(f'{harts}-hart ELF software and console passed {len(reports)} bus schedules', flush=True)
 
 
 def main():
@@ -982,6 +1118,9 @@ def main():
     parser.add_argument('--poison-bss', action='store_true')
     parser.add_argument('--software-transactions', type=int)
     parser.add_argument('--software-timeout', type=int)
+    parser.add_argument('--seeds', type=int, nargs='+', default=(1, 17, 2026))
+    parser.add_argument('--jobs', type=int, choices=range(1, 17), default=1)
+    parser.add_argument('--user-mode', action='store_true')
     parser.add_argument('--multicore-only', action='store_true')
     parser.add_argument('--platform-only', action='store_true')
     parser.add_argument('--harts', type=int, choices=(1, 2, 3, 16), action='append')
@@ -992,6 +1131,10 @@ def main():
     parser.add_argument('--case', dest='selected', action='append', default=[])
     parser.add_argument('--traffic-baseline', type=Path)
     args = parser.parse_args()
+    if len(set(args.seeds)) != len(args.seeds) or any(not 0 < seed < 1 << 32 for seed in args.seeds):
+        parser.error('--seeds requires distinct nonzero 32-bit integers')
+    if not args.elf and (args.jobs != 1 or tuple(args.seeds) != (1, 17, 2026)):
+        parser.error('--seeds and --jobs require --elf')
     if args.software_timeout is not None and (args.elf is None or args.software_timeout <= 0):
         parser.error('--software-timeout requires --elf and a positive integer')
     assert bool(args.elf) == bool(args.config), 'ELF execution requires its configuration'
@@ -1027,6 +1170,8 @@ def main():
         directory.mkdir(parents=True, exist_ok=True)
         config = configuration(width)
         config.update(pmpEntries=entries, enableInterrupts=interrupts, iCacheBytes=args.icache_bytes)
+        if args.user_mode:
+            config['enableUserMode'] = True
         config_path = directory / 'input.json'
         config_path.write_text(json.dumps(config, indent=2) + '\n')
         rtl = directory / 'rtl'
@@ -1081,6 +1226,8 @@ def main():
             directory = args.output / f'harts{harts}-axi{width}'
             directory.mkdir(parents=True, exist_ok=True)
             config = dict(configuration(width), hartCount=harts, pmpEntries=entries, enableInterrupts=interrupts, iCacheBytes=args.icache_bytes)
+            if args.user_mode:
+                config['enableUserMode'] = True
             if args.platform_only:
                 local_base = int(config['resetVector']) + 0x10000
                 config.update(localInterruptBase=str(local_base))

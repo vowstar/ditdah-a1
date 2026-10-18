@@ -41,7 +41,7 @@ module core_tb;
     logic [63:0] address, data;
     logic [2:0] size;
     logic [7:0] mask, tag;
-    logic write, fetch, atomic;
+    logic write, fetch, privileged, atomic;
     logic [4:0] atomicOperation;
     logic scEligible;
   } core_request_t;
@@ -209,7 +209,7 @@ module core_tb;
       if (arvalid && arready) begin
         if (!console_address(64'(araddr)) && (64'(araddr) < base_address || 64'(araddr) + (1 << arsize) > base_address + MB)) $fatal(1, "Truncated or unexpected read address");
         if (arid != IDW'(bus_owner / 2) || arlen != 0 || arburst != 1 || (arlock && arprot[2]) || arcache != 0 || arqos != 0) $fatal(1, "Read attributes");
-        if (arprot != 1 && arprot != 5) $fatal(1, "Read privilege");
+        if (arprot != {requests[bus_owner].fetch, 1'b0, requests[bus_owner].privileged}) $fatal(1, "Read privilege");
         if ((arprot[2] ? arsize != 2 : arsize > 3) ||
             (arlock && arsize != 3) || (araddr & ((1 << arsize) - 1)) != 0) $fatal(1, "Read alignment");
         if (HARTS > 1) $write("HART %0d ", bus_owner / 2);
@@ -257,7 +257,7 @@ module core_tb;
       if (awvalid && awready) begin
         if (!console_address(64'(awaddr)) && (64'(awaddr) < base_address || 64'(awaddr) + (1 << awsize) > base_address + MB)) $fatal(1, "Truncated or unexpected write address");
         if (awid != IDW'(bus_owner / 2) || awlen != 0 || awsize > 3 || (awlock && awsize != 3) ||
-            awburst != 1 || awcache != 0 || awprot != 1 || awqos != 0 ||
+            awburst != 1 || awcache != 0 || awprot != {2'b0, requests[bus_owner].privileged} || awqos != 0 ||
             (awaddr & ((1 << awsize) - 1)) != 0) $fatal(1, "Write attributes");
         aw_held <= 1;
         write_address <= 64'(awaddr);
@@ -378,6 +378,8 @@ module core_tb;
           requests[source].address, 1 << requests[source].size,
           requests[source].write ? requests[source].data & access_mask(requests[source].size) : 64'b0,
           requests[source].tag);
+        if (HARTS > 1) $write("HART %0d ", source / 2);
+        $display("ACCESS_PRIVILEGE %01h", requests[source].privileged);
         if (requests[source].atomic) begin
           if (HARTS > 1) $write("HART %0d ", source / 2);
           $display("ATOMIC %02h %01h", requests[source].atomicOperation, requests[source].scEligible);

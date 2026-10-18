@@ -28,6 +28,7 @@ object DitDahA1Core extends Generator[DitDahA1Parameter, DitDahA1Layers, DitDahA
     frontend.io.redirect := backend.io.redirect
     frontend.io.redirectPc := backend.io.redirectPc
     frontend.io.halt := backend.io.status.sleep
+    frontend.io.privilege := backend.io.privilege
     io.instruction :<>= frontend.io.memory
     io.data :<>= backend.io.data
     io.status :<= backend.io.status
@@ -99,6 +100,10 @@ object DitDahA1Backend extends Generator[DitDahA1Parameter, DitDahA1Layers, DitD
     issue.io.rdata2 := gpr.io.rdata2
     execute.io.csrValue := csr.io.readData
     execute.io.csrLegal := csr.io.legal
+    execute.io.privilege := csr.io.privilege
+    execute.io.wfiLegal := csr.io.wfiLegal
+    io.privilege := csr.io.privilege
+    lsu.io.privilege := csr.io.dataPrivilege
     csr.io.readAddress := execute.io.csrAddress
     // Completed data operations keep ownership until their architectural event.
     val takeInterrupt = if parameter.enableInterrupts then
@@ -268,6 +273,7 @@ object DitDahA1Frontend extends Generator[DitDahA1Parameter, DitDahA1UnitLayers,
     if parameter.pmpEntries != 0 then fetch.io.pmp.get :<= io.pmp.get
     fetch.io.clock := io.clock
     fetch.io.reset := io.reset
+    fetch.io.privilege := io.privilege
     fetch.io.request.valid := !io.redirect & !io.halt
     fetch.io.request.bits.pc := pc
     fetch.io.request.bits.tag := tag

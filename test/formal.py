@@ -21,6 +21,7 @@ FETCH = r'''
   reg response_seen;
   reg [63:0] accepted_pc;
   reg [7:0] accepted_tag;
+  reg accepted_privileged;
   always @(posedge clock) begin
     past_valid <= 1;
     if (!past_valid) assume(reset);
@@ -54,9 +55,11 @@ FETCH = r'''
         response_seen <= 0;
         accepted_pc <= request_bits_pc;
         accepted_tag <= request_bits_tag;
+        accepted_privileged <= PRIVILEGED;
       end
       assert(!memory_response_ready || outstanding);
       if (memory_request_valid) assert(!memory_request_bits_atomic && !memory_request_bits_atomicOperation && !memory_request_bits_scEligible);
+      if (memory_request_valid) assert(memory_request_bits_privileged == accepted_privileged);
       if (output_valid) begin
         assert(have_request);
         assert(response_seen || accepted_pc[1:0] != 0);
@@ -67,7 +70,7 @@ FETCH = r'''
         assert(memory_request_valid);
         assert($stable({memory_request_bits_address, memory_request_bits_data,
           memory_request_bits_size, memory_request_bits_mask, memory_request_bits_tag,
-          memory_request_bits_write, memory_request_bits_fetch, memory_request_bits_atomic,
+          memory_request_bits_write, memory_request_bits_fetch, memory_request_bits_privileged, memory_request_bits_atomic,
           memory_request_bits_atomicOperation, memory_request_bits_scEligible}));
       end
       cover(past_valid && $past(!reset && memory_request_valid && !memory_request_ready)
@@ -197,6 +200,7 @@ def header(text):
 
 def protection_cases(parameters):
     width = parameters['physicalAddressBits'] - 2
+    machine = "privilege == 3" if parameters.get('enableUserMode') else "1'b1"
     decode = f'''
   reg expected, any_byte, every_byte, carry, hit;
   reg [7:0] config;
@@ -253,7 +257,7 @@ def protection_cases(parameters):
   reg [64:0] cursor;
   integer i, b;
   always @* begin
-    expected = 1; hit = 0; cursor = 0; any_byte = 0; every_byte = 1;
+    expected = {machine}; hit = 0; cursor = 0; any_byte = 0; every_byte = 1;
     for (i = 15; i >= 0; i = i - 1) begin
       any_byte = 0; every_byte = 1;
       for (b = 0; b < 8; b = b + 1) if (b < (1 << size)) begin
@@ -267,7 +271,7 @@ def protection_cases(parameters):
           start < decoded_high[i*65 +: 65] && end_0 > decoded_low[i*65 +: 65]));
         assume(!any_byte || every_byte == (start >= decoded_low[i*65 +: 65] && end_0 <= decoded_high[i*65 +: 65]));
       end
-      if (any_byte) expected = every_byte && (!state_config[i*8+7] ||
+      if (any_byte) expected = every_byte && (({machine}) && !state_config[i*8+7] ||
         (atomic ? state_config[i*8] && state_config[i*8+1] :
           fetch ? state_config[i*8+2] : write ? state_config[i*8+1] : state_config[i*8]));
     end
@@ -310,6 +314,8 @@ def protection_cases(parameters):
     end
   end
 '''
+    if parameters.get('enableUserMode'):
+        csr = csr.replace("if (readAddress >=", "if (privilege == 3 && readAddress >=")
     fetch = FETCH.replace('reg outstanding;', 'reg outstanding;\n  reg local_denied;')
     fetch = fetch.replace('killed', 'observed_killed')
     fetch = fetch.replace('outstanding <= 0;', 'outstanding <= 0;\n      local_denied <= 0;', 1)
@@ -374,6 +380,11 @@ def interrupt_cases(parameters):
     end
   end
 '''
+    if parameters.get('enableUserMode'):
+        csr = csr.replace("status == ($past(writeData) & 64'h88)",
+                          "status == (($past(writeData) & 64'h220088) | ($past(writeData[12:11]) == 3 ? 64'h1800 : 0))")
+        csr = csr.replace('status[3] && irq_enabled != 0', '(privilege < 3 || status[3]) && irq_enabled != 0')
+        csr = csr.replace("if (readAddress ==", "if (privilege == 3 && readAddress ==")
     backend = BACKEND + f'''
   reg irq_memory_owned = 0;
   reg [1:0] irq_service_age = 0;
@@ -437,6 +448,77 @@ def interrupt_cases(parameters):
 '''
     return [('InterruptCsr', csr, 'status[3]\n    &', "1'h1\n    &"),
             ('InterruptBackend', backend, '_csr_interruptPending & ~memoryPending', '_csr_interruptPending')]
+
+
+def user_cases():
+    csr = r'''
+  reg user_past = 0;
+  always @(posedge clock) begin
+    user_past <= 1;
+    if (!user_past) assume(reset);
+    if (user_past) begin
+      assert(privilege == 0 || privilege == 3);
+      assert(status[12:11] == 0 || status[12:11] == 3);
+      assert((status & ~64'h221888) == 0);
+      if (privilege == 0) assert(!status[17]);
+      assert(dataPrivilege == (status[17] ? status[12:11] : privilege));
+      assert(wfiLegal == (privilege == 3 || !status[21]));
+      if (privilege == 0) assert(!legal);
+      if (readAddress == 12'h300 && legal) assert(readData[33:32] == 2);
+      if ($past(reset)) begin
+        assert(privilege == 3 && !status[3] && !status[17]);
+      end else if ($past(trap)) begin
+        assert(privilege == 3 && status[12:11] == $past(privilege));
+        assert(!status[3] && status[7] == $past(status[3]));
+        assert(status[17] == $past(status[17]) && status[21] == $past(status[21]));
+      end else if ($past(mret)) begin
+        assert(privilege == $past(status[12:11]) && status[12:11] == 0);
+        assert(status[3] == $past(status[7]) && status[7]);
+        assert(status[17] == ($past(status[12:11]) == 3 && $past(status[17])));
+        assert(status[21] == $past(status[21]));
+      end else begin
+        assert(privilege == $past(privilege));
+        if ($past(write && writeAddress == 12'h300)) begin
+          assert(status[12:11] == ($past(writeData[12:11]) == 3 ? 3 : 0));
+          assert(status[3] == $past(writeData[3]) && status[7] == $past(writeData[7]));
+          assert(status[17] == $past(writeData[17]) && status[21] == $past(writeData[21]));
+        end else assert($stable(status));
+      end
+      cover(privilege == 0 && !status[21]);
+      cover(privilege == 0 && status[21]);
+      cover(privilege == 3 && dataPrivilege == 0);
+      cover($past(!reset && trap && privilege == 0) && privilege == 3);
+      cover($past(!reset && mret && status[17] && status[12:11] == 3) && privilege == 3 && dataPrivilege == 0);
+    end
+  end
+'''
+    execute = r'''
+  wire [4:0] u_op = input_bits_decoded_operation;
+  wire u_fault = input_bits_decoded_instruction_fault;
+  wire [31:0] u_word = input_bits_decoded_instruction_instruction;
+  always @* begin
+    assume(privilege == 0 || privilege == 3);
+    if (u_op == 12 || u_op == 13 || u_op == 29) begin
+      assert(output_bits_instruction_fault == (u_fault || u_op == 12 ||
+        (u_op == 13 && privilege != 3) || (u_op == 29 && !wfiLegal)));
+      if (u_fault) begin
+        assert(output_bits_instruction_cause == input_bits_decoded_instruction_cause);
+        assert(output_bits_instruction_tval == input_bits_decoded_instruction_tval);
+      end else if (u_op == 12) begin
+        assert(output_bits_instruction_cause == (privilege == 0 ? 8 : 11));
+        assert(output_bits_instruction_tval == 0);
+      end else if ((u_op == 13 && privilege != 3) || (u_op == 29 && !wfiLegal)) begin
+        assert(output_bits_instruction_cause == 2 && output_bits_instruction_tval == {32'd0, u_word});
+      end
+    end
+    cover(input_valid && !u_fault && u_op == 12 && privilege == 0);
+    cover(input_valid && !u_fault && u_op == 13 && privilege == 0);
+    cover(input_valid && !u_fault && u_op == 13 && privilege == 3);
+    cover(input_valid && !u_fault && u_op == 29 && !wfiLegal);
+  end
+'''
+    return [('UserCsr', csr, 'assign privilege =', 'assign privilege = 3 |'),
+            ('UserExecute', execute, 'assign output_bits_instruction_cause =', 'assign output_bits_instruction_cause = 11 |')]
 
 
 def synchronization_case(parameters):
@@ -883,7 +965,7 @@ def word_cases(parameters):
             ('Lsu', lsu, 'assign memory_request_bits_size =', "assign memory_request_bits_size = 3'h3 |")]
 
 
-def integer_cases():
+def integer_cases(parameters):
     decode = r'''
   wire [31:0] i_word = input_bits_instruction;
   wire [6:0] i_opcode = i_word[6:0], i_funct7 = i_word[31:25];
@@ -1056,6 +1138,9 @@ def integer_cases():
       !i_write && csrLegal && input_bits_decoded_rs1 == i_word[19:15]);
   end
 '''
+    if parameters.get('enableUserMode'):
+        execute = execute.replace('i_sequential && output_bits_instruction_fault == input_bits_decoded_instruction_fault',
+                                  'i_sequential && output_bits_instruction_fault == (input_bits_decoded_instruction_fault || !wfiLegal)')
     return [('IntegerDecode', decode, 'assign output_bits_usesRs1 =', "assign output_bits_usesRs1 = 1'h0 &"),
             ('IntegerExecute', execute, 'assign output_bits_csrData =', "assign output_bits_csrData = 64'h0 &")]
 
@@ -1308,7 +1393,7 @@ def interrupt_witness(parameters, mode):
 def arbiter_case(parameters):
     count = 2 * parameters['hartCount']
     bits = (count - 1).bit_length()
-    fields = dict(address=64, data=64, size=3, mask=8, tag=8, write=1, fetch=1, atomic=1, atomicOperation=5, scEligible=1)
+    fields = dict(address=64, data=64, size=3, mask=8, tag=8, write=1, fetch=1, privileged=1, atomic=1, atomicOperation=5, scEligible=1)
     payload = lambda prefix: '{' + ', '.join(prefix + '_bits_' + field for field in fields) + '}'
     vector = lambda suffix: '{' + ', '.join(f'ports_{i}_{suffix}' for i in reversed(range(count))) + '}'
     body = f'''
@@ -1384,7 +1469,7 @@ def arbiter_case(parameters):
 
 
 def memory_case(parameters):
-    fields = ('address', 'data', 'size', 'mask', 'tag', 'write', 'fetch', 'atomic', 'atomicOperation', 'scEligible')
+    fields = ('address', 'data', 'size', 'mask', 'tag', 'write', 'fetch', 'privileged', 'atomic', 'atomicOperation', 'scEligible')
     payload = lambda prefix: '{' + ', '.join(prefix + '_bits_' + field for field in fields) + '}'
     body = r'''
   reg memory_past = 0, memory_owned, memory_denied;
@@ -1462,6 +1547,7 @@ def axi_case(parameters):
   reg [4:0] accepted_operation;
   reg [ID-1:0] accepted_id;
   reg accepted_eligible, accepted_write;
+  reg [2:0] accepted_protection;
   wire is_lr = is_atomic && accepted_operation == 2;
   wire is_sc = is_atomic && accepted_operation == 3;
   wire is_rmw = is_atomic && !is_lr && !is_sc;
@@ -1506,6 +1592,7 @@ def axi_case(parameters):
         is_atomic <= memory_request_bits_atomic; accepted_address <= memory_request_bits_address;
         accepted_operation <= memory_request_bits_atomicOperation; accepted_eligible <= memory_request_bits_scEligible;
         accepted_write <= memory_request_bits_write;
+        accepted_protection <= {memory_request_bits_fetch, 1'b0, PRIVILEGED};
         accepted_id <= hartId[ID-1:0];
         addend <= memory_request_bits_data; accepted_size <= memory_request_bits_size;
         accepted_mask <= memory_request_bits_mask; accepted_tag <= memory_request_bits_tag;
@@ -1519,6 +1606,7 @@ def axi_case(parameters):
       if (held) begin
         assert(request_address == accepted_address && request_data == addend && request_size == accepted_size &&
           request_mask == accepted_mask && request_tag == accepted_tag && request_atomic == is_atomic);
+        assert({request_fetch, 1'b0, STORED_PRIVILEGED} == accepted_protection);
         assert(request_atomicOperation == accepted_operation);
         assert(hartId_0 == accepted_id);
         assert(data == old_value && fault == expected_fault);
@@ -1534,11 +1622,13 @@ def axi_case(parameters):
       if (held && is_sc && !accepted_eligible) assert(complete && old_value == 1 && !expected_fault);
       if (axi_ar_valid) begin
         assert(held && !complete && !can_write);
+        assert(axi_ar_bits_prot == accepted_protection);
         assert(axi_ar_bits_addr == accepted_address[PHYSICAL:0] && axi_ar_bits_id == accepted_id &&
           axi_ar_bits_len == 0 && axi_ar_bits_size == accepted_size && axi_ar_bits_lock == is_atomic);
       end
       if (axi_aw_valid) begin
         assert(held && !complete && !can_read);
+        assert(axi_aw_bits_prot == accepted_protection);
         assert(axi_aw_bits_addr == accepted_address[PHYSICAL:0] && axi_aw_bits_id == accepted_id &&
           axi_aw_bits_len == 0 && axi_aw_bits_size == accepted_size && axi_aw_bits_lock == is_atomic);
       end
@@ -1611,6 +1701,8 @@ def axi_case(parameters):
                          ('WIDTH', width), ('BYTES', width // 8), ('MASKPAD', width // 8 - 8), ('PAD', width - 64),
                          ('ID', max(1, (parameters['hartCount'] - 1).bit_length()))):
         body = body.replace(token, str(value))
+    body = body.replace('STORED_PRIVILEGED', 'request_privileged' if parameters.get('enableUserMode') else "1'b1")
+    body = body.replace('PRIVILEGED', 'memory_request_bits_privileged' if parameters.get('enableUserMode') else "1'b1")
     return ('Axi', body, 'request_atomic <= memory_request_bits_atomic;', 'request_atomic <= 0;')
 
 
@@ -1633,7 +1725,7 @@ def verify(rtl, directory, modules=None):
             ('Fetch', FETCH, '& ~killed & ~cancel', '& ~cancel'),
             ('Multiply', MULTIPLY, '~busy & ~valid', '~valid'),
             ('Backend', BACKEND, '(~issuedValid | executed) & ~executePending & ~redirect_0', '(~issuedValid | executed) & ~redirect_0'))
-    cases = [*cases, *word_cases(manifest['parameters']), *integer_cases(), *wfi_cases(manifest['parameters']), synchronization_case(manifest['parameters']),
+    cases = [*cases, *word_cases(manifest['parameters']), *integer_cases(manifest['parameters']), *wfi_cases(manifest['parameters']), synchronization_case(manifest['parameters']),
              arbiter_case(manifest['parameters']), memory_case(manifest['parameters']), axi_case(manifest['parameters'])]
     if manifest['parameters'].get('localInterruptBase') is not None:
         cases.append(local_interrupt_case(manifest['parameters']))
@@ -1641,15 +1733,41 @@ def verify(rtl, directory, modules=None):
         cases.append(instruction_cache_case(manifest['parameters']))
     if manifest['parameters'].get('enableInterrupts'):
         cases = [*cases, *interrupt_cases(manifest['parameters'])]
+    if manifest['parameters'].get('enableUserMode'):
+        cases += user_cases()
     assert not modules or set(modules) <= {case[0] for case in cases}, 'Unsupported proof selection'
     for name, body, before, after in cases:
         if name == 'MemoryArbiter' and not modules and (enabled or manifest['parameters']['enableInterrupts']):
             continue
         if modules and name not in modules and not (name.startswith('Pmp') and 'Pmp' in modules):
             continue
-        unit = name.removeprefix('Interrupt').removeprefix('Synchronization').removeprefix('Word').removeprefix('Integer').removeprefix('Wfi')
+        unit = name.removeprefix('Interrupt').removeprefix('Synchronization').removeprefix('Word').removeprefix('Integer').removeprefix('Wfi').removeprefix('User')
+        machine = 'privilege == 3' if manifest['parameters'].get('enableUserMode') else "1'b1"
+        if unit == 'Fetch':
+            body = body.replace('PRIVILEGED', machine)
+        if unit in ('Lsu', 'InstructionCache'):
+            request = 'input' if unit == 'Lsu' else 'upstream_request'
+            output = 'memory_request' if unit == 'Lsu' else 'downstream_request'
+            if manifest['parameters'].get('enableUserMode'):
+                expected = machine if unit == 'Lsu' else 'upstream_request_bits_privileged'
+                body += f'''\n  reg access_privileged;
+  always @(posedge clock) if (!reset) begin
+    if ({request}_valid && {request}_ready) access_privileged <= {expected};
+    if ({output}_valid) assert({output}_bits_privileged == access_privileged);
+  end
+'''
+                if unit == 'InstructionCache':
+                    body += '  always @(posedge clock) if (!reset && state != 0) assert(privileged == access_privileged);\n'
+            else:
+                body += f'  always @(posedge clock) if (!reset && {output}_valid) assert({output}_bits_privileged);\n'
         if unit == 'Csr':
-            body += "\n  always @* if (readAddress == 12'hf14) assert(legal && readData == {60'd0, hartId});\n"
+            machine = 'privilege == 3 && ' if manifest['parameters'].get('enableUserMode') else ''
+            body += f"\n  always @* if ({machine}readAddress == 12'hf14) assert(legal && readData == {{60'd0, hartId}});\n"
+            for address in (0x306, 0x30a, 0xf15):
+                legal = 'privilege == 3' if manifest['parameters'].get('enableUserMode') else str(int(address == 0xf15))
+                body += f"  always @* if (!reset && readAddress == 12'h{address:x}) assert(legal == ({legal}) && readData == 0);\n"
+            if manifest['parameters'].get('enableUserMode'):
+                body += '\n  always @* begin assume(!mret || privilege == 3); assume(!write || privilege == 3); end\n'
         module = 'DitDahA1' + ('Pmp' if name == 'PmpDecode' else unit)
         if name == 'PmpInterval':
             module = 'formal_interval'
@@ -1666,7 +1784,7 @@ def verify(rtl, directory, modules=None):
             if unit == 'Lsu':
                 for port, width, expected in (('address', 64, 'input_bits_address'), ('size', 3, 'input_bits_memorySize'),
                                               ('write', 1, 'input_bits_store'), ('fetch', 1, "1'b0"),
-                                              ('atomic', 1, 'input_bits_load && input_bits_store')):
+                                              ('atomic', 1, 'input_bits_load && input_bits_store'), ('privilege', 2, 'privilege')):
                     pattern = rf'\.{port}\s*\(([^()]*)\)'
                     observed = files[module + '.sv']
                     connections = re.findall(pattern, observed)
@@ -1715,6 +1833,10 @@ def verify(rtl, directory, modules=None):
             checks += [('mutation-word', value, 'assign output_bits_value = (' + value.split('=', 1)[1].strip()[:-1] + ") & 64'hffffffff;"),
                        ('mutation-shift', value, 'assign output_bits_value = input_bits_operand1 << input_bits_decoded_immediate[4:0];'),
                        ('mutation-branch', branch, 'assign output_bits_nextPc = input_bits_decoded_instruction_pc + input_bits_decoded_instruction_length;')]
+        if name == 'UserCsr':
+            checks += [('mutation-data', 'assign dataPrivilege =', 'assign dataPrivilege = 3 |')]
+        if name == 'UserExecute':
+            checks += [('mutation-return', 'assign output_bits_instruction_fault =', 'assign output_bits_instruction_fault = 0 &')]
         if name == 'InterruptBackend':
             checks += [('mutation-pc', '? resumePc', "? 64'h0"),
                        ('mutation-write', 'formal_write =', "formal_write = 1'h1 |")]
@@ -1754,6 +1876,8 @@ def verify(rtl, directory, modules=None):
                        ('mutation-swap', "request_atomicOperation == 5'h1", "1'h0"),
                        ('mutation-lr-write', 'amo & ~readFault', 'request_atomic & ~readFault'),
                        ('mutation-sc-empty', 'inputSc & ~memory_request_bits_scEligible', "1'h0")]
+            if manifest['parameters'].get('enableUserMode'):
+                checks += [('mutation-privilege', 'assign axi_ar_bits_prot =', "assign axi_ar_bits_prot = 3'h1 |")]
             retry = re.search(r'wire\s+(\w+)\s*=\s*amo\s*&\s*[^;]*axi_b_bits_id[^;]+;', original).group()
             status = re.search(r'else\s+data <= \{63\x27h0, (\w+)\};', original).group()
             checks += [('mutation-sc-retry', retry, retry.replace('amo', '(amo | sc)', 1)),
@@ -1865,6 +1989,8 @@ def verify(rtl, directory, modules=None):
   end
 '''
                     text = text.replace('endmodule', guidance + '\nendmodule', 1)
+                    if mode == 'mutation-privilege':
+                        text = text.replace('endmodule', '  always @* assume(!memory_request_bits_privileged);\nendmodule', 1)
                 if unit == 'Lsu' and mutating and filename == module + '.sv':
                     load = mode == 'mutation-extension'
                     atomic = mode in ('mutation-consume', 'mutation-pair', 'mutation-alias', 'mutation-lr-fault', 'mutation-pmp-direction')
@@ -1915,6 +2041,9 @@ def verify(rtl, directory, modules=None):
   end
 '''
                     text = text.replace('endmodule', guidance + '\nendmodule', 1)
+                if name == 'UserExecute' and mutating and filename == module + '.sv':
+                    operation = 12 if mode == 'mutation' else 13
+                    text = text.replace('endmodule', f'  always @* assume(input_valid && !input_bits_decoded_instruction_fault && input_bits_decoded_operation == {operation} && privilege == 0);\nendmodule', 1)
                 if name == 'IntegerDecode' and mode in ('mutation-atomic-width', 'mutation-lr-source', 'mutation-atomic-operation') and filename == module + '.sv':
                     instruction = {'mutation-atomic-width': 0x4000a12f, 'mutation-lr-source': 0x1010b12f, 'mutation-atomic-operation': 0x2800b12f}[mode]
                     text = text.replace('endmodule', f"  always @* assume(input_valid && !input_bits_fault && input_bits_instruction == 32'h{instruction:x});\nendmodule", 1)
@@ -2008,6 +2137,7 @@ read -formal -sv {' '.join(files)}
         reservation='independent last-LR physical word and validity, successful matching LR completion only, any atomic acceptance consumes old pair, full-EA SC qualification captured before protection and stable through backpressure; endpoint exclusivity is separate' if 'Lsu' in proved else None,
         physicalMemory='independent configured region/permission/shape model; D-only atomic directions/opcodes, malformed and denied SC isolation regardless of eligibility, retained local-fault response and complete request payload forwarding' if 'Memory' in proved else None,
         integerExecution='independent raw encoding validity and dependency decode, D-only atomic encodings/LR rs2 and direction metadata, integer ALU and 5/6-bit shifts, word truncation/sign extension, branches, narrow metadata and CSR semantics; combinational safety with unrestricted inputs' if 'IntegerExecute' in proved else None,
+        userMode='M/U trap stack, fixed UXL64, MPP WARL, MPRV effective data access and lower-return clearing, TW legality, CSR minimum privilege and U ECALL/MRET/WFI exceptions; CSR write/mret inputs are legal retired effects' if 'UserCsr' in proved else None,
         wfi='raw retired encoding drives independent wait/continuation model; wake priority, younger flush, no new work while waiting, frontend halt and retained requests; sleep is architectural wait, not physical idle' if 'WfiBackend' in proved else None,
         wfiWitnessGuidance='cover/mutations only: mie software enable, WFI with immediate/delayed pending or fetch fault, younger multiply, fixed PC/tag and no data service; safety inputs unrestricted' if 'WfiBackend' in proved else None,
         wordMutationGuidance='mutations only: SW/LW at address4 or valid D LR/SC/ADD sequences at address8, high-EA SC alias, faulted LR, matching tag37, immediate memory service and permission grant except denial mutant; unrestricted prove and cover' if 'Lsu' in proved else None,
@@ -2021,6 +2151,6 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--rtl', type=Path, default=Path('result/production'))
     parser.add_argument('--output', type=Path, default=Path('result/formal'))
-    parser.add_argument('--modules', nargs='+', choices=('Fetch', 'Multiply', 'Backend', 'Pmp', 'PmpDecode', 'PmpInterval', 'Csr', 'Lsu', 'InterruptCsr', 'InterruptBackend', 'SynchronizationBackend', 'InstructionCache', 'MemoryArbiter', 'Memory', 'Axi', 'WordDecode', 'WordExecute', 'IntegerDecode', 'IntegerExecute', 'WfiBackend', 'WfiFrontend', 'LocalInterrupts'))
+    parser.add_argument('--modules', nargs='+', choices=('Fetch', 'Multiply', 'Backend', 'Pmp', 'PmpDecode', 'PmpInterval', 'Csr', 'UserCsr', 'UserExecute', 'Lsu', 'InterruptCsr', 'InterruptBackend', 'SynchronizationBackend', 'InstructionCache', 'MemoryArbiter', 'Memory', 'Axi', 'WordDecode', 'WordExecute', 'IntegerDecode', 'IntegerExecute', 'WfiBackend', 'WfiFrontend', 'LocalInterrupts'))
     args = parser.parse_args()
     verify(args.rtl, args.output, args.modules)

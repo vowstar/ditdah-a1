@@ -17,6 +17,7 @@ case class DitDahA1Parameter(
   pmpEntries: Int = 16,
   issueWidth: Int = 1,
   enableInterrupts: Boolean = false,
+  enableUserMode: Boolean = false,
   enableTrace: Boolean = false,
   localInterruptBase: Option[BigInt] = None,
   memoryRegions: Seq[MemoryRegion] = Seq(MemoryRegion())

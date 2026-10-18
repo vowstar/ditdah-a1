@@ -11,6 +11,7 @@ class DitDahA1LsuIO(parameter: DitDahA1Parameter) extends HWBundle(parameter):
   val pmp = Option.when(parameter.pmpEntries != 0)(Flipped(new PmpState(parameter)))
   val clock = Flipped(Clock())
   val reset = Flipped(Reset())
+  val privilege = Flipped(UInt(2))
   val input = Flipped(new Decoupled(new ResultPacket))
   val output = Aligned(new Decoupled(new ResultPacket))
   val storeAllowed = Flipped(Bool())
@@ -25,6 +26,7 @@ object DitDahA1Lsu extends Generator[DitDahA1Parameter, DitDahA1UnitLayers, DitD
     given ResetScope = ResetScope.syncActiveHigh(io.reset)
     val state = RegInit(0.U(2))
     val packet = Reg(new ResultPacket)
+    val privileged = Option.when(parameter.enableUserMode)(Reg(Bool()))
     val reserved = RegInit(false.B)
     val reservedWord = Reg(UInt(parameter.physicalAddressBits - 3))
     val scEligible = Reg(Bool())
@@ -41,6 +43,7 @@ object DitDahA1Lsu extends Generator[DitDahA1Parameter, DitDahA1UnitLayers, DitD
       pmp.io.write := io.input.bits.store
       pmp.io.fetch := false.B
       pmp.io.atomic := io.input.bits.load & io.input.bits.store
+      pmp.io.privilege := io.privilege
       pmp.io.allowed
     io.input.ready := (state === 0.U(2)) & (io.input.bits.instruction.fault | !io.input.bits.store | io.storeAllowed)
     io.output.valid := state === 3.U(2)
@@ -55,11 +58,13 @@ object DitDahA1Lsu extends Generator[DitDahA1Parameter, DitDahA1UnitLayers, DitD
     request.bits.tag := packet.instruction.tag
     request.bits.write := packet.store
     request.bits.fetch := false.B
+    request.bits.privileged := privileged.getOrElse(true.B)
     request.bits.atomic := packet.atomic
     request.bits.atomicOperation := packet.atomic.?(operation, 0.U(5))
     request.bits.scEligible := scEligible
     response.ready := state === 2.U(2)
     when(io.input.valid & io.input.ready) {
+      privileged.foreach(_ := (io.privilege === 3.U(2)))
       packet :<= io.input.bits
       scEligible := io.input.bits.atomic & (inputOperation === 3.U(5)) & reserved &
         (io.input.bits.address === reservedAddress) & (io.input.bits.memorySize === 3.U(3))

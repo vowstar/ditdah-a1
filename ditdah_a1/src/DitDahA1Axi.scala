@@ -50,7 +50,8 @@ object DitDahA1Axi extends Generator[DitDahA1Parameter, DitDahA1UnitLayers, DitD
       channel.bits.burst := 1.U(2)
       channel.bits.lock := request.atomic
       channel.bits.cache := 0.U(4)
-      channel.bits.prot := request.fetch.?(5.U(3), 1.U(3))
+      val privileged = if parameter.enableUserMode then request.privileged else true.B
+      channel.bits.prot := (request.fetch.asBits ## 0.B(1) ## privileged.asBits).asUInt
       channel.bits.qos := 0.U(4)
     ar.valid := (state === 1.U(3)) & !request.write
     aw.valid := (state === 1.U(3)) & request.write & !awDone

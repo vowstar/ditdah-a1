@@ -55,6 +55,7 @@ class MemoryRequest extends Bundle:
   val tag = Aligned(UInt(8))
   val write = Aligned(Bool())
   val fetch = Aligned(Bool())
+  val privileged = Aligned(Bool())
   val atomic = Aligned(Bool())
   val atomicOperation = Aligned(UInt(5))
   val scEligible = Aligned(Bool())
@@ -157,6 +158,7 @@ class DitDahA1CoreIO(parameter: DitDahA1Parameter) extends HWBundle(parameter):
   val status = Aligned(new StatusBundle)
 
 class DitDahA1FrontendIO(parameter: DitDahA1Parameter) extends HWBundle(parameter):
+  val privilege = Flipped(UInt(2))
   val pmp = Option.when(parameter.pmpEntries != 0)(Flipped(new PmpState(parameter)))
   val invalidate = Option.when(parameter.iCacheBytes != 0)(Flipped(Bool()))
   val clock = Flipped(Clock())
@@ -177,6 +179,7 @@ class DitDahA1MemoryFabricIO(parameter: DitDahA1Parameter) extends HWBundle(para
   val axi = Aligned(new AxiBundle(parameter))
 
 class DitDahA1BackendIO(parameter: DitDahA1Parameter) extends HWBundle(parameter):
+  val privilege = Aligned(UInt(2))
   val hartId = Flipped(UInt(4))
   val interrupts = Option.when(parameter.enableInterrupts)(Flipped(new InterruptBundle))
   val pmp = Option.when(parameter.pmpEntries != 0)(Aligned(new PmpState(parameter)))

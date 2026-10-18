@@ -1,0 +1,32 @@
+{
+  "resetVector": "2147483648",
+  "hartCount": 1,
+  "physicalAddressBits": 32,
+  "virtualAddressBits": 0,
+  "iCacheBytes": 0,
+  "dCacheBytes": 0,
+  "l2CacheBytes": 0,
+  "axiDataBits": 64,
+  "pmpEntries": 16,
+  "issueWidth": 1,
+  "enableInterrupts": true,
+  "enableTrace": true,
+  "localInterruptBase": "33554432",
+  "memoryRegions": [
+    {
+      "base": "2147483648", "size": "524288",
+      "readable": true, "writable": true, "executable": true,
+      "device": false, "atomic": true
+    },
+    {
+      "base": "33554432", "size": "65536",
+      "readable": true, "writable": true, "executable": false,
+      "device": true, "atomic": false
+    },
+    {
+      "base": "268435456", "size": "4096",
+      "readable": false, "writable": true, "executable": false,
+      "device": true, "atomic": false
+    }
+  ]
+}

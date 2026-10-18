@@ -32,6 +32,7 @@ object DitDahA1InstructionCache extends Generator[DitDahA1Parameter, DitDahA1Uni
     val state = RegInit(0.U(3))
     val address = Reg(UInt(64))
     val tag = Reg(UInt(8))
+    val privileged = Option.when(parameter.enableUserMode)(Reg(Bool()))
     val data = Reg(UInt(32))
     val fault = Reg(Bool())
     val valid = RegInit(0.B(lines))
@@ -59,6 +60,7 @@ object DitDahA1InstructionCache extends Generator[DitDahA1Parameter, DitDahA1Uni
     down.request.bits.tag := tag
     down.request.bits.write := false.B
     down.request.bits.fetch := true.B
+    down.request.bits.privileged := privileged.getOrElse(true.B)
     down.request.bits.atomic := false.B
     down.request.bits.atomicOperation := 0.U(5)
     down.request.bits.scEligible := false.B
@@ -113,6 +115,7 @@ object DitDahA1InstructionCache extends Generator[DitDahA1Parameter, DitDahA1Uni
       (tagRead === address.asBits.bits(parameter.physicalAddressBits - 1, indexBits + 6).asUInt)
 
     when(reading) {
+      privileged.foreach(_ := up.request.bits.privileged)
       address := up.request.bits.address
       tag := up.request.bits.tag
       data := 0.U(32)

@@ -10,6 +10,23 @@ from pathlib import Path
 import subprocess
 
 
+def load_configuration(args):
+    original = args.config
+    content = original.read_bytes()
+    document = json.loads(content)
+    config = document.get('parameters', document)
+    if args.harts is None and args.icache_bytes is None:
+        return config, {}
+    if args.harts is not None:
+        config['hartCount'] = args.harts
+    if args.icache_bytes is not None:
+        config['iCacheBytes'] = args.icache_bytes
+    args.config = args.output / 'input.json'
+    assert args.config.resolve() != original.resolve(), 'Derived configuration would overwrite its source'
+    args.config.write_text(json.dumps(config, indent=2) + '\n')
+    return config, {str(original): hashlib.sha256(content).hexdigest()}
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--config', type=Path, required=True)
@@ -18,12 +35,13 @@ def main():
     parser.add_argument('--tool-prefix', default=os.environ.get('RISCV_PREFIX', 'riscv64-unknown-elf-'))
     parser.add_argument('--stack-bytes', type=int, default=1024)
     parser.add_argument('--console-base', type=lambda value: int(value, 0))
+    parser.add_argument('--harts', type=int, choices=range(1, 17))
+    parser.add_argument('--icache-bytes', type=int, choices=(0, 8192, 16384, 32768, 65536))
     args = parser.parse_args()
     args.output.mkdir(parents=True, exist_ok=True)
     (args.output / 'manifest.json').unlink(missing_ok=True)
+    config, configuration_sources = load_configuration(args)
     configuration_bytes = args.config.read_bytes()
-    document = json.loads(configuration_bytes)
-    config = document.get('parameters', document)
     base, harts = int(config['resetVector']), config['hartCount']
     ram = next(r for r in config['memoryRegions'] if int(r['base']) == base and r['readable'] and r['writable'] and r['executable'] and not r['device'])
     assert 1 <= harts <= 16 and args.stack_bytes >= 16 and args.stack_bytes % 16 == 0
@@ -33,7 +51,8 @@ def main():
                console + 4 * harts <= int(r['base']) + int(r['size']) for r in config['memoryRegions']), 'Console device region is missing'
     runtime = Path('software/runtime')
     sources = [runtime / 'start.S', runtime / 'console.S', args.program, runtime / 'link.ld']
-    hashes = {str(p): hashlib.sha256(p.read_bytes()).hexdigest() for p in [*sources, Path('scripts/build_software.py')]}
+    hashes = {**configuration_sources, **{str(p): hashlib.sha256(p.read_bytes()).hexdigest()
+              for p in [*sources, Path('scripts/build_software.py')]}}
     tool_versions = {tool: subprocess.check_output([args.tool_prefix + tool, '--version'], text=True).splitlines()[0]
                      for tool in ('gcc', 'ld', 'objdump', 'objcopy')}
     image = args.output / 'software.elf'

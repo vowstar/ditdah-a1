@@ -109,7 +109,7 @@ class Program:
         return self
 
 
-def cases(base, protection=False, interrupts=False):
+def cases(base, protection=False, interrupts=False, user=False, local_interrupt_base=None):
     if not interrupts:
         p = Program(base)
         p.emit(0x10500073, addi(2, 0, 17))
@@ -248,6 +248,87 @@ def cases(base, protection=False, interrupts=False):
         yield from pmp_cases(base)
     if interrupts:
         yield from interrupt_cases(base, protection)
+    if user:
+        yield from user_cases(base, protection, interrupts, local_interrupt_base)
+
+
+def user_protection(p, execute_top=0x1000, data_top=0x1008):
+    for index, top in enumerate((execute_top, data_top)):
+        p.address(1, top)
+        p.emit(alu(1, 1, 2, 5, immediate=True), csr(0, 0x3b0 + index, 1))
+    p.emit(addi(1, 0, 0xb), alu(1, 1, 8, 1, immediate=True), addi(1, 1, 0xc), csr(0, 0x3a0, 1))
+
+
+def user_cases(base, protection=False, interrupts=False, local_interrupt_base=None):
+    for name in ('access', 'system', 'wait', *(['protection', 'fetch'] if protection else []),
+                 *(['interrupt'] if interrupts else []),
+                 *(['device'] if protection and local_interrupt_base is not None else [])):
+        p = Program(base)
+        p.address(10, 0x1000)
+        if protection:
+            user_protection(p, 0x200 if name == 'fetch' else 0x1000)
+        if name == 'fetch':
+            p.address(8, p.offset + 20)
+            p.address(1, 0x200)
+            p.emit(jalr(0, 1))
+        if name == 'device':
+            p.emit(csr(2, 0xf14, 0, True), addi(3, 0, 4), mul(2, 2, 3))
+            p.address(11, int(local_interrupt_base) - base)
+            p.emit(add(11, 11, 2), addi(3, 0, 1), sw(3, 11), lw(27, 11), sw(0, 11))
+        if name == 'system':
+            p.emit(csr(26, 0xf15, 0, True), csr(27, 0x306, 10), csr(28, 0x306, 0, True),
+                   csr(29, 0x30a, 10), csr(30, 0x30a, 0, True), csr(0, 0xf15, 0))
+        p.address(1, 0x200)
+        if name == 'interrupt':
+            p.emit(addi(2, 0, 8), csr(0, 0x304, 2))
+        p.emit(csr(0, 0x341, 1), addi(1, 0, 1 if name == 'wait' else 0),
+               alu(1, 1, 21, 1, immediate=True), csr(0, 0x300, 1), 0x30200073)
+        p.offset = 0x200
+        if name == 'access':
+            p.emit(addi(2, 0, 17), sd(2, 10), ld(3, 10), amo(8, 4, 10, 2), amo(2, 5, 10), amo(3, 6, 10, 2))
+            if not interrupts:
+                p.emit(0x10500073)
+        elif name == 'system':
+            p.emit(csr(2, 0x300, 0, True), csr(0, 0x340, 10), csr(0, 0xf14, 0),
+                   0x30200073, csr(3, 0x180, 0, True), csr(4, 0x306, 0, True), csr(0, 0x306, 10),
+                   csr(5, 0x30a, 0, True), csr(0, 0x30a, 10), csr(6, 0xf15, 0, True), fence(), fence(True))
+        elif name == 'wait':
+            p.emit(0x10500073)
+        elif name == 'protection':
+            p.address(11, 0x200)
+            p.emit(ld(2, 11), ld(3, 10, 8), sd(10, 10, 8), addi(11, 10, 8), amoadd(4, 11, 10))
+        elif name == 'device':
+            p.emit(addi(3, 0, 1), sd(3, 10), ld(28, 10), lw(2, 11), sw(3, 11))
+            p.address(12, int(local_interrupt_base) - base + 0xbff8)
+            p.emit(amoadd(4, 12, 3))
+        if name == 'fetch':
+            p.emit(jalr(0, 8))
+        elif name == 'interrupt':
+            p.emit(ld(9, 10), addi(7, 0, 11), *[addi(7, 7, 1) for _ in range(8)])
+        else:
+            p.emit(0x73, addi(7, 0, 29))
+        p.finish(fixed_return=name == 'fetch')
+        if name == 'fetch':
+            p.offset -= 4
+            p.emit(addi(1, 0, 3), alu(1, 1, 11, 1, immediate=True), csr(0, 0x300, 1), 0x30200073)
+        if name == 'device':
+            p.offset -= 4
+            p.emit(lw(26, 11), 0x30200073)
+        if name == 'interrupt':
+            p.offset = 0x800
+            p.address(11, 0x5008)
+            p.emit(csr(24, 0x300, 0, True), csr(20, 0x342, 0, True), csr(22, 0x341, 0, True), sd(0, 11), 0x30200073)
+            p.interrupts = dict(mode=4, mask=1, target=base + 0x200)
+        yield 'user_' + name, p
+    if protection:
+        p = Program(base)
+        p.address(10, 0x1000)
+        p.emit(addi(2, 0, 31), sd(2, 10), alu(1, 10, 2, 5, immediate=True), csr(0, 0x3b0, 1),
+               addi(1, 0, 0x1b), csr(0, 0x3a0, 1), addi(1, 0, 1), alu(1, 1, 17, 1, immediate=True),
+               csr(0, 0x300, 1), ld(3, 10), sd(2, 10), amoadd(4, 10, 2),
+               ld(7, 10, 8), sd(2, 10, 8), addi(11, 10, 8), amoadd(8, 11, 2),
+               csr(5, 0x300, 0, True), csr(0, 0x300, 0), ld(6, 10))
+        yield 'user_mprv', p.finish()
 
 
 def integer_cases(base):
@@ -507,7 +588,19 @@ def interrupt_cases(base, protection):
         yield 'interrupt_' + name, p
 
 
-def multicore_cases(base, harts, protection=False, interrupts=False):
+def multicore_cases(base, harts, protection=False, interrupts=False, user=False):
+    if user:
+        p = Program(base)
+        if protection:
+            user_protection(p, data_top=0x1800)
+        p.emit(csr(2, 0xf14, 0, True), addi(3, 0, 64), mul(3, 2, 3))
+        p.address(10, 0x1000)
+        p.emit(add(10, 10, 3))
+        p.address(1, 0x200)
+        p.emit(csr(0, 0x341, 1), csr(0, 0x300, 0), beq(2, 0, 0x200 - p.offset - 8), 0x30200073)
+        p.offset = 0x200
+        p.emit(csr(7, 0x340, 0, True), addi(4, 2, 1), sd(4, 10), ld(5, 10), 0x73, addi(6, 5, 1))
+        yield 'user_isolation', p.finish()
     yield 'synchronization', synchronization_program(base, harts)
     yield from atomic_multicore_cases(base, harts, interrupts)
     for name in ('exchange', *(('protection',) if protection else ()), *(('interrupt',) if interrupts else ())):

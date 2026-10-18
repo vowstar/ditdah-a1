@@ -15,7 +15,7 @@ Hart count and cache sizes describe configurations of the same model.
 | Multiprocessing | One to sixteen harts with hardware cache coherence |
 | Integration | Burst-capable AXI4 and JTAG debug |
 
-The executable RTL has one to sixteen RV64 harts, M mode, an overlapped single-issue pipeline, shared AXI4,
+The executable RTL has one to sixteen RV64 harts, M or optional M/U modes, an overlapped single-issue pipeline, shared AXI4,
 and precise synchronous exceptions. The generated configuration manifest lists the implemented instructions.
 PMP is configurable to zero or sixteen entries per hart; the default uncached configuration omits it.
 Machine software, timer, and external interrupts are optional synchronous level inputs.
@@ -61,6 +61,7 @@ AMO completion requires eventual bus responses and successful exclusive access; 
 Set `iCacheBytes` to zero for bypass or a power of two from 8 to 64 KiB for a blocking, direct-mapped instruction cache with 64-byte lines.
 Data remains uncached; refills use individually authorized four-byte requests, and non-demand refill faults fall back to the original demand.
 Set `pmpEntries` to 16 to enable protection; successful PMP writes restart younger execution while accepted fetches drain.
+Set `enableUserMode` for Bare M/U execution, effective data privilege via MPRV, and PMP enforcement for U accesses.
 Set `enableInterrupts` to true for precise machine interrupt entry and return; platform logic owns interrupt sources.
 System interrupt inputs are indexed by hart; each hart has independent CSR and PMP state.
 An optional `localInterruptBase` maps protected software-interrupt and 64-bit timer registers; `timeTick` supplies the synchronous timebase.
@@ -76,6 +77,7 @@ Atomic checks include independent interference, failed-write suppression, return
 Instruction-cache control proofs abstract memory read values; array geometry, storage behavior and instruction publication are checked separately.
 Platform checks execute shared work, software interrupts and timer interrupts on 1/2/3/16 harts.
 ELF checks build freestanding software with `RISCV_PREFIX` (default `riscv64-unknown-elf-`) and validate actual console writes and per-hart results.
+`make verify-software` runs short ELF consumers; `make verify-zephyr-long SOFTWARE_JOBS=3` runs 1/2/16 harts with the pinned `ZEPHYR_BASE` checkout.
 Reachability and mutation checks exercise the properties; general multiply results are checked by simulation.
 This checks the implemented instruction subset, not full ISA compliance or physical signoff.
 Use `make verify-signoff VERIFY_ARGS=--use-generated` to reuse RTL whose recorded sources and configuration still match.

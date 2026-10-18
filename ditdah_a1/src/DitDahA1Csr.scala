@@ -19,6 +19,9 @@ class DitDahA1CsrIO(parameter: DitDahA1Parameter) extends HWBundle(parameter):
   val readAddress = Flipped(UInt(12))
   val readData = Aligned(UInt(64))
   val legal = Aligned(Bool())
+  val privilege = Aligned(UInt(2))
+  val dataPrivilege = Aligned(UInt(2))
+  val wfiLegal = Aligned(Bool())
   val write = Flipped(Bool())
   val writeAddress = Flipped(UInt(12))
   val writeData = Flipped(UInt(64))
@@ -39,6 +42,13 @@ object DitDahA1Csr extends Generator[DitDahA1Parameter, DitDahA1UnitLayers, DitD
     given ClockScope = ClockScope.posedge(io.clock)
     given ResetScope = ResetScope.syncActiveHigh(io.reset)
     val status = RegInit(0.U(64))
+    val user = Option.when(parameter.enableUserMode)(RegInit(false.B))
+    val privilege = user.map(_.?(0.U(2), 3.U(2))).getOrElse(3.U(2))
+    io.privilege := privilege
+    io.dataPrivilege := (if parameter.enableUserMode then
+      ((privilege === 3.U(2)) & status.asBits.bit(17)).?(status.asBits.bits(12, 11).asUInt, privilege)
+    else 3.U(2))
+    io.wfiLegal := (if parameter.enableUserMode then (privilege === 3.U(2)) | !status.asBits.bit(21) else true.B)
     val mtvec = RegInit(0.U(64))
     val mscratch = RegInit(0.U(64))
     val mepc = RegInit(0.U(64))
@@ -48,7 +58,7 @@ object DitDahA1Csr extends Generator[DitDahA1Parameter, DitDahA1UnitLayers, DitD
     io.returnPc := mepc
     io.readData := 0.U(64)
     io.legal := false.B
-    Seq(0x301, 0x304, 0x344, 0xf11, 0xf12, 0xf13, 0xf14).foreach { address =>
+    Seq(0x301, 0x304, 0x344, 0xf11, 0xf12, 0xf13, 0xf14, 0xf15).foreach { address =>
       when(io.readAddress === address.U(12)) { io.legal := true.B }
     }
     when(io.readAddress === 0xf14.U(12)) { io.readData := io.hartId }
@@ -60,14 +70,31 @@ object DitDahA1Csr extends Generator[DitDahA1Parameter, DitDahA1UnitLayers, DitD
         else register := io.writeData
       }
     }
-    when(io.readAddress === 0x300.U(12)) { io.readData := (status.asBits | 0x1800.B(64)).asUInt; io.legal := true.B }
-    when(io.write & (io.writeAddress === 0x300.U(12))) { status := (io.writeData.asBits & 0x88.B(64)).asUInt }
-    when(io.mret) { status := status.asBits.bit(7).?(0x88.U(64), 0x80.U(64)) }
+    val fixedStatus = if parameter.enableUserMode then BigInt("200000000", 16) else BigInt(0x1800)
+    when(io.readAddress === 0x300.U(12)) { io.readData := (status.asBits | fixedStatus.B(64)).asUInt; io.legal := true.B }
+    when(io.write & (io.writeAddress === 0x300.U(12))) {
+      if parameter.enableUserMode then
+        status := ((io.writeData.asBits & 0x220088.B(64)) |
+          (io.writeData.asBits.bits(12, 11) === 3.B(2)).?(0x1800.B(64), 0.B(64))).asUInt
+      else status := (io.writeData.asBits & 0x88.B(64)).asUInt
+    }
+    when(io.mret) {
+      if parameter.enableUserMode then
+        val toUser = status.asBits.bits(12, 11) === 0.B(2)
+        user.get := toUser
+        status := ((status.asBits & toUser.?(0x200000.B(64), 0x220000.B(64))) |
+          status.asBits.bit(7).?(0x88.B(64), 0x80.B(64))).asUInt
+      else status := status.asBits.bit(7).?(0x88.U(64), 0x80.U(64))
+    }
     when(io.trap) {
       mepc := (io.trapPc.asBits.bits(63, 2) ## 0.B(2)).asUInt
       mcause := io.trapCause
       mtval := io.trapValue
-      status := status.asBits.bit(3).?(0x80.U(64), 0.U(64))
+      if parameter.enableUserMode then
+        user.get := false.B
+        status := ((status.asBits & 0x220000.B(64)) | (privilege === 3.U(2)).?(0x1800.B(64), 0.B(64)) |
+          status.asBits.bit(3).?(0x80.B(64), 0.B(64))).asUInt
+      else status := status.asBits.bit(3).?(0x80.U(64), 0.U(64))
     }
     if parameter.enableInterrupts then
       val enables = RegInit(0.U(3))
@@ -75,7 +102,7 @@ object DitDahA1Csr extends Generator[DitDahA1Parameter, DitDahA1UnitLayers, DitD
       val levels = inputs.external.asBits ## inputs.timer.asBits ## inputs.software.asBits
       val pending = enables.asBits & levels
       io.wakeup.get := pending =/= 0.B(3)
-      io.interruptPending.get := status.asBits.bit(3) & (pending =/= 0.B(3))
+      io.interruptPending.get := (status.asBits.bit(3) | (privilege =/= 3.U(2))) & (pending =/= 0.B(3))
       io.interruptCause.get := pending.bit(2).?(BigInt("800000000000000b", 16).U(64),
         pending.bit(0).?(BigInt("8000000000000003", 16).U(64), BigInt("8000000000000007", 16).U(64)))
       Seq((0x304, enables.asBits), (0x344, levels)).foreach { case (address, bits) =>
@@ -115,3 +142,8 @@ object DitDahA1Csr extends Generator[DitDahA1Parameter, DitDahA1UnitLayers, DitD
         when(io.write & (io.writeAddress === (0x3b0 + index).U(12)) & !locked & !predecessorLocked) {
           address(index) := io.writeData.asBits.bits(width - 1, 0).asUInt
         }
+    if parameter.enableUserMode then
+      Seq(0x306, 0x30a).foreach { address =>
+        when(io.readAddress === address.U(12)) { io.legal := true.B }
+      }
+      when(io.readAddress.asBits.bits(9, 8).asUInt > privilege) { io.legal := false.B }

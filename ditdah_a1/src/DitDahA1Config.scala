@@ -29,7 +29,7 @@ object DitDahA1Config:
       "status" -> "development",
       "implementation" -> ujson.Obj(
         "instructions" -> ujson.Arr.from(DitDahA1Isa.instructions),
-        "privilege" -> "M", "issueWidth" -> 1, "maxInflight" -> parameter.maxInflight,
+        "privilege" -> (if parameter.enableUserMode then "MU" else "M"), "issueWidth" -> 1, "maxInflight" -> parameter.maxInflight,
         "translation" -> "Bare", "isaComplete" -> false
       ),
       "target" -> ujson.Obj(

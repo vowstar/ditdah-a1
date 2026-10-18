@@ -1051,7 +1051,7 @@ def bench(module, body):
         new_direction, new_width, name = match.groups()
         if new_direction:
             direction, width = new_direction, new_width or ''
-        initial = " = '0" if direction == 'input' else ''
+        initial = (" = 3" if name == 'privilege' else " = 1" if name == 'wfiLegal' or name.endswith('_privileged') else " = '0") if direction == 'input' else ''
         declarations.append(f'  logic {width} {name}{initial};')
         connections.append(f'.{name}({name})')
         names.append(name)
@@ -1099,8 +1099,9 @@ def pmp_contract(parameters):
         config = sum(v << (i * 8) for i, v in enumerate(configs))
         points = sum(v << (i * width) for i, v in enumerate(addresses))
         kinds = ('read', 'write') if kind == 'atomic' else (kind,)
-        expected = int(all(pmp_allowed(configs, addresses, address, 1 << size, access, pa) for access in kinds))
-        body += f'''    state_config = 128'h{config:x}; state_address = {16 * width}'h{points:x};
+        for privilege in ((0, 3) if parameters.get('enableUserMode') else (3,)):
+            expected = int(all(pmp_allowed(configs, addresses, address, 1 << size, access, pa, privilege) for access in kinds))
+            body += f'''    state_config = 128'h{config:x}; state_address = {16 * width}'h{points:x}; privilege = {privilege};
     address = 64'h{address:x}; size = {size}; fetch = {int(kind == 'fetch')}; write = {int(kind in ('write', 'atomic'))}; atomic = {int(kind == 'atomic')};
     check(allowed == {expected}, "PMP priority, range and permissions");
 '''
@@ -1169,17 +1170,88 @@ def interrupt_csr_contract(parameters):
                 if cause:
                     body += f"    check(interruptCause == 64'h{cause:x}, \"Interrupt priority\");\n"
                 body += f"    write = 1; writeAddress = 'h344; writeData = 0; tick(); write = 0;\n    check(readData == 'h{model.csrs[0x344]:x}, \"Read-only pending levels\");\n"
-    return body + '''
+    return body + f'''
     trap = 1; trapPc = 'h123; trapCause = 64'h800000000000000b; trapValue = 0; tick(); trap = 0;
-    readAddress = 'h300; check(readData == 'h1880 && !interruptPending, "Entry masks interrupts");
+    readAddress = 'h300; check(readData == 'h{(2 << 32 if parameters.get('enableUserMode') else 0) | 0x1880:x} && !interruptPending, "Entry masks interrupts");
     readAddress = 'h341; check(readData == 'h120, "Trap PC alignment");
     readAddress = 'h342; check(readData == 64'h800000000000000b, "Interrupt cause flag");
     readAddress = 'h343; check(readData == 0, "Interrupt trap value");
     mret = 1; tick(); mret = 0; readAddress = 'h300;
-    check(readData == 'h1888 && interruptPending, "Return reevaluates held sources");
+    check(readData == 'h{(2 << 32 if parameters.get('enableUserMode') else 0x1800) | 0x88:x} && interruptPending, "Return reevaluates held sources");
     interrupts_software = 0; interrupts_timer = 0; interrupts_external = 0;
     check(!interruptPending, "Source deassertion");
 '''
+
+
+def user_csr_contract(parameters):
+    base = int(parameters['resetVector'])
+    model = Model(parameters, {base + i: (0x30200073 >> (8 * i)) & 255 for i in range(4)}, {})
+    body = '    reset = 1; tick(); reset = 0; tick();\n'
+
+    def state():
+        nonlocal body
+        body += f'''    readAddress = 'h300;
+    check(privilege == {model.privilege} && dataPrivilege == {model.data_privilege()} && wfiLegal == {int(model.privilege == 3 or not model.csrs[0x300] & (1 << 21))}, "Effective execution privilege");
+    check(legal == {int(model.privilege == 3)}, "Machine CSR privilege");
+'''
+        if model.privilege == 3:
+            body += f'    check(readData == 64\'h{model.csrs[0x300]:x}, "Privilege status WARL and trap stack");\n'
+        if parameters['enableInterrupts']:
+            body += f'    check(interruptPending == {int(bool(model.interrupt_cause()))}, "Higher privilege interrupt eligibility");\n'
+
+    state()
+    for address in (0x306, 0x30a):
+        body += f"    @(negedge clock); readAddress = 'h{address:x}; writeAddress = 'h{address:x}; writeData = '1; write = 1; tick(); write = 0; check(legal && readData == 0, \"Environment CSR WARL zero\");\n"
+    for previous in range(4):
+        value = (previous << 11) | (1 << 17) | (1 << 21) | 0x88
+        model.write_csr(0x300, value)
+        body += f"    @(negedge clock); write = 1; writeAddress = 'h300; writeData = 'h{value:x}; tick(); write = 0;\n"
+        state()
+        model.pc = base
+        model.step()
+        body += '    @(negedge clock); mret = 1; tick(); mret = 0;\n'
+        state()
+        for address in (0x300, 0x306, 0x30a, 0x340, 0xf14, 0xf15, 0x180):
+            body += f"    readAddress = 'h{address:x}; check(legal == {int(model.privilege == 3 and address in model.csrs)}, \"CSR minimum privilege\");\n"
+        model.trap(0x123, 8, 0)
+        body += "    @(negedge clock); trap = 1; trapPc = 'h123; trapCause = 8; trapValue = 0; tick(); trap = 0;\n"
+        state()
+    if parameters['enableInterrupts']:
+        for index, bit in enumerate((3, 7, 11)):
+            model.write_csr(0x304, 1 << bit)
+            model.write_csr(0x300, 0)
+            model.set_interrupts(1 << index)
+            body += f"    @(negedge clock); write = 1; writeAddress = 'h304; writeData = 'h{1 << bit:x}; tick(); writeAddress = 'h300; writeData = 0; tick(); write = 0;\n"
+            body += f'    interrupts_software = {int(index == 0)}; interrupts_timer = {int(index == 1)}; interrupts_external = {int(index == 2)};\n'
+            state()
+            model.pc = base
+            model.step()
+            body += '    @(negedge clock); mret = 1; tick(); mret = 0;\n'
+            state()
+            model.trap(0x123, (1 << 63) | bit, 0)
+            body += f"    @(negedge clock); trap = 1; trapPc = 'h123; trapCause = 64'h{(1 << 63) | bit:x}; tick(); trap = 0;\n"
+            state()
+    return body
+
+
+def privilege_memory_contract(parameters, fetch, frontend=False):
+    body = ''
+    address = int(parameters['resetVector']) + 0x100
+    for privilege in (0, 3):
+        if frontend:
+            body += '    halt = 1; redirect = 0;\n'
+        body += f'    reset = 1; tick(); reset = 0; tick(); privilege = {privilege}; memory_request_ready = 0; memory_response_valid = 0; output_ready = 0;\n'
+        if parameters['pmpEntries']:
+            body += f"    pmp_config = 'h1f; pmp_address = 'h{(1 << (parameters['physicalAddressBits'] - 2)) - 1:x};\n"
+        body += (f"    redirect = 1; redirectPc = 'h{address:x}; tick(); redirect = 0; halt = 0; tick(); halt = 1;\n" if frontend else
+                 f"    request_bits_pc = 'h{address:x}; request_valid = 1; tick(); request_valid = 0;\n" if fetch else
+                 f"    input_bits_instruction_fault = 0; input_bits_address = 'h{address:x}; input_bits_load = 1; input_bits_store = 0; input_bits_memorySize = 3; input_valid = 1; tick(); input_valid = 0;\n")
+        body += f'''    privilege = {3 - privilege}; repeat (6) tick();
+    repeat (3) begin
+      check(memory_request_valid && memory_request_bits_privileged == {int(privilege == 3)}, "Accepted access retains privilege"); tick();
+    end
+'''
+    return body + '    reset = 1; tick(); reset = 0; tick(); privilege = 3;\n'
 
 
 def protection_contract(fetch):
@@ -1371,8 +1443,13 @@ def verify(rtl, directory, modules=None):
     writeAddress = 'hf14; writeData = '1; write = 1; tick(); write = 0;
     check(readData == {hart}, "Hart identity is read-only");
 ''' for hart in range(16)) + '    hartId = 0;\n'
+    identity += "    readAddress = 'hf15; check(legal && readData == 0, \"Configuration pointer zero\");\n"
     suites += (('DitDahA1Csr', identity + (csr_contract(parameters) if enabled else '') +
-                (interrupt_csr_contract(parameters) if parameters['enableInterrupts'] else '')),)
+                (interrupt_csr_contract(parameters) if parameters['enableInterrupts'] else '') +
+                (user_csr_contract(parameters) if parameters.get('enableUserMode') else '')),)
+    if parameters.get('enableUserMode'):
+        suites = tuple((name, body + (privilege_memory_contract(parameters, name != 'DitDahA1Lsu', name == 'DitDahA1Frontend')
+                       if name in ('DitDahA1Fetch', 'DitDahA1Frontend', 'DitDahA1Lsu') else '')) for name, body in suites)
     assert not modules or set(modules) <= {name for name, _ in suites}, 'Unsupported contract selection'
     for name, body in suites:
         if modules and name not in modules:

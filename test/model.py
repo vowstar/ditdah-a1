@@ -56,7 +56,7 @@ def integer_value(insn, a, b):
     return signed(value, 32) if word else value & MASK
 
 
-def pmp_allowed(configs, addresses, address, size, kind, pa):
+def pmp_allowed(configs, addresses, address, size, kind, pa, privilege=3):
     permission = {'fetch': 4, 'read': 1, 'write': 2, 'atomic': 3}[kind]
     if address < 0 or address + size > 1 << pa:
         return False
@@ -77,8 +77,8 @@ def pmp_allowed(configs, addresses, address, size, kind, pa):
             high = low + width
         matches = [low <= byte < high for byte in range(address, address + size)]
         if any(matches):
-            return all(matches) and (not config & 128 or config & permission == permission)
-    return True
+            return all(matches) and (privilege == 3 and not config & 128 or config & permission == permission)
+    return privilege == 3 or not configs
 
 
 class Fault(Exception):
@@ -134,17 +134,21 @@ class Model:
         self.local_reservation = None
         self.atomic_operation, self.sc_eligible = 0, False
         self.pc = int(config['resetVector'])
+        self.privilege = 3
         self.registers = [0] * 32
         self.csrs = {address: 0 for address in (0x300, 0x301, 0x304, 0x305, 0x340,
                                                0x341, 0x342, 0x343, 0x344,
-                                               0xf11, 0xf12, 0xf13, 0xf14)}
-        self.csrs[0x300] = 0x1800
+                                               0xf11, 0xf12, 0xf13, 0xf14, 0xf15)}
+        if config.get('enableUserMode'):
+            self.csrs.update({0x306: 0, 0x30a: 0})
+        self.csrs[0x300] = 2 << 32 if config.get('enableUserMode') else 0x1800
         self.csrs[0xf14] = hart_id
         if config['pmpEntries']:
             self.csrs.update({address: 0 for address in (*range(0x3a0, 0x3b0, 2), *range(0x3b0, 0x3f0))})
         self.local_fetch_faults = set()
         self.bus = []
         self.requests = []
+        self.request_privileges = []
         self.order = 0
 
     def access(self, address, size, kind, data=0):
@@ -156,11 +160,13 @@ class Model:
         if self.config['pmpEntries'] and not pmp_allowed(
                 [self.pmp_config(i) for i in range(self.config['pmpEntries'])],
                 [self.csrs[0x3b0 + i] for i in range(self.config['pmpEntries'])],
-                address, size, permission_kind, self.config['physicalAddressBits']):
+                address, size, permission_kind, self.config['physicalAddressBits'],
+                self.privilege if kind == 'fetch' else self.data_privilege()):
             if kind == 'fetch':
                 self.local_fetch_faults.add(self.order)
             raise Fault(cause, address)
         self.requests.append((kind, address, size, data if kind in ('write', 'atomic') else 0))
+        self.request_privileges.append(self.privilege if kind == 'fetch' else self.data_privilege())
         permission = {'fetch': 'executable', 'read': 'readable', 'write': 'writable', 'atomic': 'atomic'}[kind]
         allowed = any(int(r['base']) <= address and address + size <= int(r['base']) + int(r['size'])
                       and r.get(permission, False) and (kind != 'atomic' or (r['readable'] and r['writable'] and not r['device']))
@@ -196,15 +202,23 @@ class Model:
         self.csrs[0x344] = sum(((levels >> index) & 1) << bit for index, bit in enumerate((3, 7, 11)))
 
     def interrupt_cause(self):
-        pending = self.csrs[0x304] & self.csrs[0x344] if self.csrs[0x300] & 8 else 0
+        pending = self.csrs[0x304] & self.csrs[0x344] if self.privilege < 3 or self.csrs[0x300] & 8 else 0
         return next(((1 << 63) | bit for bit in (11, 3, 7) if pending & (1 << bit)), 0)
+
+    def data_privilege(self):
+        return (self.csrs[0x300] >> 11) & 3 if self.csrs[0x300] & (1 << 17) else self.privilege
+
+    def trap(self, pc, cause, value):
+        self.csrs[0x341], self.csrs[0x342], self.csrs[0x343] = pc & ~3, cause, value
+        status = self.csrs[0x300]
+        self.csrs[0x300] = (status & ~0x1888) | (self.privilege << 11) | ((status & 8) << 4)
+        self.privilege = 3
 
     def interrupt(self):
         cause = self.interrupt_cause()
         assert cause, 'Interrupt without independently eligible source'
         pc, target = self.pc, self.csrs[0x305]
-        self.csrs[0x341], self.csrs[0x342], self.csrs[0x343] = pc, cause, 0
-        self.csrs[0x300] = 0x1800 | ((self.csrs[0x300] & 8) << 4)
+        self.trap(pc, cause, 0)
         self.pc = target
         record = (self.order, pc, 0, target, 0, 0, 0, 1, cause, 0)
         self.order += 1
@@ -215,7 +229,8 @@ class Model:
 
     def write_csr(self, address, value):
         if address == 0x300:
-            self.csrs[address] = 0x1800 | (value & 0x88)
+            self.csrs[address] = ((2 << 32) | (value & 0x220088) | (0x1800 if value & 0x1800 == 0x1800 else 0)
+                                  if self.config.get('enableUserMode') else 0x1800 | (value & 0x88))
         elif address == 0x304 and self.config.get('enableInterrupts', False):
             self.csrs[address] = value & 0x888
         elif address in (0x305, 0x341):
@@ -285,30 +300,39 @@ class Model:
             elif opcode == 0x0f and funct3 in (0, 1):
                 pass
             elif insn == 0x10500073:
-                pass
+                if self.privilege < 3 and self.csrs[0x300] & (1 << 21):
+                    raise Fault(2, insn)
             elif opcode == 0x73 and funct3 in (1, 2, 3, 5, 6, 7):
                 address = insn >> 20
                 update = funct3 & 3 == 1 or rs1 != 0
                 source = rs1 if funct3 & 4 else a
-                if address not in self.csrs or (update and address >> 10 == 3):
+                if address not in self.csrs or (address >> 8) & 3 > self.privilege or (update and address >> 10 == 3):
                     raise Fault(2, insn)
                 value, write = self.csrs[address], True
                 if update:
                     data = source if funct3 & 3 == 1 else value | source if funct3 & 3 == 2 else value & ~source
                     self.write_csr(address, data & MASK)
             elif insn == 0x73:
-                raise Fault(11, 0)
+                raise Fault(8 if self.privilege == 0 else 11, 0)
             elif insn == 0x30200073:
+                if self.privilege != 3:
+                    raise Fault(2, insn)
                 next_pc = self.csrs[0x341]
-                self.csrs[0x300] = 0x1880 | ((self.csrs[0x300] >> 4) & 8)
+                status = self.csrs[0x300]
+                self.privilege = (status >> 11) & 3
+                self.csrs[0x300] = (status & ~0x1888) | 0x80 | ((status >> 4) & 8)
+                if self.config.get('enableUserMode'):
+                    if self.privilege < 3:
+                        self.csrs[0x300] &= ~(1 << 17)
+                else:
+                    self.csrs[0x300] |= 0x1800
             else:
                 raise Fault(2, insn)
             if next_pc & 3:
                 raise Fault(0, next_pc)
         except Fault as error:
             trap, cause, tval, write = True, error.cause, error.value, False
-            self.csrs[0x341], self.csrs[0x342], self.csrs[0x343] = pc & ~3, cause, tval
-            self.csrs[0x300] = 0x1800 | ((self.csrs[0x300] & 8) << 4)
+            self.trap(pc, cause, tval)
             next_pc = self.csrs[0x305]
         write = write and rd != 0
         value = (value & MASK) if write else 0

@@ -5,7 +5,7 @@ typedef struct packed {
   logic [63:0] address, data;
   logic [2:0] size;
   logic [7:0] mask, tag;
-  logic write, fetch, atomic;
+  logic write, fetch, privileged, atomic;
   logic [4:0] atomicOperation;
   logic scEligible;
 } request_t;
@@ -21,6 +21,7 @@ endinterface
   .P``_request_bits_size(B.request.size), .P``_request_bits_mask(B.request.mask), \
   .P``_request_bits_tag(B.request.tag), .P``_request_bits_write(B.request.write), \
   .P``_request_bits_fetch(B.request.fetch), .P``_request_bits_atomic(B.request.atomic), \
+  .P``_request_bits_privileged(B.request.privileged), \
   .P``_request_bits_atomicOperation(B.request.atomicOperation), .P``_request_bits_scEligible(B.request.scEligible), .P``_response_ready(B.response_ready), \
   .P``_response_valid(B.response_valid), .P``_response_bits_data(B.response.data), \
   .P``_response_bits_fault(B.response.fault), .P``_response_bits_tag(B.response.tag)
@@ -125,6 +126,7 @@ module memory_tb;
         $display("REQUEST %s %016h %0d %016h", core_port[p].request.atomic ? "atomic" : (p == 0 ? "fetch" : (core_port[p].request.write ? "write" : "read")),
           core_port[p].request.address, 1 << core_port[p].request.size,
           core_port[p].request.write ? core_port[p].request.data & access_mask(core_port[p].request.size) : 64'b0);
+        $display("ACCESS_PRIVILEGE %01h", core_port[p].request.privileged);
         if (core_port[p].request.atomic)
           $display("ATOMIC %02h %01h", core_port[p].request.atomicOperation, core_port[p].request.scEligible);
       end

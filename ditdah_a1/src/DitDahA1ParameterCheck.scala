@@ -40,6 +40,11 @@ object DitDahA1ParameterCheck:
     val rtl = DitDahA1Parameter.uncached
     for count <- 1 to 16 do rtl.copy(hartCount = count).validateRtl()
     assert(!rtl.enableInterrupts)
+    assert(!rtl.enableUserMode)
+    val user = rtl.copy(enableUserMode = true)
+    user.validateRtl()
+    assert(DitDahA1Config.parameter(DitDahA1Config.document(user)) == user)
+    assert(DitDahA1Config.document(user)("implementation")("privilege").str == "MU")
     val device = MemoryRegion(base = 0x2000000, size = 65536, executable = false, device = true)
     val platform = rtl.copy(enableInterrupts = true, localInterruptBase = Some(device.base), memoryRegions = rtl.memoryRegions :+ device)
     platform.validateRtl()

@@ -11,6 +11,7 @@ class DitDahA1FetchIO(parameter: DitDahA1Parameter) extends HWBundle(parameter):
   val pmp = Option.when(parameter.pmpEntries != 0)(Flipped(new PmpState(parameter)))
   val clock = Flipped(Clock())
   val reset = Flipped(Reset())
+  val privilege = Flipped(UInt(2))
   val request = Flipped(new Decoupled(new FetchRequest))
   val output = Aligned(new Decoupled(new FetchPacket))
   val cancel = Flipped(Bool())
@@ -27,6 +28,8 @@ object DitDahA1Fetch extends Generator[DitDahA1Parameter, DitDahA1UnitLayers, Di
     val state = RegInit(0.U(2))
     val packet = Reg(new FetchPacket)
     val killed = RegInit(false.B)
+    val privileged = Option.when(parameter.enableUserMode)(Reg(Bool()))
+    val machine = if parameter.enableUserMode then io.privilege === 3.U(2) else true.B
     val cache = Option.when(parameter.iCacheBytes != 0)(DitDahA1InstructionCache.instantiate(parameter))
     val memory = cache.map(_.io.upstream).getOrElse(io.memory)
     val request = memory.request
@@ -39,6 +42,7 @@ object DitDahA1Fetch extends Generator[DitDahA1Parameter, DitDahA1UnitLayers, Di
       pmp.io.write := false.B
       pmp.io.fetch := true.B
       pmp.io.atomic := false.B
+      pmp.io.privilege := (state === 0.U(2)).?(io.privilege, privileged.map(_.?(3.U(2), 0.U(2))).getOrElse(3.U(2)))
       pmp.io.allowed
     cache.foreach { c =>
       c.io.clock := io.clock
@@ -59,12 +63,14 @@ object DitDahA1Fetch extends Generator[DitDahA1Parameter, DitDahA1UnitLayers, Di
     request.bits.mask := 0.U(8)
     request.bits.tag := packet.tag
     request.bits.fetch := true.B
+    request.bits.privileged := privileged.getOrElse(true.B)
     request.bits.write := false.B
     request.bits.atomic := false.B
     request.bits.atomicOperation := 0.U(5)
     request.bits.scEligible := false.B
     response.ready := state === 2.U(2)
     when(io.request.valid & io.request.ready) {
+      privileged.foreach(_ := machine)
       packet.pc := io.request.bits.pc
       packet.tag := io.request.bits.tag
       packet.instruction := 0.U(32)
