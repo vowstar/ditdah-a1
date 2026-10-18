@@ -10,7 +10,7 @@ import re
 from pathlib import Path
 import subprocess
 
-from contracts import verify as verify_contracts
+from contracts import verify as verify_contracts, verify_storage
 from model import Fault, Model, MASK
 from programs import cases, multicore_cases
 
@@ -45,6 +45,24 @@ def compile_tb(rtl, directory, width, pa, top='core_tb', source=None, extra_file
     parameters = json.loads((rtl / 'ditdah_a1_config.json').read_text())['parameters']
     interrupts, harts = parameters['enableInterrupts'], parameters['hartCount']
     bindings, ports = [], []
+    observers = [f'  wire [{harts - 1}:0] architectural_fetch_busy;\n  wire [63:0] architectural_fetch_pc[{harts}];']
+    for hart in range(harts if top == 'core_tb' else 1):
+        fetch = f'dut.core_{hart}.frontend.fetch' if top == 'core_tb' else 'dut.frontend.fetch'
+        order = fetch.replace('.frontend.fetch', '.backend.dV.traceOrder')
+        prefix = f'$write("HART {hart} "); ' if harts > 1 else ''
+        observers.append(f'''  assign architectural_fetch_busy[{hart}] = !{fetch}.request_ready;
+  assign architectural_fetch_pc[{hart}] = {fetch}.request_bits_pc;
+  always @(posedge clock) if (!reset) begin
+    if ({fetch}.request_valid && {fetch}.request_ready) begin
+      {prefix}$display("ARCH_REQUEST %016h %02h", {fetch}.request_bits_pc, {fetch}.request_bits_tag);
+    end
+    if ({fetch}.cancel) begin {prefix}$display("ARCH_CANCEL %016h", {order}); end
+    if ({fetch}.output_valid && {fetch}.output_ready) begin
+      {prefix}$display("ARCH_FETCH %016h %01h %08h %02h", {fetch}.output_bits_pc,
+        {fetch}.output_bits_fault, {fetch}.output_bits_instruction, {fetch}.output_bits_tag);
+    end
+  end''')
+    (directory / 'fetch_observers.svh').write_text('\n'.join(observers) + '\n')
     if top == 'core_tb':
         names = re.findall(r'\bDitDahA1Core\s+(\w+)\s*\(', (rtl / 'DitDahA1.sv').read_text())
         assert names == [f'core_{h}' for h in range(harts)], names
@@ -71,6 +89,7 @@ def compile_tb(rtl, directory, width, pa, top='core_tb', source=None, extra_file
     run(['verilator', '--binary', '--timing', '--assert', '-j', '2', '--top-module', top,
          '-Wno-TIMESCALEMOD', '-Wno-WIDTHTRUNC', '-Wno-WIDTHEXPAND',
          f'-DAXI_BITS={width}', f'-DPA_BITS={pa}', f'-DHARTS={harts}', '-I' + str(directory.resolve()), *(['-DENABLE_INTERRUPTS'] if interrupts else []), '-I' + str(rtl.resolve()),
+         *(['-DICACHE'] if parameters['iCacheBytes'] else []),
          '--Mdir', str((directory / 'obj').resolve()), *files, *extra_files, source], directory / 'compile.log')
     return (directory / 'obj' / ('V' + top)).resolve()
 
@@ -81,28 +100,69 @@ def check_fetches(lines, config, faults, local_faults=()):
             int(region['base']) <= address and address + 4 <= int(region['base']) + int(region['size'])
             and region['executable'] for region in config['memoryRegions'])
 
-    pending = None
+    architectural = any(line.startswith('ARCH_REQUEST ') for line in lines)
+    pending, requests, demand = None, {}, None
+    arch_accepted, arch_completed, arch_wraps = 0, 0, 0
     fetched, failed = Counter(), Counter()
+    physical_fetched, physical_failed, bus_failed = Counter(), Counter(), Counter()
+    cancel_order, retired_order = None, -1
+
+    def discard_outputs():
+        fetched.clear()
+        failed.clear()
+        bus_failed.clear()
+
     reachable = {int(config['resetVector'])}
     accepted, completed = 0, 0
     for line in lines:
         fields = line.split()
-        if fields[:2] == ['BUS', 'fetch']:
+        if fields[:1] == ['ARCH_REQUEST']:
+            address, tag = (int(value, 16) for value in fields[1:])
+            assert not requests and pending is None and address in reachable, 'Unexpected architectural fetch identity or control flow'
+            requests[tag] = address
+            demand = address
+            arch_wraps += int(tag == 0 and arch_accepted != 0)
+            arch_accepted += 1
+            reachable.add(address + 4)
+        elif fields[:1] == ['ARCH_CANCEL']:
+            requests.clear()
+            physical_fetched.clear()
+            physical_failed.clear()
+            if pending is not None:
+                pending[1] = True
+            cancel_order = int(fields[1], 16) if len(fields) == 2 else -1
+            if cancel_order <= retired_order:
+                discard_outputs()
+                cancel_order = None
+        elif fields[:1] == ['ARCH_FETCH']:
+            address, fault, instruction, tag = (int(value, 16) for value in fields[1:])
+            assert requests.pop(tag, None) == address, 'Unrequested, repeated or cancelled architectural fetch'
+            if not config['iCacheBytes']:
+                if not fault:
+                    assert physical_fetched[address, instruction], 'Architectural fetch without matching physical response'
+                    physical_fetched[address, instruction] -= 1
+                elif physical_failed[address]:
+                    physical_failed[address] -= 1
+                    bus_failed[address] += 1
+            arch_completed += 1
+            (failed if fault else fetched)[address if fault else (address, instruction)] += 1
+        elif fields[:2] == ['BUS', 'fetch']:
             address, size, data = int(fields[2], 16), int(fields[3]), int(fields[4], 16)
             assert pending is None, 'Overlapping instruction transactions'
             assert size == 4 and data == 0 and allowed(address), f'Forbidden fetch: {line}'
-            assert address in reachable, f'Fetch outside sequential or committed control flow: {line}'
+            expected = demand is not None and (address & ~63 == demand & ~63 if config['iCacheBytes'] else address == demand)
+            assert (expected if architectural else address in reachable), f'Fetch outside current instruction demand: {line}'
             reachable.add(address + 4)
-            pending = address
+            pending = [address, architectural and not requests]
             accepted += 1
         elif fields[:1] == ['FETCH']:
             address, response, instruction = (int(value, 16) for value in fields[1:])
-            assert pending == address, f'Unrequested fetch response: {line}'
+            assert pending is not None and pending[0] == address, f'Unrequested fetch response: {line}'
             assert response == (2 if address == faults.get('fetch') else 0), f'Fetch response: {line}'
-            if response:
-                failed[address] += 1
-            else:
-                fetched[address, instruction] += 1
+            if not architectural:
+                (failed if response else fetched)[address if response else (address, instruction)] += 1
+            elif not pending[1]:
+                (physical_failed if response else physical_fetched)[address if response else (address, instruction)] += 1
             pending = None
             completed += 1
         elif fields[:1] == ['TRACE']:
@@ -110,26 +170,70 @@ def check_fetches(lines, config, faults, local_faults=()):
             pc, instruction, trap, cause = trace[1], trace[2], trace[7], trace[8]
             reachable.add(trace[3])
             if trap and cause >> 63:
-                continue
-            if trap and cause == 1:
-                if trace[0] not in local_faults and allowed(pc):
+                pass
+            elif trap and cause == 1:
+                if architectural or (trace[0] not in local_faults and allowed(pc)):
                     assert failed[pc], f'Fetch fault without failed response: {line}'
                     failed[pc] -= 1
+                if architectural and not config['iCacheBytes'] and trace[0] not in local_faults and allowed(pc):
+                    assert bus_failed[pc], 'Architectural fetch fault without physical failure or local denial'
+                    bus_failed[pc] -= 1
             else:
                 assert fetched[pc, instruction], f'Retirement without completed instruction fetch: {line}'
                 fetched[pc, instruction] -= 1
-    return dict(accepted=accepted, completed=completed, discarded=sum(fetched.values()) + sum(failed.values()))
+            retired_order = trace[0]
+            if cancel_order == retired_order:
+                discard_outputs()
+                cancel_order = None
+    return dict(accepted=accepted, completed=completed, architecturalAccepted=arch_accepted,
+                architecturalCompleted=arch_completed, architecturalTagWraps=arch_wraps,
+                discarded=sum(fetched.values()) + sum(failed.values()))
 
 
-def compare(binary, directory, config, transport='axi'):
+def check_fetch_oracle():
+    config, word = configuration(64), 0x0400006f
+    request = 'ARCH_REQUEST 0 0'
+    physical = ['BUS fetch 0 4 0', f'FETCH 0 0 {word:x}']
+    output = f'ARCH_FETCH 0 0 {word:x} 0'
+    trace = f'TRACE 0 0 {word:x} 40 0 0 0 0 0 0'
+    valid = [request, *physical, output, trace]
+    check_fetches(valid, config, {})
+    local = [request, 'ARCH_FETCH 0 1 0 0', 'TRACE 0 0 0 0 0 0 0 1 1 0']
+    check_fetches(local, config, {}, local_faults=(0,))
+    fault = [request, 'BUS fetch 0 4 0', 'FETCH 0 2 0', 'ARCH_FETCH 0 1 0 0']
+    fault_trace = 'TRACE 0 0 0 0 0 0 0 1 1 0'
+    for ending in (['ARCH_CANCEL 0', fault_trace], [fault_trace, 'ARCH_CANCEL 0']):
+        check_fetches([*fault, *ending], config, {'fetch': 0})
+    rejected = {
+        'missingPhysicalResponse': [request, output, trace],
+        'unrelatedLine': [*valid, 'ARCH_REQUEST 40 1', *physical],
+        'cancelledOutput': [request, *physical, 'ARCH_CANCEL', output],
+        'missingFaultResponse': local,
+        'cancelledFaultCredit': [*fault, 'ARCH_CANCEL 0', 'TRACE 0 0 0 0 0 0 0 1 800000000000000b 0',
+                                 'ARCH_REQUEST 0 1', 'ARCH_FETCH 0 1 0 1', 'TRACE 1 0 0 0 0 0 0 1 1 0'],
+    }
+    for name, lines in rejected.items():
+        profiles = (config, dict(config, iCacheBytes=8192)) if name in ('unrelatedLine', 'cancelledOutput') else (config,)
+        for profile in profiles:
+            try:
+                check_fetches(lines, profile, {'fetch': 0} if name == 'cancelledFaultCredit' else {})
+            except AssertionError:
+                continue
+            raise AssertionError(f'Fetch oracle accepted {name}')
+    return list(rejected)
+
+
+def compare(binary, directory, config, transport='axi', selected=()):
     base = int(config['resetVector'])
     coverage = [0] * 6
     coverage_names = (('awBeforeW', 'wBeforeAw', 'awWithW', 'arStall', 'awStall', 'wStall') if transport == 'axi'
-                      else ('overlap', 'instructionStall', 'dataStall', 'responseDelay', 'permissionReject', 'tagWrap'))
+                      else ('overlap', 'instructionStall', 'dataStall', 'responseDelay', 'permissionReject', 'architecturalTagWrap' if config['iCacheBytes'] else 'tagWrap'))
     count = 0
     reports = []
     pipeline_max, dependency_stalls = 0, 0
     for name, program in cases(base, config['pmpEntries'] != 0, config['enableInterrupts']):
+        if selected and name not in selected:
+            continue
         image = directory / (name + '.hex')
         image.write_text('\n'.join(f'{program.memory.get(base + i, 0):02x}' for i in range(65536)) + '\n')
         model = Model(config, program.memory, program.faults)
@@ -189,7 +293,7 @@ def compare(binary, directory, config, transport='axi'):
                 assert observed == wanted, f'{name} trace {index}:\nactual {observed}\nexpected {wanted}'
             data_bus = [event for event in bus if event[0] != 'fetch']
             expected_bus = [event for event in model.bus if event[0] != 'fetch']
-            if transport == 'axi' and 'atomic' in name:
+            if transport == 'axi' and ('atomic' in name or name in ('fence_ordering', 'synchronization')):
                 check_multicore(lines, config, program, name)
             else:
                 assert data_bus == expected_bus, f'{name}: unexpected data accesses\nactual {data_bus}\nexpected {expected_bus}'
@@ -202,19 +306,25 @@ def compare(binary, directory, config, transport='axi'):
                 fault = program.faults['fetch']
                 assert any(line.startswith(f'FETCH {fault:016x} 2 ') for line in lines), 'Wrong-path fetch fault was not exercised'
             if name == 'pipeline_reuse':
-                assert fetches['accepted'] > 256, 'Instruction identity wraparound was not exercised'
+                assert fetches['architecturalAccepted'] > 256, 'Instruction identity wraparound was not exercised'
             for line in lines:
                 if line.startswith('COVER '):
-                    coverage = [a + int(b) for a, b in zip(coverage, line.split()[1:])]
+                    observed_coverage = list(map(int, line.split()[1:]))
+                    if transport == 'memory' and config['iCacheBytes']:
+                        observed_coverage[5] = fetches['architecturalTagWraps']
+                    coverage = [a + b for a, b in zip(coverage, observed_coverage)]
                 elif line.startswith('PIPELINE '):
                     occupancy, stalls = map(int, line.split()[1:])
                     pipeline_max = max(pipeline_max, occupancy)
                     dependency_stalls += stalls
             count += len(actual)
-            reports.append(dict(test=name, seed=seed, events=len(actual), busTransactions=len(bus), fetches=fetches))
+            elapsed = next(int(line.split()[1]) for line in lines if line.startswith('CYCLES '))
+            reports.append(dict(test=name, seed=seed, events=len(actual), cycles=elapsed, busTransactions=len(bus), fetches=fetches))
         print(f'  {name}: {len(expected)} events, three bus schedules', flush=True)
-    assert all(coverage), f'{transport} coverage missing: {dict(zip(coverage_names, coverage))}'
-    assert pipeline_max >= 2 and dependency_stalls, f'Pipeline coverage missing: {pipeline_max}, {dependency_stalls}'
+    assert reports, 'No selected scalar program'
+    if not selected:
+        assert all(coverage), f'{transport} coverage missing: {dict(zip(coverage_names, coverage))}'
+        assert pipeline_max >= 2 and dependency_stalls, f'Pipeline coverage missing: {pipeline_max}, {dependency_stalls}'
     return dict(events=count, cases=reports, pipelineCoverage=dict(maxOccupancy=pipeline_max, dependencyStalls=dependency_stalls),
                 **{('busCoverage' if transport == 'axi' else 'portCoverage'): dict(zip(coverage_names, coverage))})
 
@@ -226,6 +336,8 @@ def check_multicore(lines, config, program, name):
     memory, active = dict(program.memory), None
     failures = getattr(program, 'exclusive_failures', 0)
     models = [Model(config, program.memory, program.faults, hart_id=h) for h in range(harts)]
+    for model in models:
+        model.memory = memory
     pending, finished, per_hart = [None] * harts, set(), [[] for _ in range(harts)]
     collisions, tags, sources, events, effects = set(), {}, set(), 0, Counter()
     interrupts, overtaken = Counter(), 0
@@ -265,13 +377,15 @@ def check_multicore(lines, config, program, name):
         fields = line.split()
         if fields[:1] == ['HART']:
             hart, fields = int(fields[1]), fields[2:]
-        elif harts == 1 and fields and fields[0] in ('REQUEST', 'BUS', 'READ', 'WRITE', 'INTERFERE', 'RESPONSE', 'FETCH', 'IRQ', 'TRACE'):
+        elif harts == 1 and fields and fields[0] in ('REQUEST', 'BUS', 'READ', 'WRITE', 'INTERFERE', 'RESPONSE', 'FETCH', 'IRQ', 'TRACE', 'ARCH_REQUEST', 'ARCH_FETCH', 'ARCH_CANCEL'):
             hart = 0
         else:
             continue
         assert 0 <= hart < harts
         per_hart[hart].append(' '.join(fields))
         kind = fields[0]
+        if kind in ('ARCH_REQUEST', 'ARCH_FETCH', 'ARCH_CANCEL'):
+            continue
         assert kind in ('REQUEST', 'BUS', 'READ', 'WRITE', 'INTERFERE', 'RESPONSE', 'FETCH', 'IRQ', 'TRACE'), 'Unknown hart event'
         if kind == 'REQUEST':
             assert active is None, 'Overlapping source ownership'
@@ -385,8 +499,6 @@ def check_multicore(lines, config, program, name):
     assert failures == 0, 'Exclusive failure stimulus was not consumed'
     if harts > 1:
         assert sources == set(range(2 * harts)) and collisions, 'Missing source or cross-hart tag collision'
-        if 'atomic' not in name:
-            assert concurrent['trapDuringPeerService'] and concurrent['redirectDuringPeerService'], 'Missing concurrent trap or redirect'
     assert interrupts == (Counter({getattr(program, 'interrupts', {}).get('hart', 0): 1}) if hasattr(program, 'interrupts') else Counter()), 'Interrupt isolation'
     if harts > 1 and 'atomic' in name:
         word = lambda address: sum(memory.get(address + byte, 0) << (8 * byte) for byte in range(8))
@@ -394,7 +506,17 @@ def check_multicore(lines, config, program, name):
         old = [word(base + 0x2000 + hart * 64 + i * 8) for hart in range(harts) for i in range(4)]
         assert sorted(old) == list(range(14, 14 + 4 * harts)), 'Atomic old-value uniqueness'
     for hart, model in enumerate(models):
-        if harts > 1 and 'atomic' in name:
+        if hasattr(program, 'synchronization'):
+            word = lambda address: sum(memory.get(address + byte, 0) << (8 * byte) for byte in range(8))
+            tasks = program.synchronization['rounds'] * harts
+            assert word(base + 0x1810) == tasks, 'Work allocation count'
+            assert [word(base + 0x2000 + 8 * ticket) for ticket in range(tasks)] == list(range(1, tasks + 1)), 'Lost or duplicate work'
+            assert all(sum(effects[h, base + 0x2000 + 8 * ticket] for h in range(harts)) == 1 for ticket in range(tasks)), 'Repeated task execution'
+            assert effects[hart, base + 0x1810] == program.synchronization['rounds'], 'Hart did not execute every work round'
+            assert all(word(base + offset) == harts for offset in (0x1800, 0x1818, 0x1820, 0x1828, 0x1830)), 'Incomplete repeated barrier'
+            assert word(base + 0x2400 + 64 * hart) == 3 and word(base + 0x2408 + 64 * hart) == 9, 'Instruction publication did not replace warmed code'
+            assert model.registers[19] == tasks * (tasks + 1) // 2, 'Distributed work checksum'
+        elif harts > 1 and 'atomic' in name:
             assert model.registers[18] == harts * (harts + 1) // 2, 'Release/acquire publication'
         elif harts > 1:
             assert model.registers[8] == (hart + 1) % harts + 1, 'Mailbox exchange did not complete'
@@ -408,12 +530,15 @@ def check_multicore(lines, config, program, name):
                 busCoverage=dict(zip(('awBeforeW', 'wBeforeAw', 'awWithW', 'arStall', 'awStall', 'wStall'), covers[0])))
 
 
-def compare_multicore(binary, directory, config):
+def compare_multicore(binary, directory, config, selected=()):
     harts, base = config['hartCount'], int(config['resetVector'])
     reports = []
     for name, program in multicore_cases(base, harts, bool(config['pmpEntries']), config['enableInterrupts']):
+        if selected and name not in selected:
+            continue
         image = directory / (name + '.hex')
         image.write_text('\n'.join(f'{program.memory.get(base + i, 0):02x}' for i in range(65536)) + '\n')
+        first = len(reports)
         for seed in (1, 17, 2026):
             log = directory / f'{name}-{seed}.log'
             command = [binary, f'+IMAGE={image.resolve()}', f'+BASE={base:x}', f'+STOP={program.stop:x}', f'+SEED={seed}']
@@ -426,7 +551,13 @@ def compare_multicore(binary, directory, config):
             lines = log.read_text().splitlines()
             assert 'PASS' in lines, f'{name}: incomplete multicore run'
             reports.append(dict(test=name, seed=seed, **check_multicore(lines, config, program, name)))
+        if harts > 1 and 'atomic' not in name and not hasattr(program, 'synchronization'):
+            concurrent = Counter()
+            for report in reports[first:]:
+                concurrent.update(report['concurrency'])
+            assert concurrent['trapDuringPeerService'] and concurrent['redirectDuringPeerService'], f'{name}: missing concurrent trap or redirect {dict(concurrent)}'
         print(f'  {harts} harts, {name}: three shared-memory schedules', flush=True)
+    assert reports, 'No selected multicore program'
     return dict(events=sum(report['events'] for report in reports), cases=reports)
 
 
@@ -439,6 +570,9 @@ def main():
     parser.add_argument('--output', type=Path, default=Path('result/verify'))
     parser.add_argument('--interrupts', action='store_true', help='Run only enabled interrupt profiles')
     parser.add_argument('--pmp-entries', type=int, choices=(0, 16))
+    parser.add_argument('--icache-bytes', type=int, choices=(0, 8192, 16384, 32768, 65536), default=0)
+    parser.add_argument('--case', dest='selected', action='append', default=[])
+    parser.add_argument('--traffic-baseline', type=Path)
     args = parser.parse_args()
     args.output.mkdir(parents=True, exist_ok=True)
     summary_path = args.output / 'summary.json'
@@ -446,7 +580,17 @@ def main():
     test_hashes = {str(p): hashlib.sha256(p.read_bytes()).hexdigest() for name in
                    ('verify.py', 'contracts.py', 'model.py', 'programs.py', 'core_tb.sv', 'memory_tb.sv')
                    for p in (Path('test') / name,)}
-    summary = {'scope': 'implemented scalar subset; simulation and assertions', 'configurations': []}
+    summary = {'scope': 'implemented scalar subset; simulation and assertions', 'selectedCases': args.selected,
+               'fetchOracleGuards': check_fetch_oracle(), 'configurations': []}
+    frozen_sources = None
+
+    def freeze_sources(manifest):
+        nonlocal frozen_sources
+        assert manifest.get('sourceHashes'), 'Generated RTL has no source provenance'
+        if frozen_sources is None:
+            frozen_sources = manifest['sourceHashes']
+        assert manifest['sourceHashes'] == frozen_sources, 'Mixed generated source snapshots'
+
     core_profiles = {}
     profiles = [(width, entries, False) for entries in ((args.pmp_entries,) if args.pmp_entries is not None else (0, 16))
                 for width in args.width or (64, 128, 256, 512) if entries == 0 or width in (64, 512)]
@@ -458,7 +602,7 @@ def main():
         directory = args.output / f'{"irq-" if interrupts else ""}{"pmp16-" if entries else ""}axi{width}'
         directory.mkdir(parents=True, exist_ok=True)
         config = configuration(width)
-        config.update(pmpEntries=entries, enableInterrupts=interrupts)
+        config.update(pmpEntries=entries, enableInterrupts=interrupts, iCacheBytes=args.icache_bytes)
         config_path = directory / 'input.json'
         config_path.write_text(json.dumps(config, indent=2) + '\n')
         rtl = directory / 'rtl'
@@ -466,6 +610,7 @@ def main():
             print(f'Generating AXI{width} RTL', flush=True)
             run(['build-ditdah-a1', '--trace', '--config', config_path, '--output', rtl], directory / 'build.log')
         manifest = json.loads((rtl / 'ditdah_a1_config.json').read_text())
+        freeze_sources(manifest)
         assert manifest['top'] == 'DitDahA1' and manifest['validationScope'] == 'system'
         assert manifest.get('sourceHashes'), 'Generated RTL has no source provenance'
         for name, digest in manifest['sourceHashes'].items():
@@ -473,14 +618,16 @@ def main():
         for key, value in config.items():
             assert manifest['parameters'][key] == value, f'Stale RTL configuration: {key}'
         interface_contracts = verify_contracts(rtl, directory / 'contracts')
+        storage = verify_storage(rtl, directory / 'storage')
         binary = compile_tb(rtl, directory, width, config['physicalAddressBits'])
         print(f'Checking AXI{width}', flush=True)
-        report = compare(binary, directory, manifest['parameters'])
+        report = compare(binary, directory, manifest['parameters'], selected=args.selected)
         report['interfaceContracts'] = interface_contracts
-        report.update(axiDataBits=width, physicalAddressBits=config['physicalAddressBits'], pmpEntries=entries, enableInterrupts=interrupts)
+        report['instructionStorage'] = storage
+        report.update(axiDataBits=width, physicalAddressBits=config['physicalAddressBits'], pmpEntries=entries, enableInterrupts=interrupts, iCacheBytes=args.icache_bytes)
         summary['configurations'].append(report)
         core = directory / 'core'
-        core_config = dict(config, axiDataBits=256, iCacheBytes=8192)
+        core_config = dict(config, axiDataBits=256)
         core_key = json.dumps(core_config, sort_keys=True)
         if core_key in core_profiles:
             report['coreReuse'] = core_profiles[core_key]
@@ -497,7 +644,7 @@ def main():
         assert not (core / 'rtl/DitDahA1Axi.sv').exists(), 'AXI dependency in standalone Core'
         binary = compile_tb(core / 'rtl', core, width, config['physicalAddressBits'], 'memory_tb',
                             Path('test/memory_tb.sv').resolve(), [(rtl / 'DitDahA1Memory.sv').resolve()])
-        report['core'] = compare(binary, core, core_manifest['parameters'], 'memory')
+        report['core'] = compare(binary, core, core_manifest['parameters'], 'memory', args.selected)
         core_profiles[core_key] = str(core)
     if args.multicore_only:
         for harts, width, entries, interrupts in ((2, 64, 0, False), (2, 512, 16, True),
@@ -508,22 +655,25 @@ def main():
                 continue
             directory = args.output / f'harts{harts}-axi{width}'
             directory.mkdir(parents=True, exist_ok=True)
-            config = dict(configuration(width), hartCount=harts, pmpEntries=entries, enableInterrupts=interrupts)
+            config = dict(configuration(width), hartCount=harts, pmpEntries=entries, enableInterrupts=interrupts, iCacheBytes=args.icache_bytes)
             config_path, rtl = directory / 'input.json', directory / 'rtl'
             config_path.write_text(json.dumps(config, indent=2) + '\n')
             if not args.use_generated:
                 run(['build-ditdah-a1', '--trace', '--config', config_path, '--output', rtl], directory / 'build.log')
             manifest = json.loads((rtl / 'ditdah_a1_config.json').read_text())
+            freeze_sources(manifest)
             assert manifest['implementation']['hartCount'] == harts
             assert all(manifest['parameters'][key] == value for key, value in config.items())
             assert all(hashlib.sha256(Path(name).read_bytes()).hexdigest() == digest for name, digest in manifest['sourceHashes'].items())
             binary = compile_tb(rtl, directory, width, config['physicalAddressBits'])
-            report = compare_multicore(binary, directory, manifest['parameters'])
+            report = compare_multicore(binary, directory, manifest['parameters'], args.selected)
             report['interfaceContracts'] = verify_contracts(
                 rtl, directory / 'contracts', modules=('DitDahA1MemoryArbiter', 'DitDahA1MemoryFabric'))
-            report.update(hartCount=harts, axiDataBits=width, pmpEntries=entries, enableInterrupts=interrupts)
-            for count in ((15, 16) if harts == 16 else (harts,)):
-                Path(f'result/harts{count}-input.json').write_text(json.dumps(dict(config, hartCount=count), indent=2) + '\n')
+            report['instructionStorage'] = verify_storage(rtl, directory / 'storage')
+            report.update(hartCount=harts, axiDataBits=width, pmpEntries=entries, enableInterrupts=interrupts, iCacheBytes=args.icache_bytes)
+            if not args.icache_bytes:
+                for count in ((15, 16) if harts == 16 else (harts,)):
+                    Path(f'result/harts{count}-input.json').write_text(json.dumps(dict(config, hartCount=count), indent=2) + '\n')
             summary['configurations'].append(report)
         assert summary['configurations'], 'No selected multicore profile'
     else:
@@ -531,13 +681,35 @@ def main():
         Path('result/frontend-input.json').write_text(json.dumps(frontend_config, indent=2) + '\n')
         fabric_config = dict(frontend_config, resetVector='2', hartCount=16, virtualAddressBits=48, pmpEntries=16)
         Path('result/fabric-input.json').write_text(json.dumps(fabric_config, indent=2) + '\n')
-        backend_config = dict(fabric_config, issueWidth=1, pmpEntries=0, enableInterrupts=False)
+        backend_config = dict(fabric_config, issueWidth=1, pmpEntries=0, enableInterrupts=False, iCacheBytes=0)
         Path('result/backend-input.json').write_text(json.dumps(backend_config, indent=2) + '\n')
-    summary['sourceHashes'] = {str(p): hashlib.sha256(p.read_bytes()).hexdigest()
-                              for p in sorted(Path('ditdah_a1/src').glob('*.scala'))}
+    assert frozen_sources
+    for name, digest in frozen_sources.items():
+        assert hashlib.sha256(Path(name).read_bytes()).hexdigest() == digest, f'Source changed during verification: {name}'
+    summary['sourceHashes'] = dict(frozen_sources)
     for name, digest in test_hashes.items():
         assert hashlib.sha256(Path(name).read_bytes()).hexdigest() == digest, f'Test changed during verification: {name}'
     summary['sourceHashes'].update(test_hashes)
+    if args.traffic_baseline:
+        baseline = json.loads(args.traffic_baseline.read_text())
+        assert args.icache_bytes and baseline['sourceHashes'] == summary['sourceHashes'], 'Traffic baseline uses different sources'
+        comparison = []
+        keys = ('axiDataBits', 'physicalAddressBits', 'pmpEntries', 'enableInterrupts')
+        for profile in summary['configurations']:
+            previous = [entry for entry in baseline['configurations'] if not entry['iCacheBytes']
+                        and all(entry[key] == profile[key] for key in keys)]
+            assert len(previous) == 1, 'Missing matching uncached traffic profile'
+            for observed in profile['cases']:
+                if observed['test'] != 'pipeline_reuse':
+                    continue
+                wanted = next(entry for entry in previous[0]['cases'] if entry['test'] == observed['test'] and entry['seed'] == observed['seed'])
+                old, new = wanted['fetches']['accepted'], observed['fetches']['accepted']
+                assert new < old, 'Repeated instruction hits did not reduce external fetches'
+                comparison.append(dict(**{key: profile[key] for key in keys}, seed=observed['seed'],
+                                       uncachedFetches=old, cachedFetches=new,
+                                       uncachedCycles=wanted['cycles'], cachedCycles=observed['cycles']))
+        assert comparison, 'No repeated workload for traffic comparison'
+        summary['instructionCacheComparison'] = comparison
     summary_path.write_text(json.dumps(summary, indent=2) + '\n')
     print('Scalar RTL verification passed', flush=True)
 

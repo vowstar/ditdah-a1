@@ -28,5 +28,6 @@ object DitDahA1Commit extends Generator[DitDahA1Parameter, DitDahA1UnitLayers, D
       out.rdWrite := false.B
       out.csrWrite := false.B
       out.mret := false.B
+      out.fenceI := false.B
     }
     when(io.input.bits.rd === 0.U(5)) { out.rdWrite := false.B }

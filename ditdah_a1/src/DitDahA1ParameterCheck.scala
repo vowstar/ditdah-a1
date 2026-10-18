@@ -76,7 +76,9 @@ object DitDahA1ParameterCheck:
     rejects { rtl.copy(pmpEntries = 64).validateRtl() }
     rejects { rtl.copy(pmpEntries = 64).validateFrontend() }
     rejects { rtl.copy(pmpEntries = 64).validateBackend() }
-    rejects { rtl.copy(iCacheBytes = 8192).validateRtl() }
+    for bytes <- Seq(0, 8192, 16384, 32768, 65536) do rtl.copy(iCacheBytes = bytes).validateRtl()
+    rejects { rtl.copy(dCacheBytes = 8192).validateRtl() }
+    rejects { rtl.copy(l2CacheBytes = 131072).validateRtl() }
     rejects { rtl.copy(memoryRegions = Seq.empty).validateRtl() }
     rejects { rtl.copy(memoryRegions = Seq(MemoryRegion(executable = false))).validateRtl() }
     rejects { rtl.copy(memoryRegions = Seq(MemoryRegion(base = (BigInt(1) << 56) - 8, size = 16))); () }

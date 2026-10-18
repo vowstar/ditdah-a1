@@ -175,6 +175,8 @@ class Model:
                 self.access((a + offset) & MASK, 8, 'write', b)
             elif opcode == 0x2f and funct3 == 3 and insn >> 27 == 0:
                 value, write = self.access(a, 8, 'atomic', b), True
+            elif opcode == 0x0f and funct3 in (0, 1):
+                pass
             elif opcode == 0x73 and funct3 in (1, 2):
                 address = insn >> 20
                 update = funct3 == 1 or rs1 != 0

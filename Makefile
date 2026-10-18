@@ -1,9 +1,10 @@
 # SPDX-FileCopyrightText: 2026 Huang Rui <vowstar@gmail.com>
 # SPDX-License-Identifier: MIT
 
-.PHONY: config check rtl verify-signoff verify-simulation verify-production verify-formal clean
+.PHONY: config check rtl verify-signoff verify-simulation verify-production verify-cache verify-formal clean
 
 HART_COUNTS ?= 2 3 15 16
+ICACHE_CASES := pipeline_reuse cache_replacement fence_ordering fence_i_prefetch synchronization atomic_ordering atomic_denied atomic_retry bus_fetch pipeline_redirect pmp_fetch pmp_update interrupt_fence interrupt_fence_i interrupt_fetch_fault
 
 config:
 	configure-ditdah-a1 --output result/ditdah_a1_config.json
@@ -36,12 +37,19 @@ verify-production: verify-simulation
 	for count in $(HART_COUNTS); do build-ditdah-a1 --config result/harts$$count-input.json --output result/production-harts$$count || exit $$?; done
 	python3 test/check_production.py --harts $(HART_COUNTS)
 
-verify-formal: verify-production
+verify-cache: verify-production
+	python3 test/verify.py --icache-bytes 8192 --width 64 --width 512 --output result/icache --traffic-baseline result/verify/summary.json $(foreach name,$(ICACHE_CASES),--case $(name))
+	python3 test/verify.py --icache-bytes 8192 --multicore-only --output result/icache-multicore $(foreach count,$(filter-out 15,$(HART_COUNTS)),--harts $(count)) --case synchronization --case atomic --case atomic_interrupt --case protection --case interrupt
+	python3 test/verify.py --icache-bytes 65536 --width 64 --pmp-entries 0 --output result/icache-large --case pipeline_reuse --case synchronization --case fence_i_prefetch
+
+verify-formal: verify-cache
 	python3 test/formal.py
 	python3 test/formal.py --rtl result/production-pmp16 --output result/formal/pmp16
 	python3 test/formal.py --rtl result/verify/pmp16-axi64/rtl --output result/formal/pmp16-pa32 --modules Pmp Axi
 	python3 test/formal.py --rtl result/production-irq --output result/formal/irq --modules InterruptCsr InterruptBackend
 	python3 test/formal.py --rtl result/verify/irq-axi64/rtl --output result/formal/irq-pa32 --modules InterruptCsr InterruptBackend
+	python3 test/formal.py --rtl result/icache/axi64/rtl --output result/formal/icache-pa32 --modules InstructionCache SynchronizationBackend
+	python3 test/formal.py --rtl result/icache/irq-pmp16-axi512/rtl --output result/formal/icache --modules InstructionCache SynchronizationBackend
 	for count in $(HART_COUNTS); do python3 test/formal.py --rtl result/production-harts$$count --output result/formal/harts$$count --modules MemoryArbiter || exit $$?; done
 
 clean:

@@ -15,20 +15,22 @@ Hart count and cache sizes describe configurations of the same model.
 | Multiprocessing | One to sixteen harts with hardware cache coherence |
 | Integration | Burst-capable AXI4 and JTAG debug |
 
-The executable RTL has one to sixteen RV64 harts, M mode, an overlapped single-issue pipeline, uncached AXI4,
-and precise synchronous exceptions. The generated configuration manifest lists the 15 implemented instructions.
+The executable RTL has one to sixteen RV64 harts, M mode, an overlapped single-issue pipeline, shared AXI4,
+and precise synchronous exceptions. The generated configuration manifest lists the 17 implemented instructions.
 PMP is configurable to zero or sixteen entries per hart; the default uncached configuration omits it.
 Machine software, timer, and external interrupts are optional synchronous level inputs.
 MUL uses an iterative resource; accepted operations retain their instruction owner through completion or cancellation draining.
 The complete target ISA is not implemented.
-Caches, MMU, dual issue, and coherence remain design targets.
+Data caches, MMU, dual issue, and coherence remain design targets.
 Core composes Frontend and Backend; Frontend owns PC sequencing and Backend owns execution and retirement.
 Non-fault Backend packets contain four-byte instructions and word-aligned PCs; producers supply fetch faults.
-Core exposes separate instruction/data memory ports; the physical fabric owns arbitration, region checks, and AXI.
+Core exposes separate instruction/data memory ports; the physical fabric owns shared arbitration and AXI.
+Instruction permissions apply before cache lookup and to each refill word; region checks also protect external accesses.
 Harts share one outstanding physical transaction with round-robin arbitration and retained response ownership.
 AXI data width is configurable to 64/128/256/512 bits; scalar requests remain at most eight bytes.
 AMOADD.D uses one memory request, AXI exclusive retry, and one old-value response; data accesses preserve program order for all aq/rl combinations.
 This does not implement the complete A or Zaamo extension.
+FENCE preserves ordered data completion; FENCE.I restarts local instruction fetching and invalidates the optional private instruction cache.
 
 ## Development
 
@@ -54,6 +56,8 @@ The default physical map is 64 KiB of RAM at zero; configure regions for the int
 Set a region's `atomic` flag only for readable, writable, non-device memory with end-to-end exclusive monitoring of every competing writer.
 The flag defaults to false; unsupported exclusive reads fault, failed exclusive writes retry, and bus errors fault without retry or rollback guarantees.
 Completion requires eventual bus responses and successful exclusive access; contention can delay all harts on the shared fabric.
+Set `iCacheBytes` to zero for bypass or a power of two from 8 to 64 KiB for a blocking, direct-mapped instruction cache with 64-byte lines.
+Data remains uncached; refills use individually authorized four-byte requests, and non-demand refill faults fall back to the original demand.
 Set `pmpEntries` to 16 to enable protection; successful PMP writes restart younger execution while accepted fetches drain.
 Set `enableInterrupts` to true for precise machine interrupt entry and return; platform logic owns interrupt sources.
 System interrupt inputs are indexed by hart; each hart has independent CSR and PMP state.
@@ -66,7 +70,8 @@ Enabled configurations additionally check PMP decisions, CSR locks, and cancella
 Interrupt checks cover CSR eligibility, saved PC, transaction ownership, and independently modeled architectural events.
 Multicore checks use per-hart instruction models and shared memory ordered by bus service; arbiter proofs check ownership and bounded overtaking.
 Atomic checks include independent interference, failed-write suppression, returned old values, publication ordering, and AXI retry/error safety.
-They include reachable scenarios and mutations that must fail; general multiply results are checked by simulation.
+Instruction-cache control proofs abstract memory read values; array geometry, storage behavior and instruction publication are checked separately.
+Reachability and mutation checks exercise the properties; general multiply results are checked by simulation.
 This checks the implemented instruction subset, not full ISA compliance or physical signoff.
 Use `make verify-signoff VERIFY_ARGS=--use-generated` to reuse RTL whose recorded sources and configuration still match.
 

@@ -39,31 +39,32 @@ object DitDahA1Execute extends Generator[DitDahA1Parameter, DitDahA1UnitLayers, 
     out.rdWrite := d.writesRd
     out.value := 0.U(64)
     out.nextPc := sequential
-    out.load := (op === Ld.U(4)) | (op === AmoaddD.U(4))
-    out.store := (op === Sd.U(4)) | (op === AmoaddD.U(4))
+    out.load := (op === Ld.U(operationBits)) | (op === AmoaddD.U(operationBits))
+    out.store := (op === Sd.U(operationBits)) | (op === AmoaddD.U(operationBits))
     out.address := addImm
     out.storeData := b
     out.csrAddress := io.csrAddress
-    out.csrWrite := (op === Csrrw.U(4)) | ((op === Csrrs.U(4)) & (d.rs1 =/= 0.U(5)))
-    out.csrData := (op === Csrrs.U(4)).?((io.csrValue.asBits | a.asBits).asUInt, a)
-    out.mret := op === Mret.U(4)
-    when(op === Lui.U(4)) { out.value := imm }
-    when(op === Auipc.U(4)) { out.value := pcImm }
-    when(op === Addi.U(4)) { out.value := addImm }
-    when(op === Add.U(4)) { out.value := (a + b).asBits.bits(63, 0).asUInt }
-    when((op === Csrrw.U(4)) | (op === Csrrs.U(4))) { out.value := io.csrValue }
-    val jump = (op === Jal.U(4)) | (op === Jalr.U(4))
-    val taken = jump | ((op === Beq.U(4)) & (a === b))
-    val target = (op === Jalr.U(4)).?((addImm.asBits.bits(63, 1) ## 0.B(1)).asUInt, pcImm)
+    out.csrWrite := (op === Csrrw.U(operationBits)) | ((op === Csrrs.U(operationBits)) & (d.rs1 =/= 0.U(5)))
+    out.csrData := (op === Csrrs.U(operationBits)).?((io.csrValue.asBits | a.asBits).asUInt, a)
+    out.mret := op === Mret.U(operationBits)
+    out.fenceI := op === FenceI.U(operationBits)
+    when(op === Lui.U(operationBits)) { out.value := imm }
+    when(op === Auipc.U(operationBits)) { out.value := pcImm }
+    when(op === Addi.U(operationBits)) { out.value := addImm }
+    when(op === Add.U(operationBits)) { out.value := (a + b).asBits.bits(63, 0).asUInt }
+    when((op === Csrrw.U(operationBits)) | (op === Csrrs.U(operationBits))) { out.value := io.csrValue }
+    val jump = (op === Jal.U(operationBits)) | (op === Jalr.U(operationBits))
+    val taken = jump | ((op === Beq.U(operationBits)) & (a === b))
+    val target = (op === Jalr.U(operationBits)).?((addImm.asBits.bits(63, 1) ## 0.B(1)).asUInt, pcImm)
     when(taken) { out.nextPc := target }
     when(jump) { out.value := sequential }
     when(!insn.fault) {
-      when((op === Illegal.U(4)) | (((op === Csrrw.U(4)) | (op === Csrrs.U(4))) & (!io.csrLegal | (out.csrWrite & (io.csrAddress.asBits.bits(11, 10) === 3.B(2)))))) {
+      when((op === Illegal.U(operationBits)) | (((op === Csrrw.U(operationBits)) | (op === Csrrs.U(operationBits))) & (!io.csrLegal | (out.csrWrite & (io.csrAddress.asBits.bits(11, 10) === 3.B(2)))))) {
         out.instruction.fault := true.B
         out.instruction.cause := 2.U(64)
         out.instruction.tval := insn.instruction
       }
-      when(op === Ecall.U(4)) {
+      when(op === Ecall.U(operationBits)) {
         out.instruction.fault := true.B
         out.instruction.cause := 11.U(64)
         out.instruction.tval := 0.U(64)

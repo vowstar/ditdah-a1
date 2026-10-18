@@ -7,6 +7,7 @@ import argparse
 import re
 import json
 import subprocess
+from contracts import verify_storage
 
 parser = argparse.ArgumentParser()
 parser.add_argument('--harts', type=int, nargs='+', choices=(2, 3, 15, 16), default=[2])
@@ -30,6 +31,10 @@ for directory, top in (*tops, *((directory + '-pmp16', top) for directory, top i
     assert manifest['implementation']['hartCount'] == (count if top == 'DitDahA1' else int(top == 'DitDahA1Core'))
     assert manifest['implementation']['fabricRequesters'] == (2 * manifest['parameters']['hartCount'] if top in ('DitDahA1', 'DitDahA1MemoryFabric') else 0)
     files = (rtl / "filelist.f").read_text().splitlines()
+    cache_bytes = manifest['parameters']['iCacheBytes'] if top in ('DitDahA1', 'DitDahA1Core', 'DitDahA1Frontend') else 0
+    assert manifest['implementation']['iCacheBytes'] == cache_bytes
+    assert ('DitDahA1InstructionCache.sv' in files) == bool(cache_bytes), 'Instruction cache bypass or module mismatch'
+    verify_storage(rtl, rtl / 'storage-check')
     assert files and all("DV" not in name and not name.startswith("ref_") for name in files)
     assert not list(rtl.glob("*DV*.sv")) and not list(rtl.glob("ref_*.sv"))
     header = (rtl / (top + ".sv")).read_text().split(");", 1)[0]
@@ -57,7 +62,7 @@ directory = Path('result/component-checks')
 directory.mkdir(exist_ok=True)
 parameters = json.loads(Path('result/production/ditdah_a1_config.json').read_text())['parameters']
 for index, (top, overrides, diagnostic) in enumerate((
-        ('DitDahA1', {'iCacheBytes': 8192}, 'RTL supports uncached memory'),
+        ('DitDahA1', {'dCacheBytes': 8192}, 'RTL supports uncached data memory'),
         ('DitDahA1', {'hartCount': 0}, 'hartCount must be between 1 and 16'),
         ('DitDahA1', {'hartCount': 17}, 'hartCount must be between 1 and 16'),
         ('DitDahA1Core', {'pmpEntries': 64}, 'RTL supports zero or sixteen PMP entries'),

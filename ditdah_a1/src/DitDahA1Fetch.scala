@@ -14,6 +14,7 @@ class DitDahA1FetchIO(parameter: DitDahA1Parameter) extends HWBundle(parameter):
   val request = Flipped(new Decoupled(new FetchRequest))
   val output = Aligned(new Decoupled(new FetchPacket))
   val cancel = Flipped(Bool())
+  val invalidate = Option.when(parameter.iCacheBytes != 0)(Flipped(Bool()))
   val memory = Aligned(new MemoryPort)
 
 @generator
@@ -26,17 +27,28 @@ object DitDahA1Fetch extends Generator[DitDahA1Parameter, DitDahA1UnitLayers, Di
     val state = RegInit(0.U(2))
     val packet = Reg(new FetchPacket)
     val killed = RegInit(false.B)
-    val request = io.memory.request
-    val response = io.memory.response
+    val cache = Option.when(parameter.iCacheBytes != 0)(DitDahA1InstructionCache.instantiate(parameter))
+    val memory = cache.map(_.io.upstream).getOrElse(io.memory)
+    val request = memory.request
+    val response = memory.response
     val permitted = if parameter.pmpEntries == 0 then true.B else
       val pmp = DitDahA1Pmp.instantiate(parameter)
       pmp.io.state :<= io.pmp.get
-      pmp.io.address := io.request.bits.pc
+      pmp.io.address := cache.map(c => (state === 0.U(2)).?(io.request.bits.pc, c.io.checkAddress)).getOrElse(io.request.bits.pc)
       pmp.io.size := 2.U(3)
       pmp.io.write := false.B
       pmp.io.fetch := true.B
       pmp.io.atomic := false.B
       pmp.io.allowed
+    cache.foreach { c =>
+      c.io.clock := io.clock
+      c.io.reset := io.reset
+      c.io.cancel := io.cancel
+      c.io.invalidate := io.invalidate.get
+      c.io.allowed := permitted & DitDahA1Memory.executable(parameter, c.io.checkAddress, 4)
+      io.memory :<>= c.io.downstream
+    }
+    val demandPermitted = if cache.isDefined then permitted & DitDahA1Memory.executable(parameter, io.request.bits.pc, 4) else permitted
     io.request.ready := (state === 0.U(2)) & !io.cancel
     io.output.valid := (state === 3.U(2)) & !killed & !io.cancel
     io.output.bits :<= packet
@@ -60,8 +72,8 @@ object DitDahA1Fetch extends Generator[DitDahA1Parameter, DitDahA1UnitLayers, Di
       packet.tval := 0.U(64)
       killed := false.B
       state := 1.U(2)
-      if parameter.pmpEntries != 0 then
-        when(!permitted) {
+      if parameter.pmpEntries != 0 || cache.isDefined then
+        when(!demandPermitted) {
           packet.fault := true.B
           packet.cause := 1.U(64)
           packet.tval := io.request.bits.pc
@@ -69,7 +81,7 @@ object DitDahA1Fetch extends Generator[DitDahA1Parameter, DitDahA1UnitLayers, Di
         }
       when(io.request.bits.pc.asBits.bits(1, 0) =/= 0.B(2)) {
         packet.fault := true.B
-        if parameter.pmpEntries != 0 then packet.cause := 0.U(64)
+        packet.cause := 0.U(64)
         packet.tval := io.request.bits.pc
         state := 3.U(2)
       }

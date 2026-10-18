@@ -8,8 +8,37 @@ import re
 import random
 import subprocess
 
-from programs import addi, csr, sd, mul, ld
+from programs import addi, csr, sd, mul, ld, fence
 from model import Model, pmp_allowed
+
+
+def verify_storage(rtl, directory):
+    manifest = json.loads((rtl / 'ditdah_a1_config.json').read_text())
+    size = manifest['implementation']['iCacheBytes']
+    files = (rtl / 'filelist.f').read_text().splitlines()
+    arrays = [file for file in files if file.startswith(('instructions_', 'tags_'))]
+    assert ('DitDahA1InstructionCache.sv' in files) == bool(size)
+    expected = {} if not size else {'instructions': (size // 4, 32),
+        'tags': (size // 64, manifest['parameters']['physicalAddressBits'] - (size // 64).bit_length() - 5)}
+    assert set(arrays) == {f'{name}_{depth}x{width}.sv' for name, (depth, width) in expected.items()}
+    report = []
+    directory.mkdir(parents=True, exist_ok=True)
+    for name, (depth, width) in expected.items():
+        module = f'{name}_{depth}x{width}'
+        netlist = directory / (module + '.json')
+        command = f'read_verilog "{(rtl / (module + ".sv")).resolve()}"; hierarchy -top {module}; proc; memory_collect; write_json "{netlist.resolve()}"'
+        result = subprocess.run(['yosys', '-Q', '-T', '-p', command], capture_output=True, text=True, timeout=30)
+        (directory / (module + '.log')).write_text(result.stdout + result.stderr)
+        assert result.returncode == 0, 'Storage structure elaboration failed'
+        cells = json.loads(netlist.read_text())['modules'][module]['cells'].values()
+        memories = [cell for cell in cells if cell['type'] == '$mem_v2']
+        assert len(memories) == 1 and all(int(memories[0]['parameters'][key], 2) == value
+                                        for key, value in (('SIZE', depth), ('WIDTH', width))), 'Storage geometry mismatch'
+        state = sum(len(cell['connections']['Q']) for cell in cells if cell['type'].startswith('$dff'))
+        assert state <= 3 * width + 4 * depth.bit_length(), 'Storage expanded into word registers'
+        report.append(dict(array=name, depth=depth, width=width, registerBits=state))
+    (directory / 'summary.json').write_text(json.dumps(report, indent=2) + '\n')
+    return report
 
 
 FETCH = r'''
@@ -201,15 +230,20 @@ def decode_contract():
              (0x30200073, 0, 0, 0), (0xffffffff, 0, 0, 0))
     cases += ((mul(6, 5, 7), 1, 1, 1), (mul(6, 5, 7) | (1 << 12), 0, 0, 0))
     cases += tuple((0x0072b32f | (ordering << 25), 1, 1, 1) for ordering in range(4))
+    cases += tuple((fence(instruction, reserved), 0, 0, 0) for instruction in (False, True)
+                   for reserved in (0, 0x83328880, 0xffff8f80))
+    cases += ((0x200f, 0, 0, 0), (0x700f, 0, 0, 0))
     body = '    input_valid = 1; output_ready = 1;\n'
     for word, rs1, rs2, rd in cases:
-        serial = int(word in (0x34029373, 0x3402a373, 0x30200073))
+        serial = int(word in (0x34029373, 0x3402a373, 0x30200073) or word & 0x707f in (0x0f, 0x100f))
         body += (f"    input_bits_instruction = 32'h{word:08x};\n"
                  f'    check(output_valid && input_ready && output_bits_usesRs1 == {rs1} && output_bits_usesRs2 == {rs2} && output_bits_writesRd == {rd} && output_bits_serializing == {serial}, "Decode dependency metadata {word:08x}");\n')
     return body + '''    input_bits_instruction = 32'h00728333; input_bits_fault = 1;
     check(!output_bits_usesRs1 && !output_bits_usesRs2 && !output_bits_writesRd, "Faulting instruction dependencies");
     input_bits_instruction = 32'h34029373;
     check(!output_bits_usesRs1 && !output_bits_writesRd && !output_bits_serializing, "Faulting CSR serialization");
+    input_bits_instruction = 32'h0000100f;
+    check(!output_bits_usesRs1 && !output_bits_usesRs2 && !output_bits_writesRd && !output_bits_serializing, "Faulting instruction synchronization");
 '''
 
 
@@ -405,6 +439,70 @@ def frontend_contract(parameters):
     tick();
     check(memory_request_valid && memory_request_bits_address == 64'h{base+0x200:x} && memory_request_bits_tag == 3, "Redirect priority over output consumption");
 '''
+
+
+def cached_fetch_contract(parameters, frontend=False):
+    base = int(parameters['resetVector'])
+    line = base if frontend else base + 0x100
+
+    def request(address, tag):
+        return f'''    request_bits_pc = 'h{address:x}; request_bits_tag = {tag}; request_valid = 1;
+    #1; while (!request_ready) tick(); tick(); request_valid = 0;
+'''
+
+    def respond(address, value, fault=0):
+        return f'''    while (!memory_request_valid) begin check(!output_valid, "Incomplete cache refill escaped"); tick(); end
+    check(memory_request_bits_address == 'h{address:x} && memory_request_bits_size == 2 && memory_request_bits_fetch && !memory_request_bits_write && !memory_request_bits_atomic, "Cache refill address and attributes");
+    memory_response_bits_tag = memory_request_bits_tag;
+    memory_request_ready = 1; tick(); memory_request_ready = 0;
+    memory_response_valid = 1; memory_response_bits_data = {value}; memory_response_bits_fault = {fault};
+    check(memory_response_ready, "Cache response ownership"); tick(); memory_response_valid = 0; memory_response_bits_fault = 0;
+'''
+
+    def refill(address):
+        return '    for (integer beat = 0; beat < 16; beat++) begin\n' + respond(
+            address, "32'h10000000 + beat").replace(f"memory_request_bits_address == 'h{address:x}", f"memory_request_bits_address == ('h{address:x} + 4 * beat)") + '    end\n'
+
+    def output(address, value, fault=0):
+        return f'''    while (!output_valid) tick();
+    repeat (3) begin
+      check(output_valid && output_bits_pc == 'h{address:x} && output_bits_instruction == {value} && output_bits_fault == {fault} && !memory_request_valid, "Cache output retention"); tick();
+    end
+    output_ready = 1; tick(); output_ready = 0;
+'''
+
+    body = '' if frontend else request(line + 4, 21)
+    body += refill(line) + output(line if frontend else line + 4, "32'h10000000" if frontend else "32'h10000001")
+    if frontend:
+        body += output(line + 4, "32'h10000001")
+        body += f'''    redirect = 1; invalidate = 1; redirectPc = 'h{base + 0x100:x}; tick(); redirect = 0; invalidate = 0;
+'''
+        return body + refill(base + 0x100) + output(base + 0x100, "32'h10000000")
+    body += request(line + 8, 22) + output(line + 8, "32'h10000002")
+    if parameters['pmpEntries']:
+        body += f"    pmp_config = 'h90; pmp_address = 'h{(line + 8) >> 2:x};\n"
+        body += request(line + 8, 23) + output(line + 8, '0', 1)
+        body += '    pmp_config = 0; pmp_address = 0;\n'
+    body += '    cancel = 1; invalidate = 1; tick(); cancel = 0; invalidate = 0;\n'
+    if parameters['pmpEntries']:
+        body += f"    pmp_config = 'h90; pmp_address = 'h{(line + 4) >> 2:x};\n"
+        body += request(line + 8, 24) + respond(line, "32'h10000000") + respond(line + 8, "32'habcdef13")
+        body += output(line + 8, "32'habcdef13") + '    pmp_config = 0; pmp_address = 0;\n'
+    body += request(line + 8, 24) + respond(line, '0', 1) + respond(line + 8, "32'habcdef13")
+    body += output(line + 8, "32'habcdef13")
+    body += request(line + 8, 25)
+    body += f'''    while (!memory_request_valid) tick();
+    check(memory_request_bits_address == 'h{line:x}, "Faulting refill allocated a line");
+    cancel = 1; invalidate = 1; tick(); cancel = 0; invalidate = 0;
+    repeat (3) begin check(memory_request_valid && memory_request_bits_address == 'h{line:x} && !output_valid, "Cancelled cache request stability"); tick(); end
+'''
+    body += respond(line, "32'h10000000")
+    body += '    while (!request_ready) begin check(!output_valid, "Cancelled cache output escaped"); tick(); end\n'
+    body += request(line, 26) + respond(line, '0', 1) + output(line, '0', 1)
+    for address, cause in ((line + 2, 0), (base + 0x6000, 1)):
+        body += request(address, 27) + output(address, '0', 1)
+        body += f'    check(output_bits_cause == {cause}, "Local instruction authorization fault");\n'
+    return body
 
 
 def fabric_contract(parameters):
@@ -640,6 +738,43 @@ def backend_interrupt_contract():
     return body
 
 
+def backend_fence_contract():
+    def send(word, pc, tag):
+        return f'''    instruction_bits_pc = 'h{pc:x}; instruction_bits_instruction = 'h{word:x};
+    instruction_bits_tag = {tag}; instruction_valid = 1;
+    while (!instruction_ready) tick(); tick(); instruction_valid = 0;
+'''
+
+    body = ''
+    for instruction in (False, True):
+        body += '''    reset = 1; tick(); reset = 0; tick();
+    instruction_bits_length = 4; instruction_bits_fault = 0; instruction_valid = 0;
+    data_request_ready = 0; data_response_valid = 0; data_response_bits_fault = 0;
+'''
+        body += send(addi(1, 0, 0x400), 0x100, 1) + '    repeat (8) tick();\n'
+        body += send(addi(2, 0, 19), 0x104, 2) + '    repeat (8) tick();\n'
+        body += send(sd(2, 1), 0x108, 3) + send(fence(instruction), 0x10c, 4)
+        body += '''    while (!data_request_valid) begin check(!redirect, "Synchronization preceded older store"); tick(); end
+    repeat (4) begin check(data_request_valid && !redirect, "Synchronization withdrew blocked store"); tick(); end
+    data_request_ready = 1; tick(); data_request_ready = 0;
+    repeat (4) begin check(!redirect, "Synchronization preceded store response"); tick(); end
+    data_response_bits_tag = 3; data_response_valid = 1; tick(); data_response_valid = 0;
+'''
+        if instruction:
+            body += '''    while (!redirect) tick();
+    check(!status_trap && redirectPc == 'h110 && !data_request_valid, "Instruction synchronization restart"); tick();
+'''
+        body += '    repeat (12) begin check(!redirect && !data_request_valid, "Repeated synchronization effect"); tick(); end\n'
+    body += '''    reset = 1; tick(); reset = 0; tick();
+    instruction_bits_fault = 1; instruction_bits_cause = 1; instruction_bits_tval = 'h200;
+''' + send(fence(True), 0x200, 5) + '''    while (!redirect) tick();
+    check(status_trap && redirectPc == 0 && !data_request_valid, "Fault overrides instruction synchronization"); tick();
+    instruction_bits_fault = 0; instruction_bits_cause = 0; instruction_bits_tval = 0;
+    repeat (8) begin check(!redirect && !data_request_valid, "Faulting synchronization side effects"); tick(); end
+'''
+    return body
+
+
 def bench(module, body):
     header = module.read_text().split(');', 1)[0].split('(', 1)[1]
     declarations, connections, names = [], [], []
@@ -871,12 +1006,13 @@ def verify(rtl, directory, modules=None):
     parameters = json.loads((rtl / 'ditdah_a1_config.json').read_text())['parameters']
     verified = []
     enabled = parameters['pmpEntries'] != 0
-    suites = (('DitDahA1Fetch', FETCH + (protection_contract(True) if enabled else '')),
+    cached = bool(parameters['iCacheBytes'])
+    suites = (('DitDahA1Fetch', cached_fetch_contract(parameters) if cached else FETCH + (protection_contract(True) if enabled else '')),
                        ('DitDahA1Lsu', LSU + (protection_contract(False) if enabled else '')),
                        ('DitDahA1Multiply', multiply_contract()),
-                       ('DitDahA1Frontend', frontend_contract(parameters)),
+                       ('DitDahA1Frontend', cached_fetch_contract(parameters, True) if cached else frontend_contract(parameters)),
                        ('DitDahA1Decode', decode_contract()),
-                       ('DitDahA1Backend', backend_contract() + (backend_protection_contract() if enabled else '') +
+                       ('DitDahA1Backend', backend_contract() + backend_fence_contract() + (backend_protection_contract() if enabled else '') +
                         (backend_interrupt_contract() if parameters['enableInterrupts'] else '')),
                        ('DitDahA1MemoryArbiter', arbiter_contract(parameters)),
                        ('DitDahA1Memory', memory_contract(parameters)),
@@ -900,6 +1036,10 @@ def verify(rtl, directory, modules=None):
         test.write_text(bench(module, body))
         binary = directory / name
         dependencies = [rtl / 'DitDahA1Fetch.sv'] if name == 'DitDahA1Frontend' else []
+        if cached and name in ('DitDahA1Fetch', 'DitDahA1Frontend'):
+            dependencies.append(rtl / 'DitDahA1InstructionCache.sv')
+            dependencies += [rtl / file for file in (rtl / 'filelist.f').read_text().splitlines()
+                             if file.startswith(('instructions_', 'tags_'))]
         if name == 'DitDahA1MemoryFabric':
             dependencies = [rtl / (child + '.sv') for child in ('DitDahA1MemoryArbiter', 'DitDahA1Memory', 'DitDahA1Axi')]
         if name == 'DitDahA1Backend':

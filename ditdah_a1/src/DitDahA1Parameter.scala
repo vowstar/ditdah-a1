@@ -57,7 +57,7 @@ case class DitDahA1Parameter(
   def validateRtl(): Unit =
     validateCore()
     require(virtualAddressBits == 0, "RTL supports Bare addressing")
-    require(iCacheBytes == 0 && dCacheBytes == 0 && l2CacheBytes == 0, "RTL supports uncached memory")
+    require(dCacheBytes == 0 && l2CacheBytes == 0, "RTL supports uncached data memory")
     require(memoryRegions.exists(r => r.executable && resetVector >= r.base && resetVector + 4 <= r.base + r.size), "Reset vector must be in executable memory")
 
   val xlen: Int = 64

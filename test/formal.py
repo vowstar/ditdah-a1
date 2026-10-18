@@ -459,11 +459,335 @@ def interrupt_cases(parameters):
       cover(takeInterrupt_layerCapture && executePending);
       cover(takeInterrupt_layerCapture && $past(commit_output_valid_layerCapture && irq_memory_commit));
       cover(irq_service_age == 3 && takeInterrupt_layerCapture);
+      cover(takeInterrupt_layerCapture && issuedValid && issuedPacket_decoded_instruction_instruction[6:0] == 7'h0f);
+      cover(_csr_interruptPending && memoryPending && decodedValid && decodedPacket_instruction_instruction[6:0] == 7'h0f);
     end
   end
 '''
     return [('InterruptCsr', csr, 'status[3]\n    &', "1'h1\n    &"),
             ('InterruptBackend', backend, '_csr_interruptPending & ~memoryPending', '_csr_interruptPending')]
+
+
+def synchronization_case(parameters):
+    body = r'''
+  reg sync_past = 0, sync_memory_owned, sync_bus_owned, sync_sent, sync_replied;
+  reg sync_barrier_owned, sync_prior_memory, sync_after_fence;
+  reg [63:0] sync_memory_pc, sync_barrier_pc;
+  reg [7:0] sync_memory_tag, sync_barrier_tag;
+  function sync_encoding(input [31:0] word);
+    sync_encoding = word[6:0] == 7'h0f && word[14:12] <= 1;
+  endfunction
+  wire sync_decoded = decodedValid && !decodedPacket_instruction_fault &&
+    sync_encoding(decodedPacket_instruction_instruction);
+  wire sync_retired = commit_output_valid_layerCapture &&
+    sync_encoding(commitPacket_instruction_instruction);
+  wire sync_memory_retired = commit_output_valid_layerCapture && (commitPacket_load || commitPacket_store);
+  wire [63:0] sync_sequential = commitPacket_instruction_pc + commitPacket_instruction_length;
+  always @(posedge clock) begin
+    sync_past <= 1;
+    if (!sync_past) assume(reset); else assume(!reset);
+    if (reset) begin
+      sync_memory_owned <= 0; sync_bus_owned <= 0; sync_sent <= 0; sync_replied <= 0;
+      sync_barrier_owned <= 0; sync_prior_memory <= 0; sync_after_fence <= 0;
+    end else begin
+      assert(memoryPending == (data_request_valid || data_response_ready || _lsu_output_valid));
+      assert(data_response_ready == sync_bus_owned);
+      assert(!sync_replied || sync_sent);
+      if (sync_bus_owned) assert(sync_sent && !sync_replied);
+      if (data_request_valid) assert(sync_memory_owned && !sync_sent && !sync_replied);
+      if (memoryPending) assert(sync_memory_owned);
+      if (lsu_input_valid && _lsu_input_ready) begin
+        assert(!sync_memory_owned && !sync_barrier_owned);
+        sync_memory_owned <= 1; sync_sent <= 0; sync_replied <= 0;
+        sync_memory_pc <= resultPacket_instruction_pc;
+        sync_memory_tag <= resultPacket_instruction_tag;
+      end
+      if (data_request_valid && data_request_ready) begin
+        assert(sync_memory_owned && !sync_bus_owned && !sync_barrier_owned);
+        sync_bus_owned <= 1; sync_sent <= 1;
+      end
+      if (data_response_valid && data_response_ready) begin
+        assert(sync_memory_owned && sync_bus_owned);
+        sync_bus_owned <= 0; sync_replied <= 1;
+      end
+      if (sync_memory_retired && sync_memory_owned) begin
+        assert(!sync_bus_owned && (!sync_sent || sync_replied));
+        assert(commitPacket_instruction_pc == sync_memory_pc && commitPacket_instruction_tag == sync_memory_tag);
+        assert(sync_sent || commitPacket_instruction_fault);
+        sync_memory_owned <= 0; sync_prior_memory <= 1;
+      end
+      if (sync_memory_owned) begin
+        assert(memoryPending || (commitValid && (commitPacket_load || commitPacket_store)));
+        if (memoryPending) begin
+          assert(resultValid && resultPacket_instruction_pc == sync_memory_pc && resultPacket_instruction_tag == sync_memory_tag);
+          assert(!commitValid);
+          assert(_lsu_output_bits_load || _lsu_output_bits_store);
+          assert(_lsu_output_bits_instruction_pc == sync_memory_pc && _lsu_output_bits_instruction_tag == sync_memory_tag);
+        end
+        if (sync_sent) assert(sync_replied != sync_bus_owned);
+      end
+      if (sync_bus_owned) assert(sync_memory_owned && memoryPending);
+      if (decodedValid) assert((decodedPacket_operation == 17) ==
+        (sync_encoding(decodedPacket_instruction_instruction) && decodedPacket_instruction_instruction[12]));
+      if (issuedValid) assert((issuedPacket_decoded_operation == 17) ==
+        (sync_encoding(issuedPacket_decoded_instruction_instruction) && issuedPacket_decoded_instruction_instruction[12]));
+      if (resultValid) assert(resultPacket_fenceI ==
+        (sync_encoding(resultPacket_instruction_instruction) && resultPacket_instruction_instruction[12]));
+      if (commitValid) assert(commitPacket_fenceI ==
+        (sync_encoding(commitPacket_instruction_instruction) && commitPacket_instruction_instruction[12]));
+      if (memoryPending) assert(!_lsu_output_bits_fenceI);
+      if (sync_decoded) begin
+        assert(decodedPacket_operation == (decodedPacket_instruction_instruction[12] ? 17 : 16));
+        assert(decodedPacket_serializing && !decodedPacket_usesRs1 && !decodedPacket_usesRs2 && !decodedPacket_writesRd);
+        if (issued) begin
+          assert(!sync_memory_owned && !sync_bus_owned && !issuedValid && !resultValid && !commitValid);
+          assert(!sync_barrier_owned);
+          sync_barrier_owned <= 1;
+          sync_barrier_pc <= decodedPacket_instruction_pc;
+          sync_barrier_tag <= decodedPacket_instruction_tag;
+        end
+      end
+      if (issuedValid && !issuedPacket_decoded_instruction_fault && sync_encoding(issuedPacket_decoded_instruction_instruction)) begin
+        assert(sync_barrier_owned);
+        assert(issuedPacket_decoded_operation == (issuedPacket_decoded_instruction_instruction[12] ? 17 : 16));
+        assert(!issuedPacket_decoded_writesRd);
+      end
+      if (resultValid && !resultPacket_instruction_fault && sync_encoding(resultPacket_instruction_instruction)) begin
+        assert(sync_barrier_owned && !resultPacket_load && !resultPacket_store && !resultPacket_rdWrite && !resultPacket_csrWrite && !resultPacket_mret);
+        assert(resultPacket_fenceI == resultPacket_instruction_instruction[12]);
+        assert(resultPacket_nextPc == resultPacket_instruction_pc + resultPacket_instruction_length);
+      end
+      if (commitValid && !commitPacket_instruction_fault && sync_encoding(commitPacket_instruction_instruction)) begin
+        assert(sync_barrier_owned && !commitPacket_load && !commitPacket_store && !commitPacket_rdWrite && !commitPacket_csrWrite && !commitPacket_mret);
+        assert(commitPacket_fenceI == commitPacket_instruction_instruction[12]);
+        assert(commitPacket_nextPc == sync_sequential);
+      end
+      if (memoryPending) assert(!sync_encoding(_lsu_output_bits_instruction_instruction));
+      if (sync_barrier_owned) begin
+        assert(!sync_memory_owned && !sync_bus_owned && !data_request_valid && !lsu_input_valid);
+        assert((issuedValid && sync_encoding(issuedPacket_decoded_instruction_instruction) && !issuedPacket_decoded_instruction_fault) ||
+          (resultValid && sync_encoding(resultPacket_instruction_instruction) && !resultPacket_instruction_fault) ||
+          (commitValid && sync_encoding(commitPacket_instruction_instruction) && !commitPacket_instruction_fault));
+        if (issuedValid && sync_encoding(issuedPacket_decoded_instruction_instruction) && !issuedPacket_decoded_instruction_fault)
+          assert(issuedPacket_decoded_instruction_pc == sync_barrier_pc && issuedPacket_decoded_instruction_tag == sync_barrier_tag);
+        if (resultValid && sync_encoding(resultPacket_instruction_instruction) && !resultPacket_instruction_fault)
+          assert(resultPacket_instruction_pc == sync_barrier_pc && resultPacket_instruction_tag == sync_barrier_tag);
+        if (commit_output_valid_layerCapture) begin
+          assert(sync_retired && !commitPacket_instruction_fault);
+          assert(commitPacket_instruction_pc == sync_barrier_pc && commitPacket_instruction_tag == sync_barrier_tag);
+        end
+      end
+      if (sync_retired) begin
+        assert(!sync_memory_owned && !sync_bus_owned);
+        assert(!commit_output_bits_rdWrite_layerCapture && !_commit_output_bits_csrWrite && !_commit_output_bits_mret);
+        if (!commitPacket_instruction_fault) begin
+          assert(sync_barrier_owned);
+          assert(commit_output_bits_nextPc_layerCapture == sync_sequential);
+          assert(_commit_output_bits_fenceI == commitPacket_instruction_instruction[12]);
+          if (commitPacket_instruction_instruction[12])
+            assert(redirect_0 && redirectPc == sync_sequential && !data_request_valid && !issued && !executed);
+          else begin
+            assert(!redirect_0);
+            sync_after_fence <= 1;
+          end
+        end else assert(!_commit_output_bits_fenceI);
+        sync_barrier_owned <= 0;
+      end
+      if (redirect_0) sync_barrier_owned <= 0;
+      if (sync_past && $past(!reset && sync_retired && !commitPacket_instruction_fault &&
+          commitPacket_instruction_instruction[12]))
+        assert(!decodedValid && !issuedValid && !resultValid && !commitValid);
+      cover(sync_decoded && sync_memory_owned && data_request_valid && !data_request_ready);
+      cover(sync_decoded && sync_bus_owned && !data_response_valid);
+      cover(sync_prior_memory && sync_retired && !commitPacket_instruction_fault && !commitPacket_instruction_instruction[12]);
+      cover(sync_prior_memory && sync_retired && !commitPacket_instruction_fault && commitPacket_instruction_instruction[12]);
+      cover(sync_barrier_owned && issuedValid && issuedPacket_decoded_instruction_instruction[6:0] == 7'h23);
+      cover(sync_after_fence && data_request_valid && data_request_ready);
+      cover(sync_retired && commitPacket_instruction_fault && commitPacket_instruction_instruction[12]);
+    end
+  end
+'''
+    if parameters.get('enableInterrupts'):
+        body += '''  always @(posedge clock) if (!reset) begin
+    if (takeInterrupt_layerCapture) assert(!sync_memory_owned && !sync_bus_owned);
+  end
+'''
+    if parameters.get('iCacheBytes'):
+        body += '''  always @(posedge clock) if (!reset) begin
+    assert(invalidate == (commit_output_valid_layerCapture &&
+      ((sync_retired && !commitPacket_instruction_fault && commitPacket_instruction_instruction[12]) || PMP_UPDATE)));
+    if (invalidate) assert(redirect_0);
+  end
+'''.replace('PMP_UPDATE', 'pmpUpdate' if parameters['pmpEntries'] else "1'h0")
+    return ('SynchronizationBackend', body, '| _commit_output_bits_fenceI', "| 1'h0 & _commit_output_bits_fenceI")
+
+
+def instruction_cache_case(parameters):
+    index_bits = (parameters['iCacheBytes'] // 64 - 1).bit_length()
+    body = r'''
+  reg cache_past = 0, cache_owned, cache_bus, cache_killed, cache_authorized, cache_sent, cache_fault;
+  reg [63:0] cache_address, cache_permission, cache_beat;
+  reg [7:0] cache_tag;
+  reg [15:0] cache_filled;
+  (* anyconst *) reg [INDEX-1:0] cache_watched;
+  wire cache_reply = downstream_response_valid && downstream_response_ready;
+  wire cache_error = downstream_response_bits_fault || downstream_response_bits_tag != cache_tag;
+  wire cache_abort = cache_killed || cancel || invalidate;
+  always @(posedge clock) begin
+    cache_past <= 1;
+    if (!cache_past) assume(reset); else assume(!reset);
+    assume(!invalidate || cancel);
+    if (upstream_request_valid) assume(upstream_request_bits_address[1:0] == 0);
+    if (reset) begin
+      cache_owned <= 0; cache_bus <= 0; cache_killed <= 0; cache_authorized <= 0;
+      cache_filled <= 0; cache_sent <= 0; cache_fault <= 0;
+    end else begin
+      assert(state <= 5 && cache_owned == (state != 0) && cache_bus == downstream_response_ready);
+      if (cache_owned) assert(address == cache_address && tag == cache_tag && killed == cache_killed &&
+        fault == cache_fault && cache_address[1:0] == 0);
+      if (cache_bus) assert(cache_beat == (bypass ? cache_address : {cache_address[63:6], word, 2'b0}));
+      assert(filling_0 == (cache_reply && !cache_error && !bypass && !cache_abort));
+      if (upstream_request_valid && upstream_request_ready) begin
+        assert(!cache_owned && !cache_bus);
+        cache_owned <= 1; cache_address <= upstream_request_bits_address; cache_tag <= upstream_request_bits_tag;
+        cache_killed <= cancel || invalidate; cache_authorized <= 0;
+        cache_filled <= 0; cache_sent <= 0; cache_fault <= 0;
+      end
+      if (cache_owned && (cancel || invalidate)) cache_killed <= 1;
+      if (state == 2 && allowed && !cache_abort) begin
+        cache_authorized <= 1; cache_permission <= checkAddress;
+      end
+      if (downstream_request_valid) begin
+        assert(cache_owned && cache_authorized && !cache_bus);
+        assert(downstream_request_bits_address == cache_permission && downstream_request_bits_tag == cache_tag);
+        assert(downstream_request_bits_fetch && !downstream_request_bits_write && !downstream_request_bits_atomic);
+        assert(downstream_request_bits_size == 2 && downstream_request_bits_mask == 0 && downstream_request_bits_data == 0);
+      end
+      if (downstream_request_valid && downstream_request_ready) begin
+        cache_bus <= 1; cache_sent <= 1; cache_authorized <= 0;
+        cache_beat <= downstream_request_bits_address;
+      end
+      if (cache_reply) begin
+        assert(cache_owned && cache_bus);
+        cache_bus <= 0;
+        if (!cache_abort && !cache_error && !bypass) cache_filled[cache_beat[5:2]] <= 1;
+        if (!cache_abort && cache_error && cache_beat == cache_address) cache_fault <= 1;
+      end
+      if (state == 2 && !allowed && !cache_abort && checkAddress == cache_address) cache_fault <= 1;
+      if (state >= 2 && state <= 4 && !bypass && !cache_killed)
+        assert(cache_filled == ((16'h1 << word) - 1));
+      if (upstream_response_valid) begin
+        assert(cache_owned && !cache_bus && !downstream_request_valid);
+        assert(upstream_response_bits_tag == cache_tag && upstream_response_bits_fault == cache_fault);
+        if (upstream_response_ready) cache_owned <= 0;
+      end
+      if (cache_past && $past(!reset)) begin
+        if ($past(invalidate)) assert(valid == 0);
+        if (valid[cache_watched] && !$past(valid[cache_watched]))
+          assert($past(cache_reply && !cache_error && !cache_abort && !bypass &&
+            cache_beat[INDEX+5:6] == cache_watched && cache_filled == 16'h7fff && word == 15));
+        if ($past(downstream_request_valid && !downstream_request_ready)) begin
+          assert(downstream_request_valid);
+          assert($stable({downstream_request_bits_address, downstream_request_bits_tag, downstream_request_bits_size,
+            downstream_request_bits_data, downstream_request_bits_mask, downstream_request_bits_fetch,
+            downstream_request_bits_write, downstream_request_bits_atomic}));
+        end
+        if ($past(upstream_response_valid && !upstream_response_ready)) begin
+          assert(upstream_response_valid);
+          assert($stable({upstream_response_bits_data, upstream_response_bits_fault, upstream_response_bits_tag}));
+        end
+        if ($past(cache_reply && !cache_abort && cache_error && cache_beat != cache_address))
+          assert(bypass && state == 2 && checkAddress == cache_address && !upstream_response_valid);
+        if ($past(state == 2 && !cache_abort && !allowed && checkAddress != cache_address))
+          assert(bypass && state == 2 && checkAddress == cache_address && !downstream_request_valid);
+      end
+      cover(upstream_response_valid && !cache_fault && cache_filled == 16'hffff);
+      cover(upstream_response_valid && !cache_fault && !cache_sent && !cache_killed);
+      cover(downstream_request_valid && !downstream_request_ready && cancel);
+      cover(cache_bus && cancel && !downstream_response_valid);
+      cover(cache_reply && word == 15 && invalidate && !cache_error);
+      cover(bypass && state == 2 && !allowed);
+      cover(upstream_response_valid && cache_fault && cache_sent);
+      cover(upstream_response_valid && cache_killed && !upstream_response_ready);
+    end
+  end
+'''.replace('INDEX', str(index_bits))
+    return ('InstructionCache', body, ': ~filling | abort | responseFault | bypass | ~complete',
+            ': ~filling | responseFault | bypass | ~complete')
+
+
+def synchronization_witness(parameters, mode):
+    body = r'''
+  (* anyconst *) reg [2:0] sync_scenario;
+  reg [1:0] sync_packet = 0;
+  reg sync_stalled = 0, sync_waited = 0;
+  always @(posedge clock) if (!reset) begin
+    if (instruction_valid && instruction_ready && sync_packet != 3) sync_packet <= sync_packet + 1;
+    if (data_request_valid && !data_request_ready) sync_stalled <= 1;
+    sync_waited <= sync_bus_owned;
+  end
+  always @* begin
+    assume(sync_scenario < 4 && instruction_valid && instruction_bits_length == 4 && instruction_bits_tag == 0);
+    assume(instruction_bits_pc == RESET_PC);
+    assume(instruction_bits_fault == (sync_scenario == 2 && sync_packet == 0));
+    assume(instruction_bits_instruction == (sync_packet == 0 ?
+      (sync_scenario >= 2 ? 32'h0000100f : 32'h00003023) :
+      sync_packet == 1 ? (sync_scenario == 0 ? 32'h0000000f : 32'h0000100f) : 32'h00003023));
+    assume(data_request_ready == (sync_scenario != 0 || sync_stalled));
+    assume(data_response_valid == (sync_bus_owned && (sync_scenario != 0 || sync_waited)));
+    assume(data_response_bits_tag == 0 && !data_response_bits_fault && data_response_bits_data == 0);
+  end
+'''.replace('RESET_PC', f"64'h{int(parameters['resetVector']):x}")
+    if parameters.get('enableInterrupts'):
+        body += '''  always @* begin
+    assume(!interrupts_external && !interrupts_timer && !interrupts_software);
+  end
+'''
+    scenario = {'mutation': 3, 'mutation-serialization': 0, 'mutation-flag': 3,
+                'mutation-fault': 2, 'mutation-order': 0}.get(mode)
+    if scenario is not None:
+        body += f'  always @* assume(sync_scenario == {scenario});\n'
+    return body
+
+
+def interrupt_witness(parameters, mode):
+    body = r'''
+  (* anyconst *) reg [2:0] irq_scenario;
+  (* anyconst *) reg irq_delay;
+  reg [1:0] irq_setup = 0, irq_packet = 0;
+  reg irq_stalled = 0, irq_latched = 0, irq_redirected = 0;
+  wire irq_initializing = irq_setup != 3;
+  wire [1:0] irq_limit = irq_scenario == 3 || irq_scenario == 4 ? 2 : 1;
+  always @(posedge clock) if (!reset) begin
+    if (instruction_valid && instruction_ready) begin
+      if (irq_initializing) irq_setup <= irq_setup + 1;
+      else if (irq_packet != 3) irq_packet <= irq_packet + 1;
+    end
+    if (data_request_valid && !data_request_ready) irq_stalled <= 1;
+    if (irq_memory_owned) irq_latched <= 1;
+    if (takeInterrupt_layerCapture) begin irq_latched <= 0; irq_redirected <= 1; end
+  end
+  always @* begin
+    assume(irq_scenario <= 5 && instruction_bits_length == 4 && instruction_bits_tag == 0 && !instruction_bits_fault);
+    assume(instruction_bits_pc == RESET_PC);
+    assume(instruction_valid == (irq_initializing || irq_packet < irq_limit || irq_redirected));
+    assume(instruction_bits_instruction == (irq_initializing ?
+      (irq_setup == 0 ? 32'h00800093 : irq_setup == 1 ? 32'h30409073 : 32'h30009073) :
+      irq_redirected ? 32'h00000013 : irq_packet == 0 ?
+      (irq_scenario == 1 ? 32'h0010302f : irq_scenario == 2 ? 32'h02108133 : irq_scenario == 5 ? 32'h0000100f : 32'h00103023) :
+      irq_scenario == 3 ? 32'h02108133 : 32'h0000100f));
+    assume(data_request_ready == (irq_stalled || (irq_scenario != 0 && irq_scenario != 4)));
+    assume(data_response_valid == (data_response_ready && (irq_scenario != 3 || _multiply_output_valid)));
+    assume(data_response_bits_tag == 0 && !data_response_bits_fault && data_response_bits_data == 0);
+    assume(!interrupts_external && !interrupts_timer);
+    assume(interrupts_software == (irq_memory_owned || irq_latched ||
+      (owned && (!irq_delay || _multiply_output_valid)) ||
+      (irq_scenario == 5 && issuedValid && issuedPacket_decoded_instruction_instruction[6:0] == 7'h0f)));
+  end
+'''.replace('RESET_PC', f"64'h{int(parameters['resetVector']):x}")
+    if mode.startswith('mutation'):
+        body += f"  always @* assume(irq_scenario == {0 if mode == 'mutation' else 2});\n"
+    return body
 
 
 def arbiter_case(parameters):
@@ -702,7 +1026,9 @@ def verify(rtl, directory, modules=None):
             ('Fetch', FETCH, '& ~killed & ~cancel', '& ~cancel'),
             ('Multiply', MULTIPLY, '~busy & ~valid', '~valid'),
             ('Backend', BACKEND, '(~issuedValid | executed) & ~executePending & ~redirect_0', '(~issuedValid | executed) & ~redirect_0'))
-    cases = [*cases, arbiter_case(manifest['parameters']), axi_case(manifest['parameters'])]
+    cases = [*cases, synchronization_case(manifest['parameters']), arbiter_case(manifest['parameters']), axi_case(manifest['parameters'])]
+    if manifest['parameters'].get('iCacheBytes'):
+        cases.append(instruction_cache_case(manifest['parameters']))
     if manifest['parameters'].get('enableInterrupts'):
         cases = [*cases, *interrupt_cases(manifest['parameters'])]
     assert not modules or set(modules) <= {case[0] for case in cases}, 'Unsupported proof selection'
@@ -711,7 +1037,7 @@ def verify(rtl, directory, modules=None):
             continue
         if modules and name not in modules and not (name.startswith('Pmp') and 'Pmp' in modules):
             continue
-        unit = name.removeprefix('Interrupt')
+        unit = name.removeprefix('Interrupt').removeprefix('Synchronization')
         if unit == 'Csr':
             body += "\n  always @* if (readAddress == 12'hf14) assert(legal && readData == {60'd0, hartId});\n"
         module = 'DitDahA1' + ('Pmp' if name == 'PmpDecode' else unit)
@@ -719,10 +1045,15 @@ def verify(rtl, directory, modules=None):
             module = 'formal_interval'
             files = {module + '.sv': license + 'module formal_interval(input [64:0] low, high, input [63:0] address, input [2:0] size);\nendmodule\n'}
         else:
-            files = dict(sources) if unit == 'Backend' else {module + '.sv': sources[module + '.sv']}
+            files = dict(sources) if unit in ('Backend', 'InstructionCache') else {module + '.sv': sources[module + '.sv']}
+        if unit == 'InstructionCache':
+            for filename in files:
+                match = re.fullmatch(r'(?:instructions|tags)_\d+x(\d+)\.sv', filename)
+                if match:
+                    files[filename] = license + header(sources[filename]) + f'\n(* anyseq *) reg [{int(match[1])-1}:0] arbitrary_read;\nassign R0_data = arbitrary_read;\nendmodule\n'
         if enabled and unit in ('Fetch', 'Lsu', 'Backend'):
             files['DitDahA1Pmp.sv'] = license + header(sources['DitDahA1Pmp.sv']) + '\n(* anyseq *) reg permit;\nassign allowed = permit;\nendmodule\n'
-        if unit in ('Backend', 'Multiply', 'Csr', 'MemoryArbiter', 'Axi') or enabled:
+        if unit in ('Backend', 'Multiply', 'Csr', 'MemoryArbiter', 'Axi', 'InstructionCache') or enabled:
             if unit == 'Backend':
                 files['DitDahA1Multiply.sv'] = license + header(sources['DitDahA1Multiply.sv']) + RESOURCE + 'endmodule\n'
             if name == 'InterruptBackend':
@@ -760,30 +1091,31 @@ def verify(rtl, directory, modules=None):
         if name == 'Pmp':
             checks += [('mutation-atomic-read', 'state_config[0] & state_config[1]', 'state_config[1]'),
                        ('mutation-atomic-write', 'state_config[0] & state_config[1]', 'state_config[0]')]
-        for mode, before, after in checks:
+        if name == 'SynchronizationBackend':
+            checks += [('mutation-serialization', 'assign output_bits_serializing =',
+                        "assign output_bits_serializing = 1'h0 &", 'DitDahA1Decode.sv'),
+                       ('mutation-flag', 'assign output_bits_fenceI =',
+                        "assign output_bits_fenceI = 1'h0 &", 'DitDahA1Execute.sv'),
+                       ('mutation-fault', '~input_bits_instruction_fault & input_bits_fenceI',
+                        'input_bits_fenceI', 'DitDahA1Commit.sv'),
+                       ('mutation-order', '~memoryOperation | memoryPending & _lsu_output_valid', "1'h1")]
+        if unit == 'InstructionCache':
+            checks += [('mutation-hold', 'assign downstream_request_valid = downstream_request_valid_0;',
+                        'assign downstream_request_valid = downstream_request_valid_0 & ~cancel;'),
+                       ('mutation-word', "word <= word + 4'h1;", "word <= word + 4'h2;"),
+                       ('mutation-invalidate', 'invalidate\n          ?', "1'h0\n          ?"),
+                       ('mutation-denied', '_GEN_10 & ~(abort | allowed) & _GEN_12', "1'h0")]
+        for check in checks:
+            mode, before, after, *target = check
+            mutated_file = target[0] if target else module + '.sv'
             mutating = mode.startswith('mutation')
             work = directory / f'{name.lower()}-{mode}'
             work.mkdir(exist_ok=True)
             for filename, text in files.items():
+                if name == 'SynchronizationBackend' and mode != 'prove' and filename == module + '.sv':
+                    text = text.replace('endmodule', synchronization_witness(manifest['parameters'], mode) + '\nendmodule', 1)
                 if name == 'InterruptBackend' and mode != 'prove' and filename == module + '.sv':
-                    # Legal initialization narrows witness search, never the safety proof.
-                    prefix = '''
-  reg [1:0] setup_count = 0;
-  always @(posedge clock) if (!reset) begin
-    assume(!instruction_bits_fault && instruction_bits_length == 4 && instruction_bits_tag == 0);
-    assume(instruction_bits_pc == 64'h100 + {62'd0, setup_count} * 4);
-    if (setup_count != 3) begin
-      assume(instruction_valid);
-      assume(instruction_bits_instruction == (setup_count == 0 ? 32'h00800093 :
-        setup_count == 1 ? 32'h30409073 : 32'h30009073));
-      if (instruction_ready) setup_count <= setup_count + 1;
-    end else assume(instruction_bits_instruction == 32'h02108133 || instruction_bits_instruction == 32'h00103023 ||
-      instruction_bits_instruction == 32'h0010302f ||
-      instruction_bits_instruction == 32'h00000113 || instruction_bits_instruction == 0);
-  end
-'''
-                    prefix = prefix.replace("64'h100", f"64'h{int(manifest['parameters']['resetVector']):x}")
-                    text = text.replace('endmodule', prefix + '\nendmodule', 1)
+                    text = text.replace('endmodule', interrupt_witness(manifest['parameters'], mode) + '\nendmodule', 1)
                 if unit == 'MemoryArbiter' and mode != 'prove' and filename == module + '.sv':
                     guidance = ''.join(f'    assume(ports_{i}_request_valid);\n' + ''.join(
                         f"    assume(ports_{i}_request_bits_{field} == 0);\n"
@@ -815,19 +1147,44 @@ def verify(rtl, directory, modules=None):
   end
 '''
                     text = text.replace('endmodule', guidance + '\nendmodule', 1)
-                if mutating and filename == module + '.sv':
+                if unit == 'InstructionCache' and mode != 'prove' and filename == module + '.sv':
+                    scenario = {'mutation': 7, 'mutation-hold': 1, 'mutation-word': 0,
+                                'mutation-invalidate': 6, 'mutation-denied': 3}.get(mode)
+                    guidance = '''
+  (* anyconst *) reg [2:0] cache_scenario;
+  reg cache_waited = 0;
+  always @(posedge clock) cache_waited <= !reset && cache_bus;
+  always @* begin
+    assume(cache_scenario <= SCENARIO_MAX);
+    assume(upstream_request_valid && upstream_request_bits_address == 0 && upstream_request_bits_tag == 0);
+    assume(upstream_response_ready == (cache_scenario != 1));
+    assume(downstream_request_ready == (cache_scenario != 1 || killed || state != 3));
+    assume(downstream_response_valid == (cache_bus && (cache_scenario != 1 || cache_waited)));
+    assume(downstream_response_bits_tag == 0 && _tags_ext_R0_data == 0);
+    assume(downstream_response_bits_fault == (cache_scenario == 4 || (cache_scenario == 5 && word == 1 && !bypass)));
+    assume(allowed == !(cache_scenario == 3 && word == 1));
+    assume(invalidate == ((cache_scenario == 2 && state == 4 && word == 15) || (cache_scenario == 6 && valid != 0)));
+    assume(cancel == ((cache_scenario == 1 && (state == 3 || state == 4)) ||
+      (cache_scenario == 7 && state == 4 && word == 15) || invalidate));
+  end
+'''
+                    guidance = guidance.replace('SCENARIO_MAX', '4' if scenario is None else '7')
+                    if scenario is not None:
+                        guidance += f'  always @* assume(cache_scenario == {scenario});\n'
+                    text = text.replace('endmodule', guidance + '\nendmodule', 1)
+                if mutating and filename == mutated_file:
                     assert text.count(before) == (2 if name == 'Csr' else 1), (name, before)
                     text = text.replace(before, after, 1)
                 (work / filename).write_text(text)
             task = 'bmc' if mutating else mode
             if mode == 'mutation' and name == 'Fetch':
                 task = 'prove'
-            engine = 'abc pdr' if task == 'prove' and unit not in ('Multiply', 'Pmp', 'PmpDecode', 'PmpInterval', 'Csr', 'Axi') else 'smtbmc z3'
+            engine = 'abc pdr' if task == 'prove' and unit not in ('Multiply', 'Pmp', 'PmpDecode', 'PmpInterval', 'Csr', 'Axi', 'InstructionCache') and name != 'SynchronizationBackend' else 'smtbmc z3'
             timeout = 180 if name == 'InterruptBackend' and task == 'cover' else 60
             witness_option = 'aigsmt z3\n' if engine == 'abc pdr' else ''
             preparation = (f'hierarchy -check -top {top}\nproc\nflatten\nopt_expr -keepdc\nopt_clean\nwreduce\nopt_clean\ncheck'
                            if name.startswith('Pmp') else f'prep -top {top} -flatten')
-            depth = 6 * manifest['parameters']['hartCount'] + 8 if unit == 'MemoryArbiter' else 72 if task == 'cover' else 1 if name.startswith('Pmp') else (3 if task == 'prove' else 8) if unit == 'Csr' else 4 if name in ('Multiply', 'Axi') and task == 'prove' else 24
+            depth = 6 * manifest['parameters']['hartCount'] + 8 if unit == 'MemoryArbiter' else 72 if task == 'cover' or (unit == 'InstructionCache' and mode in ('mutation', 'mutation-invalidate')) else 1 if name.startswith('Pmp') else (3 if task == 'prove' else 8) if unit == 'Csr' else 4 if name in ('Multiply', 'Axi', 'SynchronizationBackend', 'InstructionCache') and task == 'prove' else 24
             config = f'''[options]
 mode {task}
 depth {depth}
@@ -843,6 +1200,7 @@ read -formal -sv {' '.join(files)}
             with (work / 'run.log').open('w') as log:
                 result = subprocess.run(['sby', '-f', '-d', 'proof', 'check.sby'], cwd=work, env=proof_env, stdout=log, stderr=subprocess.STDOUT, timeout=timeout + 30)
             assert 'multiple conflicting drivers' not in (work / 'run.log').read_text(), 'Conflicting proof drivers'
+            assert 'is implicitly declared' not in (work / 'run.log').read_text(), 'Undeclared proof signal'
             status_file = work / 'proof/status'
             assert status_file.exists(), (work / 'run.log').read_text()[-3000:]
             status = status_file.read_text().split()[0]
@@ -864,9 +1222,13 @@ read -formal -sv {' '.join(files)}
         assumptions='initial reset, then no reset except CSR proofs; Fetch responses require accepted requests and stable blocked payloads; enabled control proofs abstract combinational authorization',
         pmpComposition='Pmp uses independently proved PmpInterval identities and PmpDecode request spans; no table-value restrictions' if 'Pmp' in proved else None,
         backendAbstraction='arbitrary multiply result and completion delay under the separately proved resource protocol',
+        synchronization='raw barrier encodings, independent accepted-data ownership until retirement, sequential instruction synchronization redirect and younger flush; no data response timing assumptions' if 'SynchronizationBackend' in proved else None,
+        synchronizationWitnessGuidance='cover/mutations only: aligned zero-address SD, FENCE/FENCE.I, one request and response stall, faulted FENCE.I and quiescent interrupts; unrestricted safety proof' if 'SynchronizationBackend' in proved else None,
+        instructionCache='control proof at configured geometry; arbitrary native SRAM read outputs; independent upstream/downstream ownership, authorization, cancellation drain, full-fill publication, invalidation and precise fallback; functional array contents require separate simulation' if 'InstructionCache' in proved else None,
+        cacheWitnessGuidance='cover/mutations only: zero-address demand, successful service, canceled stalls, last-beat/post-fill invalidation, permission denial and demand/speculative fault scenarios; unrestricted safety proof' if 'InstructionCache' in proved else None,
         arbitration='one retained request and owner; at most 2N-1 other completions while continuously requesting; no bound on external service delay' if 'MemoryArbiter' in proved else None,
         interruptProgress='with eligibility held, successful matching data response reaches interrupt entry or priority synchronous trap within three cycles; memory service itself is external' if any(r['propertyGroup'] == 'InterruptBackend' for r in reports) else None,
-        witnessGuidance='InterruptBackend cover/mutations use ADDI and mie/mstatus initialization, then ADDI/MUL/SD/AMOADD.D/illegal packets at aligned fixed PCs and tag zero; unrestricted proof' if any(r['propertyGroup'] == 'InterruptBackend' for r in reports) else None,
+        witnessGuidance='InterruptBackend cover/mutations use ADDI and mie/mstatus initialization then SD, AMOADD.D, MUL, SD-to-MUL, SD-to-FENCE.I or FENCE.I, fixed PCs/tag zero, successful data replies, retained request stall and software interrupt scenarios; unrestricted proof' if any(r['propertyGroup'] == 'InterruptBackend' for r in reports) else None,
         arbiterWitnessGuidance='cover/mutations hold all requesters valid with zero payloads, one request stall and one response stall then immediate service; unrestricted proof' if 'MemoryArbiter' in proved else None,
         atomicTransport='independent request and AXI channel ownership; old-value return, exclusive retry and error isolation; no external-memory atomicity or eventual-success theorem' if 'Axi' in proved else None,
         axiAssumptions='initial reset only; atomic inputs are aligned doubleword read-modify-write requests; R requires accepted AR, B requires accepted AW and W; blocked response payloads persist; data, IDs, responses, last and delays unrestricted' if 'Axi' in proved else None,
@@ -880,6 +1242,6 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--rtl', type=Path, default=Path('result/production'))
     parser.add_argument('--output', type=Path, default=Path('result/formal'))
-    parser.add_argument('--modules', nargs='+', choices=('Fetch', 'Multiply', 'Backend', 'Pmp', 'PmpDecode', 'PmpInterval', 'Csr', 'Lsu', 'InterruptCsr', 'InterruptBackend', 'MemoryArbiter', 'Axi'))
+    parser.add_argument('--modules', nargs='+', choices=('Fetch', 'Multiply', 'Backend', 'Pmp', 'PmpDecode', 'PmpInterval', 'Csr', 'Lsu', 'InterruptCsr', 'InterruptBackend', 'SynchronizationBackend', 'InstructionCache', 'MemoryArbiter', 'Axi'))
     args = parser.parse_args()
     verify(args.rtl, args.output, args.modules)

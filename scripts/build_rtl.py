@@ -50,6 +50,7 @@ def main():
         manifest["implementation"]["pmpEntries"] = 0 if scope == "fabric" else manifest["parameters"]["pmpEntries"]
         manifest["implementation"]["pmpState"] = bool(manifest["implementation"]["pmpEntries"] and args.top in ("DitDahA1", "DitDahA1Core", "DitDahA1Backend"))
         manifest["implementation"]["machineInterrupts"] = bool(manifest["parameters"]["enableInterrupts"] and args.top in ("DitDahA1", "DitDahA1Core", "DitDahA1Backend"))
+        manifest["implementation"]["iCacheBytes"] = manifest["parameters"]["iCacheBytes"] if args.top in ("DitDahA1", "DitDahA1Core", "DitDahA1Frontend", "DitDahA1Fetch") else 0
         manifest["sourceHashes"] = hashes
         parameter = work / "parameter.json"
         parameter.write_text(json.dumps(manifest["parameters"]))

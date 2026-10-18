@@ -81,7 +81,7 @@ class FetchPacket extends Bundle:
   val tval = Aligned(UInt(64))
 class DecodedPacket extends Bundle:
   val instruction = Aligned(new FetchPacket)
-  val operation = Aligned(UInt(4))
+  val operation = Aligned(UInt(DitDahA1Isa.operationBits))
   val rs1 = Aligned(UInt(5))
   val rs2 = Aligned(UInt(5))
   val usesRs1 = Aligned(Bool())
@@ -108,6 +108,7 @@ class ResultPacket extends Bundle:
   val csrAddress = Aligned(UInt(12))
   val csrData = Aligned(UInt(64))
   val mret = Aligned(Bool())
+  val fenceI = Aligned(Bool())
 class StatusBundle extends Bundle:
   val trap = Aligned(Bool())
   val busy = Aligned(Bool())
@@ -150,6 +151,7 @@ class DitDahA1CoreIO(parameter: DitDahA1Parameter) extends HWBundle(parameter):
 
 class DitDahA1FrontendIO(parameter: DitDahA1Parameter) extends HWBundle(parameter):
   val pmp = Option.when(parameter.pmpEntries != 0)(Flipped(new PmpState(parameter)))
+  val invalidate = Option.when(parameter.iCacheBytes != 0)(Flipped(Bool()))
   val clock = Flipped(Clock())
   val reset = Flipped(Reset())
   val redirect = Flipped(Bool())
@@ -168,6 +170,7 @@ class DitDahA1BackendIO(parameter: DitDahA1Parameter) extends HWBundle(parameter
   val hartId = Flipped(UInt(4))
   val interrupts = Option.when(parameter.enableInterrupts)(Flipped(new InterruptBundle))
   val pmp = Option.when(parameter.pmpEntries != 0)(Aligned(new PmpState(parameter)))
+  val invalidate = Option.when(parameter.iCacheBytes != 0)(Aligned(Bool()))
   val clock = Flipped(Clock())
   val reset = Flipped(Reset())
   val instruction = Flipped(new Decoupled(new FetchPacket))

@@ -34,6 +34,7 @@ module memory_tb;
     .interrupts_software(irq_levels[0]), .interrupts_timer(irq_levels[1]), .interrupts_external(irq_levels[2]),
 `endif
     .status_trap(status_trap), .status_busy(status_busy), .status_sleep(status_sleep));
+  `include "fetch_observers.svh"
 `ifdef ENABLE_INTERRUPTS
   logic [2:0] irq_levels;
   logic irq_activate, irq_ack = 0, irq_retired = 0;
@@ -44,7 +45,11 @@ module memory_tb;
     0: irq_activate = 1;
     1, 2, 3: irq_activate = core_port[1].request_valid && core_port[1].request.write;
     4: irq_activate = service[1].pending && !service[1].captured.write;
+`ifdef ICACHE
+    5: irq_activate = architectural_fetch_busy[0] && architectural_fetch_pc[0] == irq_target && `CORE_TRACE.pipelineOccupancy == 0;
+`else
     5: irq_activate = service[0].pending && service[0].captured.address == irq_target && `CORE_TRACE.pipelineOccupancy == 0;
+`endif
     6: irq_activate = dut.backend.multiply.busy;
     7: irq_activate = irq_retired;
     8: irq_activate = service[1].pending && service[1].captured.atomic;
@@ -179,6 +184,7 @@ module memory_tb;
         $display("COVER %0d %0d %0d %0d %0d %0d", overlap, service[0].stalls, service[1].stalls,
           service[0].delayed + service[1].delayed, service[0].rejected + service[1].rejected, service[0].wraps);
         $display("PIPELINE %0d %0d", pipeline_max, dependency_stalls);
+        $display("CYCLES %0d", cycles);
         $display("PASS"); $finish;
       end
     end

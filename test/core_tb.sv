@@ -70,6 +70,7 @@ module core_tb;
     `include "core_ports.svh"
     .status_trap(status_trap), .status_busy(status_busy), .status_sleep(status_sleep)
   );
+  `include "fetch_observers.svh"
 `ifdef ENABLE_INTERRUPTS
   logic [2:0] irq_levels;
   wire [2:0] irq_by_hart[HARTS];
@@ -86,13 +87,19 @@ module core_tb;
     2: irq_activate = aw_held && !w_held;
     3: irq_activate = w_held && !aw_held;
     4: irq_activate = read_pending && !read_fetch;
+`ifdef ICACHE
+    5: irq_activate = architectural_fetch_busy[irq_hart] && architectural_fetch_pc[irq_hart] == irq_target && traces[irq_hart].pipelineOccupancy == 0;
+`else
     5: irq_activate = read_pending && read_fetch && read_address == irq_target && traces[irq_hart].pipelineOccupancy == 0;
+`endif
     6: irq_activate = multiply_busy[irq_hart];
     7: irq_activate = irq_retired;
     8: irq_activate = read_pending && read_exclusive && bus_owner / 2 == irq_hart;
+    9: irq_activate = irq_retired && read_pending && !read_fetch && bus_owner / 2 != irq_hart;
     default: irq_activate = 0;
   endcase
-  always @(posedge clock) irq_retired <= !reset && traces[irq_hart].traceValid && traces[irq_hart].tracePc == irq_target;
+  always @(posedge clock) irq_retired <= !reset && ((irq_mode == 9 && irq_retired) ||
+    (traces[irq_hart].traceValid && traces[irq_hart].tracePc == irq_target));
   always @(posedge clock) irq_ack <= !reset && aw_held && w_held && !write_pending && !bvalid && write_address == base_address + 'h5008;
 `endif
   byte unsigned memory [0:65535];
@@ -263,6 +270,7 @@ module core_tb;
       if (&finished) begin
         $display("COVER %0d %0d %0d %0d %0d %0d", aw_first, w_first, together, ar_stall, aw_stall, w_stall);
         $display("PIPELINE %0d %0d", pipeline_max, dependency_stalls);
+        $display("CYCLES %0d", cycles);
         $display("PASS"); $finish;
       end
     end
