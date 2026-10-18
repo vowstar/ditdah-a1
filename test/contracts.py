@@ -8,8 +8,8 @@ import re
 import random
 import subprocess
 
-from programs import addi, csr, sd, mul, ld, fence
-from model import Model, pmp_allowed
+from programs import addi, alu, amo, beq, csr, sd, mul, ld, lw, sw, load, store, fence
+from model import Fault, LocalInterrupts, Model, MASK, atomic_value, pmp_allowed, signed
 
 
 def verify_storage(rtl, directory):
@@ -103,6 +103,7 @@ FETCH = r'''
 '''
 
 LSU = r'''
+    input_bits_memorySize = 3;
     input_bits_instruction_pc = 64'h100;
     input_bits_instruction_instruction = 32'h00003023;
     input_bits_instruction_length = 4;
@@ -169,7 +170,8 @@ LSU = r'''
 
     reset = 1; tick(); reset = 0; tick();
     input_bits_instruction_fault = 0; input_bits_address = 'h1080;
-    input_bits_load = 1; input_bits_store = 1; storeAllowed = 0;
+    input_bits_load = 1; input_bits_store = 1; input_bits_atomic = 1; storeAllowed = 0;
+    input_bits_instruction_instruction = 32'h0020b4af;
     input_bits_storeData = 13; input_bits_rd = 9; input_bits_rdWrite = 1;
     input_valid = 1;
     repeat (3) begin check(!input_ready && !memory_request_valid, "Unauthorized atomic operation"); tick(); end
@@ -186,8 +188,114 @@ LSU = r'''
       check(output_valid && !output_bits_instruction_fault && output_bits_rd == 9 && output_bits_rdWrite && output_bits_value == 7, "Atomic old-value writeback"); tick();
     end
     output_ready = 1; tick(); output_ready = 0;
+    input_bits_load = 0; input_bits_store = 0; input_bits_atomic = 0;
+'''
+for size, unsigned in ((0, 0), (0, 1), (1, 0), (1, 1), (2, 0), (2, 1)):
+    expected = 0x8765c3a1 & ((1 << (8 << size)) - 1)
+    expected = expected if unsigned else signed(expected, 8 << size)
+    LSU += f'''
+    input_bits_memorySize = {size}; input_bits_unsignedLoad = {unsigned};
+    input_bits_address = 'h1004; input_bits_load = 1; input_bits_store = 0;
+    input_bits_rdWrite = 1; input_valid = 1; tick(); input_valid = 0;
+    repeat (3) begin
+      check(memory_request_valid && memory_request_bits_address == 'h1004 && memory_request_bits_size == {size} && memory_request_bits_mask == 0, "Scalar load request"); tick();
+    end
+    memory_response_bits_tag = input_bits_instruction_tag;
+    memory_request_ready = 1; tick(); memory_request_ready = 0;
+    memory_response_bits_data = 64'h123456788765c3a1; memory_response_valid = 1;
+    tick(); memory_response_valid = 0;
+    repeat (3) begin
+      check(output_valid && !output_bits_instruction_fault && output_bits_value == 64'h{expected & MASK:016x}, "Scalar load extension and retention"); tick();
+    end
+    output_ready = 1; tick(); output_ready = 0;
+'''
+for size in range(3):
+    LSU += f'''
+    input_bits_memorySize = {size}; input_bits_address = 'h{0x1000 + (3 if size == 0 else 2 if size == 1 else 4):x}; input_bits_load = 0; input_bits_store = 1;
+    storeAllowed = 1; input_valid = 1; tick(); input_valid = 0; storeAllowed = 0;
+    repeat (3) begin
+      check(memory_request_valid && memory_request_bits_write && memory_request_bits_size == {size} && memory_request_bits_mask == {(1 << (1 << size)) - 1}, "Scalar store mask and retention"); tick();
+    end
+    memory_request_ready = 1; tick(); memory_request_ready = 0;
+    memory_response_bits_data = 0; memory_response_valid = 1; tick(); memory_response_valid = 0;
+    output_ready = 1; tick(); output_ready = 0;
+'''
+LSU += '''
+    input_bits_address = 'h1002; input_bits_load = 1; input_bits_store = 0;
+    input_valid = 1; tick(); input_valid = 0;
+    check(output_valid && output_bits_instruction_fault && output_bits_instruction_cause == 4 && !memory_request_valid, "Word alignment fault");
+    output_ready = 1; tick(); output_ready = 0;
+    input_bits_memorySize = 3; input_bits_unsignedLoad = 0;
     input_bits_load = 0; input_bits_store = 0;
 '''
+
+
+def lsu_reservation_contract(parameters):
+    body, serial = '', 0
+
+    def transfer(operation, address=0x1000, value=0, fault=False, eligible=False, local_fault=0, wrong_tag=False):
+        nonlocal body, serial
+        serial += 1
+        tag = 80 + serial
+        body += f'''    input_bits_atomic = 1; input_bits_instruction_instruction = 32'h{amo(operation, 7, 1, 0 if operation == 2 else 2):x};
+    input_bits_instruction_fault = 0; input_bits_instruction_tag = {tag}; input_bits_memorySize = 3;
+    input_bits_load = {int(operation != 3)}; input_bits_store = {int(operation != 2)};
+    input_bits_address = 64'h{address:x}; input_bits_storeData = 9; input_bits_rd = 7; input_bits_rdWrite = 1;
+    input_valid = 1; storeAllowed = 1; tick(); input_valid = 0; storeAllowed = 0;
+    input_bits_atomic = 0; input_bits_address = 0;
+'''
+        if local_fault:
+            body += f'    check(output_valid && output_bits_instruction_fault && output_bits_instruction_cause == {local_fault} && !memory_request_valid, "Reservation local fault");\n'
+        else:
+            body += f'''    repeat (3) begin
+      check(memory_request_valid && memory_request_bits_atomic && memory_request_bits_atomicOperation == {operation} && memory_request_bits_scEligible == {int(eligible)} && memory_request_bits_address == 64'h{address:x} && memory_request_bits_mask == {0 if operation == 2 else 255}, "Reservation request capture"); tick();
+    end
+    memory_request_ready = 1; tick(); memory_request_ready = 0;
+    memory_response_bits_tag = {tag + int(wrong_tag)}; memory_response_bits_fault = {int(fault)};
+    memory_response_bits_data = 64'h{value:x}; memory_response_valid = 1; tick(); memory_response_valid = 0;
+    repeat (3) begin
+      check(output_valid && output_bits_instruction_fault == {int(fault or wrong_tag)} && output_bits_rd == 7 && output_bits_rdWrite && output_bits_value == 64'h{value:x}, "Reservation result retention"); tick();
+    end
+'''
+            if fault or wrong_tag:
+                body += f'    check(output_bits_instruction_cause == {5 if operation == 2 else 7} && output_bits_instruction_tval == 64\'h{address:x}, "Reservation response fault");\n'
+        body += '    output_ready = 1; tick(); output_ready = 0; memory_response_bits_fault = 0;\n'
+
+    transfer(3, value=1)
+    transfer(2, value=MASK)
+    transfer(3, eligible=True)
+    transfer(3, value=1)
+    transfer(2)
+    transfer(2, 0x1008)
+    transfer(3, value=1)
+    transfer(3, 0x1008, value=1)
+    for fault, wrong_tag in ((True, False), (False, True)):
+        transfer(2, fault=fault, wrong_tag=wrong_tag)
+        transfer(3, value=1)
+    transfer(2)
+    transfer(3, fault=True, eligible=True)
+    transfer(3, value=1)
+    transfer(2)
+    transfer(3, 0x1002, local_fault=6)
+    transfer(3, value=1)
+    transfer(2)
+    transfer(3, (1 << parameters['physicalAddressBits']) + 0x1000, value=1,
+             local_fault=7 if parameters['pmpEntries'] else 0)
+    transfer(3, value=1)
+    for operation in (0, 1, 8):
+        transfer(2)
+        transfer(operation, 0x1008)
+        transfer(3, value=1)
+    transfer(2)
+    body += '    reset = 1; tick(); reset = 0; tick();\n'
+    transfer(3, value=1)
+    if parameters['pmpEntries']:
+        body += "    pmp_config = 'h99; pmp_address = 'h400;\n"
+        transfer(2, value=7)
+        transfer(3, local_fault=7)
+        transfer(0, local_fault=7)
+        body += '    pmp_config = 0; pmp_address = 0;\n'
+    return body + '    input_bits_atomic = 0; input_bits_load = 0; input_bits_store = 0;\n'
 
 
 def arbiter_contract(parameters):
@@ -197,17 +305,20 @@ def arbiter_contract(parameters):
                    f"    ports_{i}_request_bits_data = {0x1000 + i};\n"
                    f"    ports_{i}_request_bits_tag = 7; ports_{i}_request_bits_size = 3;\n"
                    f"    ports_{i}_request_bits_mask = 255; ports_{i}_request_bits_write = {i % 2};\n"
-                   f"    ports_{i}_request_bits_fetch = {1-i % 2}; ports_{i}_request_bits_atomic = {i % 2};\n" for i in range(count))
+                   f"    ports_{i}_request_bits_fetch = {1-i % 2}; ports_{i}_request_bits_atomic = {i % 2};\n"
+                   f"    ports_{i}_request_bits_atomicOperation = {i % 9}; ports_{i}_request_bits_scEligible = {i % 2};\n" for i in range(count))
     no_ready = ' && '.join(f'!ports_{i}_request_ready' for i in range(count))
     for owner in list(range(count)) * 2:
         ready = ' && '.join(f'ports_{i}_request_ready == {int(i == owner)}' for i in range(count))
         response = ' && '.join(f'ports_{i}_response_valid == {int(i == owner)}' for i in range(count))
         body += f'''    check({ready}, "Round-robin service order"); tick();
     ports_{owner}_request_valid = 0; ports_{owner}_request_bits_address = 0;
+    ports_{owner}_request_bits_atomicOperation = 31; ports_{owner}_request_bits_scEligible = {1-owner % 2};
     repeat (3) begin
-      check(downstream_request_valid && downstream_request_bits_address == {0x100+8*owner} && downstream_request_bits_data == {0x1000+owner} && downstream_request_bits_tag == 7 && downstream_request_bits_size == 3 && downstream_request_bits_mask == 255 && downstream_request_bits_write == {owner % 2} && downstream_request_bits_fetch == {1-owner % 2} && downstream_request_bits_atomic == {owner % 2} && {no_ready}, "Captured request survives contention and backpressure"); tick();
+      check(downstream_request_valid && hartId == {owner // 2} && downstream_request_bits_address == {0x100+8*owner} && downstream_request_bits_data == {0x1000+owner} && downstream_request_bits_tag == 7 && downstream_request_bits_size == 3 && downstream_request_bits_mask == 255 && downstream_request_bits_write == {owner % 2} && downstream_request_bits_fetch == {1-owner % 2} && downstream_request_bits_atomic == {owner % 2} && downstream_request_bits_atomicOperation == {owner % 9} && downstream_request_bits_scEligible == {owner % 2} && {no_ready}, "Captured request survives contention and backpressure"); tick();
     end
     ports_{owner}_request_bits_address = {0x100+8*owner}; ports_{owner}_request_valid = 1;
+    ports_{owner}_request_bits_atomicOperation = {owner % 9}; ports_{owner}_request_bits_scEligible = {owner % 2};
     downstream_request_ready = 1; tick(); downstream_request_ready = 0;
     downstream_response_valid = 1; downstream_response_bits_data = {0x2000+owner};
     downstream_response_bits_tag = 7; downstream_response_bits_fault = {owner % 2};
@@ -227,17 +338,34 @@ def decode_contract():
              (0x00428367, 1, 0, 1), (0x0082b303, 1, 0, 1),
              (0x0072b423, 1, 1, 0), (0x34029373, 1, 0, 1),
              (0x3402a373, 1, 0, 1), (0x00000073, 0, 0, 0),
-             (0x30200073, 0, 0, 0), (0xffffffff, 0, 0, 0))
+             (0x30200073, 0, 0, 0), (0x10500073, 0, 0, 0), (0x10400073, 0, 0, 0), (0x10508073, 0, 0, 0), (0x105000f3, 0, 0, 0), (0xffffffff, 0, 0, 0))
     cases += ((mul(6, 5, 7), 1, 1, 1), (mul(6, 5, 7) | (1 << 12), 0, 0, 0))
+    cases += ((lw(6, 5, 4), 1, 0, 1), (lw(6, 5, 4, True), 1, 0, 1), (sw(7, 5, 4), 1, 1, 0))
+    extra = {alu(6, 5, 7, f): 22 for f in range(1, 8)}
+    extra.update({alu(6, 5, 7, f, immediate=True): 21 for f in range(1, 8)})
+    extra.update({alu(6, 5, 7, f, word=True, immediate=imm): 23 if imm else 24 for imm in (False, True) for f in (0, 1, 5)})
+    extra.update({beq(5, 7, 8) | (f << 12): 25 for f in (1, 4, 5, 6, 7)})
+    extra.update({load(6, 5, 4, s, u): 26 for s in (0, 1) for u in (False, True)})
+    extra.update({store(7, 5, 4, s): 27 for s in (0, 1)})
+    extra.update({csr(6, 0x340, 5, function=f): 28 for f in (3, 5, 6, 7)})
+    extra.update({amo(op, 6, 5, 0 if op == 2 else 7, order): 30 for op in (1, 2, 3, 8) for order in range(4)})
+    cases += tuple((word, int(op != 28 or (word >> 12) & 4 == 0), int(op in (22, 24, 25, 27) or op == 30 and word >> 27 != 2), int(op not in (25, 27))) for word, op in extra.items())
+    invalid = {amo(op, 6, 5, 0 if op == 2 else 7) ^ ((3 ^ size) << 12) for op in (0, 1, 2, 3, 8) for size in range(8) if size != 3}
+    invalid.update(amo(op, 6, 5, 7) for op in range(32) if op not in (0, 1, 2, 3, 8))
+    invalid.update(amo(2, 6, 5, rs) for rs in (1, 31))
+    cases += tuple((word, 0, 0, 0) for word in sorted(invalid))
+    cases += ((alu(6, 5, 32, 1, True, True), 0, 0, 0), (alu(6, 5, 64, 1, immediate=True), 0, 0, 0), (csr(6, 0x340, 5, function=4), 0, 0, 0))
     cases += tuple((0x0072b32f | (ordering << 25), 1, 1, 1) for ordering in range(4))
     cases += tuple((fence(instruction, reserved), 0, 0, 0) for instruction in (False, True)
                    for reserved in (0, 0x83328880, 0xffff8f80))
     cases += ((0x200f, 0, 0, 0), (0x700f, 0, 0, 0))
     body = '    input_valid = 1; output_ready = 1;\n'
     for word, rs1, rs2, rd in cases:
-        serial = int(word in (0x34029373, 0x3402a373, 0x30200073) or word & 0x707f in (0x0f, 0x100f))
+        serial = int((word & 127 == 0x73 and (word >> 12) & 7 in (1, 2, 3, 5, 6, 7)) or word in (0x30200073, 0x10500073) or word & 0x707f in (0x0f, 0x100f))
         body += (f"    input_bits_instruction = 32'h{word:08x};\n"
                  f'    check(output_valid && input_ready && output_bits_usesRs1 == {rs1} && output_bits_usesRs2 == {rs2} && output_bits_writesRd == {rd} && output_bits_serializing == {serial}, "Decode dependency metadata {word:08x}");\n')
+        if word in extra or word in invalid:
+            body += f'    check(output_bits_operation == {extra.get(word, 0)}, "Scalar operation class {word:08x}");\n'
     return body + '''    input_bits_instruction = 32'h00728333; input_bits_fault = 1;
     check(!output_bits_usesRs1 && !output_bits_usesRs2 && !output_bits_writesRd, "Faulting instruction dependencies");
     input_bits_instruction = 32'h34029373;
@@ -245,6 +373,77 @@ def decode_contract():
     input_bits_instruction = 32'h0000100f;
     check(!output_bits_usesRs1 && !output_bits_usesRs2 && !output_bits_writesRd && !output_bits_serializing, "Faulting instruction synchronization");
 '''
+
+
+def execute_contract():
+    config = dict(resetVector='0', physicalAddressBits=56, pmpEntries=0, enableInterrupts=True,
+                  memoryRegions=[dict(base='0', size=str(1 << 56), readable=True, writable=True, executable=True, device=False, atomic=True)])
+    body = ''
+
+    def check_instruction(word, operation, a, b=0, immediate=None):
+        nonlocal body
+        model = Model(config, {i: (word >> (8 * i)) & 255 for i in range(4)}, {})
+        model.registers[1], model.registers[2], model.csrs[0x340] = a & MASK, b & MASK, 0x55aa5555aa55aa55
+        address = word >> 20
+        csr_value, legal = model.csrs.get(address, 0), address in model.csrs
+        record = model.step()
+        opcode, function = word & 127, (word >> 12) & 7
+        csr_write = opcode == 0x73 and (function & 3 == 1 or (word >> 15) & 31 != 0)
+        checks = [f'output_bits_instruction_fault == {record[7]}', f'output_bits_load == {int(opcode == 3)}',
+                  f'output_bits_store == {int(opcode == 0x23)}', 'output_bits_atomic == 0', f'output_bits_csrWrite == {int(csr_write)}']
+        if record[7]:
+            checks += [f'output_bits_instruction_cause == 64\'h{record[8]:x}', f'output_bits_instruction_tval == 64\'h{record[9]:x}']
+        else:
+            checks += [f'output_bits_nextPc == 64\'h{record[3]:x}']
+            if opcode not in (3, 0x23):
+                checks += [f'output_bits_value == 64\'h{record[6]:x}']
+            if opcode == 0x73:
+                checks += [f'output_bits_csrData == 64\'h{model.csrs[address]:x}']
+            if opcode in (3, 0x23):
+                checks += [f'output_bits_memorySize == {function & 3}', f'output_bits_unsignedLoad == {int(opcode == 3 and function >= 4)}',
+                           f'output_bits_address == 64\'h{a + (signed(word >> 20, 12) if opcode == 3 else immediate):x}']
+        value = signed(word >> 20, 12) if immediate is None else immediate
+        body += f'''    input_valid = 1; input_bits_decoded_instruction_instruction = 32'h{word:08x}; input_bits_decoded_instruction_length = 4;
+    input_bits_decoded_operation = {operation}; input_bits_decoded_rd = {(word >> 7) & 31}; input_bits_decoded_rs1 = {(word >> 15) & 31};
+    input_bits_decoded_writesRd = {int(opcode not in (0x23, 0x63))}; input_bits_decoded_immediate = 64'h{value & MASK:x};
+    input_bits_operand1 = 64'h{a & MASK:x}; input_bits_operand2 = 64'h{b & MASK:x}; csrValue = 64'h{csr_value:x}; csrLegal = {int(legal)};
+'''
+        for ready in (0, 1):
+            body += f'    output_ready = {ready}; check(output_valid && input_ready == {ready} && ' + ' && '.join(checks) + f', "Scalar execution {word:08x}");\n'
+
+    pairs = ((0, 0), (1, 63), (MASK, 64), (1 << 63, 65), ((1 << 63) - 1, MASK), (0x80000000, 32), (0xffffffff, 31))
+    for word in (False, True):
+        for a, b in pairs:
+            for function, upper in (((f, 0) for f in range(8)) if not word else ((0, 0), (1, 0), (5, 0))):
+                check_instruction(alu(6, 1, 2, function, word, upper=upper), 24 if word else 4 if function == 0 else 22, a, b)
+            for function in (0, 5):
+                check_instruction(alu(6, 1, 2, function, word, upper=32), 24 if word else 22, a, b)
+            for function in ((0,) if word else (2, 3, 4, 6, 7)):
+                for value in (-2048, -1, 0, 2047):
+                    check_instruction(alu(6, 1, value, function, word, True), 23 if word else 21, a)
+            for function, upper in ((1, 0), (5, 0), (5, 0x400)):
+                for amount in ((0, 1, 31) if word else (0, 1, 32, 63)):
+                    check_instruction(alu(6, 1, amount | upper, function, word, True), 23 if word else 21, a)
+    for function in (1, 4, 5, 6, 7):
+        for a, b in pairs:
+            for offset in (2, 8):
+                check_instruction(beq(1, 2, offset) | (function << 12), 25, a, b, offset)
+    for function in (3, 5, 6, 7):
+        for source in (0, 1, 31):
+            for address in (0x340, 0xf14, 0x777):
+                check_instruction(csr(6, address, source, function=function), 28, 0)
+    for size in (0, 1):
+        for unsigned in (False, True):
+            check_instruction(load(6, 1, 4, size, unsigned), 26, 0x1000)
+        check_instruction(store(2, 1, 4, size), 27, 0x1000, MASK, 4)
+    for operation in (0, 1, 2, 3, 8):
+        for order in range(4):
+            body += f'''    input_bits_decoded_operation = {15 if operation == 0 else 30}; input_bits_decoded_immediate = 0;
+    input_bits_decoded_instruction_instruction = 32'h{amo(operation, 6, 1, 0 if operation == 2 else 2, order):x};
+    input_bits_decoded_writesRd = 1; input_bits_operand1 = 'h1000; input_bits_operand2 = 64'h{0 if operation == 2 else MASK:x};
+    check(output_valid && output_bits_atomic && output_bits_load == {int(operation != 3)} && output_bits_store == {int(operation != 2)} && output_bits_memorySize == 3 && output_bits_address == 'h1000 && output_bits_storeData == 64'h{0 if operation == 2 else MASK:x}, "Doubleword atomic execution metadata");
+'''
+    return body
 
 
 def memory_contract(parameters):
@@ -266,18 +465,25 @@ def memory_contract(parameters):
               (0x1001, 3, 1, 0, 255, 1, False), (0x4000, 3, 1, 0, 255, 1, False),
               (0x5000, 3, 1, 0, 255, 1, False), (0x7000, 3, 1, 0, 255, 1, False),
               (0x8000, 3, 1, 0, 255, 1, False))
+    cases = tuple((*case[:-1], 0, 0, case[-1]) for case in cases)
+    cases += tuple((0x1000, 3, int(op != 2), 0, 0 if op == 2 else 255, 1, op, int(op == 3), ram_atomic) for op in (1, 2, 3, 8))
+    cases += ((0x1000, 3, 1, 0, 255, 1, 3, 0, ram_atomic),
+              (0x1000, 3, 1, 0, 255, 1, 2, 0, False), (0x1000, 3, 0, 0, 0, 1, 3, 1, False))
+    cases += tuple((0x1000, 3, 1, 0, 255, 1, op, 0, False) for op in (4, 5, 12, 16, 20, 24, 28))
+    cases += tuple((0x1000, 2, int(op != 2), 0, 0 if op == 2 else 15, 1, op, 0, False) for op in (1, 2, 3, 8))
     body = ''
-    for tag, (offset, size, write, fetch, mask, atomic, allowed) in enumerate(cases, 1):
+    for tag, (offset, size, write, fetch, mask, atomic, operation, eligible, allowed) in enumerate(cases, 1):
         body += f'''    upstream_request_bits_address = 64'h{base + offset:x};
     upstream_request_bits_size = {size}; upstream_request_bits_write = {write};
     upstream_request_bits_fetch = {fetch}; upstream_request_bits_mask = {mask};
     upstream_request_bits_atomic = {atomic};
+    upstream_request_bits_atomicOperation = {operation}; upstream_request_bits_scEligible = {eligible};
     upstream_request_bits_tag = {tag}; upstream_request_valid = 1;
     check(downstream_request_valid == {int(allowed)} && upstream_request_ready == {int(not allowed)}, "Memory permission and shape {tag}");
 '''
         if allowed:
             body += f'''    repeat (3) begin
-      check(downstream_request_valid && downstream_request_bits_tag == {tag} && downstream_request_bits_atomic == {atomic} && !upstream_request_ready, "Memory request backpressure {tag}");
+      check(downstream_request_valid && downstream_request_bits_tag == {tag} && downstream_request_bits_atomic == {atomic} && downstream_request_bits_atomicOperation == {operation} && downstream_request_bits_scEligible == {eligible} && !upstream_request_ready, "Memory request backpressure {tag}");
       tick();
     end
     downstream_request_ready = 1; tick(); downstream_request_ready = 0;
@@ -297,7 +503,7 @@ def memory_contract(parameters):
     return body
 
 
-def axi_contract(width):
+def axi_contract(width, harts):
     bus_bytes = width // 8
     read_data = sum((0xa0 + byte) << (8 * byte) for byte in range(bus_bytes))
     write_data = 0x8877665544332211
@@ -337,7 +543,7 @@ def axi_contract(width):
     end
     memory_response_ready = 1; tick(); memory_response_ready = 0;
 '''
-    return body + axi_atomic_contract(width)
+    return body + axi_atomic_contract(width) + axi_reservation_contract(width, harts)
 
 
 def axi_atomic_contract(width):
@@ -350,9 +556,10 @@ def axi_atomic_contract(width):
              (1, 0, 2, 0, 0, False), (1, 0, 3, 0, 0, False),
              (1, 0, 1, 1, 0, False), (1, 0, 0, 1, 0, False),
              (1, 0, 1, 0, 0, True))
-    for index, (read_resp, read_id, write_resp, write_id, retries, malformed) in enumerate(cases):
+    cases = tuple((0, *case) for case in cases) + tuple((op, 1, 0, 1, 0, retries, False) for op in (1, 8) for retries in (0, 2))
+    for index, (operation, read_resp, read_id, write_resp, write_id, retries, malformed) in enumerate(cases):
         body += f'''
-    memory_request_bits_atomic = 1; memory_request_bits_write = 1;
+    memory_request_bits_atomic = 1; memory_request_bits_write = 1; memory_request_bits_atomicOperation = {operation};
     memory_request_bits_address = 'h{0x1000 + lane:x}; memory_request_bits_size = 3;
     memory_request_bits_mask = 255; memory_request_bits_data = 5; memory_request_bits_tag = 201;
     memory_request_valid = 1; tick(); memory_request_valid = 0;
@@ -361,7 +568,7 @@ def axi_atomic_contract(width):
         fault = read_resp != 1 or read_id != 0 or write_resp != 1 or write_id != 0 or malformed
         for attempt in range(retries + 1):
             old = ((1 << 64) - 3 + attempt * 11) & ((1 << 64) - 1)
-            value = (old + 5) & ((1 << 64) - 1)
+            value = atomic_value(operation, old, 5, 8)
             body += f'''
     repeat (3) begin
       check(axi_ar_valid && !axi_aw_valid && !axi_w_valid && !memory_response_valid && !memory_request_ready && axi_ar_bits_lock && axi_ar_bits_addr == 'h{0x1000 + lane:x} && axi_ar_bits_id == 0 && axi_ar_bits_len == 0 && axi_ar_bits_size == 3, "Exclusive read ownership"); tick();
@@ -399,6 +606,46 @@ def axi_atomic_contract(width):
     memory_response_ready = 1; tick(); memory_response_ready = 0;
     check(memory_request_ready && !memory_response_valid, "Atomic slot reuse");
     axi_r_bits_id = 0; axi_b_bits_id = 0; axi_r_bits_resp = 0; axi_b_bits_resp = 0;
+'''
+    return body
+
+
+def axi_reservation_contract(width, harts):
+    lane, body = width // 8 - 8, ''
+    for owner in sorted({0, harts - 1}):
+        for operation, eligible, response, wrong_id in ((2, 0, 1, 0), (2, 0, 0, 0), (2, 0, 2, 0),
+                (2, 0, 3, 0), (2, 0, 1, 1), (3, 0, 0, 0), (3, 1, 1, 0), (3, 1, 0, 0),
+                (3, 1, 2, 0), (3, 1, 3, 0), (3, 1, 1, 1)):
+            fault = wrong_id or (response != 1 if operation == 2 else response >= 2)
+            value = 0xfedcba9876543210 if operation == 2 else int(not eligible or response == 0)
+            body += f'''    hartId = {owner}; memory_request_bits_atomic = 1; memory_request_bits_atomicOperation = {operation};
+    memory_request_bits_scEligible = {eligible}; memory_request_bits_write = {int(operation == 3)};
+    memory_request_bits_address = 'h{0x1000 + lane:x}; memory_request_bits_size = 3;
+    memory_request_bits_mask = {255 if operation == 3 else 0}; memory_request_bits_data = 19; memory_request_bits_tag = 199;
+    memory_request_valid = 1; tick(); memory_request_valid = 0; hartId = {owner ^ 1};
+    memory_request_bits_atomicOperation = 0; memory_request_bits_scEligible = 0;
+'''
+            if operation == 2:
+                body += f'''    repeat (3) begin
+      check(axi_ar_valid && axi_ar_bits_addr == 'h{0x1000 + lane:x} && axi_ar_bits_id == {owner} && axi_ar_bits_lock && axi_ar_bits_size == 3 && !axi_aw_valid && !axi_w_valid, "LR captured identity and read-only ownership"); tick();
+    end
+    axi_ar_ready = 1; tick(); axi_ar_ready = 0;
+    axi_r_valid = 1; axi_r_bits_last = 1; axi_r_bits_id = {owner ^ wrong_id}; axi_r_bits_resp = {response};
+    axi_r_bits_data = {width}'h{value << (8 * lane):x}; tick(); axi_r_valid = 0;
+'''
+            elif eligible:
+                body += f'''    repeat (3) begin
+      check(axi_aw_valid && axi_w_valid && axi_aw_bits_addr == 'h{0x1000 + lane:x} && axi_aw_bits_id == {owner} && axi_aw_bits_lock && axi_aw_bits_size == 3 && !axi_ar_valid && axi_w_bits_data == {width}'h{19 << (8 * lane):x} && axi_w_bits_strb == 'h{255 << lane:x}, "SC captured single write"); tick();
+    end
+    axi_w_ready = 1; tick(); axi_w_ready = 0;
+    repeat (3) begin check(axi_aw_valid && !axi_w_valid && !axi_ar_valid && !axi_b_ready, "SC independent write handshakes"); tick(); end
+    axi_aw_ready = 1; tick(); axi_aw_ready = 0;
+    axi_b_valid = 1; axi_b_bits_id = {owner ^ wrong_id}; axi_b_bits_resp = {response}; tick(); axi_b_valid = 0;
+'''
+            body += f'''    repeat (3) begin
+      check(memory_response_valid && memory_response_bits_tag == 199 && memory_response_bits_fault == {int(fault)} && memory_response_bits_data == 64'h{value:x} && !axi_ar_valid && !axi_aw_valid && !axi_w_valid && !memory_request_ready, "LR/SC completion without extra transaction or retry"); tick();
+    end
+    memory_response_ready = 1; tick(); memory_response_ready = 0;
 '''
     return body
 
@@ -521,7 +768,7 @@ def fabric_contract(parameters):
     tick(); data_request_valid = 0; instruction_request_valid = 1;
     while (!axi_ar_valid) tick();
     repeat (3) begin
-      check(axi_ar_bits_addr == 'h{data_address:x} && axi_ar_bits_prot == 1 && !instruction_response_valid, "Data ownership under AXI backpressure"); tick();
+      check(axi_ar_bits_addr == 'h{data_address:x} && axi_ar_bits_prot == 1 && axi_ar_bits_id == 0 && !instruction_response_valid, "Data ownership under AXI backpressure"); tick();
     end
     axi_ar_ready = 1; tick(); axi_ar_ready = 0;
     axi_r_bits_data = 'h{data_value << data_shift:x}; axi_r_bits_last = 1; axi_r_valid = 1;
@@ -533,9 +780,9 @@ def fabric_contract(parameters):
     check(instruction_request_ready, "Instruction client did not recover");
     tick(); instruction_request_valid = 0;
     while (!axi_ar_valid) tick();
-    check(axi_ar_bits_addr == 'h{instruction_address:x} && axi_ar_bits_prot == 5, "Instruction ownership");
+    check(axi_ar_bits_addr == 'h{instruction_address:x} && axi_ar_bits_prot == 5 && axi_ar_bits_id == {parameters['hartCount'] - 1}, "Instruction ownership");
     axi_ar_ready = 1; tick(); axi_ar_ready = 0;
-    axi_r_bits_data = 'h{instruction_value << instruction_shift:x}; axi_r_valid = 1;
+    axi_r_bits_data = 'h{instruction_value << instruction_shift:x}; axi_r_bits_id = {parameters['hartCount'] - 1}; axi_r_valid = 1;
     tick(); axi_r_valid = 0;
     repeat (3) begin
       check(instruction_response_valid && instruction_response_bits_tag == 17 && instruction_response_bits_data == 64'h{instruction_value:x} && !instruction_response_bits_fault && !data_response_valid, "Held instruction completion retains owner"); tick();
@@ -554,9 +801,28 @@ def fabric_contract(parameters):
     tick(); data_request_valid = 0;
     while (!axi_ar_valid) tick();
     axi_ar_ready = 1; tick(); axi_ar_ready = 0;
-    axi_r_bits_resp = 2; axi_r_valid = 1; tick(); axi_r_valid = 0;
+    axi_r_bits_id = 0; axi_r_bits_resp = 2; axi_r_valid = 1; tick(); axi_r_valid = 0;
     repeat (3) begin
       check(data_response_valid && data_response_bits_fault && data_response_bits_tag == 68 && !instruction_response_valid, "Bus fault completion ownership"); tick();
+    end
+    data_response_ready = 1; tick(); data_response_ready = 0;
+'''
+    if parameters.get('localInterruptBase') is not None:
+        local_base, hart = int(parameters['localInterruptBase']), parameters['hartCount'] - 1
+        for address, write, expected, fault in ((local_base + 4 * hart, 1, 0, 0),
+                                                (local_base + 4 * hart, 0, 1, 0),
+                                                (local_base + 4 * parameters['hartCount'], 0, 0, 1)):
+            body += f'''    timeTick = 0; axi_r_bits_resp = 0;
+    data_request_bits_address = 64'h{address:x}; data_request_bits_size = 2;
+    data_request_bits_write = {write}; data_request_bits_mask = {15 if write else 0};
+    data_request_bits_data = 1; data_request_bits_tag = 85; data_request_valid = 1;
+    check(data_request_ready, "Local route slot unavailable"); tick(); data_request_valid = 0;
+    data_request_bits_address = 'h{data_address:x}; data_request_bits_write = 0; data_request_bits_size = 3;
+    while (!data_response_valid) begin
+      check(!axi_ar_valid && !axi_aw_valid && !axi_w_valid, "Local route escaped to AXI"); tick();
+    end
+    repeat (3) begin
+      check(data_response_valid && data_response_bits_tag == 85 && data_response_bits_data == {expected} && data_response_bits_fault == {fault} && localInterrupts_{hart}_software && !instruction_response_valid && !axi_ar_valid && !axi_aw_valid && !axi_w_valid, "Local route response ownership"); tick();
     end
     data_response_ready = 1; tick(); data_response_ready = 0;
 '''
@@ -934,6 +1200,7 @@ def protection_contract(fetch):
     check(!output_valid && request_ready, "Old authorized fetch did not drain");
 '''
     return prefix + '''
+    input_bits_memorySize = 3;
     input_bits_instruction_fault = 0; input_bits_address = 'h100; input_bits_load = 1; input_bits_store = 0;
     input_valid = 1; tick(); input_valid = 0;
     repeat (3) begin
@@ -1001,6 +1268,82 @@ def backend_protection_contract():
     return body
 
 
+def local_interrupt_contract(parameters):
+    base, harts = int(parameters['localInterruptBase']), parameters['hartCount']
+    model = LocalInterrupts(base, harts)
+    body = '    timeTick = 0; memory_response_ready = 0;\n'
+
+    def levels():
+        return ''.join(f'''    check(interrupts_{hart}_software == {model.software[hart]} && interrupts_{hart}_timer == {int(model.time >= model.compare[hart])} && !interrupts_{hart}_external, "Independent interrupt levels {hart}");
+''' for hart in range(harts))
+
+    def access(offset, size=3, write=False, value=0, mask=None, fetch=False, atomic=False):
+        nonlocal body
+        mask = ((1 << (1 << size)) - 1 if write else 0) if mask is None else mask
+        fault = fetch or atomic or (write and mask != (1 << (1 << size)) - 1)
+        result = 0
+        if not fault:
+            try:
+                result = model.access(base + offset, 1 << size, 'write' if write else 'read', value)
+            except Fault:
+                fault = True
+        body += f'''    memory_request_bits_address = 64'h{base + offset:x}; memory_request_bits_size = {size};
+    memory_request_bits_write = {int(write)}; memory_request_bits_fetch = {int(fetch)}; memory_request_bits_atomic = {int(atomic)};
+    memory_request_bits_data = 64'h{value & ((1 << 64) - 1):x}; memory_request_bits_mask = {mask}; memory_request_bits_tag = 91;
+    memory_request_valid = 1; check(memory_request_ready, "Local slot unavailable"); tick(); memory_request_valid = 0;
+    memory_request_bits_address = 0; memory_request_bits_data = '1;
+    repeat (3) begin
+      check(memory_response_valid && !memory_request_ready && memory_response_bits_tag == 91 && memory_response_bits_fault == {int(fault)} && memory_response_bits_data == 64'h{result:x}, "Local response retention"); tick();
+    end
+''' + levels() + '''    memory_response_ready = 1; tick(); memory_response_ready = 0;
+    check(!memory_response_valid && memory_request_ready, "Local response reused incorrectly");
+'''
+
+    body += levels()
+    for hart in range(harts):
+        access(4 * hart, 2, True, -1)
+        access(4 * hart, 2)
+        access(4 * hart, 2, True, 2)
+        access(0x4000 + 8 * hart, 3, True, 12 + hart)
+        access(0x4000 + 8 * hart)
+    for offset, size in ((4 * harts, 2), (0x4000 + 8 * harts, 3), (0x1000, 3), (0, 3), (0x4000, 2), (0xbff8, 2), (0xbffc, 2)):
+        access(offset, size, True, 1)
+        access(offset, size)
+    for options in (dict(mask=1), dict(fetch=True), dict(atomic=True)):
+        access(0, 2, True, 1, **options)
+    access(0xbff8, write=True, value=11)
+    body += '    timeTick = 1; tick(); timeTick = 0;\n'
+    model.time += 1
+    body += levels()
+    access(0xbff8)
+    body += '''    timeTick = 1; memory_request_bits_address = 64'h''' + f'{base + 0xbff8:x}' + ''';
+    memory_request_bits_size = 3; memory_request_bits_write = 1; memory_request_bits_fetch = 0; memory_request_bits_atomic = 0;
+    memory_request_bits_mask = 255; memory_request_bits_data = 4; memory_request_valid = 1;
+    tick(); memory_request_valid = 0; timeTick = 0;
+    memory_response_ready = 1; tick(); memory_response_ready = 0;
+'''
+    model.time = 4
+    body += levels()
+    access(0xbff8)
+    body += f'''    memory_request_bits_address = 64'h{base + 0xbff8:x}; memory_request_bits_size = 3;
+    memory_request_bits_write = 0; memory_request_bits_mask = 0; memory_request_valid = 1; timeTick = 1;
+    tick(); memory_request_valid = 0;
+    repeat (3) begin
+      check(memory_response_valid && memory_response_bits_data == 4 && !memory_response_bits_fault, "Timer read snapshot under backpressure"); tick();
+    end
+    memory_response_ready = 1; tick(); memory_response_ready = 0; timeTick = 0;
+'''
+    model.time = 9
+    body += levels()
+    access(0xbff8)
+    access(0xbff8, write=True, value=(1 << 64) - 1)
+    body += '    timeTick = 1; tick(); timeTick = 0;\n'
+    model.time = 0
+    body += levels()
+    access(0xbff8)
+    return body
+
+
 def verify(rtl, directory, modules=None):
     directory.mkdir(parents=True, exist_ok=True)
     parameters = json.loads((rtl / 'ditdah_a1_config.json').read_text())['parameters']
@@ -1008,16 +1351,19 @@ def verify(rtl, directory, modules=None):
     enabled = parameters['pmpEntries'] != 0
     cached = bool(parameters['iCacheBytes'])
     suites = (('DitDahA1Fetch', cached_fetch_contract(parameters) if cached else FETCH + (protection_contract(True) if enabled else '')),
-                       ('DitDahA1Lsu', LSU + (protection_contract(False) if enabled else '')),
+                       ('DitDahA1Lsu', LSU + lsu_reservation_contract(parameters) + (protection_contract(False) if enabled else '')),
                        ('DitDahA1Multiply', multiply_contract()),
                        ('DitDahA1Frontend', cached_fetch_contract(parameters, True) if cached else frontend_contract(parameters)),
                        ('DitDahA1Decode', decode_contract()),
+                       ('DitDahA1Execute', execute_contract()),
                        ('DitDahA1Backend', backend_contract() + backend_fence_contract() + (backend_protection_contract() if enabled else '') +
                         (backend_interrupt_contract() if parameters['enableInterrupts'] else '')),
                        ('DitDahA1MemoryArbiter', arbiter_contract(parameters)),
                        ('DitDahA1Memory', memory_contract(parameters)),
-                       ('DitDahA1Axi', axi_contract(parameters['axiDataBits'])),
+                       ('DitDahA1Axi', axi_contract(parameters['axiDataBits'], parameters['hartCount'])),
                        ('DitDahA1MemoryFabric', fabric_contract(parameters)))
+    if parameters.get('localInterruptBase'):
+        suites += (('DitDahA1LocalInterrupts', local_interrupt_contract(parameters)),)
     if enabled:
         suites += (('DitDahA1Pmp', pmp_contract(parameters)),)
     identity = ''.join(f'''    hartId = {hart}; readAddress = 'hf14;
@@ -1042,6 +1388,8 @@ def verify(rtl, directory, modules=None):
                              if file.startswith(('instructions_', 'tags_'))]
         if name == 'DitDahA1MemoryFabric':
             dependencies = [rtl / (child + '.sv') for child in ('DitDahA1MemoryArbiter', 'DitDahA1Memory', 'DitDahA1Axi')]
+            if parameters.get('localInterruptBase'):
+                dependencies.append(rtl / 'DitDahA1LocalInterrupts.sv')
         if name == 'DitDahA1Backend':
             dependencies = [rtl / ('DitDahA1' + child + '.sv') for child in ('Decode', 'Issue', 'Execute', 'Multiply', 'Commit', 'Gpr', 'Csr', 'Lsu')]
         if enabled and name in ('DitDahA1Fetch', 'DitDahA1Lsu', 'DitDahA1Frontend', 'DitDahA1Backend'):

@@ -10,6 +10,7 @@ import me.jiuyang.zaozi.valuetpe.*
 class DitDahA1CsrIO(parameter: DitDahA1Parameter) extends HWBundle(parameter):
   val interrupts = Option.when(parameter.enableInterrupts)(Flipped(new InterruptBundle))
   val interruptPending = Option.when(parameter.enableInterrupts)(Aligned(Bool()))
+  val wakeup = Option.when(parameter.enableInterrupts)(Aligned(Bool()))
   val interruptCause = Option.when(parameter.enableInterrupts)(Aligned(UInt(64)))
   val pmp = Option.when(parameter.pmpEntries != 0)(Aligned(new PmpState(parameter)))
   val clock = Flipped(Clock())
@@ -73,6 +74,7 @@ object DitDahA1Csr extends Generator[DitDahA1Parameter, DitDahA1UnitLayers, DitD
       val inputs = io.interrupts.get
       val levels = inputs.external.asBits ## inputs.timer.asBits ## inputs.software.asBits
       val pending = enables.asBits & levels
+      io.wakeup.get := pending =/= 0.B(3)
       io.interruptPending.get := status.asBits.bit(3) & (pending =/= 0.B(3))
       io.interruptCause.get := pending.bit(2).?(BigInt("800000000000000b", 16).U(64),
         pending.bit(0).?(BigInt("8000000000000003", 16).U(64), BigInt("8000000000000007", 16).U(64)))

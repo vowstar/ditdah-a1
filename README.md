@@ -16,7 +16,7 @@ Hart count and cache sizes describe configurations of the same model.
 | Integration | Burst-capable AXI4 and JTAG debug |
 
 The executable RTL has one to sixteen RV64 harts, M mode, an overlapped single-issue pipeline, shared AXI4,
-and precise synchronous exceptions. The generated configuration manifest lists the 17 implemented instructions.
+and precise synchronous exceptions. The generated configuration manifest lists the implemented instructions.
 PMP is configurable to zero or sixteen entries per hart; the default uncached configuration omits it.
 Machine software, timer, and external interrupts are optional synchronous level inputs.
 MUL uses an iterative resource; accepted operations retain their instruction owner through completion or cancellation draining.
@@ -28,7 +28,8 @@ Core exposes separate instruction/data memory ports; the physical fabric owns sh
 Instruction permissions apply before cache lookup and to each refill word; region checks also protect external accesses.
 Harts share one outstanding physical transaction with round-robin arbitration and retained response ownership.
 AXI data width is configurable to 64/128/256/512 bits; scalar requests remain at most eight bytes.
-AMOADD.D uses one memory request, AXI exclusive retry, and one old-value response; data accesses preserve program order for all aq/rl combinations.
+AMOADD.D, AMOOR.D and AMOSWAP.D use AXI exclusive retry and return the old value.
+LR.D/SC.D use per-hart reservations; ordered data completion covers all aq/rl combinations.
 This does not implement the complete A or Zaamo extension.
 FENCE preserves ordered data completion; FENCE.I restarts local instruction fetching and invalidates the optional private instruction cache.
 
@@ -54,13 +55,15 @@ The manifest records the selected top and validation scope; unrelated parameters
 Add `--trace` to retain the separate DV bind files.
 The default physical map is 64 KiB of RAM at zero; configure regions for the intended system.
 Set a region's `atomic` flag only for readable, writable, non-device memory with end-to-end exclusive monitoring of every competing writer.
-The flag defaults to false; unsupported exclusive reads fault, failed exclusive writes retry, and bus errors fault without retry or rollback guarantees.
-Completion requires eventual bus responses and successful exclusive access; contention can delay all harts on the shared fabric.
+The flag defaults to false; unsupported exclusive reads and bus errors fault without rollback guarantees.
+Failed AMO writes retry; SC returns a status without retry.
+AMO completion requires eventual bus responses and successful exclusive access; contention can delay all harts on the shared fabric.
 Set `iCacheBytes` to zero for bypass or a power of two from 8 to 64 KiB for a blocking, direct-mapped instruction cache with 64-byte lines.
 Data remains uncached; refills use individually authorized four-byte requests, and non-demand refill faults fall back to the original demand.
 Set `pmpEntries` to 16 to enable protection; successful PMP writes restart younger execution while accepted fetches drain.
 Set `enableInterrupts` to true for precise machine interrupt entry and return; platform logic owns interrupt sources.
 System interrupt inputs are indexed by hart; each hart has independent CSR and PMP state.
+An optional `localInterruptBase` maps protected software-interrupt and 64-bit timer registers; `timeTick` supplies the synchronous timebase.
 All harts share the reset vector and read their index from `mhartid`; standalone Core and Backend integrations must hold `hartId` constant.
 
 `make verify-signoff` checks standalone Core and AXI integration against the same instruction model,
@@ -71,6 +74,8 @@ Interrupt checks cover CSR eligibility, saved PC, transaction ownership, and ind
 Multicore checks use per-hart instruction models and shared memory ordered by bus service; arbiter proofs check ownership and bounded overtaking.
 Atomic checks include independent interference, failed-write suppression, returned old values, publication ordering, and AXI retry/error safety.
 Instruction-cache control proofs abstract memory read values; array geometry, storage behavior and instruction publication are checked separately.
+Platform checks execute shared work, software interrupts and timer interrupts on 1/2/3/16 harts.
+ELF checks build freestanding software with `RISCV_PREFIX` (default `riscv64-unknown-elf-`) and validate actual console writes and per-hart results.
 Reachability and mutation checks exercise the properties; general multiply results are checked by simulation.
 This checks the implemented instruction subset, not full ISA compliance or physical signoff.
 Use `make verify-signoff VERIFY_ARGS=--use-generated` to reuse RTL whose recorded sources and configuration still match.
@@ -88,3 +93,5 @@ E, R, A, and P identify embedded, real-time, application, and performance-orient
 - [RISC-V specifications](https://riscv.org/specifications/ratified/): instruction and privilege contracts.
 - [LLVM](https://github.com/llvm/llvm-project) and [CIRCT](https://github.com/llvm/circt): compiler toolchain.
 - [YosysHQ](https://github.com/YosysHQ): synthesis and formal verification tools.
+- [RISC-V architectural tests](https://github.com/riscv-non-isa/riscv-arch-test) and [Sail](https://github.com/riscv/sail-riscv): executable architectural checks.
+- [Zephyr](https://github.com/zephyrproject-rtos/zephyr): multicore software tests.

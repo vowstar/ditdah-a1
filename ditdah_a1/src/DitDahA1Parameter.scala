@@ -18,6 +18,7 @@ case class DitDahA1Parameter(
   issueWidth: Int = 1,
   enableInterrupts: Boolean = false,
   enableTrace: Boolean = false,
+  localInterruptBase: Option[BigInt] = None,
   memoryRegions: Seq[MemoryRegion] = Seq(MemoryRegion())
 ) extends Parameter:
   private def powerOfTwo(value: Int): Boolean = value > 0 && (value & (value - 1)) == 0
@@ -56,11 +57,20 @@ case class DitDahA1Parameter(
 
   def validateRtl(): Unit =
     validateCore()
+    validateFabric()
     require(virtualAddressBits == 0, "RTL supports Bare addressing")
     require(dCacheBytes == 0 && l2CacheBytes == 0, "RTL supports uncached data memory")
     require(memoryRegions.exists(r => r.executable && resetVector >= r.base && resetVector + 4 <= r.base + r.size), "Reset vector must be in executable memory")
 
+  def validateFabric(): Unit = localInterruptBase.foreach { base =>
+    require(enableInterrupts, "Local interrupt sources require machine interrupts")
+    require(base >= 0 && (base & 65535) == 0 && base + 65536 <= (BigInt(1) << physicalAddressBits), "Local interrupt window must be aligned and fit the physical address space")
+    require(memoryRegions.exists(r => r.device && r.readable && r.writable && !r.executable && !r.atomic &&
+      r.base <= base && base + 65536 <= r.base + r.size), "Local interrupts require a readable writable device region")
+  }
+
   val xlen: Int = 64
+  val axiIdBits: Int = math.max(1, 32 - Integer.numberOfLeadingZeros(hartCount - 1))
   val registerCount: Int = 32
   val pipelineStages: Int = 8
   val cacheLineBytes: Int = 64

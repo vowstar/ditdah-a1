@@ -20,6 +20,7 @@ object DitDahA1ParameterCheck:
     for count <- 1 to 16 do
       val selected = baseline.copy(hartCount = count)
       assert(DitDahA1Config.parameter(DitDahA1Config.document(selected)) == selected)
+      assert(selected.axiIdBits == (if count <= 2 then 1 else if count <= 4 then 2 else if count <= 8 then 3 else 4))
     assert(DitDahA1Config.document(baseline)("target")("maxHartCount").num == 16)
     assert(!DitDahA1Config.document(baseline.copy(pmpEntries = 64))("implementation").obj.contains("pmpEntries"))
     assert(DitDahA1Config.document(baseline)("target")("isa").str == "RV64GCB")
@@ -39,6 +40,19 @@ object DitDahA1ParameterCheck:
     val rtl = DitDahA1Parameter.uncached
     for count <- 1 to 16 do rtl.copy(hartCount = count).validateRtl()
     assert(!rtl.enableInterrupts)
+    val device = MemoryRegion(base = 0x2000000, size = 65536, executable = false, device = true)
+    val platform = rtl.copy(enableInterrupts = true, localInterruptBase = Some(device.base), memoryRegions = rtl.memoryRegions :+ device)
+    platform.validateRtl()
+    assert(DitDahA1Config.parameter(DitDahA1Config.document(platform)) == platform)
+    rejects { platform.copy(enableInterrupts = false).validateFabric() }
+    rejects { platform.copy(localInterruptBase = Some(device.base + 4)).validateFabric() }
+    rejects { platform.copy(localInterruptBase = Some(-65536)).validateFabric() }
+    rejects { platform.copy(localInterruptBase = Some(BigInt(1) << 56)).validateFabric() }
+    rejects { platform.copy(memoryRegions = rtl.memoryRegions).validateFabric() }
+    rejects { platform.copy(memoryRegions = rtl.memoryRegions :+ device.copy(readable = false)).validateFabric() }
+    rejects { platform.copy(memoryRegions = rtl.memoryRegions :+ device.copy(writable = false)).validateFabric() }
+    rejects { platform.copy(memoryRegions = rtl.memoryRegions :+ device.copy(size = 32768)).validateFabric() }
+    platform.copy(localInterruptBase = Some(-1)).validateCore()
     for entries <- Seq(0, 16) do
       val enabled = rtl.copy(enableInterrupts = true, pmpEntries = entries)
       enabled.validateRtl()

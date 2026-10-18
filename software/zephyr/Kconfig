@@ -1,0 +1,6 @@
+# SPDX-FileCopyrightText: 2026 Huang Rui <vowstar@gmail.com>
+# SPDX-License-Identifier: MIT
+mainmenu "Processor software test"
+config MP_MAX_NUM_CPUS
+	range 1 16
+source "Kconfig.zephyr"

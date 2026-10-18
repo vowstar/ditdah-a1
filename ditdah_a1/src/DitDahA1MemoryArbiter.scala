@@ -12,6 +12,7 @@ class DitDahA1MemoryArbiterIO(parameter: DitDahA1Parameter) extends HWBundle(par
   val reset = Flipped(Reset())
   val ports = Flipped(Vec(2 * parameter.hartCount, new MemoryPort))
   val downstream = Aligned(new MemoryPort)
+  val hartId = Aligned(UInt(4))
 
 @generator
 object DitDahA1MemoryArbiter extends Generator[DitDahA1Parameter, DitDahA1UnitLayers, DitDahA1MemoryArbiterIO, DitDahA1UnitProbe]:
@@ -27,6 +28,7 @@ object DitDahA1MemoryArbiter extends Generator[DitDahA1Parameter, DitDahA1UnitLa
     val next = RegInit(0.U(bits))
     val request = Reg(new MemoryRequest)
     val down = io.downstream
+    io.hartId := (if bits == 1 then 0.U(4) else owner.asBits.bits(bits - 1, 1).asUInt)
     val idle = state === 0.U(2)
     val valid = (0 until count).map(i => io.ports(i).request.valid)
     val following = (0 until count).map(i => valid(i) & (next <= i.U(bits)))

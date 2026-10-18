@@ -56,7 +56,7 @@ FETCH = r'''
         accepted_tag <= request_bits_tag;
       end
       assert(!memory_response_ready || outstanding);
-      if (memory_request_valid) assert(!memory_request_bits_atomic);
+      if (memory_request_valid) assert(!memory_request_bits_atomic && !memory_request_bits_atomicOperation && !memory_request_bits_scEligible);
       if (output_valid) begin
         assert(have_request);
         assert(response_seen || accepted_pc[1:0] != 0);
@@ -67,7 +67,8 @@ FETCH = r'''
         assert(memory_request_valid);
         assert($stable({memory_request_bits_address, memory_request_bits_data,
           memory_request_bits_size, memory_request_bits_mask, memory_request_bits_tag,
-          memory_request_bits_write, memory_request_bits_fetch, memory_request_bits_atomic}));
+          memory_request_bits_write, memory_request_bits_fetch, memory_request_bits_atomic,
+          memory_request_bits_atomicOperation, memory_request_bits_scEligible}));
       end
       cover(past_valid && $past(!reset && memory_request_valid && !memory_request_ready)
         && cancel && memory_request_valid && !memory_request_ready);
@@ -315,38 +316,6 @@ def protection_cases(parameters):
     fetch = fetch.replace('accepted_pc <= request_bits_pc;', 'local_denied <= !_pmp_allowed;\n        accepted_pc <= request_bits_pc;')
     fetch = fetch.replace('response_seen || accepted_pc[1:0] != 0', 'response_seen || accepted_pc[1:0] != 0 || local_denied')
     fetch = fetch.replace('if (observed_killed || cancel)', 'if (have_request && local_denied) assert(!memory_request_valid);\n      cover(output_valid && local_denied && output_bits_fault);\n      if (observed_killed || cancel)')
-    lsu = '''
-  reg past_valid = 0, pending, denied, store, atomic;
-  reg [63:0] address;
-  always @(posedge clock) begin
-    past_valid <= 1;
-    if (!past_valid) assume(reset); else assume(!reset);
-    if (reset) begin pending <= 0; denied <= 0; end
-    else begin
-      if (input_valid && input_ready) begin
-        pending <= 1;
-        denied <= !input_bits_instruction_fault && input_bits_address[2:0] == 0 && !_pmp_allowed;
-        address <= input_bits_address; store <= input_bits_store;
-        atomic <= input_bits_load && input_bits_store;
-      end
-      if (output_valid && output_ready) pending <= 0;
-      if (pending && denied) begin
-        assert(!memory_request_valid && output_valid && output_bits_instruction_fault);
-        assert(output_bits_instruction_cause == (store ? 7 : 5) && output_bits_instruction_tval == address);
-      end
-      if (memory_request_valid) assert(memory_request_bits_atomic == atomic);
-      if (past_valid && $past(!reset && memory_request_valid && !memory_request_ready)) begin
-        assert(memory_request_valid);
-        assert($stable({memory_request_bits_address, memory_request_bits_data, memory_request_bits_tag,
-          memory_request_bits_mask, memory_request_bits_size, memory_request_bits_write,
-          memory_request_bits_fetch, memory_request_bits_atomic}));
-      end
-      cover(pending && denied && !output_ready);
-      cover(pending && denied && output_ready && store);
-      cover(memory_request_valid && !memory_request_ready && !_pmp_allowed);
-    end
-  end
-'''
     backend = BACKEND + '''
   wire permission_update = commit_output_valid_layerCapture && _commit_output_bits_csrWrite &&
     ((_commit_output_bits_csrAddress >= 12'h3a0 && _commit_output_bits_csrAddress <= 12'h3ae) ||
@@ -364,7 +333,6 @@ def protection_cases(parameters):
             ('Pmp', pmp, 'assign allowed =', "assign allowed = 1'h1 |"),
             ('Csr', csr, '& ~(config_0[5])', "& 1'h1"),
             ('Fetch', fetch, '& ~killed & ~cancel', '& ~cancel'),
-            ('Lsu', lsu, '~_pmp_allowed', "1'h0"),
             ('Backend', backend, '| _commit_output_bits_csrWrite\n', "| 1'h0 & _commit_output_bits_csrWrite\n")]
 
 
@@ -389,6 +357,7 @@ def interrupt_cases(parameters):
         else if ($past(write && writeAddress == 12'h300)) assert(status == ($past(writeData) & 64'h88));
       end
       assert(interruptPending == (status[3] && irq_enabled != 0));
+      assert(wakeup == (irq_enabled != 0));
       if (interruptPending) assert(interruptCause == (64'h8000000000000000 |
         (irq_enabled[2] ? 64'd11 : irq_enabled[0] ? 64'd3 : 64'd7)));
       if (readAddress == 12'h304) assert(legal && readData ==
@@ -400,6 +369,8 @@ def interrupt_cases(parameters):
       cover(interruptPending && interruptCause[3:0] == 7);
       cover(irq_levels != 0 && !status[3] && readAddress == 12'h344);
       cover($past(mret && !reset) && interruptPending);
+      cover(wakeup && !status[3]);
+      cover(!wakeup && irq_levels != 0);
     end
   end
 '''
@@ -442,7 +413,7 @@ def interrupt_cases(parameters):
         assert(data_request_valid);
         assert($stable({{data_request_bits_address, data_request_bits_data, data_request_bits_tag,
           data_request_bits_mask, data_request_bits_size, data_request_bits_write,
-          data_request_bits_fetch, data_request_bits_atomic}}));
+          data_request_bits_fetch, data_request_bits_atomic, data_request_bits_atomicOperation, data_request_bits_scEligible}}));
       end
       if (past_valid) begin
         if ($past(reset)) assert(resumePc == 64'h{int(parameters['resetVector']):x});
@@ -622,6 +593,548 @@ def synchronization_case(parameters):
     return ('SynchronizationBackend', body, '| _commit_output_bits_fenceI', "| 1'h0 & _commit_output_bits_fenceI")
 
 
+def wfi_cases(parameters):
+    backend = r'''
+  reg wfi_past = 0, wfi_wait = 0, wfi_slept = 0;
+  reg [63:0] wfi_pc;
+  wire wfi_retired = commit_output_valid_layerCapture &&
+    commitPacket_instruction_instruction == 32'h10500073 && !commitPacket_instruction_fault;
+  always @(posedge clock) begin
+    wfi_past <= 1;
+    if (!wfi_past) assume(reset); else assume(!reset);
+    if (reset) begin wfi_wait <= 0; wfi_slept <= 0; end
+    else begin
+      assert(status_sleep == wfi_wait);
+      if (decodedValid) assert((decodedPacket_operation == 29) == (decodedPacket_instruction_instruction == 32'h10500073));
+      if (decodedValid && decodedPacket_operation == 29) assert(!decodedPacket_writesRd && decodedPacket_serializing == !decodedPacket_instruction_fault);
+      if (issuedValid) begin
+        assert((issuedPacket_decoded_operation == 29) == (issuedPacket_decoded_instruction_instruction == 32'h10500073));
+        if (issuedPacket_decoded_operation == 29) assert(!issuedPacket_decoded_writesRd);
+      end
+      if (decodedValid && decodedPacket_instruction_instruction == 32'h10500073 && !decodedPacket_instruction_fault) begin
+        assert(decodedPacket_operation == 29 && decodedPacket_serializing && !decodedPacket_writesRd);
+        if (issued) assert(!issuedValid && !resultValid && !commitValid && !memoryPending);
+      end
+      if (resultValid) assert(resultPacket_wfi == (resultPacket_instruction_instruction == 32'h10500073));
+      if (resultValid && resultPacket_wfi) assert(!resultPacket_load && !resultPacket_store && !resultPacket_csrWrite && !resultPacket_rdWrite && !resultPacket_mret);
+      if (memoryPending) assert(!_lsu_output_bits_wfi && _lsu_output_bits_instruction_instruction != 32'h10500073);
+      if (commitValid) begin
+        assert(commitPacket_wfi == (commitPacket_instruction_instruction == 32'h10500073));
+        assert(_commit_output_bits_wfi == (commitPacket_wfi && !commitPacket_instruction_fault));
+      end
+      if (wfi_retired) begin
+        assert(redirect_0 && redirectPc == commitPacket_instruction_pc + commitPacket_instruction_length);
+        assert(!memoryPending && !data_request_valid && !lsu_input_valid && !issued && !executed);
+        assert(!commit_output_bits_rdWrite_layerCapture && !_commit_output_bits_csrWrite && !_commit_output_bits_mret);
+        wfi_wait <= IRQ_ENABLED;
+        wfi_pc <= commitPacket_instruction_pc + commitPacket_instruction_length;
+      end
+      if (WAKE || status_trap) wfi_wait <= 0;
+      if (wfi_wait) begin
+        wfi_slept <= 1;
+        assert(!decodedValid && !issuedValid && !resultValid && !commitValid);
+        assert(!instruction_ready && !data_request_valid && !memoryPending);
+        assert(!issued && !executed && !multiply_input_valid);
+        PC_ASSERT
+      end
+      if (wfi_past && $past(!reset && wfi_retired)) begin
+        assert(!decodedValid && !issuedValid && !resultValid && !commitValid);
+        RESUME_ASSERT
+      end
+      assert(!memoryPending || (resultValid && !commitValid && !resultPacket_instruction_fault && (resultPacket_load || resultPacket_store)));
+      assert(memoryPending == (data_request_valid || data_response_ready || _lsu_output_valid));
+      cover(wfi_retired && !WAKE);
+      cover(wfi_retired && WAKE);
+      cover(wfi_wait && !WAKE && executePending);
+      cover(wfi_wait && WAKE);
+      cover(wfi_slept && !wfi_wait && instruction_valid && instruction_ready);
+    end
+  end
+'''
+    interrupts = parameters.get('enableInterrupts')
+    for key, value in (('IRQ_ENABLED', "1'b1" if interrupts else "1'b0"),
+                       ('WAKE', '_csr_wakeup' if interrupts else "1'b0"),
+                       ('PC_ASSERT', 'assert(resumePc == wfi_pc);' if interrupts else ''),
+                       ('RESUME_ASSERT', 'assert(resumePc == $past(commit_output_bits_nextPc_layerCapture));' if interrupts else '')):
+        backend = backend.replace(key, value)
+    if not interrupts:
+        backend = '\n'.join(line for line in backend.splitlines() if 'cover(' not in line) + '\n'
+        backend += '  always @(posedge clock) if (!reset) cover(wfi_retired);\n'
+    frontend = r'''
+  reg wfi_past = 0;
+  always @(posedge clock) begin
+    wfi_past <= 1;
+    if (!wfi_past) assume(reset); else assume(!reset);
+    if (!reset) begin
+      assert(fetch_request_valid == (!redirect && !halt));
+      if (wfi_past && $past(!reset)) begin
+        if ($past(redirect)) assert(pc == $past(redirectPc));
+        else if ($past(output_valid && output_ready)) assert(pc == $past(pc + output_bits_length));
+        else assert($stable(pc));
+        if ($past(memory_request_valid && !memory_request_ready)) begin
+          assert(memory_request_valid);
+          assert($stable({memory_request_bits_address, memory_request_bits_data, memory_request_bits_tag, memory_request_bits_size,
+            memory_request_bits_mask, memory_request_bits_fetch, memory_request_bits_write, memory_request_bits_atomic,
+            memory_request_bits_atomicOperation, memory_request_bits_scEligible}));
+        end
+      end
+      cover(halt && memory_request_valid && !memory_request_ready);
+      cover(halt && memory_response_valid && memory_response_ready);
+      cover($past(!reset && halt) && !halt && fetch_request_valid);
+    end
+  end
+'''
+    return [('WfiBackend', backend, 'assign status_sleep =', "assign status_sleep = 1'h0 &"),
+            ('WfiFrontend', frontend, 'fetch_request_valid = ~redirect & ~halt;', 'fetch_request_valid = ~redirect;')]
+
+
+def wfi_witness(parameters, mode):
+    body = r'''
+  (* anyconst *) reg [1:0] wfi_scenario;
+  reg [3:0] wfi_packet = 0;
+  reg [2:0] wfi_delay = 0;
+  always @(posedge clock) if (!reset) begin
+    if (instruction_valid && instruction_ready && wfi_packet != 15) wfi_packet <= wfi_packet + 1;
+    if (status_sleep && wfi_delay != 7) wfi_delay <= wfi_delay + 1;
+  end
+  always @* begin
+    assume(wfi_scenario < 3 && instruction_bits_length == 4 && instruction_bits_tag == 0);
+    assume(instruction_bits_fault == (wfi_scenario == 2 && wfi_packet == 2));
+    assume(instruction_bits_pc == RESET_PC);
+    assume(instruction_valid);
+    assume(instruction_bits_instruction == (wfi_packet == 0 ? 32'h00800093 :
+      wfi_packet == 1 ? 32'h30409073 : wfi_packet == 2 ? 32'h10500073 :
+      wfi_packet == 3 ? 32'h02108133 : 32'h00000013));
+    assume(data_request_ready && !data_response_valid);
+    IRQ_ASSUMPTIONS
+  end
+'''.replace('RESET_PC', f"64'h{int(parameters['resetVector']):x}")
+    interrupts = parameters.get('enableInterrupts')
+    body = body.replace('IRQ_ASSUMPTIONS', '''assume(!interrupts_external && !interrupts_timer);
+    assume(interrupts_software == (wfi_scenario == 1 ? wfi_packet >= 3 : wfi_delay >= 2));''' if interrupts else '')
+    scenario = {'mutation': 0, 'mutation-priority': 1, 'mutation-fault': 2}.get(mode)
+    if scenario is not None:
+        body += f'  always @* assume(wfi_scenario == {scenario});\n'
+    return body
+
+
+def word_cases(parameters):
+    decode = r'''
+  wire [31:0] word = input_bits_instruction;
+  wire load = word[6:0] == 7'h03 && (word[14:12] == 2 || word[14:12] == 3 || word[14:12] == 6);
+  wire store = word[6:0] == 7'h23 && (word[14:12] == 2 || word[14:12] == 3);
+  always @* begin
+    assert(input_ready == output_ready && output_valid == input_valid);
+    if (load || store) begin
+      assert(output_bits_operation == (store ? (word[12] ? 9 : 20) :
+        word[14:12] == 2 ? 18 : word[14:12] == 6 ? 19 : 8));
+      assert(output_bits_usesRs1 == !input_bits_fault);
+      assert(output_bits_usesRs2 == (store && !input_bits_fault));
+      assert(output_bits_writesRd == (load && !input_bits_fault));
+      assert(!output_bits_serializing);
+      assert(output_bits_immediate == (store ? {{52{word[31]}}, word[31:25], word[11:7]} :
+        {{52{word[31]}}, word[31:20]}));
+    end
+    cover(input_valid && load && word[14:12] == 2 && !input_bits_fault);
+    cover(input_valid && load && word[14:12] == 6 && !input_bits_fault);
+    cover(input_valid && store && word[14:12] == 2 && !input_bits_fault);
+  end
+'''
+    execute = r'''
+  wire [4:0] op = input_bits_decoded_operation;
+  wire load = op == 8 || op == 15 || op == 18 || op == 19;
+  wire store = op == 9 || op == 15 || op == 20;
+  always @* begin
+    assert(input_ready == output_ready && output_valid == input_valid);
+    if (op <= 20) begin
+      assert(output_bits_load == load && output_bits_store == store);
+      assert(output_bits_memorySize == (op == 18 || op == 19 || op == 20 ? 2 : 3));
+      assert(output_bits_unsignedLoad == (op == 19));
+    end
+    if (load || store) begin
+      assert(output_bits_address == input_bits_operand1 + input_bits_decoded_immediate);
+      assert(output_bits_storeData == input_bits_operand2);
+      assert(output_bits_nextPc == input_bits_decoded_instruction_pc + input_bits_decoded_instruction_length);
+      assert(output_bits_instruction_fault == input_bits_decoded_instruction_fault);
+      assert(!output_bits_csrWrite && !output_bits_mret && !output_bits_fenceI);
+    end
+    cover(input_valid && op == 18);
+    cover(input_valid && op == 19);
+    cover(input_valid && op == 20);
+    cover(input_valid && op == 15);
+  end
+'''
+    lsu = r'''
+  reg word_past = 0, word_owned, word_sent, word_replied, word_done, word_fault;
+  reg word_load, word_store, word_unsigned, word_atomic, word_pair, word_reservation;
+  reg [4:0] word_operation;
+  reg [63:0] word_reserved_address;
+  reg [2:0] word_size;
+  reg [63:0] word_address, word_data, word_value, word_cause, word_tval, word_pc;
+  reg [7:0] word_tag;
+  wire word_aligned = (input_bits_address & ((64'd1 << input_bits_memorySize) - 1)) == 0;
+  wire word_permitted = PERMITTED;
+  wire word_valid_size = word_size <= 3;
+  reg [63:0] word_extended;
+  always @* case (word_size)
+    0: word_extended = {{56{!word_unsigned && memory_response_bits_data[7]}}, memory_response_bits_data[7:0]};
+    1: word_extended = {{48{!word_unsigned && memory_response_bits_data[15]}}, memory_response_bits_data[15:0]};
+    2: word_extended = {{32{!word_unsigned && memory_response_bits_data[31]}}, memory_response_bits_data[31:0]};
+    default: word_extended = memory_response_bits_data;
+  endcase
+  always @(posedge clock) begin
+    word_past <= 1;
+    if (!word_past) assume(reset); else assume(!reset);
+    if (reset) begin word_owned <= 0; word_sent <= 0; word_replied <= 0; word_done <= 0; word_reservation <= 0; end
+    else begin
+      assert(word_owned == (state != 0));
+      assert(word_reservation == reserved);
+      if (word_reservation) assert(word_reserved_address == {PAD_RESERVED, reservedWord, 3'd0});
+      if (word_owned) begin
+        assert(packet_address == word_address && packet_atomic == word_atomic && packet_instruction_instruction[31:27] == word_operation);
+        assert(packet_memorySize == word_size && packet_instruction_tag == word_tag);
+        assert(scEligible == word_pair);
+      end
+      assert(memory_response_ready == (word_sent && !word_replied));
+      if (input_valid && input_ready) begin
+        assert(!word_owned);
+        word_owned <= 1; word_sent <= 0; word_replied <= 0;
+        word_done <= input_bits_instruction_fault || !word_aligned || !word_permitted;
+        word_size <= input_bits_memorySize; word_unsigned <= input_bits_unsignedLoad;
+        word_load <= input_bits_load; word_store <= input_bits_store;
+        word_atomic <= input_bits_atomic; word_operation <= input_bits_instruction_instruction[31:27];
+        word_pair <= input_bits_atomic && input_bits_instruction_instruction[31:27] == 3 && word_reservation &&
+          input_bits_address == word_reserved_address && input_bits_memorySize == 3;
+        if (input_bits_atomic) word_reservation <= 0;
+        word_address <= input_bits_address; word_data <= input_bits_storeData;
+        word_value <= input_bits_value; word_tag <= input_bits_instruction_tag;
+        word_pc <= input_bits_instruction_pc;
+        word_fault <= input_bits_instruction_fault || !word_aligned || !word_permitted;
+        word_cause <= input_bits_instruction_fault ? input_bits_instruction_cause :
+          !word_aligned ? (input_bits_store ? 6 : 4) : input_bits_store ? 7 : 5;
+        word_tval <= input_bits_instruction_fault ? input_bits_instruction_tval : input_bits_address;
+      end
+      if (memory_request_valid) begin
+        assert(word_owned && !word_sent && !word_replied);
+        assert(memory_request_bits_address == word_address && memory_request_bits_data == word_data);
+        assert(memory_request_bits_size == word_size && memory_request_bits_tag == word_tag);
+        if (word_valid_size) assert(memory_request_bits_mask == (word_store ? (9'd1 << (1 << word_size)) - 1 : 0));
+        assert(memory_request_bits_write == word_store && !memory_request_bits_fetch);
+        assert(memory_request_bits_atomic == word_atomic && memory_request_bits_atomicOperation == (word_atomic ? word_operation : 0));
+        assert(memory_request_bits_scEligible == word_pair);
+        if (word_valid_size) assert(!word_fault);
+      end
+      if (memory_request_valid && memory_request_ready) word_sent <= 1;
+      if (memory_response_valid && memory_response_ready) begin
+        assert(word_owned && word_sent && !word_replied);
+        word_replied <= 1; word_done <= 1;
+        if (word_load || word_atomic) word_value <= word_extended;
+        if (word_atomic && word_operation == 2 && word_size == 3 && !memory_response_bits_fault && memory_response_bits_tag == word_tag) begin
+          word_reservation <= 1; word_reserved_address <= word_address & MASK_RESERVED;
+        end
+        if (memory_response_bits_fault || memory_response_bits_tag != word_tag) begin
+          word_fault <= 1; word_cause <= word_store ? 7 : 5; word_tval <= word_address;
+        end
+      end
+      if (word_owned && word_valid_size) assert(output_valid == word_done);
+      if (output_valid) begin
+        assert(word_owned && (!word_sent || word_replied));
+        assert(output_bits_memorySize == word_size && output_bits_unsignedLoad == word_unsigned);
+        assert(output_bits_instruction_pc == word_pc && output_bits_instruction_tag == word_tag);
+        assert(output_bits_address == word_address && output_bits_storeData == word_data);
+        assert(output_bits_load == word_load && output_bits_store == word_store && output_bits_atomic == word_atomic);
+        if (word_valid_size) begin
+          assert(output_bits_instruction_fault == word_fault && output_bits_value == word_value);
+          if (word_fault) assert(output_bits_instruction_cause == word_cause && output_bits_instruction_tval == word_tval);
+        end
+        if (output_ready) word_owned <= 0;
+      end
+      if (word_past && $past(!reset && memory_request_valid && !memory_request_ready)) begin
+        assert(memory_request_valid);
+        assert($stable({memory_request_bits_address, memory_request_bits_data, memory_request_bits_size,
+          memory_request_bits_mask, memory_request_bits_tag, memory_request_bits_write, memory_request_bits_atomic,
+          memory_request_bits_atomicOperation, memory_request_bits_scEligible}));
+      end
+      if (word_past && $past(!reset && output_valid && !output_ready)) begin
+        assert(output_valid);
+        assert($stable({output_bits_value, output_bits_instruction_fault, output_bits_instruction_cause,
+          output_bits_instruction_tval, output_bits_memorySize, output_bits_unsignedLoad}));
+      end
+      cover(output_valid && word_size == 2 && word_load && !word_store && !word_unsigned && word_value[63] && !word_fault);
+      cover(output_valid && word_size == 2 && word_load && word_unsigned && word_value[31] && !word_fault);
+      cover(memory_request_valid && word_size == 2 && word_store && word_address[2] && !memory_request_ready);
+      cover(output_valid && word_size == 2 && word_fault && !word_sent);
+      cover(output_valid && word_fault && !word_sent && !output_ready);
+      cover(output_valid && word_size == 3 && word_load && word_store && word_atomic && word_operation == 0 && !word_fault);
+      cover(output_valid && word_size == 0 && word_load && !word_store && word_value[63] && !word_fault);
+      cover(output_valid && word_size == 1 && word_load && !word_store && word_unsigned && word_value[15] && !word_fault);
+      cover(memory_request_valid && word_size == 0 && word_store && word_address[2:0] == 7);
+      cover(memory_request_valid && word_atomic && word_operation == 3 && word_pair);
+      cover(memory_request_valid && word_atomic && word_operation == 3 && !word_pair);
+      cover(output_valid && word_atomic && word_operation == 2 && !word_fault && word_reservation);
+      cover(output_valid && word_atomic && word_operation == 3 && word_fault && !word_sent);
+    end
+  end
+'''.replace('PERMITTED', '_pmp_allowed' if parameters['pmpEntries'] else "1'b1").replace(
+        'PAD_RESERVED', f"{64 - parameters['physicalAddressBits']}'d0").replace(
+        'MASK_RESERVED', f"64'h{((1 << parameters['physicalAddressBits']) - 1) & ~7:x}")
+    return [('WordDecode', decode, 'assign output_bits_usesRs2 =', "assign output_bits_usesRs2 = 1'h0 &"),
+            ('WordExecute', execute, 'assign output_bits_unsignedLoad =', "assign output_bits_unsignedLoad = 1'h0 &"),
+            ('Lsu', lsu, 'assign memory_request_bits_size =', "assign memory_request_bits_size = 3'h3 |")]
+
+
+def integer_cases():
+    decode = r'''
+  wire [31:0] i_word = input_bits_instruction;
+  wire [6:0] i_opcode = i_word[6:0], i_funct7 = i_word[31:25];
+  wire [2:0] i_funct3 = i_word[14:12];
+  reg [4:0] i_operation;
+  reg i_checked, i_registers, i_store, i_branch, i_csr;
+  reg [63:0] i_immediate;
+  always @* begin
+    i_operation = 0; i_checked = 1; i_registers = 0; i_store = 0; i_branch = 0; i_csr = 0;
+    i_immediate = {{52{i_word[31]}}, i_word[31:20]};
+    case (i_opcode)
+      7'h13: begin
+        if (i_funct3 == 0) i_operation = 3;
+        else if ((i_funct3 == 1 && i_word[31:26] == 0) ||
+          (i_funct3 == 5 && (i_word[31:26] == 0 || i_word[31:26] == 16)) ||
+          (i_funct3 != 1 && i_funct3 != 5)) i_operation = 21;
+      end
+      7'h33: begin
+        i_registers = 1;
+        if (i_funct7 == 0) i_operation = i_funct3 == 0 ? 4 : 22;
+        else if (i_funct7 == 32 && (i_funct3 == 0 || i_funct3 == 5)) i_operation = 22;
+        else if (i_funct7 == 1 && i_funct3 == 0) i_operation = 14;
+      end
+      7'h1b: if (i_funct3 == 0 || (i_funct3 == 1 && i_funct7 == 0) ||
+        (i_funct3 == 5 && (i_funct7 == 0 || i_funct7 == 32))) i_operation = 23;
+      7'h3b: begin
+        i_registers = 1;
+        if (((i_funct3 == 0 || i_funct3 == 5) && (i_funct7 == 0 || i_funct7 == 32)) ||
+          (i_funct3 == 1 && i_funct7 == 0)) i_operation = 24;
+      end
+      7'h63: begin
+        i_registers = 1; i_branch = 1;
+        i_immediate = {{51{i_word[31]}}, i_word[31], i_word[7], i_word[30:25], i_word[11:8], 1'b0};
+        if (i_funct3 == 0) i_operation = 5;
+        else if (i_funct3 == 1 || i_funct3 >= 4) i_operation = 25;
+      end
+      7'h03: if (i_funct3 < 7) i_operation = i_funct3 == 2 ? 18 : i_funct3 == 3 ? 8 : i_funct3 == 6 ? 19 : 26;
+      7'h23: begin
+        i_registers = 1; i_store = 1;
+        i_immediate = {{52{i_word[31]}}, i_word[31:25], i_word[11:7]};
+        if (i_funct3 < 4) i_operation = i_funct3 == 2 ? 20 : i_funct3 == 3 ? 9 : 27;
+      end
+      7'h2f: begin
+        i_registers = i_word[31:27] != 2; i_immediate = 0;
+        if (i_funct3 == 3) begin
+          if (i_word[31:27] == 0) i_operation = 15;
+          else if (i_word[31:27] == 1 || i_word[31:27] == 3 || i_word[31:27] == 8 ||
+            (i_word[31:27] == 2 && i_word[24:20] == 0)) i_operation = 30;
+        end
+      end
+      7'h73: begin
+        i_csr = 1;
+        if (i_funct3 == 1) i_operation = 10;
+        else if (i_funct3 == 2) i_operation = 11;
+        else if (i_funct3 == 3 || i_funct3 >= 5) i_operation = 28;
+        else i_checked = i_funct3 != 0;
+      end
+      default: i_checked = 0;
+    endcase
+    if (i_opcode == 7'h73 && i_funct3 == 0 && i_word != 32'h00000073 && i_word != 32'h30200073) begin
+      assert(output_bits_operation == (i_word == 32'h10500073 ? 29 : 0));
+      assert(!output_bits_usesRs1 && !output_bits_usesRs2 && !output_bits_writesRd);
+      assert(output_bits_serializing == (!input_bits_fault && i_word == 32'h10500073));
+    end
+    if (i_checked) begin
+      assert(output_bits_operation == i_operation);
+      assert(output_bits_rs1 == i_word[19:15] && output_bits_rs2 == i_word[24:20] && output_bits_rd == i_word[11:7]);
+      assert(output_bits_usesRs1 == (!input_bits_fault && i_operation != 0 && !(i_csr && i_funct3[2])));
+      assert(output_bits_usesRs2 == (!input_bits_fault && i_operation != 0 && i_registers));
+      assert(output_bits_writesRd == (!input_bits_fault && i_operation != 0 && !i_store && !i_branch));
+      assert(output_bits_serializing == (!input_bits_fault && i_operation != 0 && i_csr));
+      if (i_operation != 0 && ((!i_csr && !i_registers) || i_store || i_branch || i_opcode == 7'h2f)) assert(output_bits_immediate == i_immediate);
+    end
+    cover(input_valid && !input_bits_fault && i_checked && i_operation == 0 && i_funct7 == 1);
+    cover(input_valid && i_operation == 21 && i_word[25] && i_funct3 == 5);
+    cover(input_valid && i_operation == 23 && i_funct3 == 5);
+    cover(input_valid && i_operation == 28 && i_word[19:15] == 0);
+    cover(input_valid && i_operation == 30 && i_word[31:27] == 2 && i_word[26:25] == 3);
+    cover(input_valid && i_opcode == 7'h2f && i_funct3 == 2 && i_operation == 0);
+  end
+'''
+    execute = r'''
+  wire [4:0] i_op = input_bits_decoded_operation;
+  wire [31:0] i_word = input_bits_decoded_instruction_instruction;
+  wire [2:0] i_function = i_word[14:12];
+  wire [63:0] i_a = input_bits_operand1, i_b = input_bits_operand2, i_imm = input_bits_decoded_immediate;
+  wire i_small = i_op == 23 || i_op == 24;
+  wire i_immediate = i_op == 21 || i_op == 23;
+  wire [63:0] i_rhs = i_immediate ? i_imm : i_b;
+  wire [5:0] i_shift = i_small ? {1'b0, i_rhs[4:0]} : i_rhs[5:0];
+  wire signed [63:0] i_signed_a = i_small ? {{32{i_a[31]}}, i_a[31:0]} : i_a;
+  wire [63:0] i_arithmetic_shift = i_signed_a >>> i_shift;
+  reg [63:0] i_result, i_expected, i_csr_value;
+  reg i_taken, i_write;
+  wire [63:0] i_target = input_bits_decoded_instruction_pc + i_imm;
+  wire [63:0] i_sequential = input_bits_decoded_instruction_pc + input_bits_decoded_instruction_length;
+  wire [63:0] i_csr_source = i_function[2] ? {59'd0, i_word[19:15]} : i_a;
+  always @* begin
+    case (i_function)
+      0: i_result = !i_immediate && i_word[30] ? i_a - i_rhs : i_a + i_rhs;
+      1: i_result = i_a << i_shift;
+      2: i_result = {63'd0, $signed(i_a) < $signed(i_rhs)};
+      3: i_result = {63'd0, i_a < i_rhs};
+      4: i_result = i_a ^ i_rhs;
+      5: i_result = i_word[30] ? i_arithmetic_shift :
+        (i_small ? {32'd0, i_a[31:0]} : i_a) >> i_shift;
+      6: i_result = i_a | i_rhs;
+      7: i_result = i_a & i_rhs;
+    endcase
+    i_expected = i_small ? {{32{i_result[31]}}, i_result[31:0]} : i_result;
+    assert(output_bits_wfi == (i_op == 29));
+    assert(output_bits_atomic == (i_op == 15 || i_op == 30));
+    if (i_op == 30) begin
+      assert(output_bits_load == (i_word[31:27] != 3) && output_bits_store == (i_word[31:27] != 2));
+      assert(output_bits_memorySize == 3 && !output_bits_unsignedLoad);
+      assert(output_bits_address == i_a + i_imm && output_bits_storeData == i_b && output_bits_nextPc == i_sequential);
+      assert(output_bits_instruction_fault == input_bits_decoded_instruction_fault);
+      assert(!output_bits_csrWrite && !output_bits_mret && !output_bits_fenceI && !output_bits_wfi);
+    end
+    if (i_op == 29) begin
+      assert(output_bits_nextPc == i_sequential && output_bits_instruction_fault == input_bits_decoded_instruction_fault);
+      assert(!output_bits_load && !output_bits_store && !output_bits_csrWrite && !output_bits_mret);
+    end
+    case (i_function)
+      0: i_taken = i_a == i_b;
+      1: i_taken = i_a != i_b;
+      4: i_taken = $signed(i_a) < $signed(i_b);
+      5: i_taken = $signed(i_a) >= $signed(i_b);
+      6: i_taken = i_a < i_b;
+      7: i_taken = i_a >= i_b;
+      default: i_taken = 0;
+    endcase
+    i_write = i_function[1:0] == 1 || input_bits_decoded_rs1 != 0;
+    case (i_function[1:0])
+      1: i_csr_value = i_csr_source;
+      2: i_csr_value = csrValue | i_csr_source;
+      default: i_csr_value = csrValue & ~i_csr_source;
+    endcase
+    if (i_op >= 21 && i_op <= 24 && (!i_small || i_function == 0 || i_function == 1 || i_function == 5)) begin
+      assert(output_bits_value == i_expected && output_bits_nextPc == i_sequential);
+      assert(output_bits_instruction_fault == input_bits_decoded_instruction_fault);
+      assert(!output_bits_load && !output_bits_store && !output_bits_csrWrite);
+    end
+    if (i_op == 25 && (i_function == 1 || i_function >= 4)) begin
+      assert(output_bits_nextPc == (i_taken ? i_target : i_sequential));
+      assert(output_bits_instruction_fault == (input_bits_decoded_instruction_fault || (i_taken && i_target[1:0] != 0)));
+      if (!input_bits_decoded_instruction_fault && i_taken && i_target[1:0] != 0)
+        assert(output_bits_instruction_cause == 0 && output_bits_instruction_tval == i_target);
+      assert(!output_bits_load && !output_bits_store && !output_bits_csrWrite);
+    end
+    if (i_op == 26 || i_op == 27) begin
+      assert(output_bits_load == (i_op == 26) && output_bits_store == (i_op == 27));
+      assert(output_bits_address == i_a + i_imm && output_bits_storeData == i_b);
+      assert(output_bits_memorySize == {1'b0, i_function[1:0]});
+      assert(output_bits_unsignedLoad == (i_op == 26 && i_function[2]));
+    end
+    if ((i_op == 28 || i_op == 10 || i_op == 11) && i_function != 0 && i_function != 4 &&
+        input_bits_decoded_rs1 == i_word[19:15] &&
+        (i_op == 28 ? (i_function == 3 || i_function >= 5) : i_function == (i_op == 10 ? 1 : 2))) begin
+      assert(output_bits_value == csrValue && output_bits_csrData == i_csr_value && output_bits_csrWrite == i_write);
+      assert(csrAddress == i_word[31:20] && output_bits_csrAddress == i_word[31:20]);
+      assert(output_bits_instruction_fault == (input_bits_decoded_instruction_fault || !csrLegal || (i_write && i_word[31:30] == 3)));
+      if (!input_bits_decoded_instruction_fault && (!csrLegal || (i_write && i_word[31:30] == 3)))
+        assert(output_bits_instruction_cause == 2 && output_bits_instruction_tval == {32'd0, i_word});
+    end
+    cover(input_valid && i_op == 21 && i_function == 1 && i_rhs[5]);
+    cover(input_valid && i_op == 24 && i_function == 5 && i_a[63] != i_a[31] && i_word[30]);
+    cover(input_valid && i_op == 25 && i_taken && i_target[1:0] != 0);
+    cover(input_valid && !input_bits_decoded_instruction_fault && i_op == 28 && i_function == 7 &&
+      !i_write && csrLegal && input_bits_decoded_rs1 == i_word[19:15]);
+  end
+'''
+    return [('IntegerDecode', decode, 'assign output_bits_usesRs1 =', "assign output_bits_usesRs1 = 1'h0 &"),
+            ('IntegerExecute', execute, 'assign output_bits_csrData =', "assign output_bits_csrData = 64'h0 &")]
+
+
+def local_interrupt_case(parameters):
+    base = int(parameters['localInterruptBase'])
+    count = parameters['hartCount']
+    body = r'''
+  reg local_past = 0, local_pending, local_fault;
+  reg [63:0] local_time, local_data;
+  reg [7:0] local_tag;
+  reg local_legal;
+  reg [63:0] local_read;
+  wire local_accept = memory_request_valid && memory_request_ready;
+  wire local_access = !memory_request_bits_fetch && !memory_request_bits_atomic;
+  wire local_word = memory_request_bits_size == 2 && (!memory_request_bits_write || memory_request_bits_mask == 15);
+  wire local_double = memory_request_bits_size == 3 && (!memory_request_bits_write || memory_request_bits_mask == 255);
+'''
+    for hart in range(count):
+        body += f'  reg local_software_{hart};\n  reg [63:0] local_compare_{hart};\n'
+    body += '  always @* begin\n    local_legal = 0; local_read = 0;\n'
+    for hart in range(count):
+        for offset, width, value in ((4 * hart, 'local_word', f"{{63'd0, local_software_{hart}}}"),
+                                     (0x4000 + 8 * hart, 'local_double', f'local_compare_{hart}')):
+            body += f"    if (memory_request_bits_address == 64'h{base + offset:x} && {width}) begin local_legal = local_access; local_read = {value}; end\n"
+    body += f"    if (memory_request_bits_address == 64'h{base + 0xbff8:x} && local_double) begin local_legal = local_access; local_read = local_time; end\n"
+    body += r'''  end
+  always @(posedge clock) begin
+    local_past <= 1;
+    if (!local_past) assume(reset); else assume(!reset);
+    if (reset) begin
+      local_pending <= 0; local_time <= 0;
+'''
+    for hart in range(count):
+        body += f"      local_software_{hart} <= 0; local_compare_{hart} <= 64'hffffffffffffffff;\n"
+    body += r'''    end else begin
+      assert(local_time == time_0);
+      assert(memory_request_ready == !local_pending && memory_response_valid == local_pending);
+      if (local_pending) begin
+        assert(memory_response_bits_tag == local_tag && memory_response_bits_fault == local_fault);
+        assert(memory_response_bits_data == local_data);
+        if (memory_response_ready) local_pending <= 0;
+      end
+      if (timeTick) local_time <= local_time + 1;
+      if (local_accept) begin
+        assert(!local_pending);
+        local_pending <= 1; local_tag <= memory_request_bits_tag; local_fault <= !local_legal;
+        local_data <= local_legal && !memory_request_bits_write ? local_read : 0;
+        if (local_legal && memory_request_bits_write) begin
+'''
+    for hart in range(count):
+        body += f"          if (memory_request_bits_address == 64'h{base + 4 * hart:x}) local_software_{hart} <= memory_request_bits_data[0];\n"
+        body += f"          if (memory_request_bits_address == 64'h{base + 0x4000 + 8 * hart:x}) local_compare_{hart} <= memory_request_bits_data;\n"
+    body += f"          if (memory_request_bits_address == 64'h{base + 0xbff8:x}) local_time <= memory_request_bits_data;\n"
+    body += '        end\n      end\n'
+    for hart in range(count):
+        compare = 'compare' if hart == 0 else f'compare_{hart - 1}'
+        body += f'''      assert(local_compare_{hart} == {compare});
+      assert(interrupts_{hart}_software == local_software_{hart});
+      assert(interrupts_{hart}_timer == (local_time >= local_compare_{hart}));
+      assert(!interrupts_{hart}_external);
+      cover(interrupts_{hart}_software && interrupts_{hart}_timer);
+'''
+    body += r'''      if (local_past && $past(!reset && memory_response_valid && !memory_response_ready)) begin
+        assert(memory_response_valid);
+        assert($stable({memory_response_bits_tag, memory_response_bits_fault, memory_response_bits_data}));
+      end
+      cover(local_pending && local_fault && !memory_response_ready);
+      cover(local_pending && !local_fault && !memory_response_ready && timeTick);
+      cover(local_accept && local_legal && memory_request_bits_write && timeTick);
+      cover(local_accept && memory_request_bits_fetch);
+      cover(local_accept && memory_request_bits_atomic);
+    end
+  end
+'''
+    return ('LocalInterrupts', body, 'assign memory_response_bits_fault =',
+            "assign memory_response_bits_fault = 1'h0 &")
+
+
 def instruction_cache_case(parameters):
     index_bits = (parameters['iCacheBytes'] // 64 - 1).bit_length()
     body = r'''
@@ -660,7 +1173,8 @@ def instruction_cache_case(parameters):
       if (downstream_request_valid) begin
         assert(cache_owned && cache_authorized && !cache_bus);
         assert(downstream_request_bits_address == cache_permission && downstream_request_bits_tag == cache_tag);
-        assert(downstream_request_bits_fetch && !downstream_request_bits_write && !downstream_request_bits_atomic);
+        assert(downstream_request_bits_fetch && !downstream_request_bits_write && !downstream_request_bits_atomic &&
+          !downstream_request_bits_atomicOperation && !downstream_request_bits_scEligible);
         assert(downstream_request_bits_size == 2 && downstream_request_bits_mask == 0 && downstream_request_bits_data == 0);
       end
       if (downstream_request_valid && downstream_request_ready) begin
@@ -690,7 +1204,8 @@ def instruction_cache_case(parameters):
           assert(downstream_request_valid);
           assert($stable({downstream_request_bits_address, downstream_request_bits_tag, downstream_request_bits_size,
             downstream_request_bits_data, downstream_request_bits_mask, downstream_request_bits_fetch,
-            downstream_request_bits_write, downstream_request_bits_atomic}));
+            downstream_request_bits_write, downstream_request_bits_atomic,
+            downstream_request_bits_atomicOperation, downstream_request_bits_scEligible}));
         end
         if ($past(upstream_response_valid && !upstream_response_ready)) begin
           assert(upstream_response_valid);
@@ -793,14 +1308,14 @@ def interrupt_witness(parameters, mode):
 def arbiter_case(parameters):
     count = 2 * parameters['hartCount']
     bits = (count - 1).bit_length()
-    fields = ('address', 'data', 'size', 'mask', 'tag', 'write', 'fetch', 'atomic')
+    fields = dict(address=64, data=64, size=3, mask=8, tag=8, write=1, fetch=1, atomic=1, atomicOperation=5, scEligible=1)
     payload = lambda prefix: '{' + ', '.join(prefix + '_bits_' + field for field in fields) + '}'
     vector = lambda suffix: '{' + ', '.join(f'ports_{i}_{suffix}' for i in reversed(range(count))) + '}'
     body = f'''
   reg past_valid = 0;
   reg pending, sent, wrapped;
   reg [{bits-1}:0] expected_owner;
-  reg [149:0] captured;
+  reg [{sum(fields.values())-1}:0] captured;
   (* anyconst *) reg [{bits-1}:0] watched;
   reg [{bits}:0] bypassed;
   wire [{count-1}:0] requests = {vector('request_valid')};
@@ -828,6 +1343,7 @@ def arbiter_case(parameters):
       if (!pending && |requests) assert(|accepted);
       if (pending) begin
         assert(ready == 0 && expected_owner == owner);
+        assert(hartId == (expected_owner >> 1));
         assert(downstream_request_valid == !sent);
       end
       if (downstream_request_valid) assert(pending && !sent && {payload('downstream_request')} == captured);
@@ -867,6 +1383,72 @@ def arbiter_case(parameters):
             "assign ports_0_response_valid = downstream_response_valid |")
 
 
+def memory_case(parameters):
+    fields = ('address', 'data', 'size', 'mask', 'tag', 'write', 'fetch', 'atomic', 'atomicOperation', 'scEligible')
+    payload = lambda prefix: '{' + ', '.join(prefix + '_bits_' + field for field in fields) + '}'
+    body = r'''
+  reg memory_past = 0, memory_owned, memory_denied;
+  reg [7:0] memory_tag;
+  wire m_atomic = upstream_request_bits_atomic, m_write = upstream_request_bits_write;
+  wire m_fetch = upstream_request_bits_fetch;
+  wire [4:0] m_operation = upstream_request_bits_atomicOperation;
+  wire [63:0] m_address = upstream_request_bits_address;
+  wire [7:0] m_mask = upstream_request_bits_mask;
+  wire m_shape = !m_atomic || (!m_fetch && upstream_request_bits_size == 3 &&
+    (m_operation == 2 ? !m_write : (m_operation == 0 || m_operation == 1 || m_operation == 3 || m_operation == 8) && m_write && m_mask == 255));
+  reg m_allowed;
+  always @* begin
+    m_allowed = 0;
+    case (upstream_request_bits_size)
+'''
+    for size in range(4):
+        count = 1 << size
+        body += f"      {size}: if (m_shape && (m_address & 64'd{count-1}) == 0 && (!m_write || (m_mask != 0 && (m_mask & 8'h{255 ^ ((1 << count) - 1):x}) == 0))) begin\n"
+        for region in parameters['memoryRegions']:
+            rights = {key: int(region[key]) for key in ('readable', 'writable', 'executable', 'device', 'atomic')}
+            if int(region['size']) >= count:
+                body += f"        if (m_address >= 64'h{int(region['base']):x} && m_address <= 64'h{int(region['base'])+int(region['size'])-count:x} &&\n"
+                body += f"          (m_fetch ? {int(rights['executable'] and not rights['device'])} && !m_write && !m_atomic : m_atomic ? {int(rights['atomic'] and not rights['device'])} &&\n"
+                body += f"          (m_operation == 2 ? {rights['readable']} : m_operation == 3 ? {rights['writable']} : {rights['readable'] and rights['writable']}) : m_write ? {rights['writable']} : {rights['readable']})) m_allowed = 1;\n"
+        body += '      end\n'
+    body += r'''    endcase
+  end
+  always @(posedge clock) begin
+    memory_past <= 1;
+    if (!memory_past) assume(reset); else assume(!reset);
+    if (reset) begin memory_owned <= 0; memory_denied <= 0; end
+    else begin
+      assert(pending == memory_owned);
+      if (memory_owned) assert(localFault == memory_denied && tag == memory_tag);
+      assert(upstream_request_ready == (!memory_owned && (!m_allowed || downstream_request_ready)));
+      assert(downstream_request_valid == (upstream_request_valid && !memory_owned && m_allowed));
+      if (downstream_request_valid) assert(DOWNSTREAM_PAYLOAD == UPSTREAM_PAYLOAD);
+      assert(upstream_response_valid == (memory_owned && (memory_denied || downstream_response_valid)));
+      assert(downstream_response_ready == (memory_owned && !memory_denied && upstream_response_ready));
+      if (upstream_request_valid && upstream_request_ready) begin
+        memory_owned <= 1; memory_denied <= !m_allowed; memory_tag <= upstream_request_bits_tag;
+      end
+      if (upstream_response_valid) begin
+        assert(upstream_response_bits_data == (memory_denied ? 0 : downstream_response_bits_data));
+        assert(upstream_response_bits_tag == (memory_denied ? memory_tag : downstream_response_bits_tag));
+        assert(upstream_response_bits_fault == (memory_denied || downstream_response_bits_fault));
+        if (upstream_response_ready) memory_owned <= 0;
+      end
+      cover(memory_owned && memory_denied && !upstream_response_ready);
+      cover(upstream_request_valid && m_atomic && !m_shape && upstream_request_ready);
+      cover(upstream_request_valid && m_atomic && m_operation == 3 && !upstream_request_bits_scEligible && !m_allowed && upstream_request_ready);
+    end
+  end
+'''.replace('DOWNSTREAM_PAYLOAD', payload('downstream_request')).replace('UPSTREAM_PAYLOAD', payload('upstream_request'))
+    if any(region['atomic'] for region in parameters['memoryRegions']):
+        body += '''  always @(posedge clock) if (!reset) begin
+    cover(downstream_request_valid && m_atomic && m_operation == 2 && m_mask != 0);
+    cover(downstream_request_valid && m_atomic && m_operation == 3 && !upstream_request_bits_scEligible);
+  end
+'''
+    return ('Memory', body, 'assign downstream_request_valid =', "assign downstream_request_valid = 1'h1 |")
+
+
 def axi_case(parameters):
     width = parameters['axiDataBits']
     lane_bits = (width // 8 - 1).bit_length()
@@ -877,6 +1459,15 @@ def axi_case(parameters):
   reg [63:0] accepted_address, addend, old_value;
   reg [2:0] accepted_size;
   reg [7:0] accepted_mask, accepted_tag;
+  reg [4:0] accepted_operation;
+  reg [ID-1:0] accepted_id;
+  reg accepted_eligible, accepted_write;
+  wire is_lr = is_atomic && accepted_operation == 2;
+  wire is_sc = is_atomic && accepted_operation == 3;
+  wire is_rmw = is_atomic && !is_lr && !is_sc;
+  wire input_sc = memory_request_bits_atomic && memory_request_bits_atomicOperation == 3;
+  wire input_write = memory_request_bits_write && (!memory_request_bits_atomic || input_sc);
+  wire input_rejected = input_sc && !memory_request_bits_scEligible;
   wire read_fire = axi_ar_valid && axi_ar_ready;
   wire write_address_fire = axi_aw_valid && axi_aw_ready;
   wire write_data_fire = axi_w_valid && axi_w_ready;
@@ -886,9 +1477,10 @@ def axi_case(parameters):
   wire [63:0] loaded_value = accepted_size == 0 ? {56'd0, shifted_value[7:0]} :
     accepted_size == 1 ? {48'd0, shifted_value[15:0]} :
     accepted_size == 2 ? {32'd0, shifted_value[31:0]} : accepted_size == 3 ? shifted_value : 0;
-  wire read_bad = expected_fault || axi_r_bits_id || !axi_r_bits_last ||
+  wire read_bad = expected_fault || axi_r_bits_id != accepted_id || !axi_r_bits_last ||
     axi_r_bits_resp != (is_atomic ? 1 : 0);
-  wire [63:0] stored_value = is_atomic ? old_value + addend : addend;
+  wire [63:0] update_value = accepted_operation == 1 ? addend : accepted_operation == 8 ? old_value | addend : old_value + addend;
+  wire [63:0] stored_value = is_rmw ? update_value : addend;
   wire [WIDTH-1:0] stored_lanes = {{PAD{1'b0}}, stored_value};
   wire [BYTES-1:0] stored_mask = {{MASKPAD{1'b0}}, accepted_mask};
   always @(posedge clock) begin
@@ -910,14 +1502,15 @@ def axi_case(parameters):
       end
       if (memory_request_valid && memory_request_ready) begin
         assert(!held);
-        if (memory_request_bits_atomic) assume(memory_request_bits_write && !memory_request_bits_fetch &&
-          memory_request_bits_size == 3 && memory_request_bits_mask == 255 && memory_request_bits_address[2:0] == 0);
-        held <= 1; complete <= 0; expected_fault <= 0; old_value <= 0; retried <= 0;
+        held <= 1; complete <= input_rejected; expected_fault <= 0; old_value <= input_rejected ? 1 : 0; retried <= 0;
         is_atomic <= memory_request_bits_atomic; accepted_address <= memory_request_bits_address;
+        accepted_operation <= memory_request_bits_atomicOperation; accepted_eligible <= memory_request_bits_scEligible;
+        accepted_write <= memory_request_bits_write;
+        accepted_id <= hartId[ID-1:0];
         addend <= memory_request_bits_data; accepted_size <= memory_request_bits_size;
         accepted_mask <= memory_request_bits_mask; accepted_tag <= memory_request_bits_tag;
-        can_read <= !memory_request_bits_write || memory_request_bits_atomic;
-        can_write <= memory_request_bits_write && !memory_request_bits_atomic;
+        can_read <= !input_rejected && !input_write;
+        can_write <= !input_rejected && input_write;
       end
       assert(memory_request_ready == !held && memory_response_valid == complete);
       assert(held == (can_read || can_write || complete));
@@ -926,6 +1519,8 @@ def axi_case(parameters):
       if (held) begin
         assert(request_address == accepted_address && request_data == addend && request_size == accepted_size &&
           request_mask == accepted_mask && request_tag == accepted_tag && request_atomic == is_atomic);
+        assert(request_atomicOperation == accepted_operation);
+        assert(hartId_0 == accepted_id);
         assert(data == old_value && fault == expected_fault);
       end
       if (held && !complete)
@@ -934,14 +1529,17 @@ def axi_case(parameters):
       assert(axi_aw_valid == (can_write && !address_sent));
       assert(axi_w_valid == (can_write && !data_sent));
       assert(axi_r_ready == read_owned && axi_b_ready == (address_sent && data_sent));
+      if (held && is_lr) assert(!axi_aw_valid && !axi_w_valid && !can_write);
+      if (held && is_sc && accepted_write) assert(!axi_ar_valid && !can_read && !retried);
+      if (held && is_sc && !accepted_eligible) assert(complete && old_value == 1 && !expected_fault);
       if (axi_ar_valid) begin
         assert(held && !complete && !can_write);
-        assert(axi_ar_bits_addr == accepted_address[PHYSICAL:0] && axi_ar_bits_id == 0 &&
+        assert(axi_ar_bits_addr == accepted_address[PHYSICAL:0] && axi_ar_bits_id == accepted_id &&
           axi_ar_bits_len == 0 && axi_ar_bits_size == accepted_size && axi_ar_bits_lock == is_atomic);
       end
       if (axi_aw_valid) begin
         assert(held && !complete && !can_read);
-        assert(axi_aw_bits_addr == accepted_address[PHYSICAL:0] && axi_aw_bits_id == 0 &&
+        assert(axi_aw_bits_addr == accepted_address[PHYSICAL:0] && axi_aw_bits_id == accepted_id &&
           axi_aw_bits_len == 0 && axi_aw_bits_size == accepted_size && axi_aw_bits_lock == is_atomic);
       end
       if (axi_w_valid) begin
@@ -957,18 +1555,19 @@ def axi_case(parameters):
         old_value <= loaded_value; expected_fault <= read_bad;
         if (axi_r_bits_last) begin
           read_owned <= 0; can_read <= 0;
-          if (is_atomic && !read_bad) can_write <= 1;
+          if (is_rmw && !read_bad) can_write <= 1;
           else complete <= 1;
         end
       end
       if (write_reply) begin
         assert(held && can_write && address_sent && data_sent);
         can_write <= 0; address_sent <= 0; data_sent <= 0;
-        if (is_atomic && axi_b_bits_resp == 0 && !axi_b_bits_id) begin
+        if (is_rmw && axi_b_bits_resp == 0 && axi_b_bits_id == accepted_id) begin
           can_read <= 1; retried <= 1;
         end else begin
           complete <= 1;
-          expected_fault <= axi_b_bits_id || axi_b_bits_resp != (is_atomic ? 1 : 0);
+          expected_fault <= axi_b_bits_id != accepted_id || (is_sc ? axi_b_bits_resp[1] : axi_b_bits_resp != (is_atomic ? 1 : 0));
+          if (is_sc) old_value <= axi_b_bits_resp == 0 ? 1 : 0;
         end
       end
       if (memory_response_valid) begin
@@ -990,6 +1589,13 @@ def axi_case(parameters):
       cover(is_atomic && address_sent && !data_sent);
       cover(is_atomic && data_sent && !address_sent);
       cover(is_atomic && complete && !memory_response_ready && retried);
+      cover(is_lr && complete && !expected_fault);
+      cover(is_sc && complete && !accepted_eligible && old_value == 1 && !expected_fault);
+      cover(is_sc && complete && accepted_eligible && old_value == 1 && !expected_fault);
+      cover(is_sc && complete && accepted_eligible && old_value == 0 && !expected_fault);
+      cover(is_rmw && accepted_operation == 8 && write_data_fire);
+      cover(is_rmw && accepted_operation == 1 && write_data_fire);
+      cover(held && accepted_id != 0 && axi_ar_valid && !axi_ar_ready);
     end
   end
 '''
@@ -1002,7 +1608,8 @@ def axi_case(parameters):
   end
 '''
     for token, value in (('LANE', lane_bits - 1), ('PHYSICAL', parameters['physicalAddressBits'] - 1),
-                         ('WIDTH', width), ('BYTES', width // 8), ('MASKPAD', width // 8 - 8), ('PAD', width - 64)):
+                         ('WIDTH', width), ('BYTES', width // 8), ('MASKPAD', width // 8 - 8), ('PAD', width - 64),
+                         ('ID', max(1, (parameters['hartCount'] - 1).bit_length()))):
         body = body.replace(token, str(value))
     return ('Axi', body, 'request_atomic <= memory_request_bits_atomic;', 'request_atomic <= 0;')
 
@@ -1026,7 +1633,10 @@ def verify(rtl, directory, modules=None):
             ('Fetch', FETCH, '& ~killed & ~cancel', '& ~cancel'),
             ('Multiply', MULTIPLY, '~busy & ~valid', '~valid'),
             ('Backend', BACKEND, '(~issuedValid | executed) & ~executePending & ~redirect_0', '(~issuedValid | executed) & ~redirect_0'))
-    cases = [*cases, synchronization_case(manifest['parameters']), arbiter_case(manifest['parameters']), axi_case(manifest['parameters'])]
+    cases = [*cases, *word_cases(manifest['parameters']), *integer_cases(), *wfi_cases(manifest['parameters']), synchronization_case(manifest['parameters']),
+             arbiter_case(manifest['parameters']), memory_case(manifest['parameters']), axi_case(manifest['parameters'])]
+    if manifest['parameters'].get('localInterruptBase') is not None:
+        cases.append(local_interrupt_case(manifest['parameters']))
     if manifest['parameters'].get('iCacheBytes'):
         cases.append(instruction_cache_case(manifest['parameters']))
     if manifest['parameters'].get('enableInterrupts'):
@@ -1037,7 +1647,7 @@ def verify(rtl, directory, modules=None):
             continue
         if modules and name not in modules and not (name.startswith('Pmp') and 'Pmp' in modules):
             continue
-        unit = name.removeprefix('Interrupt').removeprefix('Synchronization')
+        unit = name.removeprefix('Interrupt').removeprefix('Synchronization').removeprefix('Word').removeprefix('Integer').removeprefix('Wfi')
         if unit == 'Csr':
             body += "\n  always @* if (readAddress == 12'hf14) assert(legal && readData == {60'd0, hartId});\n"
         module = 'DitDahA1' + ('Pmp' if name == 'PmpDecode' else unit)
@@ -1045,15 +1655,25 @@ def verify(rtl, directory, modules=None):
             module = 'formal_interval'
             files = {module + '.sv': license + 'module formal_interval(input [64:0] low, high, input [63:0] address, input [2:0] size);\nendmodule\n'}
         else:
-            files = dict(sources) if unit in ('Backend', 'InstructionCache') else {module + '.sv': sources[module + '.sv']}
-        if unit == 'InstructionCache':
+            files = dict(sources) if unit in ('Backend', 'Frontend', 'InstructionCache') else {module + '.sv': sources[module + '.sv']}
+        if unit in ('InstructionCache', 'Frontend'):
             for filename in files:
                 match = re.fullmatch(r'(?:instructions|tags)_\d+x(\d+)\.sv', filename)
                 if match:
                     files[filename] = license + header(sources[filename]) + f'\n(* anyseq *) reg [{int(match[1])-1}:0] arbitrary_read;\nassign R0_data = arbitrary_read;\nendmodule\n'
-        if enabled and unit in ('Fetch', 'Lsu', 'Backend'):
+        if enabled and unit in ('Fetch', 'Lsu', 'Backend', 'Frontend'):
             files['DitDahA1Pmp.sv'] = license + header(sources['DitDahA1Pmp.sv']) + '\n(* anyseq *) reg permit;\nassign allowed = permit;\nendmodule\n'
-        if unit in ('Backend', 'Multiply', 'Csr', 'MemoryArbiter', 'Axi', 'InstructionCache') or enabled:
+            if unit == 'Lsu':
+                for port, width, expected in (('address', 64, 'input_bits_address'), ('size', 3, 'input_bits_memorySize'),
+                                              ('write', 1, 'input_bits_store'), ('fetch', 1, "1'b0"),
+                                              ('atomic', 1, 'input_bits_load && input_bits_store')):
+                    pattern = rf'\.{port}\s*\(([^()]*)\)'
+                    observed = files[module + '.sv']
+                    connections = re.findall(pattern, observed)
+                    assert len(connections) == 1, (port, connections)
+                    files[module + '.sv'] = re.sub(pattern, f'.{port}(formal_pmp_{port})', observed)
+                    body += f'\n  wire [{width-1}:0] formal_pmp_{port} = {connections[0]};\n  always @* if (!reset && input_valid && input_ready) assert(formal_pmp_{port} == ({expected}));\n'
+        if unit in ('Backend', 'Frontend', 'Multiply', 'Csr', 'MemoryArbiter', 'Memory', 'Axi', 'InstructionCache', 'Lsu', 'LocalInterrupts') or (enabled and unit not in ('Decode', 'Execute')):
             if unit == 'Backend':
                 files['DitDahA1Multiply.sv'] = license + header(sources['DitDahA1Multiply.sv']) + RESOURCE + 'endmodule\n'
             if name == 'InterruptBackend':
@@ -1071,26 +1691,116 @@ def verify(rtl, directory, modules=None):
             top = 'formal_top'
             files['wrapper.sv'] = license + header(files[module + '.sv']).replace(module, top, 1) + f'\n  {module} dut (.*);\n' + body + 'endmodule\n'
         checks = [('prove', before, after), ('cover', before, after), ('mutation', before, after)]
+        if name == 'WfiBackend' and not manifest['parameters'].get('enableInterrupts'):
+            checks[2] = ('mutation', before, "assign status_sleep = 1'h1 |")
+        if name == 'WordDecode':
+            assignment = re.search(r'assign output_bits_usesRs2\s*=\s*[^;]+;', sources[module + '.sv']).group()
+            checks[2] = ('mutation', assignment, 'assign output_bits_usesRs2 = 0;')
+        if name in ('IntegerDecode', 'IntegerExecute'):
+            field = 'usesRs1' if unit == 'Decode' else 'csrData'
+            assignment = re.search(rf'assign output_bits_{field}\s*=\s*[^;]+;', sources[module + '.sv']).group(0)
+            checks[2] = ('mutation', assignment, f'assign output_bits_{field} = 0;')
+            checks += [('mutation-wfi', "input_bits_instruction == 32'h10500073", "input_bits_instruction[31:20] == 12'h105")] if unit == 'Decode' else [
+                ('mutation-wfi', "assign output_bits_wfi = input_bits_decoded_operation == 5'h1D;", 'assign output_bits_wfi = 0;')]
+            if unit == 'Decode':
+                checks += [('mutation-atomic-width', "input_bits_instruction[14:12] == 3'h3", "input_bits_instruction[14:13] == 2'h1"),
+                           ('mutation-lr-source', "input_bits_instruction[24:20] == 5'h0", "1'h1"),
+                           ('mutation-atomic-operation', "input_bits_instruction[31:27] == 5'h8", "1'h1")]
+            else:
+                atomic_assignment = re.search(r'assign output_bits_atomic\s*=\s*[^;]+;', sources[module + '.sv']).group()
+                checks += [('mutation-atomic', atomic_assignment, 'assign output_bits_atomic = 0;')]
+        if name == 'IntegerExecute':
+            value = re.search(r'assign output_bits_value\s*=\s*[^;]+;', sources[module + '.sv']).group(0)
+            branch = re.search(r'assign output_bits_nextPc\s*=\s*[^;]+;', sources[module + '.sv']).group(0)
+            checks += [('mutation-word', value, 'assign output_bits_value = (' + value.split('=', 1)[1].strip()[:-1] + ") & 64'hffffffff;"),
+                       ('mutation-shift', value, 'assign output_bits_value = input_bits_operand1 << input_bits_decoded_immediate[4:0];'),
+                       ('mutation-branch', branch, 'assign output_bits_nextPc = input_bits_decoded_instruction_pc + input_bits_decoded_instruction_length;')]
         if name == 'InterruptBackend':
             checks += [('mutation-pc', '? resumePc', "? 64'h0"),
                        ('mutation-write', 'formal_write =', "formal_write = 1'h1 |")]
+        if name == 'InterruptCsr':
+            pending = re.search(r'assign interruptPending\s*=\s*[^;]+;', sources[module + '.sv']).group()
+            checks[2] = ('mutation', pending, 'assign interruptPending = wakeup;')
+            checks += [('mutation-wakeup', 'assign wakeup =', 'assign wakeup = status[3] &')]
+        if name == 'WfiBackend':
+            redirect = '| enterWfi;' if manifest['parameters'].get('enableInterrupts') else re.search(
+                r'\|\s*commit_output_valid_layerCapture\s*&\s*_commit_output_bits_wfi\s*&\s*~commit_output_bits_instruction_fault_layerCapture;',
+                sources[module + '.sv']).group()
+            checks += [('mutation-fault', '~input_bits_instruction_fault & input_bits_wfi', 'input_bits_wfi', 'DitDahA1Commit.sv'),
+                       ('mutation-redirect', redirect, ';')]
+            if manifest['parameters'].get('enableInterrupts'):
+                checks += [('mutation-priority', 'sleep <= (sleep | enterWfi) & ~_csr_wakeup & ~status_trap_0;',
+                            'sleep <= (sleep & ~_csr_wakeup | enterWfi) & ~status_trap_0;')]
         if unit == 'MemoryArbiter':
             advance = re.findall(r'next <= [^;]+;', sources[module + '.sv'])[-1]
             checks += [('mutation-release', 'downstream_response_valid & downstream_response_ready_0', 'downstream_response_valid'),
                        ('mutation-priority', advance, "next <= '0;")]
+            if manifest['parameters']['hartCount'] > 1:
+                checks += [('mutation-identity', 'assign hartId =', "assign hartId = 4'h0 &")]
+        if unit == 'Memory' and any(region['atomic'] for region in manifest['parameters']['memoryRegions']):
+            shape = re.search(r'wire\s+atomicShape\w*\s*=\s*[^;]*upstream_request_bits_atomicOperation[^;]+;', sources[module + '.sv']).group()
+            checks += [('mutation-shape', shape, shape.split('=', 1)[0] + "= 1'h1;")]
         if unit == 'Axi':
             original = sources[module + '.sv']
             retry_state = re.findall(r"state <= \w+ \? 3'h1 : 3'h4;", original)[0]
             read_update = re.search(r'if \((\w+)\)\n\s+data <=', original).group(0)
             checks += [('mutation-retry', retry_state, "state <= 3'h4;"),
                        ('mutation-stale', read_update, read_update.replace(')', ' && !retried)', 1)),
-                       ('mutation-read-error', 'request_atomic & ~readFault', 'request_atomic'),
+                       ('mutation-read-error', 'amo & ~readFault', 'amo'),
                        ('mutation-write-error', "axi_b_bits_resp == 2'h0", "axi_b_bits_resp != 2'h1"),
                        ('mutation-old-value', 'assign memory_response_bits_data = data;',
-                        'assign memory_response_bits_data = request_atomic ? data + request_data : data;')]
+                        'assign memory_response_bits_data = request_atomic ? data + request_data : data;'),
+                       ('mutation-or', "request_atomicOperation == 5'h8", "1'h0"),
+                       ('mutation-swap', "request_atomicOperation == 5'h1", "1'h0"),
+                       ('mutation-lr-write', 'amo & ~readFault', 'request_atomic & ~readFault'),
+                       ('mutation-sc-empty', 'inputSc & ~memory_request_bits_scEligible', "1'h0")]
+            retry = re.search(r'wire\s+(\w+)\s*=\s*amo\s*&\s*[^;]*axi_b_bits_id[^;]+;', original).group()
+            status = re.search(r'else\s+data <= \{63\x27h0, (\w+)\};', original).group()
+            checks += [('mutation-sc-retry', retry, retry.replace('amo', '(amo | sc)', 1)),
+                       ('mutation-sc-status', status, status.replace("{63'h0, ", "{63'h0, ~"))]
+            if manifest['parameters']['hartCount'] > 1:
+                checks += [('mutation-read-identity', re.search(r'assign axi_ar_bits_id\s*=\s*[^;]+;', original).group(),
+                            f"assign axi_ar_bits_id = hartId[{max(1, (manifest['parameters']['hartCount'] - 1).bit_length())-1}:0];"),
+                           ('mutation-write-identity', 'assign axi_aw_bits_id =', "assign axi_aw_bits_id = 1'h0 &")]
         if name == 'Pmp':
             checks += [('mutation-atomic-read', 'state_config[0] & state_config[1]', 'state_config[1]'),
                        ('mutation-atomic-write', 'state_config[0] & state_config[1]', 'state_config[0]')]
+        if unit == 'Lsu':
+            mask_assignment = re.search(r'assign memory_request_bits_mask\s*=\s*[^;]+;', sources[module + '.sv']).group(0)
+            checks += [('mutation-mask', mask_assignment,
+                        "assign memory_request_bits_mask = 8'hff;"),
+                       ('mutation-extension', 'assign output_bits_value = packet_value;',
+                        "assign output_bits_value = {32'd0, packet_value[31:0]};")]
+            if enabled:
+                checks += [('mutation-permission', '~_pmp_allowed', "1'h0")]
+                checks += [('mutation-pmp-direction', 'wire [0:0] formal_pmp_atomic =', "wire [0:0] formal_pmp_atomic = 1'h0 &")]
+            original = sources[module + '.sv']
+            update = re.search(r'reserved <= (\w+) \| ~\([^;]+;', original).group()
+            pair = re.search(r'scEligible <=[^;]+;', original).group()
+            success = re.search(r'wire\s+(\w+)\s*=\s*[^;]*packet_atomic[^;]*~memory_response_bits_fault[^;]+;', original).group()
+            checks += [('mutation-consume', update, re.sub(r'~\([^;]+?\) & reserved', 'reserved', update)),
+                       ('mutation-pair', pair, "scEligible <= 1'h0;"),
+                       ('mutation-alias', pair, f"scEligible <= input_bits_atomic & input_bits_instruction_instruction[31:27] == 3 & reserved & input_bits_address[{manifest['parameters']['physicalAddressBits']-1}:3] == reservedWord & input_bits_memorySize == 3;"),
+                       ('mutation-lr-fault', success, success.replace('~memory_response_bits_fault', "1'h1"))]
+        if name == 'WordExecute':
+            checks += [('mutation-size', 'assign output_bits_memorySize =',
+                        "assign output_bits_memorySize = 3'h3 |")]
+        if unit == 'LocalInterrupts':
+            checks += [('mutation-tag', 'assign memory_response_bits_tag = response_tag;',
+                        "assign memory_response_bits_tag = 8'h0;"),
+                       ('mutation-software', 'assign interrupts_0_software =',
+                        "assign interrupts_0_software = 1'h0 &"),
+                       ('mutation-compare', 'assign interrupts_0_timer = time_0 >= compare;',
+                        'assign interrupts_0_timer = time_0[31:0] >= compare[31:0];'),
+                       ('mutation-tick', "time_0 <= time_0 + 64'h1;", 'time_0 <= time_0;'),
+                       ('mutation-priority', 'if (write & timeAccess)', 'if (write & timeAccess & ~timeTick)'),
+                       ('mutation-warl', 'software <= memory_request_bits_data[0];',
+                        'software <= memory_request_bits_data[1];'),
+                       ('mutation-accept', 'accepted & permitted & memory_request_bits_write',
+                        'permitted & memory_request_bits_write')]
+            if manifest['parameters']['hartCount'] > 1:
+                checks += [('mutation-isolation', 'if (write & softwareAccess_0)',
+                            'if (write & softwareAccess)')]
         if name == 'SynchronizationBackend':
             checks += [('mutation-serialization', 'assign output_bits_serializing =',
                         "assign output_bits_serializing = 1'h0 &", 'DitDahA1Decode.sv'),
@@ -1116,10 +1826,12 @@ def verify(rtl, directory, modules=None):
                     text = text.replace('endmodule', synchronization_witness(manifest['parameters'], mode) + '\nendmodule', 1)
                 if name == 'InterruptBackend' and mode != 'prove' and filename == module + '.sv':
                     text = text.replace('endmodule', interrupt_witness(manifest['parameters'], mode) + '\nendmodule', 1)
+                if name == 'WfiBackend' and mode != 'prove' and filename == module + '.sv':
+                    text = text.replace('endmodule', wfi_witness(manifest['parameters'], mode) + '\nendmodule', 1)
                 if unit == 'MemoryArbiter' and mode != 'prove' and filename == module + '.sv':
                     guidance = ''.join(f'    assume(ports_{i}_request_valid);\n' + ''.join(
                         f"    assume(ports_{i}_request_bits_{field} == 0);\n"
-                        for field in ('address', 'data', 'size', 'mask', 'tag', 'write', 'fetch', 'atomic'))
+                        for field in ('address', 'data', 'size', 'mask', 'tag', 'write', 'fetch', 'atomic', 'atomicOperation', 'scEligible'))
                         for i in range(2 * manifest['parameters']['hartCount']))
                     guidance += f'''    assume(downstream_request_ready == (witness_age != 1));
     assume(downstream_response_valid == sent);
@@ -1132,21 +1844,80 @@ def verify(rtl, directory, modules=None):
 ''' + guidance + '  end\nendmodule', 1)
                 if unit == 'Axi' and mutating and filename == module + '.sv':
                     width = manifest['parameters']['axiDataBits']
+                    atomic_operation = {'mutation-or': 8, 'mutation-swap': 1, 'mutation-lr-write': 2,
+                                        'mutation-sc-empty': 3, 'mutation-sc-retry': 3, 'mutation-sc-status': 3,
+                                        'mutation-read-identity': 2, 'mutation-write-identity': 3}.get(mode, 0)
+                    identity = int('identity' in mode)
                     read_code = 2 if mode == 'mutation-read-error' else 1
-                    write_code = '0' if mode == 'mutation-retry' else '2' if mode == 'mutation-write-error' else '(retried ? 1 : 0)' if mode == 'mutation-stale' else '1'
+                    write_code = '0' if mode in ('mutation-retry', 'mutation-sc-retry', 'mutation-sc-status') else '2' if mode == 'mutation-write-error' else '(retried ? 1 : 0)' if mode == 'mutation-stale' else '1'
                     guidance = f'''
   always @* begin
-    assume(memory_request_valid && memory_request_bits_atomic && memory_request_bits_write && !memory_request_bits_fetch);
+    assume(memory_request_valid && memory_request_bits_atomic && memory_request_bits_write == {int(atomic_operation != 2)} && !memory_request_bits_fetch);
+    assume(memory_request_bits_atomicOperation == {atomic_operation} && memory_request_bits_scEligible == {int(mode != 'mutation-sc-empty')});
+    assume(hartId == {"(held ? 0 : 1)" if mode == 'mutation-read-identity' else identity});
     assume(memory_request_bits_address == 8 && memory_request_bits_data == 1 && memory_request_bits_tag == 37);
-    assume(memory_request_bits_size == 3 && memory_request_bits_mask == 255 && memory_response_ready);
+    assume(memory_request_bits_size == 3 && memory_request_bits_mask == {0 if atomic_operation == 2 else 255} && memory_response_ready);
     assume(axi_ar_ready && axi_aw_ready && axi_w_ready);
     assume(axi_r_valid == read_owned && axi_b_valid == (address_sent && data_sent));
-    assume(!axi_r_bits_id && axi_r_bits_last && !axi_b_bits_id);
+    assume(axi_r_bits_id == {identity} && axi_r_bits_last && axi_b_bits_id == {identity});
     assume(axi_r_bits_resp == {read_code} && axi_b_bits_resp == {write_code});
     assume(axi_r_bits_data == ((retried ? {width}'d11 : {width}'d7) << {8 * (8 % (width // 8))}));
   end
 '''
                     text = text.replace('endmodule', guidance + '\nendmodule', 1)
+                if unit == 'Lsu' and mutating and filename == module + '.sv':
+                    load = mode == 'mutation-extension'
+                    atomic = mode in ('mutation-consume', 'mutation-pair', 'mutation-alias', 'mutation-lr-fault', 'mutation-pmp-direction')
+                    guidance = f'''
+  always @* begin
+    assume(input_valid && !input_bits_instruction_fault && !input_bits_atomic && storeAllowed && output_ready);
+    assume(input_bits_memorySize == 2 && !input_bits_unsignedLoad);
+    assume(input_bits_load == {int(load)} && input_bits_store == {int(not load)});
+    assume(input_bits_instruction_instruction == 32'h{0x00402283 if load else 0x00102223:x});
+    assume(input_bits_address == 4 && input_bits_instruction_tag == 37);
+    assume(memory_request_ready && memory_response_valid == (word_sent && !word_replied));
+    assume(memory_response_bits_data == 64'h80000000 && memory_response_bits_tag == 37 && !memory_response_bits_fault);
+  end
+'''
+                    if atomic:
+                        guidance = f'''
+  reg [1:0] pair_sequence = 0;
+  always @(posedge clock) if (!reset && output_valid && output_ready && pair_sequence != 2) pair_sequence <= pair_sequence + 1;
+  always @* begin
+    assume(input_valid && !input_bits_instruction_fault && input_bits_atomic && storeAllowed && output_ready);
+    assume(input_bits_memorySize == 3 && !input_bits_unsignedLoad && input_bits_value == 0);
+    assume(input_bits_load == {"1" if mode == 'mutation-pmp-direction' else '(pair_sequence == 0)'} && input_bits_store == {"1" if mode == 'mutation-pmp-direction' else '(pair_sequence != 0)'});
+    assume(input_bits_instruction_instruction == {"32'h0030b12f" if mode == 'mutation-pmp-direction' else "(pair_sequence == 0 ? 32'h1000b12f : 32'h1830b12f)"});
+    assume(input_bits_address == {f"(pair_sequence == 1 ? 64'h{(1 << manifest['parameters']['physicalAddressBits']) + 8:x} : 64'd8)" if mode == 'mutation-alias' else "64'd8"} && input_bits_storeData == 13 && input_bits_instruction_tag == 37);
+    assume(memory_request_ready && memory_response_valid == (word_sent && !word_replied));
+    assume(memory_response_bits_data == 0 && memory_response_bits_tag == 37 && memory_response_bits_fault == {int(mode == 'mutation-lr-fault')});
+  end
+'''
+                    if enabled:
+                        guidance += f"  always @* assume(_pmp_allowed == {int(mode != 'mutation-permission')});\n"
+                    text = text.replace('endmodule', guidance + '\nendmodule', 1)
+                if name == 'IntegerExecute' and mutating and filename == module + '.sv':
+                    op, instruction, immediate, first = {
+                        'mutation': (28, 0x3401f2f3, 0, 0),
+                        'mutation-word': (23, 0xfff0009b, (1 << 64) - 1, 0),
+                        'mutation-shift': (21, 0x02009093, 32, 1),
+                        'mutation-branch': (25, 0x00009463, 8, 1),
+                        'mutation-wfi': (29, 0x10500073, 0, 0),
+                        'mutation-atomic': (30, 0x1830b12f, 0, 8)}[mode]
+                    guidance = f'''
+  always @* begin
+    assume(input_valid && !input_bits_decoded_instruction_fault && csrLegal);
+    assume(input_bits_decoded_operation == {op} && input_bits_decoded_instruction_instruction == 32'h{instruction:x});
+    assume(input_bits_decoded_instruction_pc == 0 && input_bits_decoded_instruction_length == 4);
+    assume(input_bits_decoded_rs1 == {(instruction >> 15) & 31});
+    assume(input_bits_decoded_immediate == 64'h{immediate:x} && input_bits_operand1 == {first} && input_bits_operand2 == 0);
+    assume(csrValue == 15);
+  end
+'''
+                    text = text.replace('endmodule', guidance + '\nendmodule', 1)
+                if name == 'IntegerDecode' and mode in ('mutation-atomic-width', 'mutation-lr-source', 'mutation-atomic-operation') and filename == module + '.sv':
+                    instruction = {'mutation-atomic-width': 0x4000a12f, 'mutation-lr-source': 0x1010b12f, 'mutation-atomic-operation': 0x2800b12f}[mode]
+                    text = text.replace('endmodule', f"  always @* assume(input_valid && !input_bits_fault && input_bits_instruction == 32'h{instruction:x});\nendmodule", 1)
                 if unit == 'InstructionCache' and mode != 'prove' and filename == module + '.sv':
                     scenario = {'mutation': 7, 'mutation-hold': 1, 'mutation-word': 0,
                                 'mutation-invalidate': 6, 'mutation-denied': 3}.get(mode)
@@ -1179,12 +1950,12 @@ def verify(rtl, directory, modules=None):
             task = 'bmc' if mutating else mode
             if mode == 'mutation' and name == 'Fetch':
                 task = 'prove'
-            engine = 'abc pdr' if task == 'prove' and unit not in ('Multiply', 'Pmp', 'PmpDecode', 'PmpInterval', 'Csr', 'Axi', 'InstructionCache') and name != 'SynchronizationBackend' else 'smtbmc z3'
+            engine = 'abc pdr' if task == 'prove' and unit not in ('Multiply', 'Pmp', 'PmpDecode', 'PmpInterval', 'Csr', 'Memory', 'Axi', 'InstructionCache', 'Decode', 'Execute', 'LocalInterrupts') and name not in ('SynchronizationBackend', 'WfiBackend') else 'smtbmc z3'
             timeout = 180 if name == 'InterruptBackend' and task == 'cover' else 60
             witness_option = 'aigsmt z3\n' if engine == 'abc pdr' else ''
             preparation = (f'hierarchy -check -top {top}\nproc\nflatten\nopt_expr -keepdc\nopt_clean\nwreduce\nopt_clean\ncheck'
                            if name.startswith('Pmp') else f'prep -top {top} -flatten')
-            depth = 6 * manifest['parameters']['hartCount'] + 8 if unit == 'MemoryArbiter' else 72 if task == 'cover' or (unit == 'InstructionCache' and mode in ('mutation', 'mutation-invalidate')) else 1 if name.startswith('Pmp') else (3 if task == 'prove' else 8) if unit == 'Csr' else 4 if name in ('Multiply', 'Axi', 'SynchronizationBackend', 'InstructionCache') and task == 'prove' else 24
+            depth = 6 * manifest['parameters']['hartCount'] + 8 if unit == 'MemoryArbiter' else 72 if task == 'cover' or (unit == 'InstructionCache' and mode in ('mutation', 'mutation-invalidate')) else 1 if name.startswith('Pmp') or unit in ('Decode', 'Execute') else (3 if task == 'prove' else 8) if unit == 'Csr' else 4 if name in ('Multiply', 'Memory', 'Axi', 'SynchronizationBackend', 'WfiBackend', 'InstructionCache', 'LocalInterrupts') and task == 'prove' else 24
             config = f'''[options]
 mode {task}
 depth {depth}
@@ -1226,13 +1997,21 @@ read -formal -sv {' '.join(files)}
         synchronizationWitnessGuidance='cover/mutations only: aligned zero-address SD, FENCE/FENCE.I, one request and response stall, faulted FENCE.I and quiescent interrupts; unrestricted safety proof' if 'SynchronizationBackend' in proved else None,
         instructionCache='control proof at configured geometry; arbitrary native SRAM read outputs; independent upstream/downstream ownership, authorization, cancellation drain, full-fill publication, invalidation and precise fallback; functional array contents require separate simulation' if 'InstructionCache' in proved else None,
         cacheWitnessGuidance='cover/mutations only: zero-address demand, successful service, canceled stalls, last-beat/post-fill invalidation, permission denial and demand/speculative fault scenarios; unrestricted safety proof' if 'InstructionCache' in proved else None,
-        arbitration='one retained request and owner; at most 2N-1 other completions while continuously requesting; no bound on external service delay' if 'MemoryArbiter' in proved else None,
+        arbitration='one retained request and owner, hart identity from independent accepted requester/2 through response; at most 2N-1 other completions while continuously requesting; no bound on external service delay' if 'MemoryArbiter' in proved else None,
         interruptProgress='with eligibility held, successful matching data response reaches interrupt entry or priority synchronous trap within three cycles; memory service itself is external' if any(r['propertyGroup'] == 'InterruptBackend' for r in reports) else None,
         witnessGuidance='InterruptBackend cover/mutations use ADDI and mie/mstatus initialization then SD, AMOADD.D, MUL, SD-to-MUL, SD-to-FENCE.I or FENCE.I, fixed PCs/tag zero, successful data replies, retained request stall and software interrupt scenarios; unrestricted proof' if any(r['propertyGroup'] == 'InterruptBackend' for r in reports) else None,
         arbiterWitnessGuidance='cover/mutations hold all requesters valid with zero payloads, one request stall and one response stall then immediate service; unrestricted proof' if 'MemoryArbiter' in proved else None,
-        atomicTransport='independent request and AXI channel ownership; old-value return, exclusive retry and error isolation; no external-memory atomicity or eventual-success theorem' if 'Axi' in proved else None,
-        axiAssumptions='initial reset only; atomic inputs are aligned doubleword read-modify-write requests; R requires accepted AR, B requires accepted AW and W; blocked response payloads persist; data, IDs, responses, last and delays unrestricted' if 'Axi' in proved else None,
-        axiMutationGuidance='mutations only: aligned address8, addend1, read values7 then11 after retry, immediate service and per-fault response codes; prove and cover unrestricted' if 'Axi' in proved else None,
+        atomicTransport='independent request and AXI channel ownership and retained hart identity; LR read-only, one-shot SC status/no-bus failure, ADD/OR/SWAP exclusive retry and error isolation; no external-memory atomicity or eventual-success theorem' if 'Axi' in proved else None,
+        axiAssumptions='initial reset only; R requires accepted AR, B requires accepted AW and W; blocked response payloads persist; all request metadata, hart/response IDs, data, responses, last and delays unrestricted' if 'Axi' in proved else None,
+        axiMutationGuidance='mutations only: aligned D ADD/OR/SWAP/LR/SC at address8, operand1, values7 then11 after retry, immediate service, per-fault codes, SC eligibility and valid hart1 with changing live sideband for retained-ID check; prove and cover unrestricted' if 'Axi' in proved else None,
+        wordMemory='independent decode and execution metadata, accepted LSU ownership, size/mask, alignment, authorization, narrow extension and response fault attribution; metadata inputs unrestricted, functional completion checked for byte/halfword/word/doubleword sizes' if 'Lsu' in proved else None,
+        reservation='independent last-LR physical word and validity, successful matching LR completion only, any atomic acceptance consumes old pair, full-EA SC qualification captured before protection and stable through backpressure; endpoint exclusivity is separate' if 'Lsu' in proved else None,
+        physicalMemory='independent configured region/permission/shape model; D-only atomic directions/opcodes, malformed and denied SC isolation regardless of eligibility, retained local-fault response and complete request payload forwarding' if 'Memory' in proved else None,
+        integerExecution='independent raw encoding validity and dependency decode, D-only atomic encodings/LR rs2 and direction metadata, integer ALU and 5/6-bit shifts, word truncation/sign extension, branches, narrow metadata and CSR semantics; combinational safety with unrestricted inputs' if 'IntegerExecute' in proved else None,
+        wfi='raw retired encoding drives independent wait/continuation model; wake priority, younger flush, no new work while waiting, frontend halt and retained requests; sleep is architectural wait, not physical idle' if 'WfiBackend' in proved else None,
+        wfiWitnessGuidance='cover/mutations only: mie software enable, WFI with immediate/delayed pending or fetch fault, younger multiply, fixed PC/tag and no data service; safety inputs unrestricted' if 'WfiBackend' in proved else None,
+        wordMutationGuidance='mutations only: SW/LW at address4 or valid D LR/SC/ADD sequences at address8, high-EA SC alias, faulted LR, matching tag37, immediate memory service and permission grant except denial mutant; unrestricted prove and cover' if 'Lsu' in proved else None,
+        localInterrupts='independent request-driven MSIP, MTIME and MTIMECMP model; exact register widths, WARL bit, invalid-access isolation, read snapshots, write-once side effects, tag ownership and timer comparison; timeTick unrestricted' if 'LocalInterrupts' in proved else None,
         configurations=manifest['parameters'], sourceHashes=manifest['sourceHashes'],
         rtlHashes={p: hashlib.sha256(text.encode()).hexdigest() for p, text in sources.items()},
         checkerHash=checker_hash, tools=tools, reports=reports), indent=2) + '\n')
@@ -1242,6 +2021,6 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--rtl', type=Path, default=Path('result/production'))
     parser.add_argument('--output', type=Path, default=Path('result/formal'))
-    parser.add_argument('--modules', nargs='+', choices=('Fetch', 'Multiply', 'Backend', 'Pmp', 'PmpDecode', 'PmpInterval', 'Csr', 'Lsu', 'InterruptCsr', 'InterruptBackend', 'SynchronizationBackend', 'InstructionCache', 'MemoryArbiter', 'Axi'))
+    parser.add_argument('--modules', nargs='+', choices=('Fetch', 'Multiply', 'Backend', 'Pmp', 'PmpDecode', 'PmpInterval', 'Csr', 'Lsu', 'InterruptCsr', 'InterruptBackend', 'SynchronizationBackend', 'InstructionCache', 'MemoryArbiter', 'Memory', 'Axi', 'WordDecode', 'WordExecute', 'IntegerDecode', 'IntegerExecute', 'WfiBackend', 'WfiFrontend', 'LocalInterrupts'))
     args = parser.parse_args()
     verify(args.rtl, args.output, args.modules)

@@ -61,6 +61,8 @@ object DitDahA1Fetch extends Generator[DitDahA1Parameter, DitDahA1UnitLayers, Di
     request.bits.fetch := true.B
     request.bits.write := false.B
     request.bits.atomic := false.B
+    request.bits.atomicOperation := 0.U(5)
+    request.bits.scEligible := false.B
     response.ready := state === 2.U(2)
     when(io.request.valid & io.request.ready) {
       packet.pc := io.request.bits.pc

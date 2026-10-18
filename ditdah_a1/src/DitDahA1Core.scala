@@ -27,6 +27,7 @@ object DitDahA1Core extends Generator[DitDahA1Parameter, DitDahA1Layers, DitDahA
     if parameter.iCacheBytes != 0 then frontend.io.invalidate.get := backend.io.invalidate.get
     frontend.io.redirect := backend.io.redirect
     frontend.io.redirectPc := backend.io.redirectPc
+    frontend.io.halt := backend.io.status.sleep
     io.instruction :<>= frontend.io.memory
     io.data :<>= backend.io.data
     io.status :<= backend.io.status
@@ -65,6 +66,8 @@ object DitDahA1Backend extends Generator[DitDahA1Parameter, DitDahA1Layers, DitD
     val memoryPending = RegInit(false.B)
     val executePending = RegInit(false.B)
     val resumePc = Option.when(parameter.enableInterrupts)(RegInit(parameter.resetVector.U(64)))
+    val sleep = Option.when(parameter.enableInterrupts)(RegInit(false.B))
+    val sleeping = if parameter.enableInterrupts then sleep.get else false.B
     val decode = DitDahA1Decode.instantiate(parameter)
     val issue = DitDahA1Issue.instantiate(parameter)
     val execute = DitDahA1Execute.instantiate(parameter)
@@ -110,11 +113,12 @@ object DitDahA1Backend extends Generator[DitDahA1Parameter, DitDahA1Layers, DitD
     val retire = commit.io.output
     val retired = retire.valid & retire.ready
     val sequentialPc = (retire.bits.instruction.pc + retire.bits.instruction.length).asBits.bits(63, 0).asUInt
+    val enterWfi = retired & retire.bits.wfi & !retire.bits.instruction.fault
     val pmpUpdate = if parameter.pmpEntries == 0 then false.B else
       retire.bits.csrWrite & (((retire.bits.csrAddress >= 0x3a0.U(12)) & (retire.bits.csrAddress <= 0x3ae.U(12))) |
         ((retire.bits.csrAddress >= 0x3b0.U(12)) & (retire.bits.csrAddress <= 0x3ef.U(12))))
     val redirect = takeInterrupt | (retired & (retire.bits.instruction.fault | retire.bits.mret |
-      pmpUpdate | retire.bits.fenceI | (retire.bits.nextPc =/= sequentialPc)))
+      pmpUpdate | retire.bits.fenceI | (retire.bits.nextPc =/= sequentialPc))) | enterWfi
     if parameter.iCacheBytes != 0 then io.invalidate.get := retired & (retire.bits.fenceI | pmpUpdate)
     val commitReady = !commitValid | retired
     val memoryOperation = (resultPacket.load | resultPacket.store) & !resultPacket.instruction.fault
@@ -137,7 +141,7 @@ object DitDahA1Backend extends Generator[DitDahA1Parameter, DitDahA1Layers, DitD
     issue.io.input.valid := decodedValid & !stalled & !redirect
     issue.io.output.ready := (!issuedValid | executed) & !executePending & !redirect
     val issued = issue.io.output.valid & issue.io.output.ready
-    decode.io.output.ready := (!decodedValid | issued) & !redirect
+    decode.io.output.ready := (!decodedValid | issued) & !redirect & !sleeping
     val decoded = decode.io.output.valid & decode.io.output.ready
     io.redirect := redirect
     io.redirectPc := retire.bits.nextPc
@@ -157,6 +161,7 @@ object DitDahA1Backend extends Generator[DitDahA1Parameter, DitDahA1Layers, DitD
     csr.io.trapValue := retire.bits.instruction.tval
     csr.io.mret := retired & retire.bits.mret
     if parameter.enableInterrupts then
+      sleep.get := (sleep.get | enterWfi) & !csr.io.wakeup.get & !csr.io.trap
       when(retired) { resumePc.get := retire.bits.nextPc }
       when(takeInterrupt) {
         resumePc.get := csr.io.trapVector
@@ -168,7 +173,7 @@ object DitDahA1Backend extends Generator[DitDahA1Parameter, DitDahA1Layers, DitD
       }
     io.status.trap := csr.io.trap
     io.status.busy := true.B
-    io.status.sleep := false.B
+    io.status.sleep := sleeping
     io.data :<>= lsu.io.memory
     when(retired) { commitValid := false.B }
     when(resultAdvance) {
@@ -263,7 +268,7 @@ object DitDahA1Frontend extends Generator[DitDahA1Parameter, DitDahA1UnitLayers,
     if parameter.pmpEntries != 0 then fetch.io.pmp.get :<= io.pmp.get
     fetch.io.clock := io.clock
     fetch.io.reset := io.reset
-    fetch.io.request.valid := !io.redirect
+    fetch.io.request.valid := !io.redirect & !io.halt
     fetch.io.request.bits.pc := pc
     fetch.io.request.bits.tag := tag
     fetch.io.cancel := io.redirect

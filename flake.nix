@@ -74,15 +74,21 @@
           "--java-opt" "--enable-preview"
           "--java-opt" "-Djava.library.path=${javaLibraryPath}"
         ];
-        configure = pkgs.writeShellScriptBin "configure-ditdah-a1" ''
+        runScala = pkgs.writeShellScript "run-ditdah-scala" ''
           set -euo pipefail
-          exec ${pkgs.scala-cli}/bin/scala-cli run ${scalaArgs} \
+          scratch=/data/tmp
+          if [ ! -w "$scratch" ]; then scratch="''${TMPDIR:-/tmp}"; fi
+          workspace=$(mktemp -d "$scratch/ditdah-scala-XXXXXX")
+          trap 'rm -rf "$workspace"' EXIT
+          ${pkgs.scala-cli}/bin/scala-cli run ${scalaArgs} --workspace "$workspace" "$@"
+        '';
+        configure = pkgs.writeShellScriptBin "configure-ditdah-a1" ''
+          exec ${runScala} \
             --main-class com.vowstar.ditdah.a1.DitDahA1Config \
             ditdah_a1/src -- "$@"
         '';
         elaborate = pkgs.writeShellScriptBin "elaborate-ditdah-a1" ''
-          set -euo pipefail
-          exec ${pkgs.scala-cli}/bin/scala-cli run ${scalaArgs} \
+          exec ${runScala} \
             --main-class "com.vowstar.ditdah.a1.''${DITDAH_A1_GENERATOR:-DitDahA1Module}" \
             "$DITDAH_A1_SOURCE" -- "$@"
         '';
@@ -119,7 +125,7 @@
           buildInputs = [
             configure elaborate build pkgs.scala-cli pkgs.circt-install pkgs.mlir-install
             pkgs.jextract pkgs.verilator pkgs.iverilog pkgs.yosys pkgs.sby pkgs.z3
-            (pkgs.python313.withPackages (ps: [ ps.pytest ps.click ]))
+            (pkgs.python313.withPackages (ps: [ ps.pytest ps.click ps.pyelftools ]))
           ];
           env = {
             ZAOZI_JAR = jar;

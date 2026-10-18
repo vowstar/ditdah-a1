@@ -47,12 +47,18 @@ for directory, top in (*tops, *((directory + '-pmp16', top) for directory, top i
         assert re.findall(r'\bDitDahA1Core\s+(\w+)\s*\(', (rtl / (top + '.sv')).read_text()) == [f'core_{h}' for h in range(count)]
     if top in ("DitDahA1Core", "DitDahA1Frontend", "DitDahA1Backend"):
         assert "axi_" not in header
+    else:
+        width = max(1, (manifest['parameters']['hartCount'] - 1).bit_length())
+        for channel in ('aw', 'ar', 'b', 'r'):
+            port = next((m for m in re.finditer(r'\b(?:input|output)\s*(?:\[(\d+):0\])?([\s\S]*?)(?=\binput\b|\boutput\b|$)', header)
+                         if re.search(r'\baxi_' + channel + r'_bits_id\b', m[2])), None)
+            assert port and (int(port[1]) + 1 if port[1] else 1) == width, 'AXI hart identity width mismatch'
     if top == 'DitDahA1Backend':
         assert set(files) == {'DitDahA1' + name + '.sv' for name in ('Backend', 'Decode', 'Issue', 'Execute', 'Multiply', 'Commit', 'Gpr', 'Csr', 'Lsu', *(('Pmp',) if enabled else ()))}
         assert (rtl / (top + '.sv')).read_bytes() == Path('result/verify/' + ('irq-' if interrupts else '') + ('pmp16-' if enabled else '') + 'axi512/rtl', top + '.sv').read_bytes()
     if top == 'DitDahA1MemoryFabric':
         assert set(files) == {name + '.sv' for name in (top, 'DitDahA1MemoryArbiter', 'DitDahA1Memory', 'DitDahA1Axi')}
-        integrated = Path('result/verify/axi512/rtl')
+        integrated = Path('result/production-harts16')
         assert all((rtl / name).read_bytes() == (integrated / name).read_bytes() for name in ('DitDahA1Memory.sv', 'DitDahA1Axi.sv'))
     subprocess.run(["verilator", "--lint-only", "--top-module", top,
                     *[str(rtl / name) for name in files]], check=True)

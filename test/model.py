@@ -9,6 +9,53 @@ def signed(value, bits):
     return (value & ((1 << (bits - 1)) - 1)) - (value & (1 << (bits - 1)))
 
 
+def atomic_value(operation, old, operand, size):
+    assert size == 8 and operation in (0, 1, 8)
+    return {0: old + operand, 1: operand, 8: old | operand}[operation] & MASK
+
+
+class ExclusiveMonitor:
+    def __init__(self):
+        self.reservations = {}
+
+    def reserve(self, owner, address, size):
+        self.reservations[owner] = address, size
+
+    def write(self, address, size):
+        self.reservations = {owner: (base, length) for owner, (base, length) in self.reservations.items()
+                             if address + size <= base or base + length <= address}
+
+    def conditional(self, owner, address, size):
+        success = self.reservations.pop(owner, None) == (address, size)
+        if success:
+            self.write(address, size)
+        return success
+
+
+def integer_value(insn, a, b):
+    opcode, function, upper = insn & 127, (insn >> 12) & 7, insn >> 25
+    word, immediate = opcode in (0x1b, 0x3b), opcode in (0x13, 0x1b)
+    width = 32 if word else 64
+    left, right = a & ((1 << width) - 1), signed(insn >> 20, 12) & MASK if immediate else b
+    shift = (insn >> 20 if immediate else b) & (width - 1)
+    if function == 0 and (immediate or upper in (0, 32)):
+        value = left - right if not immediate and upper == 32 else left + right
+    elif not immediate and opcode == 0x33 and function == 0 and upper == 1:
+        value = a * b
+    elif function in (1, 5):
+        prefix = insn >> (25 if word or not immediate else 26)
+        arithmetic = prefix == (32 if word or not immediate else 16)
+        if prefix != 0 and not (function == 5 and arithmetic):
+            raise Fault(2, insn)
+        value = left << shift if function == 1 else signed(left, width) >> shift if arithmetic else left >> shift
+    elif not word and (immediate or upper == 0) and function in (2, 3, 4, 6, 7):
+        value = {2: int(signed(a, 64) < signed(right, 64)), 3: int(a < right),
+                 4: a ^ right, 6: a | right, 7: a & right}[function]
+    else:
+        raise Fault(2, insn)
+    return signed(value, 32) if word else value & MASK
+
+
 def pmp_allowed(configs, addresses, address, size, kind, pa):
     permission = {'fetch': 4, 'read': 1, 'write': 2, 'atomic': 3}[kind]
     if address < 0 or address + size > 1 << pa:
@@ -39,12 +86,53 @@ class Fault(Exception):
         self.cause, self.value = cause, value
 
 
+class LocalInterrupts:
+    def __init__(self, base, harts):
+        self.base, self.harts = base, harts
+        self.time, self.software, self.compare = 0, [0] * harts, [MASK] * harts
+        self.cycle, self.tick, self.time_written = -1, False, False
+
+    def begin_cycle(self, cycle, tick):
+        assert cycle == self.cycle + 1, 'Missing or repeated platform cycle'
+        if self.tick and not self.time_written:
+            self.time = (self.time + 1) & MASK
+        self.cycle, self.tick, self.time_written = cycle, bool(tick), False
+
+    def levels(self, hart):
+        return self.software[hart] | (int(self.time >= self.compare[hart]) << 1)
+
+    def access(self, address, size, kind, data):
+        offset = address - self.base
+        if kind not in ('read', 'write'):
+            raise Fault(7, address)
+        if size == 4 and offset % 4 == 0 and 0 <= offset < 4 * self.harts:
+            index, registers = offset // 4, self.software
+            value = registers[index]
+            if kind == 'write':
+                registers[index] = data & 1
+        elif size == 8 and offset % 8 == 0 and 0x4000 <= offset < 0x4000 + 8 * self.harts:
+            index, registers = (offset - 0x4000) // 8, self.compare
+            value = registers[index]
+            if kind == 'write':
+                registers[index] = data & MASK
+        elif size == 8 and offset == 0xbff8:
+            value = self.time
+            if kind == 'write':
+                self.time, self.time_written = data & MASK, True
+        else:
+            raise Fault(5 if kind == 'read' else 7, address)
+        return 0 if kind == 'write' else value
+
+
 class Model:
     def __init__(self, config, memory, faults, hart_id=0, access=None):
         self.config = config
         self.memory = dict(memory)
         self.faults = faults
         self.external_access = access
+        self.monitor = ExclusiveMonitor()
+        self.local_reservation = None
+        self.atomic_operation, self.sc_eligible = 0, False
         self.pc = int(config['resetVector'])
         self.registers = [0] * 32
         self.csrs = {address: 0 for address in (0x300, 0x301, 0x304, 0x305, 0x340,
@@ -60,13 +148,15 @@ class Model:
         self.order = 0
 
     def access(self, address, size, kind, data=0):
-        cause = {'fetch': 1, 'read': 5, 'write': 7, 'atomic': 7}[kind]
+        permission_kind = {2: 'read', 3: 'write'}.get(self.atomic_operation, 'atomic') if kind == 'atomic' else kind
+        cause = {'fetch': 1, 'read': 5, 'write': 7, 'atomic': 7}[permission_kind]
+        data &= (1 << (8 * size)) - 1
         if address % size:
-            raise Fault({'fetch': 0, 'read': 4, 'write': 6, 'atomic': 6}[kind], address)
+            raise Fault({'fetch': 0, 'read': 4, 'write': 6, 'atomic': 6}[permission_kind], address)
         if self.config['pmpEntries'] and not pmp_allowed(
                 [self.pmp_config(i) for i in range(self.config['pmpEntries'])],
                 [self.csrs[0x3b0 + i] for i in range(self.config['pmpEntries'])],
-                address, size, kind, self.config['physicalAddressBits']):
+                address, size, permission_kind, self.config['physicalAddressBits']):
             if kind == 'fetch':
                 self.local_fetch_faults.add(self.order)
             raise Fault(cause, address)
@@ -80,14 +170,26 @@ class Model:
         self.bus.append((kind, address, size, data if kind in ('write', 'atomic') else 0))
         if kind != 'fetch' and self.external_access is not None:
             return self.external_access(address, size, kind, data)
-        if address == self.faults.get(kind) or (kind == 'atomic' and address in [self.faults.get(k) for k in ('read', 'write', 'exclusive')]):
+        if kind == 'atomic' and self.atomic_operation == 3 and not self.sc_eligible:
+            return 1
+        stages = ('read', 'exclusive') if self.atomic_operation == 2 else ('write',) if self.atomic_operation == 3 else ('read', 'write', 'exclusive')
+        if address == self.faults.get(kind) or (kind == 'atomic' and address in [self.faults.get(k) for k in stages]):
             raise Fault(cause, address)
         old = sum(self.memory.get(address + i, 0) << (8 * i) for i in range(size))
+        if kind == 'atomic':
+            if self.atomic_operation == 2:
+                self.monitor.reserve(self.csrs[0xf14], address, size)
+                return old
+            if self.atomic_operation == 3:
+                if not self.monitor.conditional(self.csrs[0xf14], address, size):
+                    return 1
+            else:
+                data = atomic_value(self.atomic_operation, old, data, size)
         if kind in ('write', 'atomic'):
-            data = (old + data) & MASK if kind == 'atomic' else data
+            self.monitor.write(address, size)
             for i in range(size):
                 self.memory[address + i] = (data >> (8 * i)) & 255
-            return old if kind == 'atomic' else 0
+            return old if kind == 'atomic' and self.atomic_operation != 3 else 0
         return old
 
     def set_interrupts(self, levels):
@@ -151,16 +253,14 @@ class Model:
                 value, write = signed(insn & 0xfffff000, 32), True
             elif opcode == 0x17:
                 value, write = pc + signed(insn & 0xfffff000, 32), True
-            elif opcode == 0x13 and funct3 == 0:
-                value, write = a + immediate, True
-            elif opcode == 0x33 and funct3 == 0 and insn >> 25 == 0:
-                value, write = a + b, True
-            elif opcode == 0x33 and funct3 == 0 and insn >> 25 == 1:
-                value, write = a * b, True
-            elif opcode == 0x63 and funct3 == 0:
+            elif opcode in (0x13, 0x1b, 0x33, 0x3b):
+                value, write = integer_value(insn, a, b), True
+            elif opcode == 0x63 and funct3 in (0, 1, 4, 5, 6, 7):
                 displacement = signed(((insn >> 31) << 12) | (((insn >> 7) & 1) << 11)
                                       | (((insn >> 25) & 63) << 5) | (((insn >> 8) & 15) << 1), 13)
-                if a == b:
+                taken = {0: a == b, 1: a != b, 4: signed(a, 64) < signed(b, 64),
+                         5: signed(a, 64) >= signed(b, 64), 6: a < b, 7: a >= b}[funct3]
+                if taken:
                     next_pc = (pc + displacement) & MASK
             elif opcode == 0x6f:
                 displacement = signed(((insn >> 31) << 20) | (((insn >> 12) & 255) << 12)
@@ -168,23 +268,34 @@ class Model:
                 value, write, next_pc = pc + 4, True, (pc + displacement) & MASK
             elif opcode == 0x67 and funct3 == 0:
                 value, write, next_pc = pc + 4, True, ((a + immediate) & MASK) & ~1
-            elif opcode == 0x03 and funct3 == 3:
-                value, write = self.access((a + immediate) & MASK, 8, 'read'), True
-            elif opcode == 0x23 and funct3 == 3:
+            elif opcode == 0x03 and funct3 != 7:
+                size = 1 << (funct3 & 3)
+                value = self.access((a + immediate) & MASK, size, 'read')
+                value, write = signed(value, size * 8) if funct3 < 4 else value, True
+            elif opcode == 0x23 and funct3 < 4:
                 offset = signed(((insn >> 25) << 5) | ((insn >> 7) & 31), 12)
-                self.access((a + offset) & MASK, 8, 'write', b)
-            elif opcode == 0x2f and funct3 == 3 and insn >> 27 == 0:
+                self.access((a + offset) & MASK, 1 << funct3, 'write', b)
+            elif opcode == 0x2f and funct3 == 3 and insn >> 27 in (0, 1, 2, 3, 8) and (insn >> 27 != 2 or rs2 == 0):
+                self.atomic_operation = insn >> 27
+                self.sc_eligible = self.atomic_operation == 3 and self.local_reservation == (a, 8)
+                self.local_reservation = None
                 value, write = self.access(a, 8, 'atomic', b), True
+                if self.atomic_operation == 2:
+                    self.local_reservation = a, 8
             elif opcode == 0x0f and funct3 in (0, 1):
                 pass
-            elif opcode == 0x73 and funct3 in (1, 2):
+            elif insn == 0x10500073:
+                pass
+            elif opcode == 0x73 and funct3 in (1, 2, 3, 5, 6, 7):
                 address = insn >> 20
-                update = funct3 == 1 or rs1 != 0
+                update = funct3 & 3 == 1 or rs1 != 0
+                source = rs1 if funct3 & 4 else a
                 if address not in self.csrs or (update and address >> 10 == 3):
                     raise Fault(2, insn)
                 value, write = self.csrs[address], True
                 if update:
-                    self.write_csr(address, a if funct3 == 1 else value | a)
+                    data = source if funct3 & 3 == 1 else value | source if funct3 & 3 == 2 else value & ~source
+                    self.write_csr(address, data & MASK)
             elif insn == 0x73:
                 raise Fault(11, 0)
             elif insn == 0x30200073:

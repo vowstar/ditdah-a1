@@ -25,16 +25,42 @@ def sd(rs, base, offset=0):
     return (((offset & 4095) >> 5) << 25) | (rs << 20) | (base << 15) | (3 << 12) | ((offset & 31) << 7) | 0x23
 
 
+def lw(rd, base, offset=0, unsigned=False):
+    return (ld(rd, base, offset) & ~(7 << 12)) | ((6 if unsigned else 2) << 12)
+
+
+def sw(rs, base, offset=0):
+    return sd(rs, base, offset) & ~(1 << 12)
+
+
+def alu(rd, rs1, operand, function, word=False, immediate=False, upper=0):
+    opcode = (0x1b if word else 0x13) if immediate else (0x3b if word else 0x33)
+    source = (operand & 4095) << 20 if immediate else (upper << 25) | (operand << 20)
+    return source | (rs1 << 15) | (function << 12) | (rd << 7) | opcode
+
+
+def load(rd, base, offset=0, size=3, unsigned=False):
+    return (ld(rd, base, offset) & ~(7 << 12)) | ((size + 4 * unsigned) << 12)
+
+
+def store(rs, base, offset=0, size=3):
+    return (sd(rs, base, offset) & ~(7 << 12)) | (size << 12)
+
+
 def amoadd(rd, base, rs, aqrl=0):
     return (aqrl << 25) | (rs << 20) | (base << 15) | (3 << 12) | (rd << 7) | 0x2f
+
+
+def amo(operation, rd, base, rs=0, aqrl=0):
+    return (operation << 27) | amoadd(rd, base, rs, aqrl)
 
 
 def fence(instruction=False, reserved=0):
     return (reserved & 0xffff8f80) | (int(instruction) << 12) | 0x0f
 
 
-def csr(rd, address, rs, set_bits=False):
-    return (address << 20) | (rs << 15) | ((2 if set_bits else 1) << 12) | (rd << 7) | 0x73
+def csr(rd, address, rs, set_bits=False, function=None):
+    return (address << 20) | (rs << 15) | (((2 if set_bits else 1) if function is None else function) << 12) | (rd << 7) | 0x73
 
 
 def jal(rd, offset):
@@ -84,6 +110,10 @@ class Program:
 
 
 def cases(base, protection=False, interrupts=False):
+    if not interrupts:
+        p = Program(base)
+        p.emit(0x10500073, addi(2, 0, 17))
+        yield 'wfi_no_interrupts', p.finish()
     p = Program(base)
     p.emit(addi(0, 0, 127), addi(2, 0, -1), (0x80000 << 12) | (3 << 7) | 0x37,
            add(4, 2, 3), addi(5, 0, 7))
@@ -108,6 +138,32 @@ def cases(base, protection=False, interrupts=False):
     p.address(10, 0x5000)
     p.emit(sd(2, 10), ld(4, 10))
     yield 'memory', p.finish()
+
+    p = Program(base)
+    p.address(10, 0x1000)
+    values = (0, 1, 0x7fffffff, 0x80000000, 0xffffffff, 0xa5a55a5a)
+    for index, value in enumerate(values):
+        for byte in range(4):
+            p.memory[base + 0x1800 + index * 4 + byte] = (value >> (8 * byte)) & 255
+    p.address(11, 0x1800)
+    p.emit(addi(2, 0, -1), sd(2, 10))
+    for lane in range(0, 64, 4):
+        p.emit(lw(2, 11, lane % 24), lw(3, 11, lane % 24, True),
+               sw(2, 10, lane), lw(4, 10, lane), lw(5, 10, lane, True))
+    p.emit(ld(6, 10), lw(0, 10), lw(0, 10, 2), sw(2, 10, 2))
+    for offset in (0x3ffc, 0x4000, 0x4ffc, 0x5000, 0x5ffc, 0x6000, 0x7000, 0x9000):
+        p.address(10, offset)
+        p.emit(lw(7, 10), lw(8, 10, unsigned=True), sw(2, 10))
+    p.emit(addi(10, 0, -4), lw(9, 10), sw(2, 10))
+    p.emit(load(9, 10, size=3, unsigned=True), store(2, 10, size=7))
+    yield 'memory_word', p.finish()
+
+    for kind in ('read', 'write'):
+        p = Program(base)
+        p.address(10, 0x1004)
+        p.faults[kind] = base + 0x1004
+        p.emit(lw(2, 10) if kind == 'read' else sw(1, 10))
+        yield 'word_bus_' + kind, p.finish()
 
     p = Program(base)
     p.emit(addi(1, 0, -1), csr(2, 0x300, 1), csr(3, 0x300, 0, True),
@@ -185,15 +241,85 @@ def cases(base, protection=False, interrupts=False):
            sd(4, 11), mul(6, 0, 4), sd(6, 11, 8),
            mul(7, 2, 3) | (1 << 12), mul(7, 2, 3) | (4 << 12), mul(7, 2, 3) | 8)
     yield 'multiply', p.finish()
+    yield from integer_cases(base)
     yield from synchronization_cases(base)
-    yield from atomic_cases(base)
+    yield from atomic_cases(base, protection)
     if protection:
         yield from pmp_cases(base)
     if interrupts:
         yield from interrupt_cases(base, protection)
 
 
-def atomic_cases(base):
+def integer_cases(base):
+    values = (0, 1, -1, 1 << 63, (1 << 63) - 1, 0x80000000, 0xffffffff, 0x80000001)
+    for name in ('register', 'immediate', 'word', 'branch'):
+        p = Program(base)
+        p.address(10, 0x3000)
+        for index, value in enumerate(values):
+            other = (0, 63, 64, 65, 127, -1, 32, 31)[index]
+            for offset, number in ((0, value), (8, other)):
+                for byte in range(8):
+                    p.memory[base + 0x3000 + 16 * index + offset + byte] = (number >> (8 * byte)) & 255
+            p.emit(ld(1, 10, 16 * index), ld(2, 10, 16 * index + 8))
+            if name == 'register':
+                p.emit(*(alu(6, 1, 2, function) for function in range(8)),
+                       alu(6, 1, 2, 0, upper=32), alu(6, 1, 2, 5, upper=32))
+            elif name == 'immediate':
+                p.emit(*(alu(6, 1, immediate, function, immediate=True) for function in (0, 2, 3, 4, 6, 7)
+                         for immediate in (-2048, -1, 0, 1, 2047)))
+                p.emit(*(alu(6, 1, amount | upper, function, immediate=True) for function, upper in ((1, 0), (5, 0), (5, 0x400))
+                         for amount in (0, 1, 31, 32, 63)))
+            elif name == 'word':
+                p.emit(*(alu(6, 1, 2, function, word=True, upper=upper) for function, upper in ((0, 0), (0, 32), (1, 0), (5, 0), (5, 32))))
+                p.emit(*(alu(6, 1, immediate, 0, word=True, immediate=True) for immediate in (-2048, -1, 0, 1, 2047)))
+                p.emit(*(alu(6, 1, amount | upper, function, word=True, immediate=True) for function, upper in ((1, 0), (5, 0), (5, 0x400))
+                         for amount in (0, 1, 15, 31)))
+            else:
+                for function in (0, 1, 4, 5, 6, 7):
+                    p.emit(beq(1, 2, 8) | (function << 12), addi(6, 6, 1),
+                           beq(1, 1, 8) | (function << 12), addi(7, 7, 1))
+                p.emit(beq(1, 1, 2) | (1 << 12), beq(1, 1, 2) | (7 << 12))
+        yield 'integer_' + name, p.finish()
+    p = Program(base)
+    for word in (False, True):
+        for function in (1, 5):
+            p.emit(*(alu(6, 1, immediate, function, word, True) for immediate in ((32, 0x800) if word else (64, 0x800))))
+        p.emit(*(alu(6, 1, 2, function, word, upper=32) for function in (1, 2, 3, 4, 6, 7)))
+    p.emit(*(alu(6, 1, 2, function, True) for function in (2, 3, 4, 6, 7)),
+           *(alu(6, 1, 1, function, True, True) for function in (2, 3, 4, 6, 7)),
+           alu(6, 1, 2, 0, True, upper=1), alu(6, 1, 2, 4, upper=1),
+           beq(1, 2, 8) | (2 << 12), beq(1, 2, 8) | (3 << 12), 0x00100073)
+    yield 'integer_reserved', p.finish()
+    p = Program(base)
+    p.address(10, 0x1000)
+    p.emit(addi(2, 0, -1), *(sd(2, 10, offset) for offset in range(0, 64, 8)))
+    for size in (0, 1):
+        for lane in range(0, 64, 1 << size):
+            p.emit(addi(2, 0, -128 if lane % 3 else 127), store(2, 10, lane, size),
+                   load(3, 10, lane, size), load(4, 10, lane, size, True))
+        p.emit(*(ld(5, 10, lane) for lane in range(0, 64, 8)))
+    p.emit(load(3, 10, 1, 1), store(2, 10, 1, 1))
+    for offset in (0x3ffe, 0x4ffe, 0x5ffe, 0x6000, 0x9000):
+        p.address(10, offset)
+        p.emit(load(3, 10, 1, 0), store(2, 10, 1, 0), load(4, 10, 0, 1), store(2, 10, 0, 1))
+    yield 'narrow_memory', p.finish()
+    for kind in ('read', 'write'):
+        p = Program(base)
+        p.address(10, 0x1002)
+        p.faults[kind] = base + 0x1002
+        p.emit(load(2, 10, size=0) if kind == 'read' else store(1, 10, size=1))
+        yield 'narrow_bus_' + kind, p.finish()
+    p = Program(base)
+    for function in (1, 2, 3, 5, 6, 7):
+        p.emit(addi(1, 0, 0), csr(6, 0x340, 1, function=function), csr(7, 0x340, 0, True),
+               csr(6, 0xf14, 0, function=function), csr(6, 0xf14, 1, function=function),
+               addi(1, 0, -1), csr(1, 0x340, 1, function=function), csr(0, 0x340, 31, function=function),
+               csr(7, 0x340, 0, True), csr(6, 0x777, 0, function=function))
+    p.emit(csr(6, 0x340, 0, function=4))
+    yield 'csr_variants', p.finish()
+
+
+def atomic_cases(base, protection=False):
     p = Program(base)
     p.address(10, 0x1000)
     p.emit(addi(2, 0, -1), sd(2, 10), addi(2, 0, 1))
@@ -205,7 +331,7 @@ def atomic_cases(base):
     for offset in (0x4000, 0x5000, 0x6000, 0x7000, 0x9000, 0x1002):
         p.address(10, offset)
         p.emit(amoadd(3, 10, 1))
-    p.emit(addi(10, 0, -8), amoadd(3, 10, 1), amoadd(3, 10, 1) | (1 << 27), amoadd(3, 10, 1) ^ (1 << 12))
+    p.emit(addi(10, 0, -8), amoadd(3, 10, 1), amoadd(3, 10, 1) | (5 << 27), amoadd(3, 10, 1) ^ (1 << 12))
     yield 'atomic_denied', p.finish()
     for kind in ('read', 'write', 'exclusive', 'retry'):
         p = Program(base)
@@ -216,6 +342,53 @@ def atomic_cases(base):
         else:
             p.faults[kind] = base + 0x1000
         yield 'atomic_' + ('retry' if kind == 'retry' else 'fault_' + kind), p.finish()
+    p = Program(base)
+    p.address(10, 0x1000)
+    p.address(11, 0x1800)
+    operands = ((0, 0), (0, -1), (-1, 1), (1 << 63, 0x5555555555555555))
+    for operation in (1, 8):
+        for index, (old, operand) in enumerate(operands):
+            for offset, value in ((16 * index, old), (16 * index + 8, operand)):
+                p.memory.update((base + 0x1800 + offset + byte, (value >> (8 * byte)) & 255) for byte in range(8))
+            p.emit(ld(2, 11, 16 * index), ld(3, 11, 16 * index + 8), sd(2, 10),
+                   amo(operation, 4, 10, 3, index), ld(5, 10))
+        p.emit(amo(operation, 0, 10, 3), amo(operation, 3, 10, 3), amo(operation, 10, 10, 0))
+        p.address(10, 0x1000)
+    yield 'amo_operations', p.finish()
+    p = Program(base)
+    p.address(10, 0x1000)
+    p.address(11, 0x1008)
+    p.emit(addi(2, 0, 9), amo(3, 3, 10, 2), amo(2, 3, 10), amo(3, 4, 10, 2),
+           amo(3, 5, 10, 2), amo(2, 0, 10), amo(3, 0, 10, 2),
+           amo(2, 6, 10), amo(2, 7, 11), amo(3, 8, 10, 2), amo(3, 9, 11, 2),
+           amo(2, 6, 10), amo(3, 7, 11, 2), amo(3, 8, 10, 2))
+    for operation in (0, 1, 8):
+        p.emit(amo(2, 6, 10), amo(operation, 7, 11, 2), amo(3, 8, 10, 2))
+    p.emit(amo(2, 6, 10), sd(2, 10), amo(3, 7, 10, 2),
+           amo(2, 6, 10), sw(2, 10, 4), amo(3, 7, 10, 2),
+           amo(2, 6, 10), beq(0, 0, 8), addi(9, 0, 99), amo(3, 7, 10, 2),
+           amo(2, 6, 10), amo(2, 7, 10) ^ (1 << 12), amo(3, 8, 10, 2))
+    yield 'lrsc_pairing', p.finish()
+    p = Program(base)
+    for offset in (0x4000, 0x5000, 0x6000, 0x9000, 0x1002):
+        p.address(10, offset)
+        p.emit(amo(2, 3, 10), amo(3, 4, 10, 2))
+    p.emit(addi(10, 0, -8), amo(2, 3, 10), amo(3, 4, 10, 2))
+    for operation in (2, 3, 4, 5, 12, 16, 20, 24, 28):
+        p.emit(amo(operation, 3, 10, 1) if operation != 3 else amo(operation, 3, 10, 1) ^ (1 << 12))
+    yield 'lrsc_denied', p.finish()
+    for kind in ('read', 'exclusive', 'write'):
+        p = Program(base)
+        p.address(10, 0x1000)
+        p.emit(addi(2, 0, 13), amo(2, 3, 10), amo(3, 4, 10, 2), amo(3, 5, 10, 2))
+        p.faults[kind] = base + 0x1000
+        yield 'lrsc_fault_' + kind, p.finish()
+    if protection:
+        p = Program(base)
+        p.address(10, 0x1000)
+        p.emit(alu(1, 10, 2, 5, immediate=True), csr(0, 0x3b0, 1), addi(1, 0, 0x99), csr(0, 0x3a0, 1),
+               amo(2, 3, 10), amo(3, 4, 10, 2), amo(3, 5, 10, 2), amo(0, 6, 10, 2), amo(1, 7, 10, 2), amo(8, 8, 10, 2))
+        yield 'lrsc_pmp', p.finish()
 
 
 def synchronization_cases(base):
@@ -256,7 +429,7 @@ def synchronization_cases(base):
 
 
 def pmp_cases(base):
-    for name in ('permissions', 'tor_lock', 'partial', 'fetch', 'update', 'atomic_readonly', 'atomic_none'):
+    for name in ('permissions', 'tor_lock', 'partial', 'word', 'fetch', 'update', 'atomic_readonly', 'atomic_none'):
         p = Program(base)
         constant_offset = 0x3000
 
@@ -269,7 +442,7 @@ def pmp_cases(base):
             constant_offset += 8
 
         p.address(10, 0x1000)
-        point = 0x200 if name == 'update' else 0x1004 if name == 'partial' else 0x1000
+        point = 0x200 if name == 'update' else 0x1004 if name in ('partial', 'word') else 0x1000
         constant(2, ((base + point) >> 2) | (1 if name in ('permissions', 'fetch') else 0))
         p.emit(csr(0, 0x3b0, 2))
         if name == 'tor_lock':
@@ -281,7 +454,9 @@ def pmp_cases(base):
             p.emit(jalr(0, 1))
             p.offset = 0x1fc
         p.emit(csr(4, 0x3a0, 3))
-        if name.startswith('atomic_'):
+        if name == 'word':
+            p.emit(lw(5, 10, 4), lw(6, 10, 4, True), ld(7, 10), sw(2, 10, 4))
+        elif name.startswith('atomic_'):
             p.emit(amoadd(5, 10, 2, 3), ld(6, 10))
         elif name in ('fetch', 'update'):
             p.emit(jalr(0, 10) if name == 'fetch' else sd(2, 10), mul(5, 2, 3))
@@ -389,6 +564,70 @@ def multicore_cases(base, harts, protection=False, interrupts=False):
         yield name, p
 
 
+def platform_program(base, harts, local_base, wait=False):
+    p = Program(base)
+    p.emit(csr(2, 0xf14, 0, True), addi(3, 0, 4), mul(3, 2, 3))
+    p.address(10, local_base - base)
+    p.emit(add(10, 10, 3), addi(3, 0, 8), mul(3, 2, 3))
+    p.address(11, local_base - base + 0x4000)
+    p.emit(add(11, 11, 3))
+    p.address(12, local_base - base + 0xbff8)
+    p.address(13, 0x1800)
+    p.emit(addi(3, 0, 64), mul(3, 2, 3))
+    p.address(14, 0x2000)
+    p.emit(add(14, 14, 3), addi(3, 2, 1), addi(4, 0, harts), beq(3, 4, 8), jal(0, 8), addi(3, 0, 0),
+           addi(4, 0, 4), mul(3, 3, 4))
+    p.address(15, local_base - base)
+    p.emit(add(15, 15, 3), addi(5, 0, 1), addi(3, 0, 128), addi(3, 3, 8),
+           csr(0, 0x304, 3), addi(3, 0, 8), csr(0, 0x300, 3), amoadd(6, 13, 5))
+
+    def barrier(offset):
+        if offset:
+            p.emit(addi(9, 13, offset), amoadd(6, 9, 5))
+        p.emit(addi(7, 0, harts))
+        loop = p.offset
+        p.emit(ld(6, 13, offset), beq(6, 7, 8), jal(0, loop - p.offset - 8), fence())
+
+    barrier(0)
+    p.address(16, 0x1810)
+    p.address(17, 0x2400)
+    p.emit(addi(18, 0, 0))
+    for iteration in range(3):
+        if wait:
+            p.emit(csr(0, 0x300, 0), addi(28, 0, 128), csr(0, 0x304, 28))
+        p.emit(amoadd(6, 16, 5), addi(7, 6, 1), addi(8, 0, 8), mul(8, 6, 8),
+               add(8, 17, 8), sd(7, 8), add(18, 18, 7), fence(), ld(6, 12))
+        if wait:
+            delay = 2000 * harts
+            p.emit((((delay + 2048) >> 12) << 12) | (28 << 7) | 0x37,
+                   addi(28, 28, delay - (((delay + 2048) >> 12) << 12)), add(6, 6, 28))
+        else:
+            p.emit(addi(6, 6, 32))
+        p.emit(sd(6, 11), sw(5, 15))
+        if wait:
+            if iteration == 1:
+                p.emit(addi(28, 0, 8), csr(0, 0x300, 28))
+            p.emit(0x10500073, addi(28, 0, 136), csr(0, 0x304, 28), addi(28, 0, 8), csr(0, 0x300, 28))
+        p.emit(addi(7, 0, iteration + 1))
+        loop = p.offset
+        p.emit(beq(23, 7, 8), jal(0, loop - p.offset - 4), beq(24, 7, 8), jal(0, loop - p.offset - 12))
+        barrier(0x20 + 8 * iteration)
+    p.emit(sd(23, 14), sd(24, 14, 8), sd(18, 14, 16), addi(19, 0, 0))
+    for ticket in range(3 * harts):
+        p.emit(ld(6, 17, 8 * ticket), add(19, 19, 6))
+    p.platform = dict(rounds=3, base=local_base, wait=wait)
+    p.finish()
+    p.offset = 0x800
+    p.emit(csr(20, 0x342, 0, True))
+    p.address(25, 0x3000)
+    p.emit(ld(25, 25), beq(20, 25, 20), addi(25, 0, -1), sd(25, 11), addi(24, 24, 1), 0x30200073,
+           sw(0, 10), addi(23, 23, 1), 0x30200073)
+    cause = (1 << 63) | 3
+    for byte in range(8):
+        p.memory[base + 0x3000 + byte] = (cause >> (8 * byte)) & 255
+    return p
+
+
 def synchronization_program(base, harts):
     p = Program(base)
     p.emit(csr(2, 0xf14, 0, True), addi(3, 0, 64), mul(3, 2, 3), addi(5, 0, 1))
@@ -434,6 +673,20 @@ def synchronization_program(base, harts):
 
 
 def atomic_multicore_cases(base, harts, interrupts):
+    for shared in (True, False):
+        p = Program(base)
+        p.emit(csr(2, 0xf14, 0, True))
+        p.address(10, 0x1800)
+        if not shared:
+            p.emit(alu(3, 2, 3, 1, immediate=True), add(10, 10, 3))
+        p.address(11, 0x2000)
+        p.emit(alu(3, 2, 5, 1, immediate=True), add(11, 11, 3))
+        for iteration in range(2):
+            loop = p.offset
+            p.emit(amo(2, 6, 10, aqrl=2), addi(7, 6, 1), amo(3, 8, 10, 7, 1),
+                   beq(8, 0, 8), jal(0, loop - (p.offset + 16)), sd(6, 11, iteration * 8))
+        p.lrsc = dict(shared=shared, rounds=2, counter=base + 0x1800, witnesses=base + 0x2000, stride=32)
+        yield 'atomic_lrsc_' + ('shared' if shared else 'private'), p.finish()
     for name in ('atomic', *(('atomic_interrupt',) if interrupts else ())):
         p = Program(base)
         p.emit(csr(2, 0xf14, 0, True), addi(3, 0, 64), mul(3, 2, 3), addi(4, 2, 1), addi(5, 0, 1))

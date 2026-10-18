@@ -1,14 +1,29 @@
 // SPDX-FileCopyrightText: 2026 Huang Rui <vowstar@gmail.com>
 // SPDX-License-Identifier: MIT
 `timescale 1ns/1ps
+`ifndef MEMORY_BYTES
+`define MEMORY_BYTES 65536
+`endif
+`ifndef TIME_TICK_CYCLES
+`define TIME_TICK_CYCLES 1
+`endif
 `define CORE_TRACE traces[0]
 module core_tb;
   localparam integer DW = `AXI_BITS;
   localparam integer PA = `PA_BITS;
   localparam integer HARTS = `HARTS;
-  // Multicore programs allow 256 transactions per hart and 128 cycles per transaction.
+  localparam integer IDW = HARTS > 1 ? $clog2(HARTS) : 1;
+  localparam integer MB = `MEMORY_BYTES;
+`ifdef SOFTWARE
+  localparam integer TRANSACTION_LIMIT = 640 * HARTS;
+`elsif LOCAL_INTERRUPTS
+  // Repeated platform work exceeds 256 retired instructions per hart.
+  localparam integer TRANSACTION_LIMIT = 512 * HARTS;
+`else
   localparam integer TRANSACTION_LIMIT = HARTS == 1 ? 4096 : 256 * HARTS;
+`endif
   localparam integer CYCLE_LIMIT = HARTS == 1 ? 50000 : TRANSACTION_LIMIT * 128;
+  integer transaction_limit = TRANSACTION_LIMIT, cycle_limit = CYCLE_LIMIT;
   typedef struct packed {
     logic traceValid;
     logic [63:0] traceOrder, tracePc;
@@ -27,6 +42,8 @@ module core_tb;
     logic [2:0] size;
     logic [7:0] mask, tag;
     logic write, fetch, atomic;
+    logic [4:0] atomicOperation;
+    logic scEligible;
   } core_request_t;
   typedef struct packed { logic [63:0] data; logic fault; logic [7:0] tag; } core_response_t;
   trace_t traces[HARTS];
@@ -44,7 +61,8 @@ module core_tb;
   logic arvalid, arready = 0, rvalid = 0, rready, rlast = 1;
   logic awvalid, awready = 0, wvalid, wready = 0, wlast, bvalid = 0, bready;
   logic [PA-1:0] araddr, awaddr;
-  logic arid, awid, arlock, awlock;
+  logic [IDW-1:0] arid, awid, read_id, write_id;
+  logic arlock, awlock;
   logic [7:0] arlen, awlen;
   logic [2:0] arsize, awsize, arprot, awprot;
   logic [1:0] arburst, awburst, rresp = 0, bresp = 0;
@@ -52,6 +70,9 @@ module core_tb;
   logic [DW-1:0] rdata = 0, wdata;
   logic [DW/8-1:0] wstrb;
   logic status_trap, status_busy, status_sleep;
+`ifdef LOCAL_INTERRUPTS
+  wire local_tick = cycles % `TIME_TICK_CYCLES == 0;
+`endif
   DitDahA1 dut (
     .clock(clock), .reset(reset),
     .axi_ar_valid(arvalid), .axi_ar_ready(arready), .axi_ar_bits_addr(araddr),
@@ -59,21 +80,23 @@ module core_tb;
     .axi_ar_bits_burst(arburst), .axi_ar_bits_lock(arlock), .axi_ar_bits_cache(arcache),
     .axi_ar_bits_prot(arprot), .axi_ar_bits_qos(arqos),
     .axi_r_valid(rvalid), .axi_r_ready(rready), .axi_r_bits_data(rdata),
-    .axi_r_bits_resp(rresp), .axi_r_bits_id(1'b0), .axi_r_bits_last(rlast),
+    .axi_r_bits_resp(rresp), .axi_r_bits_id(read_id), .axi_r_bits_last(rlast),
     .axi_aw_valid(awvalid), .axi_aw_ready(awready), .axi_aw_bits_addr(awaddr),
     .axi_aw_bits_id(awid), .axi_aw_bits_len(awlen), .axi_aw_bits_size(awsize),
     .axi_aw_bits_burst(awburst), .axi_aw_bits_lock(awlock), .axi_aw_bits_cache(awcache),
     .axi_aw_bits_prot(awprot), .axi_aw_bits_qos(awqos),
     .axi_w_valid(wvalid), .axi_w_ready(wready), .axi_w_bits_data(wdata),
     .axi_w_bits_strb(wstrb), .axi_w_bits_last(wlast),
-    .axi_b_valid(bvalid), .axi_b_ready(bready), .axi_b_bits_resp(bresp), .axi_b_bits_id(1'b0),
+    .axi_b_valid(bvalid), .axi_b_ready(bready), .axi_b_bits_resp(bresp), .axi_b_bits_id(write_id),
     `include "core_ports.svh"
     .status_trap(status_trap), .status_busy(status_busy), .status_sleep(status_sleep)
   );
   `include "fetch_observers.svh"
+  `include "platform_observers.svh"
 `ifdef ENABLE_INTERRUPTS
   logic [2:0] irq_levels;
   wire [2:0] irq_by_hart[HARTS];
+  wire [2:0] effective_irq[HARTS];
   integer irq_hart;
   initial if (!$value$plusargs("IRQ_HART=%d", irq_hart)) irq_hart = 0;
   for (genvar h = 0; h < HARTS; h++) assign irq_by_hart[h] = h == irq_hart ? irq_levels : 0;
@@ -102,21 +125,35 @@ module core_tb;
     (traces[irq_hart].traceValid && traces[irq_hart].tracePc == irq_target));
   always @(posedge clock) irq_ack <= !reset && aw_held && w_held && !write_pending && !bvalid && write_address == base_address + 'h5008;
 `endif
-  byte unsigned memory [0:65535];
+  byte unsigned memory [0:MB-1];
   string image;
+  string console_path, console_lines[HARTS];
+  bit console_enabled = 0;
+  integer console_file = 0;
+  logic [63:0] console_base, results_address, result_value;
   logic [63:0] base_address, stop_pc, fault_fetch, fault_read, fault_write, fault_exclusive;
-  logic [63:0] reservation_address, interference, interference_value;
-  logic reservation_valid = 0, read_exclusive = 0, write_exclusive = 0;
+  logic [63:0] reservation_address[HARTS], interference, interference_value;
+  logic [2:0] reservation_size[HARTS];
+  logic [HARTS-1:0] reservation_valid = 0;
+  logic read_exclusive = 0, write_exclusive = 0, exclusive_success, write_success;
+  integer reservation_max = 0;
   integer exclusive_failures;
   logic [31:0] random_state;
   logic read_pending = 0, read_fetch = 0, aw_held = 0, w_held = 0, write_pending = 0;
   logic [63:0] read_address, write_address;
+  logic [2:0] read_size, write_size;
   logic [DW-1:0] write_data;
   logic [DW/8-1:0] write_mask;
   integer read_delay = 0, write_delay = 0, cycles = 0;
   integer aw_first = 0, w_first = 0, together = 0;
   integer ar_stall = 0, aw_stall = 0, w_stall = 0;
   integer pipeline_max = 0, dependency_stalls = 0;
+  function automatic bit console_address(input logic [63:0] address);
+    return console_enabled && address >= console_base && address < console_base + 4 * HARTS;
+  endfunction
+  function automatic logic [63:0] access_mask(input logic [2:0] size);
+    return 64'hffffffffffffffff >> (64 - (8 << size));
+  endfunction
   initial begin
     if (!$value$plusargs("IMAGE=%s", image)) $fatal(1, "Missing image");
     if (!$value$plusargs("BASE=%h", base_address)) $fatal(1, "Missing base");
@@ -128,7 +165,19 @@ module core_tb;
     if (!$value$plusargs("FAULT_EXCLUSIVE=%h", fault_exclusive)) fault_exclusive = '1;
     if (!$value$plusargs("EXCLUSIVE_FAILURES=%d", exclusive_failures)) exclusive_failures = 0;
     if (!$value$plusargs("INTERFERENCE=%d", interference)) interference = 0;
-    for (integer i = 0; i < 65536; i++) memory[i] = 0;
+    console_enabled = $value$plusargs("CONSOLE_BASE=%h", console_base);
+    if (console_enabled) begin
+      if (!$value$plusargs("CONSOLE_LOG=%s", console_path) || !$value$plusargs("RESULTS=%h", results_address)) $fatal(1, "Missing software output contract");
+      if (results_address < base_address || results_address + 8 * HARTS > base_address + MB) $fatal(1, "Software result bounds");
+      console_file = $fopen(console_path, "w");
+      if (!console_file) $fatal(1, "Cannot open software console");
+    end
+`ifdef SOFTWARE
+    if (!console_enabled) $fatal(1, "Missing software console");
+    if (!$value$plusargs("TRANSACTIONS=%d", transaction_limit) || transaction_limit <= 0 ||
+        !$value$plusargs("CYCLE_LIMIT=%d", cycle_limit) || cycle_limit <= 0) $fatal(1, "Missing software resource bounds");
+`endif
+    for (integer i = 0; i < MB; i++) memory[i] = 0;
     $readmemh(image, memory);
     repeat (3) @(negedge clock);
     reset = 0;
@@ -149,20 +198,26 @@ module core_tb;
   end
   always @(posedge clock) begin
     if (!reset) begin
+`ifdef LOCAL_INTERRUPTS
+      observe_platform();
+`endif
       cycles <= cycles + 1;
-      if (cycles > CYCLE_LIMIT) $fatal(1, "Timeout");
+      if (cycles > cycle_limit) $fatal(1, "Timeout");
       if (arvalid && !arready) ar_stall <= ar_stall + 1;
       if (awvalid && !awready) aw_stall <= aw_stall + 1;
       if (wvalid && !wready) w_stall <= w_stall + 1;
       if (arvalid && arready) begin
-        if (64'(araddr) < base_address || 64'(araddr) >= base_address + 65536) $fatal(1, "Truncated or unexpected read address");
-        if (arid != 0 || arlen != 0 || arburst != 1 || (arlock && arprot[2]) || arcache != 0 || arqos != 0) $fatal(1, "Read attributes");
+        if (!console_address(64'(araddr)) && (64'(araddr) < base_address || 64'(araddr) + (1 << arsize) > base_address + MB)) $fatal(1, "Truncated or unexpected read address");
+        if (arid != IDW'(bus_owner / 2) || arlen != 0 || arburst != 1 || (arlock && arprot[2]) || arcache != 0 || arqos != 0) $fatal(1, "Read attributes");
         if (arprot != 1 && arprot != 5) $fatal(1, "Read privilege");
-        if (arsize != (arprot[2] ? 2 : 3) || (araddr & ((1 << arsize) - 1)) != 0) $fatal(1, "Read alignment");
+        if ((arprot[2] ? arsize != 2 : arsize > 3) ||
+            (arlock && arsize != 3) || (araddr & ((1 << arsize) - 1)) != 0) $fatal(1, "Read alignment");
         if (HARTS > 1) $write("HART %0d ", bus_owner / 2);
         $display("BUS %s %016h %0d %016h", arlock ? "exclusive_read" : (arprot[2] ? "fetch" : "read"), 64'(araddr), 1 << arsize, 64'b0);
         read_pending <= 1;
         read_address <= 64'(araddr);
+        read_id <= arid;
+        read_size <= arsize;
         read_fetch <= arprot[2];
         read_exclusive <= arlock;
         read_delay <= arprot[2] ? integer'(random_state[5:4]) : 32 + integer'(random_state[7:4]);
@@ -174,12 +229,15 @@ module core_tb;
         if (read_delay > 0) read_delay <= read_delay - 1;
         else begin
           for (integer i = 0; i < DW/8; i++)
-            rdata[i*8 +: 8] <= memory[integer'((read_address - base_address) & ~(64'(DW/8) - 1)) + i];
-          rresp <= ((read_fetch && read_address == fault_fetch) || (!read_fetch && read_address == fault_read)) ? 2 :
+            rdata[i*8 +: 8] <= console_address(read_address) ? 0 : memory[integer'((read_address - base_address) & ~(64'(DW/8) - 1)) + i];
+          rresp <= ((read_fetch && read_address == fault_fetch) || (!read_fetch && read_address == fault_read) || console_address(read_address)) ? 2 :
             (read_exclusive && read_address != fault_exclusive ? 1 : 0);
-          if (read_exclusive) begin
-            reservation_address <= read_address;
-            reservation_valid <= read_address != fault_read && read_address != fault_exclusive;
+          if (read_exclusive && read_address != fault_read && read_address != fault_exclusive && !console_address(read_address)) begin
+            reservation_address[read_id] <= read_address;
+            reservation_size[read_id] <= read_size;
+            reservation_valid[read_id] <= 1;
+            if ($countones(reservation_valid | (HARTS'(1) << read_id)) > reservation_max)
+              reservation_max <= $countones(reservation_valid | (HARTS'(1) << read_id));
           end
           rvalid <= 1;
           read_pending <= 0;
@@ -188,7 +246,7 @@ module core_tb;
       if (rvalid && rready) begin
         if (HARTS > 1) $write("HART %0d ", bus_owner / 2);
         $display("READ %016h %01h %016h", read_address, rresp,
-          64'(rdata >> (8 * (read_address % (DW/8)))) & (read_fetch ? 64'hffffffff : '1));
+          64'(rdata >> (8 * (read_address % (DW/8)))) & access_mask(read_size));
         if (read_fetch) begin
           if (HARTS > 1) $write("HART %0d ", bus_owner / 2);
           $display("FETCH %016h %01h %08h", read_address, rresp,
@@ -197,10 +255,14 @@ module core_tb;
         rvalid <= 0;
       end
       if (awvalid && awready) begin
-        if (64'(awaddr) < base_address || 64'(awaddr) >= base_address + 65536) $fatal(1, "Truncated or unexpected write address");
-        if (awid != 0 || awlen != 0 || awsize != 3 || awburst != 1 || awcache != 0 || awprot != 1 || awqos != 0 || awaddr[2:0] != 0) $fatal(1, "Write attributes");
+        if (!console_address(64'(awaddr)) && (64'(awaddr) < base_address || 64'(awaddr) + (1 << awsize) > base_address + MB)) $fatal(1, "Truncated or unexpected write address");
+        if (awid != IDW'(bus_owner / 2) || awlen != 0 || awsize > 3 || (awlock && awsize != 3) ||
+            awburst != 1 || awcache != 0 || awprot != 1 || awqos != 0 ||
+            (awaddr & ((1 << awsize) - 1)) != 0) $fatal(1, "Write attributes");
         aw_held <= 1;
         write_address <= 64'(awaddr);
+        write_id <= awid;
+        write_size <= awsize;
         write_exclusive <= awlock;
         if (!w_held && !(wvalid && wready)) aw_first <= aw_first + 1;
       end
@@ -213,23 +275,41 @@ module core_tb;
       end
       if (awvalid && awready && wvalid && wready) together <= together + 1;
       if (aw_held && w_held && !write_pending && !bvalid) begin
-        if (write_mask != (DW/8)'(255 << (write_address % (DW/8)))) $fatal(1, "Write strobes");
+        if (write_mask != ((DW/8)'((1 << (1 << write_size)) - 1) << (write_address % (DW/8)))) $fatal(1, "Write strobes");
         if (HARTS > 1) $write("HART %0d ", bus_owner / 2);
-        $display("BUS %s %016h 8 %016h", write_exclusive ? "exclusive_write" : "write", write_address, 64'(write_data >> (8 * (write_address % (DW/8)))));
-        bresp <= write_address == fault_write ? 2 : (write_exclusive ? (reservation_valid && reservation_address == write_address ? 1 : 0) : 0);
-        if (write_exclusive && reservation_valid && reservation_address == write_address && exclusive_failures > 0 && write_address != fault_write) begin
+        $display("BUS %s %016h %0d %016h", write_exclusive ? "exclusive_write" : "write", write_address,
+          1 << write_size, 64'(write_data >> (8 * (write_address % (DW/8)))) & access_mask(write_size));
+        if (console_address(write_address) && write_address != fault_write) begin
+          if (write_size != 2 || write_exclusive || write_address != console_base + 4 * (bus_owner / 2)) $fatal(1, "Console access ownership");
+          if ((write_data >> (8 * (write_address % (DW/8)))) & 32'hffffff80) $fatal(1, "Console requires ASCII");
+          $display("CONSOLE %0d %02h", bus_owner / 2, 8'(write_data >> (8 * (write_address % (DW/8)))));
+          if (8'(write_data >> (8 * (write_address % (DW/8)))) == 10) begin
+            $fdisplay(console_file, "[hart %0d] %s", bus_owner / 2, console_lines[bus_owner / 2]);
+            $display("CONSOLE_LINE [hart %0d] %s", bus_owner / 2, console_lines[bus_owner / 2]);
+            console_lines[bus_owner / 2] = "";
+          end else console_lines[bus_owner / 2] = {console_lines[bus_owner / 2], 8'(write_data >> (8 * (write_address % (DW/8))))};
+        end
+        exclusive_success = reservation_valid[write_id] && reservation_address[write_id] == write_address && reservation_size[write_id] == write_size;
+        write_success = write_address != fault_write && (!write_exclusive || exclusive_success);
+        bresp <= write_address == fault_write ? 2 : (write_exclusive ? (exclusive_success ? 1 : 0) : 0);
+        if (write_exclusive && exclusive_success && exclusive_failures > 0 && write_address != fault_write) begin
           interference_value = 0;
           for (integer i = 0; i < 8; i++) interference_value[i*8 +: 8] = memory[integer'(write_address - base_address) + i];
           interference_value = interference_value + interference;
           for (integer i = 0; i < 8; i++) memory[integer'(write_address - base_address) + i] <= interference_value[i*8 +: 8];
           exclusive_failures <= exclusive_failures - 1;
+          write_success = 0;
           bresp <= 0;
           if (HARTS > 1) $write("HART %0d ", bus_owner / 2);
           $display("INTERFERE %016h %016h", write_address, interference_value);
-        end else if (write_address != fault_write && (!write_exclusive || (reservation_valid && reservation_address == write_address)))
+        end else if (!console_address(write_address) && write_success)
           for (integer i = 0; i < DW/8; i++)
             if (write_mask[i]) memory[integer'((write_address - base_address) & ~(64'(DW/8) - 1)) + i] <= write_data[i*8 +: 8];
-        if (reservation_address == write_address) reservation_valid <= 0;
+        if (write_success || (write_exclusive && exclusive_success && exclusive_failures > 0 && write_address != fault_write))
+          for (integer h = 0; h < HARTS; h++)
+            if (write_address < reservation_address[h] + (1 << reservation_size[h]) &&
+                reservation_address[h] < write_address + (1 << write_size)) reservation_valid[h] <= 0;
+        if (write_exclusive && write_address != fault_write) reservation_valid[write_id] <= 0;
         write_pending <= 1;
         write_delay <= integer'(random_state[11:8]);
       end
@@ -256,7 +336,7 @@ module core_tb;
         if (traces[h].traceValid) begin
 `ifdef ENABLE_INTERRUPTS
           if (HARTS > 1) $write("HART %0d ", h);
-          $display("IRQ %01h", irq_by_hart[h]);
+          $display("IRQ %01h", effective_irq[h]);
 `endif
           if (traces[h].traceRdWrite && traces[h].traceRd == 0) $fatal(1, "x0 write");
           if (HARTS > 1) $write("HART %0d ", h);
@@ -268,7 +348,17 @@ module core_tb;
         end
       end
       if (&finished) begin
+        if (console_enabled) begin
+          for (integer h = 0; h < HARTS; h++) begin
+            if (console_lines[h] != "") $fatal(1, "Incomplete console line");
+            result_value = 0;
+            for (integer i = 0; i < 8; i++) result_value[i*8 +: 8] = memory[integer'(results_address - base_address) + 8 * h + i];
+            $display("RESULT %0d %016h", h, result_value);
+          end
+          $fclose(console_file);
+        end
         $display("COVER %0d %0d %0d %0d %0d %0d", aw_first, w_first, together, ar_stall, aw_stall, w_stall);
+        $display("EXCLUSIVE %0d", reservation_max);
         $display("PIPELINE %0d %0d", pipeline_max, dependency_stalls);
         $display("CYCLES %0d", cycles);
         $display("PASS"); $finish;
@@ -285,15 +375,20 @@ module core_tb;
         if (HARTS > 1) $write("HART %0d ", source / 2);
         $display("REQUEST %s %016h %0d %016h %02h",
           requests[source].atomic ? "atomic" : (source % 2 == 0 ? "fetch" : (requests[source].write ? "write" : "read")),
-          requests[source].address, 1 << requests[source].size, requests[source].write ? requests[source].data : 64'b0,
+          requests[source].address, 1 << requests[source].size,
+          requests[source].write ? requests[source].data & access_mask(requests[source].size) : 64'b0,
           requests[source].tag);
+        if (requests[source].atomic) begin
+          if (HARTS > 1) $write("HART %0d ", source / 2);
+          $display("ATOMIC %02h %01h", requests[source].atomicOperation, requests[source].scEligible);
+        end
       end
       if (response_valid[source] && response_ready[source]) begin
         if (active_source != source || responses[source].tag != accepted_tag)
           $fatal(1, "Response source or tag");
         active_source = -1;
         completed_transactions = completed_transactions + 1;
-        if (completed_transactions > TRANSACTION_LIMIT) $fatal(1, "Transaction budget");
+        if (completed_transactions > transaction_limit) $fatal(1, "Transaction budget");
         if (HARTS > 1) $write("HART %0d ", source / 2);
         $display("RESPONSE %0d %016h %01h %02h", source % 2,
           responses[source].data, responses[source].fault, responses[source].tag);

@@ -22,11 +22,16 @@ object DitDahA1Module extends Generator[DitDahA1Parameter, DitDahA1Layers, DitDa
       core.io.clock := io.clock
       core.io.reset := io.reset
       core.io.hartId := hart.U(4)
-      if parameter.enableInterrupts then core.io.interrupts.get :<= io.interrupts.get(hart)
+      if parameter.enableInterrupts then
+        core.io.interrupts.get :<= io.interrupts.get(hart)
+        if parameter.localInterruptBase.nonEmpty then
+          core.io.interrupts.get.software := io.interrupts.get(hart).software | fabric.io.localInterrupts.get(hart).software
+          core.io.interrupts.get.timer := io.interrupts.get(hart).timer | fabric.io.localInterrupts.get(hart).timer
       fabric.io.instruction(hart) :<>= core.io.instruction
       fabric.io.data(hart) :<>= core.io.data
     fabric.io.clock := io.clock
     fabric.io.reset := io.reset
+    if parameter.localInterruptBase.nonEmpty then fabric.io.timeTick.get := io.timeTick.get
     io.axi :<>= fabric.io.axi
     io.status.trap := cores.map[Referable[Bool]](_.io.status.trap).reduce(_ | _)
     io.status.busy := cores.map[Referable[Bool]](_.io.status.busy).reduce(_ | _)
@@ -36,6 +41,7 @@ object DitDahA1Module extends Generator[DitDahA1Parameter, DitDahA1Layers, DitDa
 object DitDahA1MemoryFabric extends Generator[DitDahA1Parameter, DitDahA1UnitLayers, DitDahA1MemoryFabricIO, DitDahA1UnitProbe]:
   override def moduleName(parameter: DitDahA1Parameter): String = "DitDahA1MemoryFabric"
   def architecture(parameter: DitDahA1Parameter) =
+    parameter.validateFabric()
     val io = summon[Interface[DitDahA1MemoryFabricIO]]
     val arbiter = DitDahA1MemoryArbiter.instantiate(parameter)
     val memory = DitDahA1Memory.instantiate(parameter)
@@ -46,9 +52,33 @@ object DitDahA1MemoryFabric extends Generator[DitDahA1Parameter, DitDahA1UnitLay
     memory.io.reset := io.reset
     axi.io.clock := io.clock
     axi.io.reset := io.reset
+    axi.io.hartId := arbiter.io.hartId
     for hart <- 0 until parameter.hartCount do
       arbiter.io.ports(2 * hart) :<>= io.instruction(hart)
       arbiter.io.ports(2 * hart + 1) :<>= io.data(hart)
     memory.io.upstream :<>= arbiter.io.downstream
-    axi.io.memory :<>= memory.io.downstream
+    if parameter.localInterruptBase.isEmpty then axi.io.memory :<>= memory.io.downstream
+    else
+      given ClockScope = ClockScope.posedge(io.clock)
+      given ResetScope = ResetScope.syncActiveHigh(io.reset)
+      val localInterrupts = DitDahA1LocalInterrupts.instantiate(parameter)
+      val port = memory.io.downstream
+      val base = parameter.localInterruptBase.get
+      val selected = (port.request.bits.address >= base.U(64)) & (port.request.bits.address < (base + 65536).U(64))
+      val responseLocal = RegInit(false.B)
+      localInterrupts.io.clock := io.clock
+      localInterrupts.io.reset := io.reset
+      localInterrupts.io.timeTick := io.timeTick.get
+      io.localInterrupts.get :<= localInterrupts.io.interrupts
+      axi.io.memory.request.bits :<= port.request.bits
+      localInterrupts.io.memory.request.bits :<= port.request.bits
+      axi.io.memory.request.valid := port.request.valid & !selected
+      localInterrupts.io.memory.request.valid := port.request.valid & selected
+      port.request.ready := selected.?(localInterrupts.io.memory.request.ready, axi.io.memory.request.ready)
+      when(port.request.valid & port.request.ready) { responseLocal := selected }
+      port.response.valid := responseLocal.?(localInterrupts.io.memory.response.valid, axi.io.memory.response.valid)
+      port.response.bits :<= axi.io.memory.response.bits
+      when(responseLocal) { port.response.bits :<= localInterrupts.io.memory.response.bits }
+      axi.io.memory.response.ready := port.response.ready & !responseLocal
+      localInterrupts.io.memory.response.ready := port.response.ready & responseLocal
     io.axi :<>= axi.io.axi

@@ -20,7 +20,7 @@ class Decoupled[T <: Data](gen: T) extends Bundle:
 
 class AxiAddress(parameter: DitDahA1Parameter) extends Bundle:
   val addr = Aligned(UInt(parameter.physicalAddressBits))
-  val id = Aligned(UInt(1))
+  val id = Aligned(UInt(parameter.axiIdBits))
   val len = Aligned(UInt(8))
   val size = Aligned(UInt(3))
   val burst = Aligned(UInt(2))
@@ -35,15 +35,15 @@ class AxiWrite(parameter: DitDahA1Parameter) extends Bundle:
 class AxiRead(parameter: DitDahA1Parameter) extends Bundle:
   val data = Aligned(UInt(parameter.axiDataBits))
   val resp = Aligned(UInt(2))
-  val id = Aligned(UInt(1))
+  val id = Aligned(UInt(parameter.axiIdBits))
   val last = Aligned(Bool())
-class AxiResponse extends Bundle:
+class AxiResponse(parameter: DitDahA1Parameter) extends Bundle:
   val resp = Aligned(UInt(2))
-  val id = Aligned(UInt(1))
+  val id = Aligned(UInt(parameter.axiIdBits))
 class AxiBundle(parameter: DitDahA1Parameter) extends Bundle:
   val aw = Aligned(new Decoupled(new AxiAddress(parameter)))
   val w = Aligned(new Decoupled(new AxiWrite(parameter)))
-  val b = Flipped(new Decoupled(new AxiResponse))
+  val b = Flipped(new Decoupled(new AxiResponse(parameter)))
   val ar = Aligned(new Decoupled(new AxiAddress(parameter)))
   val r = Flipped(new Decoupled(new AxiRead(parameter)))
 
@@ -56,6 +56,8 @@ class MemoryRequest extends Bundle:
   val write = Aligned(Bool())
   val fetch = Aligned(Bool())
   val atomic = Aligned(Bool())
+  val atomicOperation = Aligned(UInt(5))
+  val scEligible = Aligned(Bool())
 class MemoryResponse extends Bundle:
   val data = Aligned(UInt(64))
   val fault = Aligned(Bool())
@@ -102,6 +104,9 @@ class ResultPacket extends Bundle:
   val nextPc = Aligned(UInt(64))
   val load = Aligned(Bool())
   val store = Aligned(Bool())
+  val atomic = Aligned(Bool())
+  val memorySize = Aligned(UInt(3))
+  val unsignedLoad = Aligned(Bool())
   val address = Aligned(UInt(64))
   val storeData = Aligned(UInt(64))
   val csrWrite = Aligned(Bool())
@@ -109,6 +114,7 @@ class ResultPacket extends Bundle:
   val csrData = Aligned(UInt(64))
   val mret = Aligned(Bool())
   val fenceI = Aligned(Bool())
+  val wfi = Aligned(Bool())
 class StatusBundle extends Bundle:
   val trap = Aligned(Bool())
   val busy = Aligned(Bool())
@@ -118,6 +124,7 @@ class InterruptBundle extends Bundle:
   val timer = Aligned(Bool())
   val external = Aligned(Bool())
 class DitDahA1IO(parameter: DitDahA1Parameter) extends HWBundle(parameter):
+  val timeTick = Option.when(parameter.localInterruptBase.nonEmpty)(Flipped(Bool()))
   val interrupts = Option.when(parameter.enableInterrupts)(Flipped(Vec(parameter.hartCount, new InterruptBundle)))
   val clock = Flipped(Clock())
   val reset = Flipped(Reset())
@@ -155,11 +162,14 @@ class DitDahA1FrontendIO(parameter: DitDahA1Parameter) extends HWBundle(paramete
   val clock = Flipped(Clock())
   val reset = Flipped(Reset())
   val redirect = Flipped(Bool())
+  val halt = Flipped(Bool())
   val redirectPc = Flipped(UInt(64))
   val output = Aligned(new Decoupled(new FetchPacket))
   val memory = Aligned(new MemoryPort)
 
 class DitDahA1MemoryFabricIO(parameter: DitDahA1Parameter) extends HWBundle(parameter):
+  val timeTick = Option.when(parameter.localInterruptBase.nonEmpty)(Flipped(Bool()))
+  val localInterrupts = Option.when(parameter.localInterruptBase.nonEmpty)(Aligned(Vec(parameter.hartCount, new InterruptBundle)))
   val clock = Flipped(Clock())
   val reset = Flipped(Reset())
   val instruction = Flipped(Vec(parameter.hartCount, new MemoryPort))

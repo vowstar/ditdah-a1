@@ -1,0 +1,13 @@
+# SPDX-FileCopyrightText: 2026 Huang Rui <vowstar@gmail.com>
+# SPDX-License-Identifier: MIT
+config SOC_DITDAH_A1
+	select RISCV
+	select RISCV_PRIVILEGED
+	select INCLUDE_RESET_VECTOR
+	select RISCV_SOC_HAS_GP_RELATIVE_ADDRESSING
+if SOC_DITDAH_A1
+config NUM_IRQS
+	default 16
+config PMP_SLOTS
+	default 16
+endif
