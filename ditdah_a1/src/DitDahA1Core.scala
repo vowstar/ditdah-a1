@@ -30,7 +30,19 @@ object DitDahA1Core extends Generator[DitDahA1Parameter, DitDahA1Layers, DitDahA
     frontend.io.halt := backend.io.status.sleep
     frontend.io.privilege := backend.io.privilege
     io.instruction :<>= frontend.io.memory
-    io.data :<>= backend.io.data
+    if !parameter.enableTranslation then io.data :<>= backend.io.data
+    else
+      given ClockScope = ClockScope.posedge(io.clock)
+      given ResetScope = ResetScope.syncActiveHigh(io.reset)
+      val translation = DitDahA1Translation.instantiate(parameter)
+      translation.io.clock := io.clock
+      translation.io.reset := io.reset
+      translation.io.state :<= backend.io.translationState.get
+      translation.io.cancelInstruction := backend.io.redirect
+      if parameter.pmpEntries != 0 then translation.io.pmp.get :<= backend.io.pmp.get
+      translation.io.ports(0) :<>= frontend.io.translation.get
+      translation.io.ports(1) :<>= backend.io.translation.get
+      DitDahA1MemoryArbiter.arbitrate(Seq(backend.io.data, translation.io.memory), io.data)
     io.status :<= backend.io.status
     layer("DV"):
       probe.valid <== backend.probe.valid
@@ -102,6 +114,11 @@ object DitDahA1Backend extends Generator[DitDahA1Parameter, DitDahA1Layers, DitD
     execute.io.csrLegal := csr.io.legal
     execute.io.privilege := csr.io.privilege
     execute.io.wfiLegal := csr.io.wfiLegal
+    execute.io.sretLegal := csr.io.sretLegal
+    execute.io.sfenceLegal := csr.io.sfenceLegal
+    if parameter.enableTranslation then
+      io.translationState.get :<= csr.io.translationState.get
+      io.translation.get :<>= lsu.io.translation.get
     io.privilege := csr.io.privilege
     lsu.io.privilege := csr.io.dataPrivilege
     csr.io.readAddress := execute.io.csrAddress
@@ -122,9 +139,11 @@ object DitDahA1Backend extends Generator[DitDahA1Parameter, DitDahA1Layers, DitD
     val pmpUpdate = if parameter.pmpEntries == 0 then false.B else
       retire.bits.csrWrite & (((retire.bits.csrAddress >= 0x3a0.U(12)) & (retire.bits.csrAddress <= 0x3ae.U(12))) |
         ((retire.bits.csrAddress >= 0x3b0.U(12)) & (retire.bits.csrAddress <= 0x3ef.U(12))))
-    val redirect = takeInterrupt | (retired & (retire.bits.instruction.fault | retire.bits.mret |
-      pmpUpdate | retire.bits.fenceI | (retire.bits.nextPc =/= sequentialPc))) | enterWfi
-    if parameter.iCacheBytes != 0 then io.invalidate.get := retired & (retire.bits.fenceI | pmpUpdate)
+    val translationUpdate = if parameter.enableTranslation then
+      retire.bits.sfenceVma | (retire.bits.csrWrite & (retire.bits.csrAddress === 0x180.U(12))) else false.B
+    val redirect = takeInterrupt | (retired & (retire.bits.instruction.fault | retire.bits.mret | retire.bits.sret |
+      pmpUpdate | translationUpdate | retire.bits.fenceI | (retire.bits.nextPc =/= sequentialPc))) | enterWfi
+    if parameter.iCacheBytes != 0 then io.invalidate.get := retired & (retire.bits.fenceI | pmpUpdate | translationUpdate)
     val commitReady = !commitValid | retired
     val memoryOperation = (resultPacket.load | resultPacket.store) & !resultPacket.instruction.fault
     val resultAdvance = resultValid & (!memoryOperation | (memoryPending & lsu.io.output.valid)) & commitReady & !redirect
@@ -165,6 +184,7 @@ object DitDahA1Backend extends Generator[DitDahA1Parameter, DitDahA1Layers, DitD
     csr.io.trapCause := retire.bits.instruction.cause
     csr.io.trapValue := retire.bits.instruction.tval
     csr.io.mret := retired & retire.bits.mret
+    csr.io.sret := retired & retire.bits.sret
     if parameter.enableInterrupts then
       sleep.get := (sleep.get | enterWfi) & !csr.io.wakeup.get & !csr.io.trap
       when(retired) { resumePc.get := retire.bits.nextPc }
@@ -274,6 +294,7 @@ object DitDahA1Frontend extends Generator[DitDahA1Parameter, DitDahA1UnitLayers,
     fetch.io.clock := io.clock
     fetch.io.reset := io.reset
     fetch.io.privilege := io.privilege
+    if parameter.enableTranslation then io.translation.get :<>= fetch.io.translation.get
     fetch.io.request.valid := !io.redirect & !io.halt
     fetch.io.request.bits.pc := pc
     fetch.io.request.bits.tag := tag

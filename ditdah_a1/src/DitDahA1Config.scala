@@ -28,9 +28,9 @@ object DitDahA1Config:
       "schemaVersion" -> 2,
       "status" -> "development",
       "implementation" -> ujson.Obj(
-        "instructions" -> ujson.Arr.from(DitDahA1Isa.instructions),
-        "privilege" -> (if parameter.enableUserMode then "MU" else "M"), "issueWidth" -> 1, "maxInflight" -> parameter.maxInflight,
-        "translation" -> "Bare", "isaComplete" -> false
+        "instructions" -> ujson.Arr.from(DitDahA1Isa.instructions ++ (if parameter.enableSupervisorMode then DitDahA1Isa.supervisorInstructions else Seq.empty) ++ (if parameter.enableTranslation then Seq("sfence.vma") else Seq.empty)),
+        "privilege" -> (if parameter.enableSupervisorMode then "MSU" else if parameter.enableUserMode then "MU" else "M"), "issueWidth" -> 1, "maxInflight" -> parameter.maxInflight,
+        "translation" -> (if parameter.enableTranslation then "Sv39/Svade" else "Bare"), "isaComplete" -> false
       ),
       "target" -> ujson.Obj(
         "isa" -> "RV64GCB", "maxHartCount" -> 16,

@@ -22,13 +22,15 @@ object DitDahA1Commit extends Generator[DitDahA1Parameter, DitDahA1UnitLayers, D
     io.output.valid := io.input.valid
     io.output.bits :<= io.input.bits
     val out = io.output.bits
-    when(io.input.bits.mret) { out.nextPc := io.returnPc }
+    when(io.input.bits.mret | io.input.bits.sret) { out.nextPc := io.returnPc }
     when(io.input.bits.instruction.fault) {
       out.nextPc := io.trapVector
       out.rdWrite := false.B
       out.csrWrite := false.B
       out.mret := false.B
+      out.sret := false.B
       out.fenceI := false.B
+      out.sfenceVma := false.B
       out.wfi := false.B
     }
     when(io.input.bits.rd === 0.U(5)) { out.rdWrite := false.B }

@@ -15,6 +15,8 @@ class DitDahA1ExecuteIO(parameter: DitDahA1Parameter) extends HWBundle(parameter
   val csrLegal = Flipped(Bool())
   val privilege = Flipped(UInt(2))
   val wfiLegal = Flipped(Bool())
+  val sretLegal = Flipped(Bool())
+  val sfenceLegal = Flipped(Bool())
 
 @generator
 object DitDahA1Execute extends Generator[DitDahA1Parameter, DitDahA1UnitLayers, DitDahA1ExecuteIO, DitDahA1UnitProbe]:
@@ -67,7 +69,10 @@ object DitDahA1Execute extends Generator[DitDahA1Parameter, DitDahA1UnitLayers, 
     when(csrAction === 2.B(2)) { out.csrData := (io.csrValue.asBits | csrSource.asBits).asUInt }
     when(csrAction === 3.B(2)) { out.csrData := (io.csrValue.asBits & (csrSource.asBits ^ BigInt("ffffffffffffffff", 16).B(64))).asUInt }
     out.mret := op === Mret.U(operationBits)
+    out.sret := op === Sret.U(operationBits)
     out.fenceI := op === FenceI.U(operationBits)
+    out.sfenceVma := parameter.enableTranslation.B & (op === Fence.U(operationBits)) &
+      ((encoding & BigInt("fe007fff", 16).B(32)) === 0x12000073.B(32))
     out.wfi := op === Wfi.U(operationBits)
     when(op === Lui.U(operationBits)) { out.value := imm }
     when(op === Auipc.U(operationBits)) { out.value := pcImm }
@@ -105,8 +110,9 @@ object DitDahA1Execute extends Generator[DitDahA1Parameter, DitDahA1UnitLayers, 
     when(taken) { out.nextPc := target }
     when(jump) { out.value := sequential }
     when(!insn.fault) {
-      when((op === Illegal.U(operationBits)) | ((op === Mret.U(operationBits)) & !machine) |
+      when((op === Illegal.U(operationBits)) | (out.sfenceVma & !io.sfenceLegal) | ((op === Mret.U(operationBits)) & !machine) |
         ((op === Wfi.U(operationBits)) & !wfiLegal) |
+        ((op === Sret.U(operationBits)) & !io.sretLegal) |
         (csr & (!io.csrLegal | (out.csrWrite & (io.csrAddress.asBits.bits(11, 10) === 3.B(2)))))) {
         out.instruction.fault := true.B
         out.instruction.cause := 2.U(64)
@@ -114,7 +120,8 @@ object DitDahA1Execute extends Generator[DitDahA1Parameter, DitDahA1UnitLayers, 
       }
       when(op === Ecall.U(operationBits)) {
         out.instruction.fault := true.B
-        out.instruction.cause := machine.?(11.U(64), 8.U(64))
+        out.instruction.cause := machine.?(11.U(64),
+          (parameter.enableSupervisorMode.B & (io.privilege === 1.U(2))).?(9.U(64), 8.U(64)))
         out.instruction.tval := 0.U(64)
       }
       when(taken & (target.asBits.bits(1, 0) =/= 0.B(2))) {

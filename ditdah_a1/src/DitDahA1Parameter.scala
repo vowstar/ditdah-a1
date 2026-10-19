@@ -18,6 +18,7 @@ case class DitDahA1Parameter(
   issueWidth: Int = 1,
   enableInterrupts: Boolean = false,
   enableUserMode: Boolean = false,
+  enableSupervisorMode: Boolean = false,
   enableTrace: Boolean = false,
   localInterruptBase: Option[BigInt] = None,
   memoryRegions: Seq[MemoryRegion] = Seq(MemoryRegion())
@@ -50,16 +51,18 @@ case class DitDahA1Parameter(
     require(issueWidth == 1, "Backend supports single issue")
 
   def validateCore(): Unit =
+    require(Set(0, 39).contains(virtualAddressBits), "RTL supports Bare or Sv39 addressing")
     validateFrontend()
     validateBackend()
 
   def validateProtection(): Unit =
+    require(virtualAddressBits != 39 || enableSupervisorMode, "Sv39 requires supervisor mode")
     require(pmpEntries == 0 || pmpEntries == 16, "RTL supports zero or sixteen PMP entries")
+    require(!enableSupervisorMode || (enableUserMode && enableInterrupts), "Supervisor mode requires user mode and interrupts")
 
   def validateRtl(): Unit =
     validateCore()
     validateFabric()
-    require(virtualAddressBits == 0, "RTL supports Bare addressing")
     require(dCacheBytes == 0 || dCacheBytes == 8192, "RTL supports zero or 8192 data cache bytes")
     require(l2CacheBytes == 0, "RTL does not support a shared cache")
     require(memoryRegions.exists(r => r.executable && resetVector >= r.base && resetVector + 4 <= r.base + r.size), "Reset vector must be in executable memory")
@@ -70,6 +73,8 @@ case class DitDahA1Parameter(
     require(memoryRegions.exists(r => r.device && r.readable && r.writable && !r.executable && !r.atomic &&
       r.base <= base && base + 65536 <= r.base + r.size), "Local interrupts require a readable writable device region")
   }
+
+  def enableTranslation: Boolean = virtualAddressBits == 39 && enableSupervisorMode
 
   val xlen: Int = 64
   val axiIdBits: Int = math.max(1, 32 - Integer.numberOfLeadingZeros(hartCount - 1))

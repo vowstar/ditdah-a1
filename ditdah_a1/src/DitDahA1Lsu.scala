@@ -15,6 +15,7 @@ class DitDahA1LsuIO(parameter: DitDahA1Parameter) extends HWBundle(parameter):
   val input = Flipped(new Decoupled(new ResultPacket))
   val output = Aligned(new Decoupled(new ResultPacket))
   val storeAllowed = Flipped(Bool())
+  val translation = Option.when(parameter.enableTranslation)(Aligned(new TranslationPort))
   val memory = Aligned(new MemoryPort)
 
 @generator
@@ -24,9 +25,12 @@ object DitDahA1Lsu extends Generator[DitDahA1Parameter, DitDahA1UnitLayers, DitD
     val io = summon[Interface[DitDahA1LsuIO]]
     given ClockScope = ClockScope.posedge(io.clock)
     given ResetScope = ResetScope.syncActiveHigh(io.reset)
-    val state = RegInit(0.U(2))
+    val stateBits = if parameter.enableTranslation then 3 else 2
+    val state = RegInit(0.U(stateBits))
     val packet = Reg(new ResultPacket)
-    val privileged = Option.when(parameter.enableUserMode)(Reg(Bool()))
+    val privileged = Option.when(parameter.enableUserMode && !parameter.enableTranslation)(Reg(Bool()))
+    val privilege = Option.when(parameter.enableTranslation)(Reg(UInt(2)))
+    val physicalAddress = Option.when(parameter.enableTranslation)(Reg(UInt(64)))
     val reserved = RegInit(false.B)
     val reservedWord = Reg(UInt(parameter.physicalAddressBits - 3))
     val scEligible = Reg(Bool())
@@ -38,18 +42,18 @@ object DitDahA1Lsu extends Generator[DitDahA1Parameter, DitDahA1UnitLayers, DitD
     val permitted = if parameter.pmpEntries == 0 then true.B else
       val pmp = DitDahA1Pmp.instantiate(parameter)
       pmp.io.state :<= io.pmp.get
-      pmp.io.address := io.input.bits.address
-      pmp.io.size := io.input.bits.memorySize
-      pmp.io.write := io.input.bits.store
+      pmp.io.address := io.translation.map(_.response.bits.address).getOrElse(io.input.bits.address)
+      pmp.io.size := (if parameter.enableTranslation then packet.memorySize else io.input.bits.memorySize)
+      pmp.io.write := (if parameter.enableTranslation then packet.store else io.input.bits.store)
       pmp.io.fetch := false.B
-      pmp.io.atomic := io.input.bits.load & io.input.bits.store
-      pmp.io.privilege := io.privilege
+      pmp.io.atomic := (if parameter.enableTranslation then packet.load & packet.store else io.input.bits.load & io.input.bits.store)
+      pmp.io.privilege := privilege.getOrElse(io.privilege)
       pmp.io.allowed
-    io.input.ready := (state === 0.U(2)) & (io.input.bits.instruction.fault | !io.input.bits.store | io.storeAllowed)
-    io.output.valid := state === 3.U(2)
+    io.input.ready := (state === 0.U(stateBits)) & (io.input.bits.instruction.fault | !io.input.bits.store | io.storeAllowed)
+    io.output.valid := state === 3.U(stateBits)
     io.output.bits :<= packet
-    request.valid := state === 1.U(2)
-    request.bits.address := packet.address
+    request.valid := state === 1.U(stateBits)
+    request.bits.address := physicalAddress.getOrElse(packet.address)
     request.bits.data := packet.storeData
     request.bits.size := packet.memorySize
     request.bits.mask := 0.U(8)
@@ -58,24 +62,49 @@ object DitDahA1Lsu extends Generator[DitDahA1Parameter, DitDahA1UnitLayers, DitD
     request.bits.tag := packet.instruction.tag
     request.bits.write := packet.store
     request.bits.fetch := false.B
-    request.bits.privileged := privileged.getOrElse(true.B)
+    request.bits.privileged := privilege.map(_ =/= 0.U(2)).getOrElse(privileged.getOrElse(true.B))
     request.bits.atomic := packet.atomic
     request.bits.atomicOperation := packet.atomic.?(operation, 0.U(5))
     request.bits.scEligible := scEligible
-    response.ready := state === 2.U(2)
+    response.ready := state === 2.U(stateBits)
+    io.translation.foreach { t =>
+      t.request.valid := state === 4.U(stateBits)
+      t.request.bits.address := packet.address
+      t.request.bits.privilege := privilege.get
+      t.request.bits.fetch := false.B
+      t.request.bits.write := packet.store
+      t.response.ready := state === 5.U(stateBits)
+      when(t.request.valid & t.request.ready) { state := 5.U(stateBits) }
+      when(t.response.valid & t.response.ready) {
+        physicalAddress.get := t.response.bits.address
+        scEligible := scEligible & (t.response.bits.address === reservedAddress)
+        packet.instruction.fault := t.response.bits.fault
+        packet.instruction.cause := t.response.bits.fault.?(t.response.bits.cause, 0.U(64))
+        packet.instruction.tval := t.response.bits.fault.?(packet.address, 0.U(64))
+        state := 1.U(stateBits)
+        when(!t.response.bits.fault & !permitted) {
+          packet.instruction.fault := true.B
+          packet.instruction.cause := packet.store.?(7.U(64), 5.U(64))
+          packet.instruction.tval := packet.address
+          state := 3.U(stateBits)
+        }
+        when(t.response.bits.fault) { state := 3.U(stateBits) }
+      }
+    }
     when(io.input.valid & io.input.ready) {
-      privileged.foreach(_ := (io.privilege === 3.U(2)))
+      privileged.foreach(_ := (io.privilege =/= 0.U(2)))
+      privilege.foreach(_ := io.privilege)
       packet :<= io.input.bits
       scEligible := io.input.bits.atomic & (inputOperation === 3.U(5)) & reserved &
-        (io.input.bits.address === reservedAddress) & (io.input.bits.memorySize === 3.U(3))
+        (if parameter.enableTranslation then true.B else io.input.bits.address === reservedAddress) & (io.input.bits.memorySize === 3.U(3))
       when(io.input.bits.atomic) { reserved := false.B }
-      state := 1.U(2)
-      if parameter.pmpEntries != 0 then
+      state := (if parameter.enableTranslation then 4 else 1).U(stateBits)
+      if parameter.pmpEntries != 0 && !parameter.enableTranslation then
         when(!io.input.bits.instruction.fault & !permitted) {
           packet.instruction.fault := true.B
           packet.instruction.cause := io.input.bits.store.?(7.U(64), 5.U(64))
           packet.instruction.tval := io.input.bits.address
-          state := 3.U(2)
+          state := 3.U(stateBits)
         }
       val alignment = Wire(UInt(64))
       alignment := 7.U(64)
@@ -85,11 +114,11 @@ object DitDahA1Lsu extends Generator[DitDahA1Parameter, DitDahA1UnitLayers, DitD
         packet.instruction.fault := true.B
         packet.instruction.cause := io.input.bits.store.?(6.U(64), 4.U(64))
         packet.instruction.tval := io.input.bits.address
-        state := 3.U(2)
+        state := 3.U(stateBits)
       }
-      when(io.input.bits.instruction.fault) { state := 3.U(2) }
+      when(io.input.bits.instruction.fault) { state := 3.U(stateBits) }
     }
-    when(request.valid & request.ready) { state := 2.U(2) }
+    when(request.valid & request.ready) { state := 2.U(stateBits) }
     when(response.valid & response.ready) {
       when(packet.load | packet.atomic) {
         packet.value := response.bits.data
@@ -107,8 +136,8 @@ object DitDahA1Lsu extends Generator[DitDahA1Parameter, DitDahA1UnitLayers, DitD
       when(packet.atomic & (operation === 2.U(5)) & (packet.memorySize === 3.U(3)) &
         !response.bits.fault & (response.bits.tag === packet.instruction.tag)) {
         reserved := true.B
-        reservedWord := packet.address.asBits.bits(parameter.physicalAddressBits - 1, 3).asUInt
+        reservedWord := physicalAddress.getOrElse(packet.address).asBits.bits(parameter.physicalAddressBits - 1, 3).asUInt
       }
-      state := 3.U(2)
+      state := 3.U(stateBits)
     }
-    when(io.output.valid & io.output.ready) { state := 0.U(2) }
+    when(io.output.valid & io.output.ready) { state := 0.U(stateBits) }

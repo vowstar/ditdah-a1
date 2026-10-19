@@ -45,6 +45,26 @@ object DitDahA1ParameterCheck:
     user.validateRtl()
     assert(DitDahA1Config.parameter(DitDahA1Config.document(user)) == user)
     assert(DitDahA1Config.document(user)("implementation")("privilege").str == "MU")
+    val supervisor = user.copy(enableSupervisorMode = true, enableInterrupts = true)
+    supervisor.validateRtl()
+    assert(DitDahA1Config.parameter(DitDahA1Config.document(supervisor)) == supervisor)
+    assert(DitDahA1Config.document(supervisor)("implementation")("privilege").str == "MSU")
+    assert(DitDahA1Config.document(supervisor)("implementation")("instructions").arr.exists(_.str == "sret"))
+    assert(!DitDahA1Config.document(user)("implementation")("instructions").arr.exists(_.str == "sret"))
+    rejects { supervisor.copy(enableUserMode = false).validateRtl() }
+    rejects { supervisor.copy(enableInterrupts = false).validateRtl() }
+    val paged = supervisor.copy(virtualAddressBits = 39)
+    paged.validateRtl()
+    assert(paged.enableTranslation && !supervisor.enableTranslation)
+    assert(DitDahA1Config.parameter(DitDahA1Config.document(paged)) == paged)
+    assert(DitDahA1Config.document(paged)("implementation")("translation").str == "Sv39/Svade")
+    assert(DitDahA1Config.document(paged)("implementation")("instructions").arr.exists(_.str == "sfence.vma"))
+    rejects { paged.copy(enableSupervisorMode = false).validateRtl() }
+    rejects { paged.copy(enableSupervisorMode = false).validateCore() }
+    rejects { paged.copy(enableSupervisorMode = false).validateFrontend() }
+    rejects { paged.copy(enableSupervisorMode = false).validateBackend() }
+    rejects { paged.copy(virtualAddressBits = 48).validateRtl() }
+    rejects { paged.copy(virtualAddressBits = 48).validateCore() }
     val device = MemoryRegion(base = 0x2000000, size = 65536, executable = false, device = true)
     val platform = rtl.copy(enableInterrupts = true, localInterruptBase = Some(device.base), memoryRegions = rtl.memoryRegions :+ device)
     platform.validateRtl()

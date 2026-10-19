@@ -109,7 +109,7 @@ class Program:
         return self
 
 
-def cases(base, protection=False, interrupts=False, user=False, local_interrupt_base=None):
+def cases(base, protection=False, interrupts=False, user=False, local_interrupt_base=None, supervisor=False, sv39=False):
     if not interrupts:
         p = Program(base)
         p.emit(0x10500073, addi(2, 0, 17))
@@ -251,6 +251,64 @@ def cases(base, protection=False, interrupts=False, user=False, local_interrupt_
         yield from interrupt_cases(base, protection)
     if user:
         yield from user_cases(base, protection, interrupts, local_interrupt_base)
+    if supervisor:
+        yield from supervisor_cases(base, protection)
+    if sv39:
+        yield from sv39_cases(base, protection)
+
+
+def sv39_cases(base, protection):
+    for name, flags, status, address, levels in (
+            ('data', 0xcf, 0x20800, 0x40000100, 0),
+            ('large', 0xcf, 0x20800, 0x40000100, 1),
+            ('gigantic', 0xcf, 0x20800, 0x40000100, 2),
+            ('accessed', 0x8f, 0x20800, 0x40000100, 0),
+            ('dirty', 0x4f, 0x20800, 0x40000100, 0),
+            ('user_denied', 0xdf, 0x20800, 0x40000100, 0),
+            ('sum', 0xdf, 0x60800, 0x40000100, 0),
+            ('mxr', 0xc9, 0xa0800, 0x40000100, 0),
+            ('canonical', 0xcf, 0x20800, 1 << 39, 0)):
+        p = Program(base)
+        def word(physical, value):
+            for byte in range(8):
+                p.memory[physical + byte] = (value >> (byte * 8)) & 255
+        root, middle, leaf = base + 0x1000, base + 0x2000, base + 0x3000
+        word(root + 8, ((base >> 12) << 10) | flags if levels == 2 else ((middle >> 12) << 10) | 1)
+        word(middle, ((base >> 12) << 10) | flags if levels == 1 else ((leaf >> 12) << 10) | 1)
+        word(leaf, ((base >> 12) << 10) | flags)
+        word(base + 0x100, 0x12345678)
+        if protection:
+            p.emit(addi(2, 0, -1), csr(0, 0x3b0, 2), addi(2, 0, 0x1f), csr(0, 0x3a0, 2))
+        p.address(10, 0x600)
+        word(base + 0x600, (8 << 60) | (root >> 12))
+        word(base + 0x608, address)
+        word(base + 0x610, status)
+        p.emit(ld(2, 10), csr(0, 0x180, 2), 0x12000073, ld(11, 10, 8), ld(2, 10, 16), csr(0, 0x300, 2),
+               ld(3, 11), sd(3, 11), csr(0, 0x300, 0))
+        yield 'sv39_' + name, p.finish()
+    p = Program(base)
+    root, other, middle, alternate, leaf, changed = (base + offset for offset in (0x1000, 0, 0x2000, 0x3000, 0x4000, 0x7000))
+    def word(physical, value):
+        for byte in range(8):
+            p.memory[physical + byte] = (value >> (8 * byte)) & 255
+    for address, value in ((root + 255 * 8, ((middle >> 12) << 10) | 1), (other + 255 * 8, ((alternate >> 12) << 10) | 1),
+                           (middle, ((leaf >> 12) << 10) | 1), (alternate, ((changed >> 12) << 10) | 1),
+                           (leaf, ((root >> 12) << 10) | 0xcf), (changed, ((middle >> 12) << 10) | 0xcf),
+                           (root + 0x100, 0x11), (middle + 0x100, 0x22), (alternate + 0x100, 0x33),
+                           (base + 0x600, (8 << 60) | root >> 12), (base + 0x608, (8 << 60) | other >> 12),
+                           (base + 0x610, (255 << 30) | 0x100), (base + 0x618, 0x20800),
+                           (base + 0x620, ((alternate >> 12) << 10) | 0xcf)):
+        word(address, value)
+    if protection:
+        p.emit(addi(2, 0, -1), csr(0, 0x3b0, 2), addi(2, 0, 0x1f), csr(0, 0x3a0, 2))
+    p.address(10, 0x600)
+    p.address(13, 0x7000)
+    p.emit(ld(2, 10), ld(3, 10, 8), ld(11, 10, 16), ld(12, 10, 24), ld(14, 10, 32),
+           csr(0, 0x180, 2), 0x12000073, csr(0, 0x300, 12), ld(4, 11), csr(0, 0x300, 0),
+           csr(0, 0x180, 3), 0x12358073, csr(0, 0x300, 12), ld(5, 11), csr(0, 0x300, 0),
+           sd(14, 13), 0x12000073, csr(0, 0x300, 12), ld(6, 11), csr(0, 0x300, 0), csr(0, 0x180, 0))
+    p.translation = {4: 0x11, 5: 0x22, 6: 0x33}
+    yield 'sv39_context', p.finish()
 
 
 def user_protection(p, execute_top=0x1000, data_top=0x1008):
@@ -258,6 +316,53 @@ def user_protection(p, execute_top=0x1000, data_top=0x1008):
         p.address(1, top)
         p.emit(alu(1, 1, 2, 5, immediate=True), csr(0, 0x3b0 + index, 1))
     p.emit(addi(1, 0, 0xb), alu(1, 1, 8, 1, immediate=True), addi(1, 1, 0xc), csr(0, 0x3a0, 1))
+
+
+def supervisor_cases(base, protection=False):
+    for name in ('traps', 'csr', 'mprv'):
+        p = Program(base)
+        p.address(10, 0x1000)
+        if protection:
+            user_protection(p)
+        p.address(1, 0x600)
+        p.emit(csr(0, 0x105, 1), addi(1, 0, 0x100), csr(0, 0x302, 1),
+               addi(1, 0, 0x222), csr(0, 0x303, 1))
+        if name == 'mprv':
+            p.emit(ld(6, 10, 8), addi(1, 0, 0x3ff), csr(0, 0x302, 1), addi(1, 0, 1), alu(1, 1, 17, 1, immediate=True),
+                   addi(1, 1, 0x400), addi(1, 1, 0x400), csr(0, 0x300, 1),
+                   ld(3, 10), ld(4, 10, 8), csr(5, 0x342, 0, True), csr(0, 0x300, 0))
+            yield 'supervisor_' + name, p.finish()
+            continue
+        p.address(1, 0x200)
+        p.emit(csr(0, 0x341, 1), addi(1, 0, 1), alu(1, 1, 11, 1, immediate=True),
+               csr(0, 0x300, 1), 0x30200073)
+        p.offset = 0x200
+        p.emit(csr(2, 0x100, 0, True), csr(3, 0x180, 10), csr(4, 0x180, 0, True),
+               csr(5, 0x106, 10), csr(6, 0x10a, 10), addi(2, 0, 17), sd(2, 10), ld(3, 10))
+        if name == 'csr':
+            p.emit(addi(2, 0, 0x222), csr(0, 0x104, 2), csr(4, 0x104, 0, True),
+                   csr(0, 0x104, 0), csr(0, 0x144, 2), csr(5, 0x144, 0, True),
+                   csr(0, 0x144, 0), csr(6, 0x300, 0, True))
+        p.address(1, 0x400)
+        p.emit(csr(0, 0x141, 1), csr(0, 0x100, 0), 0x10200073)
+        p.offset = 0x400
+        p.emit(csr(7, 0x100, 0, True), 0x10200073, 0x10500073, ld(8, 10),
+               ld(9, 10, 8), 0x73, addi(11, 0, 23))
+        p.stop = base + p.offset
+        p.emit(jal(0, 0))
+        p.offset = 0x600
+        p.emit(csr(26, 0x142, 0, True), csr(27, 0x143, 0, True),
+               csr(28, 0x141, 0, True), addi(29, 29, 1), csr(30, 0x100, 0, True),
+               csr(2, 0x300, 0, True), addi(28, 28, 4), csr(0, 0x141, 28))
+        p.emit(addi(2, 0, 8), beq(26, 2, 8), 0x10200073, 0x73, 0x10200073)
+        p.offset = 0x800
+        p.emit(csr(24, 0x300, 0, True), csr(20, 0x342, 0, True),
+               csr(21, 0x343, 0, True), csr(22, 0x341, 0, True), addi(23, 23, 1),
+               addi(2, 0, 9), beq(20, 2, 16), addi(22, 22, 4), csr(0, 0x341, 22), 0x30200073)
+        p.address(1, p.stop - base)
+        p.emit(csr(0, 0x341, 1), addi(1, 0, 3), alu(1, 1, 11, 1, immediate=True),
+               csr(0, 0x300, 1), 0x30200073)
+        yield 'supervisor_' + name, p
 
 
 def user_cases(base, protection=False, interrupts=False, local_interrupt_base=None):

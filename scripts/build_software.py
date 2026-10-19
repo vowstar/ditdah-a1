@@ -11,11 +11,13 @@ import subprocess
 
 
 def load_configuration(args):
+    sv39 = getattr(args, 'sv39', False)
+    supervisor_mode = getattr(args, 'supervisor_mode', False) or sv39
     original = args.config
     content = original.read_bytes()
     document = json.loads(content)
     config = document.get('parameters', document)
-    if args.harts is None and args.icache_bytes is None and args.dcache_bytes is None:
+    if args.harts is None and args.icache_bytes is None and args.dcache_bytes is None and not supervisor_mode:
         return config, {}
     if args.harts is not None:
         config['hartCount'] = args.harts
@@ -23,6 +25,10 @@ def load_configuration(args):
         config['iCacheBytes'] = args.icache_bytes
     if args.dcache_bytes is not None:
         config['dCacheBytes'] = args.dcache_bytes
+    if supervisor_mode:
+        config.update(enableSupervisorMode=True, enableUserMode=True, enableInterrupts=True)
+    if sv39:
+        config['virtualAddressBits'] = 39
     args.config = args.output / 'input.json'
     assert args.config.resolve() != original.resolve(), 'Derived configuration would overwrite its source'
     args.config.write_text(json.dumps(config, indent=2) + '\n')
@@ -40,6 +46,9 @@ def main():
     parser.add_argument('--harts', type=int, choices=range(1, 17))
     parser.add_argument('--icache-bytes', type=int, choices=(0, 8192, 16384, 32768, 65536))
     parser.add_argument('--dcache-bytes', type=int, choices=(0, 8192))
+    parser.add_argument('--supervisor-mode', action='store_true')
+    parser.add_argument('--sv39', action='store_true')
+    parser.add_argument('--expected-interrupt', type=int, choices=(1, 3, 5, 7, 9, 11), action='append', default=[])
     args = parser.parse_args()
     args.output.mkdir(parents=True, exist_ok=True)
     (args.output / 'manifest.json').unlink(missing_ok=True)
@@ -61,7 +70,9 @@ def main():
     image = args.output / 'software.elf'
     definitions = dict(__ram_base=base, __ram_bytes=int(ram['size']), __hart_count=harts,
                        __stack_bytes=args.stack_bytes, __console_base=console)
-    command = [args.tool_prefix + 'gcc', '-march=rv64i_zicsr_zifencei', '-mabi=lp64', '-mcmodel=medany',
+    command = [args.tool_prefix + 'gcc', '-march=rv64i_zicsr_zifencei',
+               f'-DDITDAH_RAM_BASE={base}', f'-DDITDAH_RAM_BYTES={int(ram["size"])}',
+               f'-DDITDAH_CONSOLE_BASE={console}', '-mabi=lp64', '-mcmodel=medany',
                '-Os', '-ffreestanding', '-fno-builtin', '-fno-stack-protector', '-msmall-data-limit=0',
                '-nostdlib', '-nostartfiles', '-Wl,--no-relax', '-T', str(runtime / 'link.ld'),
                *(f'-Wl,--defsym={name}={value}' for name, value in definitions.items()),
@@ -83,7 +94,8 @@ def main():
     manifest = dict(sourceHashes=hashes, configurationHash=hashlib.sha256(configuration_bytes).hexdigest(),
                     imageHash=hashlib.sha256(image.read_bytes()).hexdigest(), symbols=symbols, commands=[command],
                     toolVersions=tool_versions,
-                    target=subprocess.check_output([args.tool_prefix + 'gcc', '-dumpmachine'], text=True).strip())
+                    target=subprocess.check_output([args.tool_prefix + 'gcc', '-dumpmachine'], text=True).strip(),
+                    expectedInterruptCauses=args.expected_interrupt)
     (args.output / 'manifest.json').write_text(json.dumps(manifest, indent=2) + '\n')
     print(image)
 

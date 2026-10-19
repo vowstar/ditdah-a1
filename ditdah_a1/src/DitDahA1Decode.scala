@@ -71,6 +71,8 @@ object DitDahA1Decode extends Generator[DitDahA1Parameter, DitDahA1UnitLayers, D
     when((opcode === 0x73.B(7)) & ((funct3 === 3.B(3)) | funct3.bit(2) & (funct3 =/= 4.B(3)))) { out.operation := Csr.U(operationBits) }
     when(insn === 0x00000073L.B(32)) { out.operation := Ecall.U(operationBits) }
     when(insn === 0x30200073L.B(32)) { out.operation := Mret.U(operationBits) }
+    if parameter.enableSupervisorMode then
+      when(insn === 0x10200073L.B(32)) { out.operation := Sret.U(operationBits) }
     when(insn === 0x10500073L.B(32)) { out.operation := Wfi.U(operationBits) }
     when((opcode === 0x0f.B(7)) & (funct3 === 0.B(3))) { out.operation := Fence.U(operationBits) }
     when((opcode === 0x0f.B(7)) & (funct3 === 1.B(3))) { out.operation := FenceI.U(operationBits) }
@@ -85,5 +87,7 @@ object DitDahA1Decode extends Generator[DitDahA1Parameter, DitDahA1UnitLayers, D
       out.usesRs1 := !in.fault
       out.usesRs2 := !in.fault & !lr
     }
-    out.writesRd := !in.fault & (operation =/= Illegal.U(operationBits)) & !branch & !store & (operation =/= Ecall.U(operationBits)) & (operation =/= Mret.U(operationBits)) & (operation =/= Fence.U(operationBits)) & (operation =/= FenceI.U(operationBits)) & (operation =/= Wfi.U(operationBits))
-    out.serializing := !in.fault & (csr | (operation === Mret.U(operationBits)) | (operation === Fence.U(operationBits)) | (operation === FenceI.U(operationBits)) | (operation === Wfi.U(operationBits)))
+    if parameter.enableTranslation then
+      when((in.instruction.asBits & BigInt("fe007fff", 16).B(32)) === 0x12000073.B(32)) { out.operation := Fence.U(operationBits) }
+    out.writesRd := !in.fault & (operation =/= Illegal.U(operationBits)) & !branch & !store & (operation =/= Ecall.U(operationBits)) & (operation =/= Mret.U(operationBits)) & (operation =/= Sret.U(operationBits)) & (operation =/= Fence.U(operationBits)) & (operation =/= FenceI.U(operationBits)) & (operation =/= Wfi.U(operationBits))
+    out.serializing := !in.fault & (csr | (operation === Mret.U(operationBits)) | (operation === Sret.U(operationBits)) | (operation === Fence.U(operationBits)) | (operation === FenceI.U(operationBits)) | (operation === Wfi.U(operationBits)))

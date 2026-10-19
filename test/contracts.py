@@ -9,7 +9,7 @@ import random
 import subprocess
 
 from programs import addi, alu, amo, beq, csr, sd, mul, ld, lw, sw, load, store, fence
-from model import Fault, LocalInterrupts, Model, MASK, atomic_value, pmp_allowed, signed
+from model import Fault, LocalInterrupts, Model, MASK, atomic_value, pmp_allowed, signed, sv39_walk
 
 
 def verify_storage(rtl, directory):
@@ -337,7 +337,7 @@ def arbiter_contract(parameters):
     return body
 
 
-def decode_contract():
+def decode_contract(parameters):
     cases = ((0x12345337, 0, 0, 1), (0x12345317, 0, 0, 1),
              (0x12328313, 1, 0, 1), (0x00728333, 1, 1, 1),
              (0x00728463, 1, 1, 0), (0x0080036f, 0, 0, 1),
@@ -355,7 +355,9 @@ def decode_contract():
     extra.update({store(7, 5, 4, s): 27 for s in (0, 1)})
     extra.update({csr(6, 0x340, 5, function=f): 28 for f in (3, 5, 6, 7)})
     extra.update({amo(op, 6, 5, 0 if op == 2 else 7, order): 30 for op in (1, 2, 3, 8) for order in range(4)})
-    cases += tuple((word, int(op != 28 or (word >> 12) & 4 == 0), int(op in (22, 24, 25, 27) or op == 30 and word >> 27 != 2), int(op not in (25, 27))) for word, op in extra.items())
+    if parameters.get('enableSupervisorMode'):
+        extra[0x10200073] = 31
+    cases += tuple((word, int(op != 31 and (op != 28 or (word >> 12) & 4 == 0)), int(op in (22, 24, 25, 27) or op == 30 and word >> 27 != 2), int(op not in (25, 27, 31))) for word, op in extra.items())
     invalid = {amo(op, 6, 5, 0 if op == 2 else 7) ^ ((3 ^ size) << 12) for op in (0, 1, 2, 3, 8) for size in range(8) if size != 3}
     invalid.update(amo(op, 6, 5, 7) for op in range(32) if op not in (0, 1, 2, 3, 8))
     invalid.update(amo(2, 6, 5, rs) for rs in (1, 31))
@@ -367,11 +369,19 @@ def decode_contract():
     cases += ((0x200f, 0, 0, 0), (0x700f, 0, 0, 0))
     body = '    input_valid = 1; output_ready = 1;\n'
     for word, rs1, rs2, rd in cases:
-        serial = int((word & 127 == 0x73 and (word >> 12) & 7 in (1, 2, 3, 5, 6, 7)) or word in (0x30200073, 0x10500073) or word & 0x707f in (0x0f, 0x100f))
+        serial = int((word & 127 == 0x73 and (word >> 12) & 7 in (1, 2, 3, 5, 6, 7)) or word in (0x30200073, 0x10500073) or word == 0x10200073 and parameters.get('enableSupervisorMode') or word & 0x707f in (0x0f, 0x100f))
         body += (f"    input_bits_instruction = 32'h{word:08x};\n"
                  f'    check(output_valid && input_ready && output_bits_usesRs1 == {rs1} && output_bits_usesRs2 == {rs2} && output_bits_writesRd == {rd} && output_bits_serializing == {serial}, "Decode dependency metadata {word:08x}");\n')
         if word in extra or word in invalid:
             body += f'    check(output_bits_operation == {extra.get(word, 0)}, "Scalar operation class {word:08x}");\n'
+    if parameters.get('virtualAddressBits') == 39:
+        for rs1, rs2 in ((0, 0), (1, 0), (0, 31), (31, 31)):
+            word = 0x12000073 | (rs1 << 15) | (rs2 << 20)
+            body += f'''    input_bits_instruction = 32'h{word:x};
+    check(output_bits_operation == 16 && output_bits_serializing && !output_bits_usesRs1 && !output_bits_usesRs2 && !output_bits_writesRd, "Full local SFENCE accepts standard selectors");
+'''
+        for word in (0x120000f3, 0x12001073, 0x14000073):
+            body += f"    input_bits_instruction = 32'h{word:x}; check(output_bits_operation != 16, \"SFENCE requires its complete standard encoding\");\n"
     return body + '''    input_bits_instruction = 32'h00728333; input_bits_fault = 1;
     check(!output_bits_usesRs1 && !output_bits_usesRs2 && !output_bits_writesRd, "Faulting instruction dependencies");
     input_bits_instruction = 32'h34029373;
@@ -1238,7 +1248,7 @@ def pmp_contract(parameters):
         config = sum(v << (i * 8) for i, v in enumerate(configs))
         points = sum(v << (i * width) for i, v in enumerate(addresses))
         kinds = ('read', 'write') if kind == 'atomic' else (kind,)
-        for privilege in ((0, 3) if parameters.get('enableUserMode') else (3,)):
+        for privilege in ((0, 1, 3) if parameters.get('enableSupervisorMode') else (0, 3) if parameters.get('enableUserMode') else (3,)):
             expected = int(all(pmp_allowed(configs, addresses, address, 1 << size, access, pa, privilege) for access in kinds))
             body += f'''    state_config = 128'h{config:x}; state_address = {16 * width}'h{points:x}; privilege = {privilege};
     address = 64'h{address:x}; size = {size}; fetch = {int(kind == 'fetch')}; write = {int(kind in ('write', 'atomic'))}; atomic = {int(kind == 'atomic')};
@@ -1373,10 +1383,281 @@ def user_csr_contract(parameters):
     return body
 
 
+def supervisor_csr_contract(parameters):
+    model = Model(parameters, {}, {})
+    body = '    reset = 1; tick(); reset = 0; tick();\n'
+
+    def state():
+        nonlocal body
+        status = model.csrs[0x300]
+        body += f'''    check(privilege == {model.privilege} && dataPrivilege == {model.data_privilege()}, "Execution and effective data mode");
+    check(wfiLegal == {int(model.privilege == 3 or model.privilege == 1 and not status & (1 << 21))} && sretLegal == {int(model.privilege == 3 or model.privilege == 1 and not status & (1 << 22))}, "Privileged instruction controls");
+    check(interruptPending == {int(bool(model.interrupt_cause()))} && wakeup == {int(bool(model.csrs[0x304] & model.csrs[0x344]))}, "Delegated interrupt eligibility");
+'''
+        if model.interrupt_cause():
+            body += f'    check(interruptCause == 64\'h{model.interrupt_cause():x}, "Target privilege precedes interrupt source priority");\n'
+        body += f'    check(sfenceLegal == {int(parameters.get("virtualAddressBits") == 39 and (model.privilege == 3 or model.privilege == 1 and not status & (1 << 20)))}, "SFENCE minimum privilege and TVM");\n'
+        for address in (0x100, 0x104, 0x105, 0x106, 0x10a, 0x140, 0x141, 0x142, 0x143, 0x144,
+                        0x180, 0x300, 0x302, 0x303, 0x304, 0x305, 0x340, 0x341, 0x342, 0x343, 0x344):
+            legal = model.csr_legal(address)
+            body += f"    readAddress = 'h{address:x}; check(legal == {int(legal)}"
+            body += (f" && readData == 64'h{model.read_csr(address):x}" if legal else '') + ', "CSR privilege, aliases and trap bank");\n'
+
+    def write(address, value):
+        nonlocal body
+        model.write_csr(address, value)
+        body += f"    @(negedge clock); write = 1; writeAddress = 'h{address:x}; writeData = 64'h{value:x}; tick(); write = 0;\n"
+
+    def trap(cause, pc=0x123, value=0x456):
+        nonlocal body
+        target = model.trap(pc, cause, value)
+        body += f"    @(negedge clock); trap = 1; trapPc = 'h{pc:x}; trapCause = 64'h{cause:x}; trapValue = 'h{value:x};\n"
+        body += f"    check(trapVector == 'h{target:x}, \"Execution mode selects trap target\"); tick(); trap = 0;\n"
+        state()
+
+    def ret(supervisor=False):
+        nonlocal body
+        pc = model.return_from_trap(supervisor)
+        signal = 'sret' if supervisor else 'mret'
+        body += f"    @(negedge clock); {signal} = 1; check(returnPc == 'h{pc:x}, \"Return selects its own trap bank\"); tick(); {signal} = 0;\n"
+        state()
+
+    state()
+    for address, value in ((0x302, MASK), (0x303, MASK), (0x300, MASK), (0x100, MASK),
+                           (0x105, 0x203), (0x305, 0x803), (0x141, 0x347), (0x341, 0x567),
+                           (0x106, MASK), (0x10a, MASK), (0x180, MASK), (0x140, 0x1234),
+                           (0x304, MASK), (0x104, 0), (0x344, MASK), (0x144, 0)):
+        write(address, value)
+        state()
+    write(0x304, 0)
+    write(0x344, 0)
+    for previous in (0, 1, 2, 3):
+        write(0x300, (previous << 11) | 0x2201aa)
+        ret()
+        trap(8)
+        if model.privilege == 1:
+            ret(True)
+        trap(11)
+    for mode in (0, 1, 3):
+        for delegated in (0, 0x222):
+            for global_enable in (0, 2):
+                write(0x303, delegated)
+                write(0x304, 0xaaa)
+                write(0x344, 0x222)
+                write(0x300, (mode << 11) | global_enable)
+                ret()
+                for levels in (0, 1, 2, 4, 7):
+                    model.set_interrupts(levels)
+                    body += f'    interrupts_software = {levels & 1}; interrupts_timer = {(levels >> 1) & 1}; interrupts_external = {levels >> 2};\n'
+                    state()
+                if model.interrupt_cause():
+                    trap(model.interrupt_cause(), value=0)
+                trap(11)
+                model.set_interrupts(0)
+                body += '    interrupts_software = 0; interrupts_timer = 0; interrupts_external = 0;\n'
+    write(0x304, 0)
+    write(0x344, 0)
+    for control in (1 << 20, 1 << 21, 1 << 22):
+        write(0x300, 0x800 | control)
+        ret()
+        trap(11)
+    write(0x300, 0x20800)
+    trap(5)
+    if parameters.get('virtualAddressBits') == 39:
+        root = int(parameters['resetVector']) + 0x1000
+        for value in ((8 << 60) | root >> 12, (9 << 60) | root >> 12,
+                      (8 << 60) | (0xffff << 44) | root >> 12, 0):
+            write(0x180, value)
+            state()
+        write(0x300, 0xc0000)
+        state()
+        write(0x100, 0)
+        state()
+    return body
+
+
+def translation_contract(parameters):
+    base, pa = int(parameters['resetVector']), parameters['physicalAddressBits']
+    root, middle, bottom = base + 0x1000, base + 0x2000, base + 0x3000
+    body = '    reset = 1; tick(); reset = 0; tick();\n'
+    if parameters['pmpEntries']:
+        body += f"    pmp_config = 'h1f; pmp_address = 'h{(1 << (pa - 2)) - 1:x};\n"
+    vectors = []
+    for level in (0, 1, 2):
+        for kind in ('fetch', 'read', 'write'):
+            for privilege in (0, 1, 3):
+                for flags, status in ((0xcf, 0), (0xdf, 0), (0xdf, 1 << 18), (0xc9, 0), (0xc9, 1 << 19), (0x4f, 0), (0x8f, 0)):
+                    vectors.append((level, kind, privilege, flags, status, 0x12345100, None))
+    for bad in (0, 1, 0xc5, 0xce, (1 << 54) | 0xcf, (1 << 63) | 0xcf, 0x100000000000cf):
+        vectors.append((0, 'read', 1, bad, 0, 0x12345100, None))
+    for level in (1, 2):
+        vectors.append((level, 'read', 1, 0x4cf, 0, 0x12345100, None))
+    for address in (1 << 39, (1 << 38) - 8, MASK - 7):
+        vectors.append((0, 'read', 1, 0xcf, 0, address, None))
+    for nonleaf in (0x11, 0x41, 0x81):
+        vectors.append((0, 'read', 1, 0xcf, 0, 0x12345100, nonleaf))
+    for index, (level, kind, privilege, flags, status, address, nonleaf) in enumerate(vectors):
+        vpn = [(address >> (12 + 9 * i)) & 511 for i in range(3)]
+        entries = {root + vpn[2] * 8: ((middle >> 12) << 10) | (nonleaf or 1),
+                   middle + vpn[1] * 8: ((bottom >> 12) << 10) | 1,
+                   bottom + vpn[0] * 8: ((base >> 12) << 10) | flags}
+        entries[(root, middle, bottom)[2 - level] + vpn[level] * 8] = ((base >> 12) << 10) | flags
+        reads = []
+        def read_pte(physical):
+            reads.append((physical, entries.get(physical, 0)))
+            return entries.get(physical, 0)
+        fault, cause, physical = False, 0, address
+        try:
+            physical = sv39_walk(address, kind, privilege, (8 << 60) | root >> 12, status, read_pte)
+        except Fault as error:
+            fault, cause = True, error.cause
+        port = index % 2
+        body += f'''    state_satp = 64'h{(8 << 60) | root >> 12:x}; state_sum = {int(bool(status & (1 << 18)))}; state_mxr = {int(bool(status & (1 << 19)))};
+    ports_{port}_request_bits_address = 64'h{address:x}; ports_{port}_request_bits_privilege = {privilege};
+    ports_{port}_request_bits_fetch = {int(kind == 'fetch')}; ports_{port}_request_bits_write = {int(kind == 'write')};
+    ports_{port}_request_valid = 1; #1; while (!ports_{port}_request_ready) tick(); tick(); ports_{port}_request_valid = 0;
+    state_satp = 0; state_sum = !state_sum; state_mxr = !state_mxr; ports_{port}_request_bits_address = '1;
+'''
+        for pte_address, pte in reads:
+            body += f'''    while (!memory_request_valid) tick();
+    repeat (2) begin
+      check(memory_request_bits_address == 64'h{pte_address:x} && memory_request_bits_size == 3 && memory_request_bits_data == 0 && memory_request_bits_mask == 0 && memory_request_bits_tag == 0 && memory_request_bits_privileged && !memory_request_bits_fetch && !memory_request_bits_write && !memory_request_bits_atomic, "PTE identity and ordinary S read"); tick();
+    end
+    memory_request_ready = 1; tick(); memory_request_ready = 0;
+    memory_response_bits_data = 64'h{pte:x}; memory_response_bits_tag = 0; memory_response_valid = 1;
+    check(memory_response_ready, "PTE response owner"); tick(); memory_response_valid = 0;
+'''
+        body += f'''    while (!ports_{port}_response_valid) tick();
+    repeat (2) begin
+      check(!ports_{1-port}_response_valid && ports_{port}_response_bits_fault == {int(fault)} && ports_{port}_response_bits_cause == {cause} && ports_{port}_response_bits_address == 64'h{physical:x} && !memory_request_valid, "Independent page walk and retained response"); tick();
+    end
+    ports_{port}_response_ready = 1; tick(); ports_{port}_response_ready = 0;
+'''
+    body += f'''    state_satp = 64'h{(8 << 60) | root >> 12:x}; ports_0_request_bits_address = 0; ports_0_request_bits_privilege = 1; ports_0_request_bits_fetch = 1; ports_0_request_valid = 1;
+    #1; while (!ports_0_request_ready) tick(); tick(); ports_0_request_valid = 0;
+    while (!memory_request_valid) tick(); cancelInstruction = 1; tick(); cancelInstruction = 0;
+    check(memory_request_valid, "Cancellation withdrew PTE request"); memory_request_ready = 1; tick(); memory_request_ready = 0;
+    memory_response_bits_data = 64'h{((middle >> 12) << 10) | 1:x}; memory_response_valid = 1; tick(); memory_response_valid = 0;
+    while (!ports_0_response_valid) tick();
+    check(!memory_request_valid && !ports_0_response_bits_fault, "Cancelled walk continued or published a fault");
+    ports_0_response_ready = 1; tick(); ports_0_response_ready = 0;
+'''
+    for fault, tag in ((1, 0), (0, 1)):
+        body += f'''    ports_1_request_bits_address = 'h100; ports_1_request_bits_privilege = 1; ports_1_request_bits_fetch = 0; ports_1_request_bits_write = 1;
+    ports_1_request_valid = 1; #1; while (!ports_1_request_ready) tick(); tick(); ports_1_request_valid = 0;
+    while (!memory_request_valid) tick(); memory_request_ready = 1; tick(); memory_request_ready = 0;
+    memory_response_bits_data = '1; memory_response_bits_fault = {fault}; memory_response_bits_tag = {tag}; memory_response_valid = 1;
+    tick(); memory_response_valid = 0; memory_response_bits_fault = 0; memory_response_bits_tag = 0;
+    while (!ports_1_response_valid) tick();
+    check(ports_1_response_bits_fault && ports_1_response_bits_cause == 7 && ports_1_response_bits_address == 'h100 && !memory_request_valid, "PTE transport errors retain original store attribution");
+    ports_1_response_ready = 1; tick(); ports_1_response_ready = 0;
+'''
+    denied = [int(r['base']) for r in parameters['memoryRegions'] if r['device']]
+    if pa < 56:
+        denied.append(1 << pa)
+    if parameters['pmpEntries']:
+        denied.append(root)
+    for physical in denied:
+        if physical == root:
+            body += '    pmp_config = 0; pmp_address = 0;\n'
+        body += f'''    state_satp = 64'h{(8 << 60) | physical >> 12:x}; ports_1_request_bits_write = 0;
+    ports_1_request_valid = 1; #1; while (!ports_1_request_ready) tick(); tick(); ports_1_request_valid = 0;
+    while (!ports_1_response_valid) begin check(!memory_request_valid, "Denied PTE was offered to physical memory"); tick(); end
+    check(ports_1_response_bits_fault && ports_1_response_bits_cause == 5 && ports_1_response_bits_address == 'h100, "PTE physical authorization uses S privilege");
+    ports_1_response_ready = 1; tick(); ports_1_response_ready = 0;
+'''
+    body += '''    state_satp = 0; ports_0_request_bits_address = 'h40; ports_0_request_bits_fetch = 1;
+    ports_1_request_bits_address = 'h80; ports_0_request_valid = 1; ports_1_request_valid = 1;
+    ports_0_response_ready = 1; ports_1_response_ready = 1;
+    begin
+      integer first_owner;
+      #1; check(ports_0_request_ready != ports_1_request_ready, "Translation arbitration selected two clients");
+      first_owner = ports_1_request_ready; tick();
+      if (first_owner) ports_1_request_valid = 0; else ports_0_request_valid = 0;
+      check(ports_0_response_valid != ports_1_response_valid, "Translation response ownership"); tick();
+      #1; check(first_owner ? ports_0_request_ready : ports_1_request_ready, "Waiting translation client was starved"); tick();
+      ports_0_request_valid = 0; ports_1_request_valid = 0;
+      check(first_owner ? ports_0_response_valid : ports_1_response_valid, "Second translation lost its owner"); tick();
+    end
+'''
+    return body
+
+
+def translated_consumer_contract(parameters, fetch):
+    physical = int(parameters['resetVector']) + 0x1000
+    body = '    reset = 1; tick(); reset = 0; tick(); privilege = 1;\n'
+    if parameters['pmpEntries']:
+        addresses = ((physical >> 2) | 0x1ff) | ((((physical + 0x1000) >> 2) | 0x1ff) << (parameters['physicalAddressBits'] - 2))
+        body += f"    pmp_config = 'h1f1f; pmp_address = 'h{addresses:x};\n"
+    def start(virtual, operation=None):
+        nonlocal body
+        body += '    privilege = 1;\n'
+        if fetch:
+            body += f"    request_bits_pc = 'h{virtual:x}; request_bits_tag = 37; request_valid = 1; tick(); request_valid = 0;\n"
+        else:
+            body += f'''    storeAllowed = 1; input_bits_address = 'h{virtual:x}; input_bits_instruction_pc = 'h40; input_bits_instruction_tag = 37;
+    input_bits_instruction_fault = 0; input_bits_memorySize = 3; input_bits_atomic = {int(operation is not None)};
+    input_bits_load = {int(operation != 3)}; input_bits_store = {int(operation == 3)}; input_bits_instruction_instruction = 32'h{amo(operation, 1, 2) if operation is not None else ld(1, 2):x};
+    input_valid = 1; tick(); input_valid = 0;
+'''
+        body += f'''    privilege = 3;
+    repeat (2) begin
+      check(translation_request_valid && translation_request_bits_address == 'h{virtual:x} && translation_request_bits_privilege == 1 && translation_request_bits_fetch == {int(fetch)} && translation_request_bits_write == {int(operation == 3)} && !memory_request_valid, "Retained virtual address and effective privilege"); tick();
+    end
+    translation_request_ready = 1; tick(); translation_request_ready = 0;
+'''
+    def translated(address, cause=0):
+        nonlocal body
+        body += f'''    translation_response_bits_address = 64'h{address:x}; translation_response_bits_fault = {int(bool(cause))}; translation_response_bits_cause = {cause}; translation_response_valid = 1;
+    check(translation_response_ready, "Translation response ownership"); tick(); translation_response_valid = 0;
+'''
+    def complete(virtual, address, operation=None, eligible=False):
+        nonlocal body
+        for word in range(16 if fetch and parameters['iCacheBytes'] else 1):
+            body += f'''    while (!memory_request_valid) tick();
+    check(memory_request_bits_address == 64'h{address + 4*word:x} && memory_request_bits_privileged && memory_request_bits_scEligible == {int(eligible)}, "Physical request address and reservation qualification");
+    memory_request_ready = 1; tick(); memory_request_ready = 0;
+    memory_response_bits_tag = 37; memory_response_bits_data = 'h13; memory_response_valid = 1; tick(); memory_response_valid = 0;
+'''
+        body += f'''    while (!output_valid) tick();
+    check(!output_bits_{'fault' if fetch else 'instruction_fault'} && output_bits_{'pc' if fetch else 'address'} == 'h{virtual:x}, "Architectural output retains virtual identity");
+    output_ready = 1; tick(); output_ready = 0;
+'''
+    start(0x100, None if fetch else 2)
+    translated(physical)
+    complete(0x100, physical, None if fetch else 2)
+    if not fetch:
+        for virtual, address, operation, eligible in ((0x200, physical, 3, True), (0x100, physical, 2, False), (0x100, physical + 0x1000, 3, False)):
+            start(virtual, operation)
+            translated(address)
+            complete(virtual, address, operation, eligible)
+    for cause in ((12, 1) if fetch else (13, 5)):
+        start(0x300)
+        translated(0x300, cause)
+        body += f'''    while (!output_valid) tick();
+    check(!memory_request_valid && output_bits_{'fault' if fetch else 'instruction_fault'} && output_bits_{'cause' if fetch else 'instruction_cause'} == {cause} && output_bits_{'tval' if fetch else 'instruction_tval'} == 'h300, "Translation fault retains original virtual address");
+    output_ready = 1; tick(); output_ready = 0;
+'''
+    if parameters['pmpEntries']:
+        body += "    pmp_config = 'h1f; pmp_address = 'h40;\n"
+        start(0x100)
+        translated(physical)
+        body += f'''    while (!output_valid) tick();
+    check(!memory_request_valid && output_bits_{'fault' if fetch else 'instruction_fault'} && output_bits_{'cause' if fetch else 'instruction_cause'} == {1 if fetch else 5} && output_bits_{'tval' if fetch else 'instruction_tval'} == 'h100, "Final PMP checks physical address before a cached or external access");
+    output_ready = 1; tick(); output_ready = 0;
+'''
+    if fetch:
+        start(0x400)
+        body += '    cancel = 1; tick(); cancel = 0;\n'
+        translated(physical + 0x2000)
+        body += '    repeat (3) begin check(!memory_request_valid && !output_valid, "Cancelled translation created a physical demand"); tick(); end\n'
+    return body
+
+
 def privilege_memory_contract(parameters, fetch, frontend=False):
     body = ''
     address = int(parameters['resetVector']) + 0x100
-    for privilege in (0, 3):
+    for privilege in ((0, 1, 3) if parameters.get('enableSupervisorMode') else (0, 3)):
         if frontend:
             body += '    halt = 1; redirect = 0;\n'
         body += f'    reset = 1; tick(); reset = 0; tick(); privilege = {privilege}; memory_request_ready = 0; memory_response_valid = 0; output_ready = 0;\n'
@@ -1385,10 +1666,22 @@ def privilege_memory_contract(parameters, fetch, frontend=False):
         body += (f"    redirect = 1; redirectPc = 'h{address:x}; tick(); redirect = 0; halt = 0; tick(); halt = 1;\n" if frontend else
                  f"    request_bits_pc = 'h{address:x}; request_valid = 1; tick(); request_valid = 0;\n" if fetch else
                  f"    input_bits_instruction_fault = 0; input_bits_address = 'h{address:x}; input_bits_load = 1; input_bits_store = 0; input_bits_memorySize = 3; input_valid = 1; tick(); input_valid = 0;\n")
-        body += f'''    privilege = {3 - privilege}; repeat (6) tick();
+        body += f'''    privilege = {0 if privilege == 3 else 3}; repeat (6) tick();
     repeat (3) begin
-      check(memory_request_valid && memory_request_bits_privileged == {int(privilege == 3)}, "Accepted access retains privilege"); tick();
+      check(memory_request_valid && memory_request_bits_privileged == {int(privilege != 0)}, "Accepted access retains privilege"); tick();
     end
+'''
+    if fetch and not frontend and parameters.get('enableSupervisorMode') and parameters['pmpEntries'] and parameters['iCacheBytes']:
+        demand = address + 8
+        body += f'''    reset = 1; tick(); reset = 0; tick(); privilege = 1;
+    pmp_config = 'h14; pmp_address = 'h{demand >> 2:x}; memory_request_ready = 0; memory_response_valid = 0;
+    request_bits_pc = 'h{demand:x}; request_valid = 1; tick(); request_valid = 0; privilege = 3;
+    repeat (12) tick();
+    check(memory_request_valid && memory_request_bits_address == 'h{demand:x} && memory_request_bits_privileged, "Captured S mode denies neighboring refill words");
+    memory_response_bits_tag = memory_request_bits_tag; memory_request_ready = 1; tick(); memory_request_ready = 0;
+    memory_response_bits_data = 'h12345013; memory_response_valid = 1; tick(); memory_response_valid = 0;
+    while (!output_valid) tick();
+    check(!output_bits_fault && output_bits_pc == 'h{demand:x} && output_bits_instruction == 'h12345013 && !memory_request_valid, "Authorized S demand survives denied speculation");
 '''
     return body + '    reset = 1; tick(); reset = 0; tick(); privilege = 3;\n'
 
@@ -1565,7 +1858,7 @@ def verify(rtl, directory, modules=None):
                        ('DitDahA1Lsu', LSU + lsu_reservation_contract(parameters) + (protection_contract(False) if enabled else '')),
                        ('DitDahA1Multiply', multiply_contract()),
                        ('DitDahA1Frontend', cached_fetch_contract(parameters, True) if cached else frontend_contract(parameters)),
-                       ('DitDahA1Decode', decode_contract()),
+                       ('DitDahA1Decode', decode_contract(parameters)),
                        ('DitDahA1Execute', execute_contract()),
                        ('DitDahA1Backend', backend_contract() + backend_fence_contract() + (backend_protection_contract() if enabled else '') +
                         (backend_interrupt_contract() if parameters['enableInterrupts'] else '')),
@@ -1587,11 +1880,18 @@ def verify(rtl, directory, modules=None):
 ''' for hart in range(16)) + '    hartId = 0;\n'
     identity += "    readAddress = 'hf15; check(legal && readData == 0, \"Configuration pointer zero\");\n"
     suites += (('DitDahA1Csr', identity + (csr_contract(parameters) if enabled else '') +
-                (interrupt_csr_contract(parameters) if parameters['enableInterrupts'] else '') +
-                (user_csr_contract(parameters) if parameters.get('enableUserMode') else '')),)
+                (supervisor_csr_contract(parameters) if parameters.get('enableSupervisorMode') else
+                 (interrupt_csr_contract(parameters) if parameters['enableInterrupts'] else '') +
+                 (user_csr_contract(parameters) if parameters.get('enableUserMode') else ''))),)
     if parameters.get('enableUserMode'):
         suites = tuple((name, body + (privilege_memory_contract(parameters, name != 'DitDahA1Lsu', name == 'DitDahA1Frontend')
                        if name in ('DitDahA1Fetch', 'DitDahA1Frontend', 'DitDahA1Lsu') else '')) for name, body in suites)
+    if parameters.get('virtualAddressBits') == 39:
+        suites = tuple((name, body) for name, body in suites if name not in
+                       ('DitDahA1Fetch', 'DitDahA1Frontend', 'DitDahA1Lsu', 'DitDahA1Backend'))
+        suites += (('DitDahA1Translation', translation_contract(parameters)),)
+        suites += (('DitDahA1Fetch', translated_consumer_contract(parameters, True)),
+                   ('DitDahA1Lsu', translated_consumer_contract(parameters, False)))
     assert not modules or set(modules) <= {name for name, _ in suites}, 'Unsupported contract selection'
     for name, body in suites:
         if modules and name not in modules:
@@ -1617,6 +1917,8 @@ def verify(rtl, directory, modules=None):
         if name == 'DitDahA1Backend':
             dependencies = [rtl / ('DitDahA1' + child + '.sv') for child in ('Decode', 'Issue', 'Execute', 'Multiply', 'Commit', 'Gpr', 'Csr', 'Lsu')]
         if enabled and name in ('DitDahA1Fetch', 'DitDahA1Lsu', 'DitDahA1Frontend', 'DitDahA1Backend'):
+            dependencies.append(rtl / 'DitDahA1Pmp.sv')
+        if enabled and name == 'DitDahA1Translation':
             dependencies.append(rtl / 'DitDahA1Pmp.sv')
         subprocess.run(['iverilog', '-g2012', '-s', 'contract_tb', '-o', str(binary),
                         str(module), *map(str, dependencies), str(test)], check=True)

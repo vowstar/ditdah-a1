@@ -1,7 +1,6 @@
 # DitDah-A1
 
 DitDah-A1 targets a 64-bit RISC-V application processor with scalar execution.
-A denotes application processing; 1 identifies the architecture generation.
 Hart count and cache sizes describe configurations of the same model.
 
 ## Architecture target
@@ -15,13 +14,12 @@ Hart count and cache sizes describe configurations of the same model.
 | Multiprocessing | One to sixteen harts with hardware cache coherence |
 | Integration | Burst-capable AXI4 and JTAG debug |
 
-The executable RTL has one to sixteen RV64 harts, M or optional M/U modes, an overlapped single-issue pipeline, shared AXI4,
+The executable RTL has one to sixteen RV64 harts, M or optional M/U and M/S/U modes, an overlapped single-issue pipeline, shared AXI4,
 and precise synchronous exceptions. The generated configuration manifest lists the implemented instructions.
 PMP is configurable to zero or sixteen entries per hart; the default uncached configuration omits it.
 Machine software, timer, and external interrupts are optional synchronous level inputs.
 MUL uses an iterative resource; accepted operations retain their instruction owner through completion or cancellation draining.
-The complete target ISA is not implemented.
-MMU, dual issue, writeback caches and shared L2 remain design targets.
+Sv48, dual issue, writeback caches and shared L2 remain design targets.
 Core composes Frontend and Backend; Frontend owns PC sequencing and Backend owns execution and retirement.
 Non-fault Backend packets contain four-byte instructions and word-aligned PCs; producers supply fetch faults.
 Core exposes separate instruction/data memory ports; the physical fabric owns shared arbitration and AXI.
@@ -45,7 +43,6 @@ make verify-signoff
 
 `make config` writes the uncached execution configuration to `result/ditdah_a1_config.json`.
 `make check` validates configuration, memory-region, and serialization contracts.
-`nix build` produces a validated configuration package.
 `configure-ditdah-a1 --config input.json --output result/config.json` validates a supplied configuration.
 `build-ditdah-a1 --config input.json --output result/rtl` generates supported RTL configurations.
 Use `--top DitDahA1Core`, `DitDahA1Frontend`, `DitDahA1Backend`, or `DitDahA1MemoryFabric`
@@ -64,7 +61,10 @@ Set `dCacheBytes` to 8192 for private read caches on `dataCacheable` non-device 
 Authorized aligned eight-byte ordinary reads fill individual sectors; other accesses bypass, and CPU writes invalidate all private copies before forwarding.
 External writers require platform coordination; no DMA coherence is implemented.
 Set `pmpEntries` to 16 to enable protection; successful PMP writes restart younger execution while accepted fetches drain.
-Set `enableUserMode` for Bare M/U execution, effective data privilege via MPRV, and PMP enforcement for U accesses.
+Set `enableUserMode` for Bare M/U execution and effective data privilege via MPRV.
+Set `enableSupervisorMode` with user mode and interrupts for M/S/U, standard trap delegation and SRET.
+Set `virtualAddressBits` to 39 for Sv39/Svade with 4 KiB/2 MiB/1 GiB pages, ASIDLEN=0 and no TLB; zero selects Bare.
+Page-table reads share the data path under S-mode PMP/PMA; SFENCE.VMA orders local translation and drains canceled reads.
 Set `enableInterrupts` to true for precise machine interrupt entry and return; platform logic owns interrupt sources.
 System interrupt inputs are indexed by hart; each hart has independent CSR and PMP state.
 An optional `localInterruptBase` maps protected software-interrupt and 64-bit timer registers; `timeTick` supplies the synchronous timebase.
@@ -79,6 +79,7 @@ Multicore checks use per-hart instruction models and shared memory ordered by bu
 Atomic checks include independent interference, failed-write suppression, returned old values, publication ordering, and AXI retry/error safety.
 Instruction-cache control proofs abstract memory read values; array geometry, storage behavior and instruction publication are checked separately.
 Data-cache checks separate architectural samples from physical service, test native arrays, and prove invalidation and ownership control with abstract array values.
+Translation checks cover page permissions, faults, context changes, protected implicit reads, and virtual software on 1/2/16 harts.
 Platform checks execute shared work, software interrupts and timer interrupts on 1/2/3/16 harts.
 ELF checks build freestanding software with `RISCV_PREFIX` (default `riscv64-unknown-elf-`) and validate actual console writes and per-hart results.
 `make verify-software` runs short ELF consumers; `make verify-zephyr-long SOFTWARE_JOBS=3` runs 1/2/16 harts with the pinned `ZEPHYR_BASE` checkout.

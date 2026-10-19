@@ -1,11 +1,12 @@
 # SPDX-FileCopyrightText: 2026 Huang Rui <vowstar@gmail.com>
 # SPDX-License-Identifier: MIT
 
-.PHONY: config check rtl software verify-software verify-data-software zephyr verify-zephyr verify-zephyr-long verify-signoff verify-simulation verify-production verify-cache verify-platform verify-user verify-data-cache verify-formal verify-scalar-formal verify-user-formal verify-data-formal clean
+.PHONY: config check rtl software verify-software verify-data-software verify-supervisor-software zephyr verify-zephyr verify-zephyr-long verify-signoff verify-simulation verify-production verify-cache verify-platform verify-user verify-data-cache verify-supervisor verify-formal verify-scalar-formal verify-user-formal verify-data-formal verify-supervisor-formal verify-translation verify-translation-formal verify-translation-software clean
 
 HART_COUNTS ?= 2 3 15 16
 ICACHE_CASES := pipeline_reuse cache_replacement fence_ordering fence_i_prefetch synchronization atomic_ordering atomic_denied atomic_retry bus_fetch pipeline_redirect pmp_fetch pmp_update interrupt_fence interrupt_fence_i interrupt_fetch_fault
 USER_CASES := user_access user_system user_wait user_protection user_fetch user_mprv
+SUPERVISOR_CASES := supervisor_traps supervisor_csr supervisor_mprv
 SOFTWARE_HARTS ?= 2
 SOFTWARE_CONFIG ?= software/platform.json
 SOFTWARE_OUTPUT ?= result/software
@@ -43,6 +44,13 @@ verify-software: software
 
 verify-data-software:
 	for count in 1 2 16; do $(MAKE) verify-software SOFTWARE_HARTS=$$count SOFTWARE_DCACHE_BYTES=8192 SOFTWARE_OUTPUT=$(SOFTWARE_OUTPUT)/data-cache || exit $$?; done
+
+verify-supervisor-software:
+	for count in 1 2 16; do for cache in 0 8192; do \
+		image=$(SOFTWARE_OUTPUT)/supervisor/harts$$count-cache$$cache; \
+		python3 scripts/build_software.py --config $(SOFTWARE_CONFIG) --supervisor-mode --expected-interrupt 1 --harts $$count --icache-bytes $$cache --dcache-bytes $$cache --console-base 0x10000000 --program software/tests/supervisor.S --stack-bytes 512 --output $$image && \
+		python3 test/verify.py --elf $$image/software.elf --config $$image/input.json --output $$image/verification --jobs $(SOFTWARE_JOBS) || exit $$?; \
+	done; done
 
 zephyr:
 	@test -n "$(ZEPHYR_TRANSACTIONS_$(SOFTWARE_HARTS))" || { echo 'Select SOFTWARE_HARTS=1, 2 or 16'; exit 1; }
@@ -110,7 +118,36 @@ verify-data-cache: verify-user
 	python3 test/check_production.py --data-cache
 	$(MAKE) verify-data-software
 
-verify-formal: verify-data-formal
+verify-formal: verify-translation-formal
+
+verify-translation-software:
+	for count in 1 2 16; do for cache in 0 8192; do \
+		image=$(SOFTWARE_OUTPUT)/translation/harts$$count-cache$$cache; \
+		python3 scripts/build_software.py --config $(SOFTWARE_CONFIG) --sv39 --harts $$count --icache-bytes $$cache --dcache-bytes $$cache --console-base 0x10000000 --program software/tests/virtual_memory.S --stack-bytes 512 --output $$image && \
+		python3 test/verify.py --elf $$image/software.elf --config $$image/input.json --output $$image/verification --software-transactions $$((4096 * count)) --jobs $(SOFTWARE_JOBS) || exit $$?; \
+	done; done
+
+verify-translation: verify-supervisor-formal
+	python3 test/verify.py --sv39 --width 64 --pmp-entries 16 --output result/translation --case sv39_data --case sv39_large --case sv39_gigantic --case sv39_accessed --case sv39_dirty --case sv39_user_denied --case sv39_sum --case sv39_mxr --case sv39_canonical --case sv39_context
+	python3 test/verify.py --sv39 --width 512 --pmp-entries 16 --icache-bytes 8192 --dcache-bytes 8192 --output result/translation-cache --case sv39_data --case sv39_sum --case sv39_mxr --case sv39_context
+	$(MAKE) verify-translation-software
+	build-ditdah-a1 --no-trace --config $(SOFTWARE_OUTPUT)/translation/harts16-cache8192/input.json --output result/production-sv39
+	python3 test/check_production.py --sv39
+
+verify-translation-formal: verify-translation
+	python3 test/formal.py --rtl result/translation/irq-pmp16-axi64/rtl --output result/formal/translation --modules Translation SupervisorCsr SupervisorExecute IntegerDecode
+	python3 test/formal.py --rtl result/translation-cache/irq-pmp16-axi512/rtl --output result/formal/translation-cache --modules Translation SupervisorCsr SupervisorExecute
+
+verify-supervisor: verify-data-formal
+	python3 test/verify.py --supervisor-mode --width 64 --pmp-entries 16 --output result/supervisor $(foreach name,$(SUPERVISOR_CASES),--case $(name))
+	python3 test/verify.py --supervisor-mode --width 512 --pmp-entries 16 --icache-bytes 8192 --dcache-bytes 8192 --output result/supervisor-cache $(foreach name,$(SUPERVISOR_CASES),--case $(name)) --case data_cache
+	$(MAKE) verify-supervisor-software
+	build-ditdah-a1 --no-trace --config $(SOFTWARE_OUTPUT)/supervisor/harts16-cache8192/input.json --output result/production-supervisor
+	python3 test/check_production.py --supervisor
+
+verify-supervisor-formal: verify-supervisor
+	python3 test/formal.py --rtl result/supervisor/irq-pmp16-axi64/rtl --output result/formal/supervisor --modules SupervisorCsr SupervisorExecute SupervisorFetch Pmp Fetch Lsu Axi IntegerDecode
+	python3 test/formal.py --rtl result/supervisor-cache/irq-pmp16-axi512/rtl --output result/formal/supervisor-cache --modules SupervisorCsr SupervisorExecute SupervisorFetch InstructionCache DataCache
 
 verify-scalar-formal: verify-data-cache
 	python3 test/formal.py

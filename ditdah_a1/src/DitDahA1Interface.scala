@@ -67,6 +67,23 @@ class MemoryPort extends Bundle:
   val request = Aligned(new Decoupled(new MemoryRequest))
   val response = Flipped(new Decoupled(new MemoryResponse))
 
+class TranslationState extends Bundle:
+  val satp = Aligned(UInt(64))
+  val sum = Aligned(Bool())
+  val mxr = Aligned(Bool())
+class TranslationRequest extends Bundle:
+  val address = Aligned(UInt(64))
+  val privilege = Aligned(UInt(2))
+  val fetch = Aligned(Bool())
+  val write = Aligned(Bool())
+class TranslationResponse extends Bundle:
+  val address = Aligned(UInt(64))
+  val fault = Aligned(Bool())
+  val cause = Aligned(UInt(64))
+class TranslationPort extends Bundle:
+  val request = Aligned(new Decoupled(new TranslationRequest))
+  val response = Flipped(new Decoupled(new TranslationResponse))
+
 class PmpState(parameter: DitDahA1Parameter) extends Bundle:
   val config = Aligned(UInt(parameter.pmpEntries * 8))
   val address = Aligned(UInt(parameter.pmpEntries * (parameter.physicalAddressBits - 2)))
@@ -114,7 +131,9 @@ class ResultPacket extends Bundle:
   val csrAddress = Aligned(UInt(12))
   val csrData = Aligned(UInt(64))
   val mret = Aligned(Bool())
+  val sret = Aligned(Bool())
   val fenceI = Aligned(Bool())
+  val sfenceVma = Aligned(Bool())
   val wfi = Aligned(Bool())
 class StatusBundle extends Bundle:
   val trap = Aligned(Bool())
@@ -158,6 +177,7 @@ class DitDahA1CoreIO(parameter: DitDahA1Parameter) extends HWBundle(parameter):
   val status = Aligned(new StatusBundle)
 
 class DitDahA1FrontendIO(parameter: DitDahA1Parameter) extends HWBundle(parameter):
+  val translation = Option.when(parameter.enableTranslation)(Aligned(new TranslationPort))
   val privilege = Flipped(UInt(2))
   val pmp = Option.when(parameter.pmpEntries != 0)(Flipped(new PmpState(parameter)))
   val invalidate = Option.when(parameter.iCacheBytes != 0)(Flipped(Bool()))
@@ -180,6 +200,8 @@ class DitDahA1MemoryFabricIO(parameter: DitDahA1Parameter) extends HWBundle(para
   val axi = Aligned(new AxiBundle(parameter))
 
 class DitDahA1BackendIO(parameter: DitDahA1Parameter) extends HWBundle(parameter):
+  val translation = Option.when(parameter.enableTranslation)(Aligned(new TranslationPort))
+  val translationState = Option.when(parameter.enableTranslation)(Aligned(new TranslationState))
   val privilege = Aligned(UInt(2))
   val hartId = Flipped(UInt(4))
   val interrupts = Option.when(parameter.enableInterrupts)(Flipped(new InterruptBundle))

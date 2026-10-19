@@ -9,6 +9,7 @@ object DitDahA1Isa:
     "addiw", "slliw", "srliw", "sraiw", "addw", "subw", "sllw", "srlw", "sraw", "bne", "blt", "bge", "bltu", "bgeu",
     "lb", "lh", "lbu", "lhu", "sb", "sh", "csrrc", "csrrwi", "csrrsi", "csrrci", "wfi",
     "amoor.d", "amoswap.d", "lr.d", "sc.d")
+  val supervisorInstructions = Seq("sret")
   val Illegal = 0
   val Lui = 1
   val Auipc = 2
@@ -40,4 +41,5 @@ object DitDahA1Isa:
   val Csr = 28
   val Wfi = 29
   val Atomic = 30
+  val Sret = 31
   val operationBits = 5

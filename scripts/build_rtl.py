@@ -24,7 +24,7 @@ def main():
     trace_options = parser.add_mutually_exclusive_group()
     trace_options.add_argument("--trace", action="store_true", default=None)
     trace_options.add_argument("--no-trace", action="store_false", dest="trace")
-    parser.add_argument("--top", choices=["DitDahA1", "DitDahA1Core", "DitDahA1Backend", "DitDahA1Frontend", "DitDahA1MemoryFabric", "DitDahA1Fetch", "DitDahA1Lsu", "DitDahA1LocalInterrupts", "DitDahA1DataCache", "DitDahA1Coherence"], default="DitDahA1")
+    parser.add_argument("--top", choices=["DitDahA1", "DitDahA1Core", "DitDahA1Backend", "DitDahA1Frontend", "DitDahA1MemoryFabric", "DitDahA1Fetch", "DitDahA1Lsu", "DitDahA1Translation", "DitDahA1LocalInterrupts", "DitDahA1DataCache", "DitDahA1Coherence"], default="DitDahA1")
     args = parser.parse_args()
     hashes = source_hashes()
     output = args.output.resolve()
