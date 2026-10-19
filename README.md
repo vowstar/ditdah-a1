@@ -21,7 +21,7 @@ PMP is configurable to zero or sixteen entries per hart; the default uncached co
 Machine software, timer, and external interrupts are optional synchronous level inputs.
 MUL uses an iterative resource; accepted operations retain their instruction owner through completion or cancellation draining.
 The complete target ISA is not implemented.
-Data caches, MMU, dual issue, and coherence remain design targets.
+MMU, dual issue, writeback caches and shared L2 remain design targets.
 Core composes Frontend and Backend; Frontend owns PC sequencing and Backend owns execution and retirement.
 Non-fault Backend packets contain four-byte instructions and word-aligned PCs; producers supply fetch faults.
 Core exposes separate instruction/data memory ports; the physical fabric owns shared arbitration and AXI.
@@ -59,7 +59,10 @@ The flag defaults to false; unsupported exclusive reads and bus errors fault wit
 Failed AMO writes retry; SC returns a status without retry.
 AMO completion requires eventual bus responses and successful exclusive access; contention can delay all harts on the shared fabric.
 Set `iCacheBytes` to zero for bypass or a power of two from 8 to 64 KiB for a blocking, direct-mapped instruction cache with 64-byte lines.
-Data remains uncached; refills use individually authorized four-byte requests, and non-demand refill faults fall back to the original demand.
+Instruction refills use individually authorized four-byte requests; non-demand refill faults fall back to the original demand.
+Set `dCacheBytes` to 8192 for private read caches on `dataCacheable` non-device regions; zero bypasses them.
+Authorized aligned eight-byte ordinary reads fill individual sectors; other accesses bypass, and CPU writes invalidate all private copies before forwarding.
+External writers require platform coordination; no DMA coherence is implemented.
 Set `pmpEntries` to 16 to enable protection; successful PMP writes restart younger execution while accepted fetches drain.
 Set `enableUserMode` for Bare M/U execution, effective data privilege via MPRV, and PMP enforcement for U accesses.
 Set `enableInterrupts` to true for precise machine interrupt entry and return; platform logic owns interrupt sources.
@@ -75,16 +78,13 @@ Interrupt checks cover CSR eligibility, saved PC, transaction ownership, and ind
 Multicore checks use per-hart instruction models and shared memory ordered by bus service; arbiter proofs check ownership and bounded overtaking.
 Atomic checks include independent interference, failed-write suppression, returned old values, publication ordering, and AXI retry/error safety.
 Instruction-cache control proofs abstract memory read values; array geometry, storage behavior and instruction publication are checked separately.
+Data-cache checks separate architectural samples from physical service, test native arrays, and prove invalidation and ownership control with abstract array values.
 Platform checks execute shared work, software interrupts and timer interrupts on 1/2/3/16 harts.
 ELF checks build freestanding software with `RISCV_PREFIX` (default `riscv64-unknown-elf-`) and validate actual console writes and per-hart results.
 `make verify-software` runs short ELF consumers; `make verify-zephyr-long SOFTWARE_JOBS=3` runs 1/2/16 harts with the pinned `ZEPHYR_BASE` checkout.
 Reachability and mutation checks exercise the properties; general multiply results are checked by simulation.
 This checks the implemented instruction subset, not full ISA compliance or physical signoff.
 Use `make verify-signoff VERIFY_ARGS=--use-generated` to reuse RTL whose recorded sources and configuration still match.
-
-Pipeline depth, issue width, and cache sizes are specifications rather than model-number fields.
-Major architecture generations use 1, 2, and 3. Release versions track maintenance separately.
-E, R, A, and P identify embedded, real-time, application, and performance-oriented designs.
 
 ## Credits
 

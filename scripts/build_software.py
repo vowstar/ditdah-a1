@@ -15,12 +15,14 @@ def load_configuration(args):
     content = original.read_bytes()
     document = json.loads(content)
     config = document.get('parameters', document)
-    if args.harts is None and args.icache_bytes is None:
+    if args.harts is None and args.icache_bytes is None and args.dcache_bytes is None:
         return config, {}
     if args.harts is not None:
         config['hartCount'] = args.harts
     if args.icache_bytes is not None:
         config['iCacheBytes'] = args.icache_bytes
+    if args.dcache_bytes is not None:
+        config['dCacheBytes'] = args.dcache_bytes
     args.config = args.output / 'input.json'
     assert args.config.resolve() != original.resolve(), 'Derived configuration would overwrite its source'
     args.config.write_text(json.dumps(config, indent=2) + '\n')
@@ -37,6 +39,7 @@ def main():
     parser.add_argument('--console-base', type=lambda value: int(value, 0))
     parser.add_argument('--harts', type=int, choices=range(1, 17))
     parser.add_argument('--icache-bytes', type=int, choices=(0, 8192, 16384, 32768, 65536))
+    parser.add_argument('--dcache-bytes', type=int, choices=(0, 8192))
     args = parser.parse_args()
     args.output.mkdir(parents=True, exist_ok=True)
     (args.output / 'manifest.json').unlink(missing_ok=True)

@@ -1316,6 +1316,174 @@ def instruction_cache_case(parameters):
             ': ~filling | responseFault | bypass | ~complete')
 
 
+def data_cache_case(parameters):
+    index = (parameters['dCacheBytes'] // 64 - 1).bit_length()
+    sector = index + 3
+    fields = ('address', 'data', 'size', 'mask', 'tag', 'write', 'fetch', 'privileged', 'atomic', 'atomicOperation', 'scEligible')
+    payload = lambda prefix: '{' + ', '.join(prefix + '_' + field for field in fields) + '}'
+    ranges = ' || '.join(f"(upstream_request_bits_address >= 64'h{int(r['base']):x} && upstream_request_bits_address <= 64'h{int(r['base'])+int(r['size'])-8:x})"
+                         for r in parameters['memoryRegions'] if r.get('dataCacheable') and r['readable'] and not r['device'] and int(r['size']) >= 8)
+    body = f'''
+  reg cache_past = 0, cache_owned, cache_bus, cache_sent, cache_finished, cache_killed, cache_eligible;
+  reg [156:0] cache_request;
+  reg [63:0] cache_address, cache_result;
+  reg [7:0] cache_tag;
+  reg cache_fault, cache_same_tag;
+  (* anyconst *) reg [{sector-1}:0] cache_watched;
+  wire cache_accept = upstream_request_valid && upstream_request_ready;
+  wire cache_reply = downstream_response_valid && downstream_response_ready;
+  wire cache_sample = state == 1 && eligible_layerCapture && hit_layerCapture;
+  wire cache_invalidate = invalidate_valid && invalidate_ready;
+  wire cache_collision = cache_invalidate && invalidate_bits[{index+5}:6] == cache_address[{index+5}:6];
+  wire cache_error = downstream_response_bits_fault || downstream_response_bits_tag != cache_tag;
+  wire cache_clear_watched = cache_invalidate && invalidate_bits[{index+5}:6] == cache_watched[{sector-1}:3];
+  wire cache_expected_valid = !cache_clear_watched &&
+    ((filling_0 && cache_address[{index+5}:3] == cache_watched) ||
+      (valid[cache_watched] && !(filling_0 && !cache_same_tag && cache_address[{index+5}:6] == cache_watched[{sector-1}:3])));
+  wire cache_input_eligible = !upstream_request_bits_write && !upstream_request_bits_fetch && !upstream_request_bits_atomic &&
+    upstream_request_bits_size == 3 && upstream_request_bits_address[2:0] == 0 && ({ranges or '0'});
+  always @(posedge clock) begin
+    cache_past <= 1;
+    if (!cache_past) assume(reset); else assume(!reset);
+    if (reset) begin
+      cache_owned <= 0; cache_bus <= 0; cache_sent <= 0; cache_finished <= 0; cache_killed <= 0;
+    end else begin
+      assume(!downstream_response_valid || cache_bus);
+      if ($past(!reset && downstream_response_valid && !downstream_response_ready)) begin
+        assume(downstream_response_valid);
+        assume($stable({{downstream_response_bits_data, downstream_response_bits_fault, downstream_response_bits_tag}}));
+      end
+      assert(state <= 4 && cache_owned == (state != 0) && cache_bus == (state == 3));
+      assert(cache_finished == (state == 4));
+      assert(invalidate_ready);
+      if (cache_accept) begin
+        assert(!cache_owned);
+        cache_owned <= 1; cache_request <= {payload('upstream_request_bits')};
+        cache_address <= upstream_request_bits_address; cache_tag <= upstream_request_bits_tag;
+        cache_eligible <= cache_input_eligible;
+        cache_bus <= 0; cache_sent <= 0; cache_finished <= 0;
+        cache_killed <= cache_invalidate && invalidate_bits[{index+5}:6] == upstream_request_bits_address[{index+5}:6];
+      end
+      if (cache_owned) begin
+        assert({payload('request')} == cache_request);
+        assert(request_address == cache_address && request_tag == cache_tag);
+        assert(eligible_layerCapture == cache_eligible && invalidated == cache_killed);
+        if (cache_collision) cache_killed <= 1;
+      end
+      if (state == 1) cache_same_tag <= _dataTags_ext_R0_data == cache_address[{parameters['physicalAddressBits']-1}:{index+6}];
+      if (state >= 2) assert(sameTag == cache_same_tag);
+      if (downstream_request_valid) begin
+        assert(cache_owned && !cache_bus && !cache_sent);
+        assert({payload('downstream_request_bits')} == cache_request);
+      end
+      if (downstream_request_valid && downstream_request_ready) begin cache_bus <= 1; cache_sent <= 1; end
+      if (cache_reply) begin
+        assert(cache_owned && cache_bus);
+        cache_bus <= 0; cache_finished <= 1;
+        cache_result <= downstream_response_bits_data; cache_fault <= cache_error;
+      end
+      if (cache_sample) begin
+        assert(cache_owned && cache_eligible && !cache_bus && !cache_sent && !cache_killed && !cache_collision);
+        assert(valid[cache_address[{index+5}:3]] && _dataTags_ext_R0_data == cache_address[{parameters['physicalAddressBits']-1}:{index+6}]);
+        cache_finished <= 1; cache_result <= output_layerCapture; cache_fault <= 0;
+      end
+      assert(filling_0 == (cache_reply && cache_eligible && !cache_killed && !cache_collision && !cache_error));
+      if (upstream_response_valid) begin
+        assert(cache_owned && cache_finished && !cache_bus && !downstream_request_valid);
+        assert(upstream_response_bits_tag == cache_tag && upstream_response_bits_fault == cache_fault);
+        if (!cache_fault) assert(upstream_response_bits_data == cache_result);
+        if (upstream_response_ready) begin cache_owned <= 0; cache_finished <= 0; end
+      end
+      if ($past(!reset)) begin
+        assert(valid[cache_watched] == $past(cache_expected_valid));
+        if ($past(cache_invalidate && invalidate_bits[{index+5}:6] == cache_watched[{sector-1}:3])) assert(!valid[cache_watched]);
+        if (valid[cache_watched] && !$past(valid[cache_watched]))
+          assert($past(filling_0 && cache_address[{index+5}:3] == cache_watched));
+        if ($past(downstream_request_valid && !downstream_request_ready)) begin
+          assert(downstream_request_valid); assert($stable({payload('downstream_request_bits')}));
+        end
+        if ($past(upstream_response_valid && !upstream_response_ready)) begin
+          assert(upstream_response_valid);
+          assert($stable({{upstream_response_bits_data, upstream_response_bits_fault, upstream_response_bits_tag}}));
+        end
+      end
+      cover(cache_sample);
+      cover(cache_reply && cache_collision && !cache_error);
+      cover(cache_bus && cache_invalidate && !downstream_response_valid);
+      cover(downstream_request_valid && !downstream_request_ready && cache_invalidate);
+      cover(upstream_response_valid && !upstream_response_ready && cache_invalidate);
+      cover(upstream_response_valid && cache_fault);
+      cover(cache_reply && !cache_eligible && request_atomic);
+    end
+  end
+'''
+    return ('DataCache', body, 'assign invalidate_ready =', "assign invalidate_ready = 1'h0 &")
+
+
+def coherence_case(parameters):
+    count = parameters['hartCount']
+    fields = ('address', 'data', 'size', 'mask', 'tag', 'write', 'fetch', 'privileged', 'atomic', 'atomicOperation', 'scEligible')
+    payload = lambda prefix: '{' + ', '.join(prefix + '_bits_' + field for field in fields) + '}'
+    vector = lambda suffix: '{' + ', '.join(f'invalidate_{i}_{suffix}' for i in reversed(range(count))) + '}'
+    ranges = ' || '.join(f"(upstream_request_bits_address >= 64'h{int(r['base']):x} && upstream_request_bits_address < 64'h{int(r['base'])+int(r['size']):x})"
+                         for r in parameters['memoryRegions'] if r.get('dataCacheable'))
+    body = f'''
+  reg coherent_past = 0, coherent_started, coherent_bus;
+  reg [{count-1}:0] coherent_completed;
+  wire [{count-1}:0] coherent_valid = {vector('valid')};
+  wire [{count-1}:0] coherent_ready = {vector('ready')};
+  wire coherent_write = upstream_request_bits_write && ({ranges or '0'});
+  always @(posedge clock) begin
+    coherent_past <= 1;
+    if (!coherent_past) assume(reset); else assume(!reset);
+    if (reset) begin coherent_started <= 0; coherent_completed <= 0; coherent_bus <= 0; end
+    else begin
+      if ($past(!reset && upstream_request_valid && !upstream_request_ready)) begin
+        assume(upstream_request_valid); assume($stable({payload('upstream_request')}));
+      end
+      assume(!downstream_response_valid || coherent_bus);
+      assume(!upstream_request_valid || !coherent_bus);
+      assert(busy == coherent_started);
+      if (busy) assert(pending == ~coherent_completed);
+      if (coherent_started) assert(upstream_request_valid && coherent_write && !coherent_bus);
+      if (coherent_started) assert(coherent_valid == ~coherent_completed);
+      else assert(coherent_valid == 0);
+      if (upstream_request_valid && coherent_write && !coherent_started && !coherent_bus) begin
+        coherent_started <= 1; coherent_completed <= 0;
+      end
+      coherent_completed <= coherent_completed | (coherent_valid & coherent_ready);
+      assert((upstream_request_valid && upstream_request_ready) == (downstream_request_valid && downstream_request_ready));
+      if (downstream_request_valid) begin
+        assert(upstream_request_valid && !coherent_bus);
+        assert({payload('downstream_request')} == {payload('upstream_request')});
+        if (coherent_write) assert(coherent_started && &coherent_completed);
+      end
+      if (downstream_request_valid && downstream_request_ready) begin
+        assert(upstream_request_ready); coherent_bus <= 1;
+        coherent_started <= 0; coherent_completed <= 0;
+      end
+      assert(upstream_response_valid == downstream_response_valid);
+      assert(downstream_response_ready == upstream_response_ready);
+      if (upstream_response_valid) assert({{upstream_response_bits_data, upstream_response_bits_fault, upstream_response_bits_tag}} ==
+        {{downstream_response_bits_data, downstream_response_bits_fault, downstream_response_bits_tag}});
+      if (downstream_response_valid && downstream_response_ready) coherent_bus <= 0;
+      cover(coherent_started && |coherent_completed && !(&coherent_completed));
+      cover(downstream_request_valid && coherent_write && !downstream_request_ready);
+      cover(downstream_request_valid && !coherent_write);
+      cover(downstream_response_valid && !upstream_response_ready);
+'''
+    for hart in range(count):
+        body += f'''      if (invalidate_{hart}_valid) assert(invalidate_{hart}_bits == upstream_request_bits_address);
+      if ($past(!reset && invalidate_{hart}_valid && !invalidate_{hart}_ready)) begin
+        assert(invalidate_{hart}_valid && $stable(invalidate_{hart}_bits));
+      end
+'''
+    body += '    end\n  end\n'
+    if count == 1:
+        body = body.replace('      cover(coherent_started && |coherent_completed && !(&coherent_completed));\n', '')
+    return ('Coherence', body, 'assign downstream_request_valid =', "assign downstream_request_valid = upstream_request_valid |")
+
+
 def synchronization_witness(parameters, mode):
     body = r'''
   (* anyconst *) reg [2:0] sync_scenario;
@@ -1731,6 +1899,8 @@ def verify(rtl, directory, modules=None):
         cases.append(local_interrupt_case(manifest['parameters']))
     if manifest['parameters'].get('iCacheBytes'):
         cases.append(instruction_cache_case(manifest['parameters']))
+    if manifest['parameters'].get('dCacheBytes'):
+        cases += [data_cache_case(manifest['parameters']), coherence_case(manifest['parameters'])]
     if manifest['parameters'].get('enableInterrupts'):
         cases = [*cases, *interrupt_cases(manifest['parameters'])]
     if manifest['parameters'].get('enableUserMode'):
@@ -1773,10 +1943,10 @@ def verify(rtl, directory, modules=None):
             module = 'formal_interval'
             files = {module + '.sv': license + 'module formal_interval(input [64:0] low, high, input [63:0] address, input [2:0] size);\nendmodule\n'}
         else:
-            files = dict(sources) if unit in ('Backend', 'Frontend', 'InstructionCache') else {module + '.sv': sources[module + '.sv']}
-        if unit in ('InstructionCache', 'Frontend'):
+            files = dict(sources) if unit in ('Backend', 'Frontend', 'InstructionCache', 'DataCache') else {module + '.sv': sources[module + '.sv']}
+        if unit in ('InstructionCache', 'Frontend', 'DataCache'):
             for filename in files:
-                match = re.fullmatch(r'(?:instructions|tags)_\d+x(\d+)\.sv', filename)
+                match = re.fullmatch(r'(?:instructions|tags|data|dataTags|mem)_\d+x(\d+)\.sv', filename)
                 if match:
                     files[filename] = license + header(sources[filename]) + f'\n(* anyseq *) reg [{int(match[1])-1}:0] arbitrary_read;\nassign R0_data = arbitrary_read;\nendmodule\n'
         if enabled and unit in ('Fetch', 'Lsu', 'Backend', 'Frontend'):
@@ -1791,7 +1961,7 @@ def verify(rtl, directory, modules=None):
                     assert len(connections) == 1, (port, connections)
                     files[module + '.sv'] = re.sub(pattern, f'.{port}(formal_pmp_{port})', observed)
                     body += f'\n  wire [{width-1}:0] formal_pmp_{port} = {connections[0]};\n  always @* if (!reset && input_valid && input_ready) assert(formal_pmp_{port} == ({expected}));\n'
-        if unit in ('Backend', 'Frontend', 'Multiply', 'Csr', 'MemoryArbiter', 'Memory', 'Axi', 'InstructionCache', 'Lsu', 'LocalInterrupts') or (enabled and unit not in ('Decode', 'Execute')):
+        if unit in ('Backend', 'Frontend', 'Multiply', 'Csr', 'MemoryArbiter', 'Memory', 'Axi', 'InstructionCache', 'DataCache', 'Coherence', 'Lsu', 'LocalInterrupts') or (enabled and unit not in ('Decode', 'Execute')):
             if unit == 'Backend':
                 files['DitDahA1Multiply.sv'] = license + header(sources['DitDahA1Multiply.sv']) + RESOURCE + 'endmodule\n'
             if name == 'InterruptBackend':
@@ -1939,6 +2109,19 @@ def verify(rtl, directory, modules=None):
                        ('mutation-word', "word <= word + 4'h1;", "word <= word + 4'h2;"),
                        ('mutation-invalidate', 'invalidate\n          ?', "1'h0\n          ?"),
                        ('mutation-denied', '_GEN_10 & ~(abort | allowed) & _GEN_12', "1'h0")]
+        if unit == 'DataCache':
+            checks += [('mutation-hold', 'assign downstream_request_valid =',
+                        'assign downstream_request_valid = ~invalidate_valid &'),
+                       ('mutation-allocation', 'wire          filling_0 =', "wire          filling_0 = 1'h1 |"),
+                       ('mutation-authorization', 'wire          eligible_layerCapture =', "wire          eligible_layerCapture = 1'h1 |"),
+                       ('mutation-tag-lifetime', '{' + str(manifest['parameters']['dCacheBytes'] // 8) + '{sameTag}}',
+                        '{' + str(manifest['parameters']['dCacheBytes'] // 8) + '{hit_0}}'),
+                       ('mutation-valid-hit', 'hit[0] & hit_0', "1'h1 & hit_0")]
+        if unit == 'Coherence':
+            checks += [('mutation-acknowledgement', 'assign invalidate_0_valid =',
+                        "assign invalidate_0_valid = 1'h0 &"),
+                       ('mutation-read-acceptance', 'assign upstream_request_ready =',
+                        'assign upstream_request_ready = ~upstream_request_bits_write |')]
         for check in checks:
             mode, before, after, *target = check
             mutated_file = target[0] if target else module + '.sv'
@@ -2072,6 +2255,25 @@ def verify(rtl, directory, modules=None):
                     if scenario is not None:
                         guidance += f'  always @* assume(cache_scenario == {scenario});\n'
                     text = text.replace('endmodule', guidance + '\nendmodule', 1)
+                if unit == 'DataCache' and mode == 'mutation-tag-lifetime' and filename == module + '.sv':
+                    base = min(int(r['base']) for r in manifest['parameters']['memoryRegions'] if r.get('dataCacheable'))
+                    base = (base + 63) & ~63
+                    tag_shift = (manifest['parameters']['dCacheBytes'] // 64 - 1).bit_length() + 6
+                    guidance = f'''
+  reg cache_witness_second = 0;
+  always @(posedge clock) if (reset) cache_witness_second <= 0;
+  else if (upstream_response_valid && upstream_response_ready) cache_witness_second <= 1;
+  always @* begin
+    assume(upstream_request_valid && upstream_response_ready && downstream_request_ready && !invalidate_valid);
+    assume(upstream_request_bits_address == (cache_witness_second ? 64'h{base+8:x} : 64'h{base:x}));
+    assume(upstream_request_bits_size == 3 && upstream_request_bits_tag == 0);
+    assume(!upstream_request_bits_write && !upstream_request_bits_fetch && !upstream_request_bits_atomic);
+    assume(downstream_response_valid == cache_bus && !downstream_response_bits_fault && downstream_response_bits_tag == 0);
+    assume(_dataTags_ext_R0_data == (state == 1 ? {base >> tag_shift} : {(base >> tag_shift) ^ 1}));
+    assume(cache_watched == {(base >> 3) % (manifest['parameters']['dCacheBytes'] // 8)});
+  end
+'''
+                    text = text.replace('endmodule', guidance + '\nendmodule', 1)
                 if mutating and filename == mutated_file:
                     assert text.count(before) == (2 if name == 'Csr' else 1), (name, before)
                     text = text.replace(before, after, 1)
@@ -2079,12 +2281,15 @@ def verify(rtl, directory, modules=None):
             task = 'bmc' if mutating else mode
             if mode == 'mutation' and name == 'Fetch':
                 task = 'prove'
-            engine = 'abc pdr' if task == 'prove' and unit not in ('Multiply', 'Pmp', 'PmpDecode', 'PmpInterval', 'Csr', 'Memory', 'Axi', 'InstructionCache', 'Decode', 'Execute', 'LocalInterrupts') and name not in ('SynchronizationBackend', 'WfiBackend') else 'smtbmc z3'
+            engine = 'abc pdr' if task == 'prove' and unit not in ('Multiply', 'Pmp', 'PmpDecode', 'PmpInterval', 'Csr', 'Memory', 'Axi', 'InstructionCache', 'DataCache', 'Coherence', 'Decode', 'Execute', 'LocalInterrupts') and name not in ('SynchronizationBackend', 'WfiBackend') else 'smtbmc z3'
             timeout = 180 if name == 'InterruptBackend' and task == 'cover' else 60
+            if (unit == 'Axi' and task == 'prove' and manifest['parameters'].get('enableUserMode')
+                    and manifest['parameters']['axiDataBits'] == 512):
+                timeout = 120
             witness_option = 'aigsmt z3\n' if engine == 'abc pdr' else ''
             preparation = (f'hierarchy -check -top {top}\nproc\nflatten\nopt_expr -keepdc\nopt_clean\nwreduce\nopt_clean\ncheck'
                            if name.startswith('Pmp') else f'prep -top {top} -flatten')
-            depth = 6 * manifest['parameters']['hartCount'] + 8 if unit == 'MemoryArbiter' else 72 if task == 'cover' or (unit == 'InstructionCache' and mode in ('mutation', 'mutation-invalidate')) else 1 if name.startswith('Pmp') or unit in ('Decode', 'Execute') else (3 if task == 'prove' else 8) if unit == 'Csr' else 4 if name in ('Multiply', 'Memory', 'Axi', 'SynchronizationBackend', 'WfiBackend', 'InstructionCache', 'LocalInterrupts') and task == 'prove' else 24
+            depth = 6 * manifest['parameters']['hartCount'] + 8 if unit == 'MemoryArbiter' else 72 if task == 'cover' or (unit == 'InstructionCache' and mode in ('mutation', 'mutation-invalidate')) else 1 if name.startswith('Pmp') or unit in ('Decode', 'Execute') else (3 if task == 'prove' else 8) if unit == 'Csr' else 6 if unit in ('DataCache', 'Coherence') and task == 'prove' else 4 if name in ('Multiply', 'Memory', 'Axi', 'SynchronizationBackend', 'WfiBackend', 'InstructionCache', 'LocalInterrupts') and task == 'prove' else 24
             config = f'''[options]
 mode {task}
 depth {depth}
@@ -2125,6 +2330,9 @@ read -formal -sv {' '.join(files)}
         synchronization='raw barrier encodings, independent accepted-data ownership until retirement, sequential instruction synchronization redirect and younger flush; no data response timing assumptions' if 'SynchronizationBackend' in proved else None,
         synchronizationWitnessGuidance='cover/mutations only: aligned zero-address SD, FENCE/FENCE.I, one request and response stall, faulted FENCE.I and quiescent interrupts; unrestricted safety proof' if 'SynchronizationBackend' in proved else None,
         instructionCache='control proof at configured geometry; arbitrary native SRAM read outputs; independent upstream/downstream ownership, authorization, cancellation drain, full-fill publication, invalidation and precise fallback; functional array contents require separate simulation' if 'InstructionCache' in proved else None,
+        dataCache='control safety with arbitrary native SRAM reads; independently captured requests, physical ownership, valid-sector/tag-qualified sampling, fault/tag attribution, index invalidation and sector publication; functional SRAM contents require separate simulation' if 'DataCache' in proved else None,
+        dataCacheWitnessGuidance='tag-lifetime mutation only: two permitted sectors, successful immediate service, lookup tag match and unrelated later SRAM output; safety and cover remain unrestricted' if 'DataCache' in proved else None,
+        coherence='broadcast completion before cacheable writes; held upstream request and one physical transaction supplied by the shared arbiter; no endpoint progress assumption or DMA coherence claim' if 'Coherence' in proved else None,
         cacheWitnessGuidance='cover/mutations only: zero-address demand, successful service, canceled stalls, last-beat/post-fill invalidation, permission denial and demand/speculative fault scenarios; unrestricted safety proof' if 'InstructionCache' in proved else None,
         arbitration='one retained request and owner, hart identity from independent accepted requester/2 through response; at most 2N-1 other completions while continuously requesting; no bound on external service delay' if 'MemoryArbiter' in proved else None,
         interruptProgress='with eligibility held, successful matching data response reaches interrupt entry or priority synchronous trap within three cycles; memory service itself is external' if any(r['propertyGroup'] == 'InterruptBackend' for r in reports) else None,
@@ -2151,6 +2359,6 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--rtl', type=Path, default=Path('result/production'))
     parser.add_argument('--output', type=Path, default=Path('result/formal'))
-    parser.add_argument('--modules', nargs='+', choices=('Fetch', 'Multiply', 'Backend', 'Pmp', 'PmpDecode', 'PmpInterval', 'Csr', 'UserCsr', 'UserExecute', 'Lsu', 'InterruptCsr', 'InterruptBackend', 'SynchronizationBackend', 'InstructionCache', 'MemoryArbiter', 'Memory', 'Axi', 'WordDecode', 'WordExecute', 'IntegerDecode', 'IntegerExecute', 'WfiBackend', 'WfiFrontend', 'LocalInterrupts'))
+    parser.add_argument('--modules', nargs='+', choices=('Fetch', 'Multiply', 'Backend', 'Pmp', 'PmpDecode', 'PmpInterval', 'Csr', 'UserCsr', 'UserExecute', 'Lsu', 'InterruptCsr', 'InterruptBackend', 'SynchronizationBackend', 'InstructionCache', 'DataCache', 'Coherence', 'MemoryArbiter', 'Memory', 'Axi', 'WordDecode', 'WordExecute', 'IntegerDecode', 'IntegerExecute', 'WfiBackend', 'WfiFrontend', 'LocalInterrupts'))
     args = parser.parse_args()
     verify(args.rtl, args.output, args.modules)

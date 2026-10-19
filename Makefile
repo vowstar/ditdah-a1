@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: 2026 Huang Rui <vowstar@gmail.com>
 # SPDX-License-Identifier: MIT
 
-.PHONY: config check rtl software verify-software zephyr verify-zephyr verify-zephyr-long verify-signoff verify-simulation verify-production verify-cache verify-platform verify-user verify-formal clean
+.PHONY: config check rtl software verify-software verify-data-software zephyr verify-zephyr verify-zephyr-long verify-signoff verify-simulation verify-production verify-cache verify-platform verify-user verify-data-cache verify-formal verify-scalar-formal verify-user-formal verify-data-formal clean
 
 HART_COUNTS ?= 2 3 15 16
 ICACHE_CASES := pipeline_reuse cache_replacement fence_ordering fence_i_prefetch synchronization atomic_ordering atomic_denied atomic_retry bus_fetch pipeline_redirect pmp_fetch pmp_update interrupt_fence interrupt_fence_i interrupt_fetch_fault
@@ -11,7 +11,8 @@ SOFTWARE_CONFIG ?= software/platform.json
 SOFTWARE_OUTPUT ?= result/software
 SOFTWARE_JOBS ?= 1
 SOFTWARE_ICACHE_BYTES ?= $(if $(filter 16,$(SOFTWARE_HARTS)),8192,0)
-SOFTWARE_PROFILE = --config $(SOFTWARE_CONFIG) --harts $(SOFTWARE_HARTS) --icache-bytes $(SOFTWARE_ICACHE_BYTES) --console-base 0x10000000
+SOFTWARE_DCACHE_BYTES ?= 0
+SOFTWARE_PROFILE = --config $(SOFTWARE_CONFIG) --harts $(SOFTWARE_HARTS) --icache-bytes $(SOFTWARE_ICACHE_BYTES) --dcache-bytes $(SOFTWARE_DCACHE_BYTES) --console-base 0x10000000
 ZEPHYR_TRANSACTIONS_1 := 280000
 ZEPHYR_TRANSACTIONS_2 := 480000
 ZEPHYR_TRANSACTIONS_16 := 2500000
@@ -39,6 +40,9 @@ verify-software: software
 		image=$(SOFTWARE_OUTPUT)/harts$(SOFTWARE_HARTS)/$$name; \
 		python3 test/verify.py --elf $$image/software.elf --config $$image/input.json --output $$image/verification --jobs $(SOFTWARE_JOBS) || exit $$?; \
 	done
+
+verify-data-software:
+	for count in 1 2 16; do $(MAKE) verify-software SOFTWARE_HARTS=$$count SOFTWARE_DCACHE_BYTES=8192 SOFTWARE_OUTPUT=$(SOFTWARE_OUTPUT)/data-cache || exit $$?; done
 
 zephyr:
 	@test -n "$(ZEPHYR_TRANSACTIONS_$(SOFTWARE_HARTS))" || { echo 'Select SOFTWARE_HARTS=1, 2 or 16'; exit 1; }
@@ -95,7 +99,20 @@ verify-user: verify-platform
 	python3 test/verify.py --user-mode --width 64 --pmp-entries 0 --interrupts --output result/user-pmp0 --case user_access --case user_system --case user_wait --case user_interrupt
 	python3 test/verify.py --user-mode --platform-only --harts 16 --width 512 --pmp-entries 16 --icache-bytes 8192 --output result/user-multicore --case user_isolation --case user_device
 
-verify-formal: verify-user
+verify-data-cache: verify-user
+	python3 test/verify.py --dcache-bytes 8192 --width 64 --pmp-entries 0 --output result/data-cache --case data_cache --case memory_word --case atomic_ordering --case bus_read --case bus_write
+	python3 test/verify.py --dcache-bytes 8192 --icache-bytes 8192 --user-mode --interrupts --width 512 --pmp-entries 16 --output result/data-cache-user --case data_cache --case pmp_update --case user_access --case user_protection --case user_mprv --case user_interrupt
+	python3 test/verify.py --dcache-bytes 8192 --multicore-only --output result/data-coherence --harts 2 --harts 3 --harts 16 --case data_coherence --case synchronization --case atomic_lrsc_shared --case atomic_lrsc_private
+	python3 test/verify.py --dcache-bytes 8192 --user-mode --platform-only --harts 16 --width 512 --pmp-entries 16 --icache-bytes 8192 --output result/data-platform --case user_isolation --case user_device
+	build-ditdah-a1 --no-trace --config result/data-cache-user/irq-pmp16-axi512/input.json --output result/production-dcache
+	build-ditdah-a1 --no-trace --config result/data-coherence/harts16-axi512/input.json --output result/production-dcache-harts16
+	build-ditdah-a1 --no-trace --top DitDahA1MemoryFabric --config result/data-coherence/harts16-axi512/input.json --output result/fabric-dcache
+	python3 test/check_production.py --data-cache
+	$(MAKE) verify-data-software
+
+verify-formal: verify-data-formal
+
+verify-scalar-formal: verify-data-cache
 	python3 test/formal.py
 	python3 test/formal.py --rtl result/production-pmp16 --output result/formal/pmp16
 	python3 test/formal.py --rtl result/verify/pmp16-axi64/rtl --output result/formal/pmp16-pa32 --modules Pmp Axi
@@ -106,8 +123,18 @@ verify-formal: verify-user
 	python3 test/formal.py --rtl result/platform/harts2-axi64/rtl --output result/formal/platform --modules LocalInterrupts
 	python3 test/formal.py --rtl result/platform/harts16-axi512/rtl --output result/formal/platform-harts16 --modules LocalInterrupts Lsu WfiBackend
 	for count in $(HART_COUNTS); do python3 test/formal.py --rtl result/production-harts$$count --output result/formal/harts$$count --modules MemoryArbiter || exit $$?; done
+
+verify-user-formal: verify-scalar-formal
 	python3 test/formal.py --rtl result/user/pmp16-axi64/rtl --output result/formal/user --modules UserCsr UserExecute Csr Pmp Fetch Lsu Axi
 	python3 test/formal.py --rtl result/user-cache/irq-pmp16-axi512/rtl --output result/formal/user-cache --modules UserCsr UserExecute Pmp InstructionCache Axi InterruptCsr
+
+verify-data-formal: verify-user-formal
+	python3 test/formal.py --rtl result/data-cache/axi64/rtl --output result/formal/data-cache --modules DataCache Coherence
+	python3 test/formal.py --rtl result/data-cache-user/irq-pmp16-axi512/rtl --output result/formal/data-cache-user --modules DataCache
+	for profile in 2:64 3:64 16:512; do \
+		count=$${profile%:*}; width=$${profile#*:}; \
+		python3 test/formal.py --rtl result/data-coherence/harts$$count-axi$$width/rtl --output result/formal/coherence-harts$$count --modules Coherence || exit $$?; \
+	done
 
 clean:
 	rm -rf result

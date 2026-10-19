@@ -11,19 +11,24 @@ from contracts import verify_storage
 
 parser = argparse.ArgumentParser()
 parser.add_argument('--harts', type=int, nargs='+', choices=(2, 3, 15, 16), default=[2])
+parser.add_argument('--data-cache', action='store_true')
 args = parser.parse_args()
 
 tops = (("production", "DitDahA1"), ("core", "DitDahA1Core"),
         ("frontend", "DitDahA1Frontend"), ("fabric", "DitDahA1MemoryFabric"), ("backend", "DitDahA1Backend"))
-for directory, top in (*tops, *((directory + '-pmp16', top) for directory, top in tops if directory != 'fabric'),
+profiles = (*tops, *((directory + '-pmp16', top) for directory, top in tops if directory != 'fabric'),
                        *((directory + '-irq', top) for directory, top in tops if directory in ('production', 'core', 'backend')),
-                       *((f'production-harts{count}', 'DitDahA1') for count in args.harts)):
+                       *((f'production-harts{count}', 'DitDahA1') for count in args.harts))
+if args.data_cache:
+    profiles = (('production-dcache', 'DitDahA1'), ('production-dcache-harts16', 'DitDahA1'),
+                ('fabric-dcache', 'DitDahA1MemoryFabric'))
+for directory, top in profiles:
     rtl = Path("result") / directory
     manifest = json.loads((rtl / 'ditdah_a1_config.json').read_text())
     count = int(directory.split('-harts')[1]) if '-harts' in directory else 1
     component = directory.split('-')[0]
     assert manifest['validationScope'] == {'production': 'system', 'core': 'core', 'frontend': 'frontend', 'fabric': 'fabric', 'backend': 'backend'}[component]
-    interrupts = directory.endswith('-irq') or '-harts' in directory
+    interrupts = top != 'DitDahA1MemoryFabric' and (directory.endswith('-irq') or '-harts' in directory or args.data_cache)
     enabled = directory.endswith('-pmp16') or interrupts
     assert manifest['implementation']['machineInterrupts'] == interrupts
     assert manifest['implementation']['pmpEntries'] == (16 if enabled else 0)
@@ -34,6 +39,10 @@ for directory, top in (*tops, *((directory + '-pmp16', top) for directory, top i
     cache_bytes = manifest['parameters']['iCacheBytes'] if top in ('DitDahA1', 'DitDahA1Core', 'DitDahA1Frontend') else 0
     assert manifest['implementation']['iCacheBytes'] == cache_bytes
     assert ('DitDahA1InstructionCache.sv' in files) == bool(cache_bytes), 'Instruction cache bypass or module mismatch'
+    assert manifest['implementation']['dCacheBytes'] == (8192 if args.data_cache and top == 'DitDahA1' else 0)
+    assert manifest['implementation']['dataCoherence'] == args.data_cache
+    assert ('DitDahA1DataCache.sv' in files) == (args.data_cache and top == 'DitDahA1')
+    assert ('DitDahA1Coherence.sv' in files) == args.data_cache
     verify_storage(rtl, rtl / 'storage-check')
     assert files and all("DV" not in name and not name.startswith("ref_") for name in files)
     assert not list(rtl.glob("*DV*.sv")) and not list(rtl.glob("ref_*.sv"))
@@ -45,6 +54,7 @@ for directory, top in (*tops, *((directory + '-pmp16', top) for directory, top i
     assert ('hartId' in header) == (top in ('DitDahA1Core', 'DitDahA1Backend'))
     if top == 'DitDahA1':
         assert re.findall(r'\bDitDahA1Core\s+(\w+)\s*\(', (rtl / (top + '.sv')).read_text()) == [f'core_{h}' for h in range(count)]
+        assert re.findall(r'\bDitDahA1DataCache\s+(\w+)\s*\(', (rtl / (top + '.sv')).read_text()) == ([f'data_cache_{h}' for h in range(count)] if args.data_cache else [])
     if top in ("DitDahA1Core", "DitDahA1Frontend", "DitDahA1Backend"):
         assert "axi_" not in header
     else:
@@ -57,18 +67,21 @@ for directory, top in (*tops, *((directory + '-pmp16', top) for directory, top i
         assert set(files) == {'DitDahA1' + name + '.sv' for name in ('Backend', 'Decode', 'Issue', 'Execute', 'Multiply', 'Commit', 'Gpr', 'Csr', 'Lsu', *(('Pmp',) if enabled else ()))}
         assert (rtl / (top + '.sv')).read_bytes() == Path('result/verify/' + ('irq-' if interrupts else '') + ('pmp16-' if enabled else '') + 'axi512/rtl', top + '.sv').read_bytes()
     if top == 'DitDahA1MemoryFabric':
-        assert set(files) == {name + '.sv' for name in (top, 'DitDahA1MemoryArbiter', 'DitDahA1Memory', 'DitDahA1Axi')}
-        integrated = Path('result/production-harts16')
+        assert set(files) == {name + '.sv' for name in (top, 'DitDahA1MemoryArbiter', 'DitDahA1Memory', 'DitDahA1Axi', *(('DitDahA1Coherence',) if args.data_cache else ()))}
+        integrated = Path('result/production-dcache-harts16' if args.data_cache else 'result/production-harts16')
         assert all((rtl / name).read_bytes() == (integrated / name).read_bytes() for name in ('DitDahA1Memory.sv', 'DitDahA1Axi.sv'))
     subprocess.run(["verilator", "--lint-only", "--top-module", top,
                     *[str(rtl / name) for name in files]], check=True)
     print(f"{top} production interface and lint passed")
 
+if args.data_cache:
+    raise SystemExit(0)
+
 directory = Path('result/component-checks')
 directory.mkdir(exist_ok=True)
 parameters = json.loads(Path('result/production/ditdah_a1_config.json').read_text())['parameters']
 for index, (top, overrides, diagnostic) in enumerate((
-        ('DitDahA1', {'dCacheBytes': 8192}, 'RTL supports uncached data memory'),
+        ('DitDahA1', {'dCacheBytes': 16384}, 'RTL supports zero or 8192 data cache bytes'),
         ('DitDahA1', {'hartCount': 0}, 'hartCount must be between 1 and 16'),
         ('DitDahA1', {'hartCount': 17}, 'hartCount must be between 1 and 16'),
         ('DitDahA1Core', {'pmpEntries': 64}, 'RTL supports zero or sixteen PMP entries'),

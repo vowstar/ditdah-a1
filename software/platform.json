@@ -16,17 +16,17 @@
     {
       "base": "2147483648", "size": "524288",
       "readable": true, "writable": true, "executable": true,
-      "device": false, "atomic": true
+      "device": false, "atomic": true, "dataCacheable": true
     },
     {
       "base": "33554432", "size": "65536",
       "readable": true, "writable": true, "executable": false,
-      "device": true, "atomic": false
+      "device": true, "atomic": false, "dataCacheable": false
     },
     {
       "base": "268435456", "size": "4096",
       "readable": false, "writable": true, "executable": false,
-      "device": true, "atomic": false
+      "device": true, "atomic": false, "dataCacheable": false
     }
   ]
 }

@@ -243,6 +243,7 @@ def cases(base, protection=False, interrupts=False, user=False, local_interrupt_
     yield 'multiply', p.finish()
     yield from integer_cases(base)
     yield from synchronization_cases(base)
+    yield 'data_cache', data_cache_program(base)
     yield from atomic_cases(base, protection)
     if protection:
         yield from pmp_cases(base)
@@ -602,6 +603,7 @@ def multicore_cases(base, harts, protection=False, interrupts=False, user=False)
         p.emit(csr(7, 0x340, 0, True), addi(4, 2, 1), sd(4, 10), ld(5, 10), 0x73, addi(6, 5, 1))
         yield 'user_isolation', p.finish()
     yield 'synchronization', synchronization_program(base, harts)
+    yield 'data_coherence', data_coherence_program(base, harts)
     yield from atomic_multicore_cases(base, harts, interrupts)
     for name in ('exchange', *(('protection',) if protection else ()), *(('interrupt',) if interrupts else ())):
         p = Program(base)
@@ -655,6 +657,57 @@ def multicore_cases(base, harts, protection=False, interrupts=False, user=False)
             p.address(26, 0x1808)
             p.emit(addi(27, 0, 1), sd(27, 26), 0x30200073)
         yield name, p
+
+
+def data_cache_program(base):
+    p = Program(base)
+    initial = 0x1122334455667788
+    for offset, value in ((0x1000, initial), (0x1008, 23), (0x1038, 47), (0x3000, 91)):
+        p.memory.update((base + offset + byte, (value >> (8 * byte)) & 255) for byte in range(8))
+    p.address(10, 0x1000)
+    p.address(11, 0x3000)
+    p.emit(ld(3, 10), ld(4, 10), ld(5, 10, 8), ld(6, 10, 8), ld(7, 10, 56), ld(8, 10, 56),
+           ld(9, 10), ld(12, 11), ld(13, 10), ld(14, 10), addi(2, 0, 0x5a), store(2, 10, 1, 0),
+           ld(15, 10), ld(16, 10), addi(2, 0, 0x123), store(2, 10, 2, 1), ld(17, 10), ld(18, 10),
+           addi(2, 0, 1), amoadd(19, 10, 2), ld(20, 10), ld(21, 10), amo(2, 22, 10),
+           addi(22, 22, 1), amo(3, 24, 10, 22), ld(25, 10), ld(26, 10))
+    narrowed = 0x1122334401235a88
+    p.data_cache = dict(minHits=9, addresses=[base + 0x1000, base + 0x1008, base + 0x1038],
+                        expectedRegisters={'3': initial, '4': initial, '5': 23, '6': 23, '7': 47, '8': 47,
+                                           '9': initial, '12': 91, '13': initial, '14': initial,
+                                           '15': 0x1122334455665a88, '16': 0x1122334455665a88,
+                                           '17': narrowed, '18': narrowed, '19': narrowed,
+                                           '20': narrowed + 1, '21': narrowed + 1, '24': 0,
+                                           '25': narrowed + 2, '26': narrowed + 2})
+    return p.finish()
+
+
+def data_coherence_program(base, harts):
+    p = Program(base)
+    initial = 0x1122334455667788
+    p.memory.update((base + 0x1000 + byte, (initial >> (8 * byte)) & 255) for byte in range(8))
+    p.emit(csr(2, 0xf14, 0, True), addi(3, 0, 64), mul(3, 2, 3), addi(4, 0, 1))
+    p.address(10, 0x1000)
+    p.address(11, 0x2000)
+    p.emit(add(11, 11, 3), addi(14, 0, harts))
+    for iteration, (size, value, offset) in enumerate(((0, 0x5a, 1), (1, 0x123, 2), (3, 1, 0))):
+        p.address(12, 0x1800 + iteration * 64)
+        p.address(13, 0x1a00 + iteration * 64)
+        p.emit(ld(5, 10), ld(6, 10), amoadd(6, 12, 4))
+        loop = p.offset
+        p.emit(ld(6, 12), beq(6, 14, 8), jal(0, loop - p.offset - 8), fence(), beq(2, 0, 8))
+        skip = p.offset
+        p.emit(0, addi(7, 0, value))
+        p.emit(amoadd(7, 10, 7) if size == 3 else store(7, 10, offset, size))
+        p.emit(fence(), sd(4, 13))
+        resume = p.offset
+        p.memory.update((base + skip + byte, (jal(0, resume - skip) >> (8 * byte)) & 255) for byte in range(4))
+        loop = p.offset
+        p.emit(ld(6, 13), beq(6, 0, loop - p.offset - 4), fence(), ld(8, 10), ld(9, 10), sd(8, 11, iteration * 8))
+    values = [0x1122334455665a88, 0x1122334401235a88, 0x1122334401235a89]
+    p.data_cache = dict(minHits=6, addresses=[base + 0x1000], witnesses=base + 0x2000, stride=64,
+                        values=values, finalRegisters=[{'8': values[-1], '9': values[-1]} for _ in range(harts)])
+    return p.finish()
 
 
 def platform_program(base, harts, local_base, wait=False):

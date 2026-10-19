@@ -96,7 +96,10 @@ object DitDahA1ParameterCheck:
     rejects { rtl.copy(pmpEntries = 64).validateFrontend() }
     rejects { rtl.copy(pmpEntries = 64).validateBackend() }
     for bytes <- Seq(0, 8192, 16384, 32768, 65536) do rtl.copy(iCacheBytes = bytes).validateRtl()
-    rejects { rtl.copy(dCacheBytes = 8192).validateRtl() }
+    rtl.copy(dCacheBytes = 8192).validateRtl()
+    rejects { rtl.copy(dCacheBytes = 16384).validateRtl() }
+    rejects { MemoryRegion(device = true, executable = false, dataCacheable = true); () }
+    assert(DitDahA1Config.parameter(DitDahA1Config.document(rtl.copy(memoryRegions = Seq(MemoryRegion(dataCacheable = true))))).memoryRegions.head.dataCacheable)
     rejects { rtl.copy(l2CacheBytes = 131072).validateRtl() }
     rejects { rtl.copy(memoryRegions = Seq.empty).validateRtl() }
     rejects { rtl.copy(memoryRegions = Seq(MemoryRegion(executable = false))).validateRtl() }

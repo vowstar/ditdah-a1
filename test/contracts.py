@@ -15,16 +15,22 @@ from model import Fault, LocalInterrupts, Model, MASK, atomic_value, pmp_allowed
 def verify_storage(rtl, directory):
     manifest = json.loads((rtl / 'ditdah_a1_config.json').read_text())
     size = manifest['implementation']['iCacheBytes']
+    data_size = manifest['implementation'].get('dCacheBytes', 0)
     files = (rtl / 'filelist.f').read_text().splitlines()
-    arrays = [file for file in files if file.startswith(('instructions_', 'tags_'))]
+    arrays = {file[:-3]: tuple(map(int, re.search(r'_(\d+)x(\d+)\.sv$', file).groups()))
+              for file in files if file.startswith(('instructions_', 'tags_', 'data_', 'dataTags_', 'mem_'))}
     assert ('DitDahA1InstructionCache.sv' in files) == bool(size)
+    assert ('DitDahA1DataCache.sv' in files) == bool(data_size)
     expected = {} if not size else {'instructions': (size // 4, 32),
         'tags': (size // 64, manifest['parameters']['physicalAddressBits'] - (size // 64).bit_length() - 5)}
-    assert set(arrays) == {f'{name}_{depth}x{width}.sv' for name, (depth, width) in expected.items()}
+    if data_size:
+        expected.update(data=(data_size // 8, 64),
+                        dataTags=(data_size // 64, manifest['parameters']['physicalAddressBits'] - (data_size // 64).bit_length() - 5))
+    assert set(arrays.values()) == set(expected.values())
     report = []
     directory.mkdir(parents=True, exist_ok=True)
-    for name, (depth, width) in expected.items():
-        module = f'{name}_{depth}x{width}'
+    for module, (depth, width) in arrays.items():
+        name = module.rsplit('_', 1)[0]
         netlist = directory / (module + '.json')
         command = f'read_verilog "{(rtl / (module + ".sv")).resolve()}"; hierarchy -top {module}; proc; memory_collect; write_json "{netlist.resolve()}"'
         result = subprocess.run(['yosys', '-Q', '-T', '-p', command], capture_output=True, text=True, timeout=30)
@@ -752,6 +758,139 @@ def cached_fetch_contract(parameters, frontend=False):
     return body
 
 
+def data_cache_contract(parameters):
+    region = next(r for r in parameters['memoryRegions'] if r.get('dataCacheable'))
+    base, size = int(region['base']), parameters['dCacheBytes']
+    assert int(region['size']) >= 2 * size
+    fields = dict(address=64, data=64, size=3, mask=8, tag=8, write=1, fetch=1,
+                  privileged=1, atomic=1, atomicOperation=5, scEligible=1)
+    current = {}
+
+    def request(address, **options):
+        invalidate_accept = options.pop('invalidate_accept', False)
+        current.clear()
+        current.update(dict.fromkeys(fields, 0), address=address, size=3, tag=37, privileged=1)
+        current.update(options)
+        body = '    @(negedge clock);\n' + ''.join(
+            f"    upstream_request_bits_{key} = {fields[key]}'h{value:x};\n" for key, value in current.items()) + '''    upstream_request_valid = 1;
+'''
+        if invalidate_accept:
+            body += f"    invalidate_bits = 64'h{address:x}; invalidate_valid = 1;\n"
+        return body + '    #1; while (!upstream_request_ready) tick(); tick(); upstream_request_valid = 0; invalidate_valid = 0;\n'
+
+    def invalidate(address):
+        return f'''    invalidate_bits = 64'h{address:x}; invalidate_valid = 1;
+    check(invalidate_ready, "Invalidation must not wait for local or physical service");
+    tick(); invalidate_valid = 0;
+'''
+
+    def bus(value, fault=0, wrong_tag=False, invalidation=None):
+        body = '''    while (!downstream_request_valid) begin check(!upstream_response_valid, "Miss completed before physical service"); tick(); end
+    repeat (3) begin
+'''
+        body += '      check(' + ' && '.join(f"downstream_request_bits_{key} == {fields[key]}'h{value:x}" for key, value in current.items())
+        body += ', "Captured request payload changed"); tick();\n    end\n'
+        if invalidation == 'held':
+            body += invalidate(current['address'])
+        body += '    downstream_request_ready = 1; tick(); downstream_request_ready = 0;\n'
+        if invalidation == 'waiting':
+            body += invalidate(current['address'])
+        body += f'''    downstream_response_bits_data = 64'h{value:x}; downstream_response_bits_tag = {current['tag'] ^ int(wrong_tag)};
+    downstream_response_bits_fault = {fault}; downstream_response_valid = 1;
+    check(downstream_response_ready, "Physical response ownership");
+'''
+        if invalidation == 'response':
+            body += invalidate(current['address'])
+        else:
+            body += '    tick();\n'
+        return body + '    downstream_response_valid = 0; downstream_response_bits_fault = 0;\n'
+
+    def reply(value, fault=0, invalidate_hit=False):
+        body = '''    while (!upstream_response_valid) begin check(!downstream_request_valid, "Hit generated a physical request"); tick(); end
+    repeat (3) begin
+'''
+        data = '' if fault else f" && upstream_response_bits_data == 64'h{value:x}"
+        body += f'''      check(upstream_response_valid && upstream_response_bits_tag == {current['tag']} && upstream_response_bits_fault == {fault}{data} && !downstream_request_valid, "Data completion identity, value and retention"); tick();
+    end
+'''
+        if invalidate_hit:
+            body += invalidate(current['address'])
+            body += f'''    check(upstream_response_valid && upstream_response_bits_data == 64'h{value:x}, "Sampled hit did not drain after invalidation");
+'''
+        return body + '    upstream_response_ready = 1; tick(); upstream_response_ready = 0;\n'
+
+    body = request(base) + bus(0x123456789abcdef0) + reply(0x123456789abcdef0)
+    body += request(base, tag=38, privileged=0) + reply(0x123456789abcdef0)
+    body += request(base + 8) + bus(0x9988776655443322) + reply(0x9988776655443322)
+    body += request(base) + reply(0x123456789abcdef0, invalidate_hit=True)
+    body += request(base) + bus(3) + reply(3)
+    body += request(base + 8) + bus(4) + reply(4)
+    body += request(base + size) + bus(5) + reply(5)
+    body += request(base) + bus(6) + reply(6)
+    for phase in ('held', 'waiting', 'response'):
+        body += invalidate(base) + request(base) + bus(7, invalidation=phase) + reply(7)
+        body += request(base) + bus(8) + reply(8)
+        body += request(base) + reply(8)
+    body += request(base, invalidate_accept=True) + bus(10) + reply(10)
+    body += request(base) + bus(11) + reply(11)
+    for options in ({'fault': 1}, {'wrong_tag': True}):
+        body += invalidate(base) + request(base) + bus(0, **options) + reply(0, fault=1)
+        body += request(base) + bus(9) + reply(9)
+    for options in ({'size': 2}, {'write': 1, 'data': 11, 'mask': 1, 'size': 0},
+                    {'atomic': 1, 'atomicOperation': 2},
+                    {'atomic': 1, 'atomicOperation': 3, 'write': 1, 'mask': 255, 'data': 12, 'scEligible': 1}):
+        for _ in range(2):
+            body += request(base, **options) + bus(13, invalidation='waiting') + reply(13)
+    for address in (base + 1, 1 << parameters['physicalAddressBits']):
+        body += request(address) + bus(0, fault=1) + reply(0, fault=1)
+    for region in parameters['memoryRegions']:
+        if region['device']:
+            options = {} if region['readable'] else dict(write=1, mask=255, data=14)
+            for _ in range(2):
+                body += request(int(region['base']), **options) + bus(14) + reply(14)
+            break
+    return body
+
+
+def coherence_contract(parameters):
+    count = parameters['hartCount']
+    base = int(next(r for r in parameters['memoryRegions'] if r.get('dataCacheable'))['base'])
+    body = ''
+    for write, atomic, operation, cacheable in ((1, 0, 0, True), (1, 1, 0, True),
+                                               (1, 1, 3, True), (0, 1, 2, True), (0, 0, 0, True),
+                                               (1, 0, 0, False)):
+        address = base if cacheable else 1 << parameters['physicalAddressBits']
+        body += f'''    @(negedge clock);
+    upstream_request_bits_address = 64'h{address:x}; upstream_request_bits_tag = 37;
+    upstream_request_bits_size = 3; upstream_request_bits_mask = {255 if write else 0};
+    upstream_request_bits_write = {write}; upstream_request_bits_atomic = {atomic};
+    upstream_request_bits_atomicOperation = {operation}; upstream_request_bits_data = 19;
+    upstream_request_valid = 1; downstream_request_ready = 0;
+'''
+        if write and cacheable:
+            body += '    tick();\n'
+            for hart in range(count):
+                for peer in range(count):
+                    body += f'''    check(invalidate_{peer}_valid == {int(peer >= hart)} && (!invalidate_{peer}_valid || invalidate_{peer}_bits == 64'h{address:x}), "Invalidation identity and one completion per hart");
+'''
+                body += f'''    check(!downstream_request_valid && !upstream_request_ready, "Write forwarded before every invalidation completed");
+    invalidate_{hart}_ready = 1; tick(); invalidate_{hart}_ready = 0;
+'''
+        else:
+            body += '    #1;\n' + ''.join(f'    check(!invalidate_{hart}_valid, "Bypass generated invalidation");\n' for hart in range(count))
+        body += f'''    repeat (3) begin
+      check(downstream_request_valid && downstream_request_bits_address == 64'h{address:x} && downstream_request_bits_tag == 37 && downstream_request_bits_write == {write} && downstream_request_bits_atomic == {atomic} && downstream_request_bits_atomicOperation == {operation} && !upstream_request_ready, "Forwarded request retention"); tick();
+    end
+    downstream_request_ready = 1; tick(); downstream_request_ready = 0; upstream_request_valid = 0;
+    downstream_response_bits_tag = 37; downstream_response_bits_data = 23; downstream_response_valid = 1;
+    repeat (3) begin
+      check(upstream_response_valid && upstream_response_bits_tag == 37 && upstream_response_bits_data == 23 && !downstream_response_ready, "Shared response retention"); tick();
+    end
+    upstream_response_ready = 1; tick(); upstream_response_ready = 0; downstream_response_valid = 0;
+'''
+    return body
+
+
 def fabric_contract(parameters):
     base, width = int(parameters['resetVector']), parameters['axiDataBits']
     data_address, instruction_address = base + 0x238, base + 0x104
@@ -1436,6 +1575,9 @@ def verify(rtl, directory, modules=None):
                        ('DitDahA1MemoryFabric', fabric_contract(parameters)))
     if parameters.get('localInterruptBase'):
         suites += (('DitDahA1LocalInterrupts', local_interrupt_contract(parameters)),)
+    if parameters.get('dCacheBytes'):
+        suites += (('DitDahA1DataCache', data_cache_contract(parameters)),
+                   ('DitDahA1Coherence', coherence_contract(parameters)))
     if enabled:
         suites += (('DitDahA1Pmp', pmp_contract(parameters)),)
     identity = ''.join(f'''    hartId = {hart}; readAddress = 'hf14;
@@ -1462,11 +1604,16 @@ def verify(rtl, directory, modules=None):
         if cached and name in ('DitDahA1Fetch', 'DitDahA1Frontend'):
             dependencies.append(rtl / 'DitDahA1InstructionCache.sv')
             dependencies += [rtl / file for file in (rtl / 'filelist.f').read_text().splitlines()
-                             if file.startswith(('instructions_', 'tags_'))]
+                             if file.startswith(('instructions_', 'tags_', 'mem_'))]
         if name == 'DitDahA1MemoryFabric':
             dependencies = [rtl / (child + '.sv') for child in ('DitDahA1MemoryArbiter', 'DitDahA1Memory', 'DitDahA1Axi')]
+            if parameters.get('dCacheBytes'):
+                dependencies.append(rtl / 'DitDahA1Coherence.sv')
             if parameters.get('localInterruptBase'):
                 dependencies.append(rtl / 'DitDahA1LocalInterrupts.sv')
+        if name == 'DitDahA1DataCache':
+            dependencies = [rtl / file for file in (rtl / 'filelist.f').read_text().splitlines()
+                            if file.startswith(('data_', 'dataTags_', 'mem_'))]
         if name == 'DitDahA1Backend':
             dependencies = [rtl / ('DitDahA1' + child + '.sv') for child in ('Decode', 'Issue', 'Execute', 'Multiply', 'Commit', 'Gpr', 'Csr', 'Lsu')]
         if enabled and name in ('DitDahA1Fetch', 'DitDahA1Lsu', 'DitDahA1Frontend', 'DitDahA1Backend'):

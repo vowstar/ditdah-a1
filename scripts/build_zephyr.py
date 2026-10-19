@@ -66,6 +66,7 @@ def main():
     parser.add_argument('--qemu', action='store_true')
     parser.add_argument('--harts', type=int, choices=range(1, 17))
     parser.add_argument('--icache-bytes', type=int, choices=(0, 8192, 16384, 32768, 65536))
+    parser.add_argument('--dcache-bytes', type=int, choices=(0, 8192))
     args = parser.parse_args()
     output = args.output.resolve()
     output.mkdir(parents=True, exist_ok=True)

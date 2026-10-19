@@ -60,7 +60,8 @@ case class DitDahA1Parameter(
     validateCore()
     validateFabric()
     require(virtualAddressBits == 0, "RTL supports Bare addressing")
-    require(dCacheBytes == 0 && l2CacheBytes == 0, "RTL supports uncached data memory")
+    require(dCacheBytes == 0 || dCacheBytes == 8192, "RTL supports zero or 8192 data cache bytes")
+    require(l2CacheBytes == 0, "RTL does not support a shared cache")
     require(memoryRegions.exists(r => r.executable && resetVector >= r.base && resetVector + 4 <= r.base + r.size), "Reset vector must be in executable memory")
 
   def validateFabric(): Unit = localInterruptBase.foreach { base =>

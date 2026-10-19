@@ -22,16 +22,11 @@ object DitDahA1Memory extends Generator[DitDahA1Parameter, DitDahA1UnitLayers, D
     parameter.memoryRegions.filter(r => r.executable && !r.device && r.size >= bytes).foldLeft[Referable[Bool]](false.B) { (allowed, region) =>
       allowed | ((address >= region.base.U(64)) & (address <= (region.base + region.size - bytes).U(64)))
     }
-  def architecture(parameter: DitDahA1Parameter) =
-    val io = summon[Interface[DitDahA1MemoryIO]]
-    given ClockScope = ClockScope.posedge(io.clock)
-    given ResetScope = ResetScope.syncActiveHigh(io.reset)
-    val pending = RegInit(false.B)
-    val localFault = RegInit(false.B)
-    val tag = Reg(UInt(8))
-    val up = io.upstream
-    val down = io.downstream
-    val request = up.request.bits
+  def dataCacheable(parameter: DitDahA1Parameter, address: Referable[UInt], bytes: Int)(using Arena, Context, Block, InstanceContext): Referable[Bool] =
+    parameter.memoryRegions.filter(r => r.dataCacheable && !r.device && r.size >= bytes).foldLeft[Referable[Bool]](false.B) { (selected, region) =>
+      selected | ((address >= region.base.U(64)) & (address <= (region.base + region.size - bytes).U(64)))
+    }
+  def permitted(parameter: DitDahA1Parameter, request: Referable[MemoryRequest])(using Arena, Context, Block, InstanceContext): Referable[Bool] =
     val allowed = Wire(Bool())
     allowed := false.B
     val operation = request.atomicOperation
@@ -61,6 +56,18 @@ object DitDahA1Memory extends Generator[DitDahA1Parameter, DitDahA1UnitLayers, D
             }
           }
       }
+    allowed
+  def architecture(parameter: DitDahA1Parameter) =
+    val io = summon[Interface[DitDahA1MemoryIO]]
+    given ClockScope = ClockScope.posedge(io.clock)
+    given ResetScope = ResetScope.syncActiveHigh(io.reset)
+    val pending = RegInit(false.B)
+    val localFault = RegInit(false.B)
+    val tag = Reg(UInt(8))
+    val up = io.upstream
+    val down = io.downstream
+    val request = up.request.bits
+    val allowed = permitted(parameter, request)
     up.request.ready := !pending & (!allowed | down.request.ready)
     down.request.valid := up.request.valid & !pending & allowed
     down.request.bits :<= request

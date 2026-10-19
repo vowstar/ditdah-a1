@@ -6,8 +6,6 @@ import me.jiuyang.zaozi.*
 import me.jiuyang.zaozi.default.{*, given}
 import me.jiuyang.zaozi.reftpe.*
 import me.jiuyang.zaozi.valuetpe.*
-import org.llvm.mlir.scalalib.capi.ir.{Block, LocationApi, OperationApi, Value, given}
-import org.llvm.circt.scalalib.dialect.firrtl.operation.{ConnectApi, SubfieldApi, given}
 
 class DitDahA1InstructionCacheIO(parameter: DitDahA1Parameter) extends HWBundle(parameter):
   val clock = Flipped(Clock())
@@ -70,47 +68,12 @@ object DitDahA1InstructionCache extends Generator[DitDahA1Parameter, DitDahA1Uni
     val filling = down.response.valid & down.response.ready & !responseFault & !bypass & !abort
     val complete = word === 15.U(4)
 
-    def array(name: String, depth: Int, width: Int, readAddress: Referable[UInt],
-              writeAddress: Referable[UInt], writeData: Referable[UInt], writeEnable: Referable[Bool]): Wire[UInt] =
-      val addressBits = Integer.numberOfTrailingZeros(depth)
-      val output = Wire(UInt(width))
-      // The native verifier requires a containing module while parsing a memory.
-      val container = summon[OperationApi].operationCreateParse(
-        s"""firrtl.circuit "StorageArray" { firrtl.module @StorageArray() {
-          %r, %w = firrtl.mem interesting_name Undefined {depth = $depth : i64,
-          name = "$name", portNames = ["read", "write"], readLatency = 1 : i32, writeLatency = 1 : i32} :
-          !firrtl.bundle<addr: uint<$addressBits>, en: uint<1>, clk: clock, data flip: uint<$width>>,
-          !firrtl.bundle<addr: uint<$addressBits>, en: uint<1>, clk: clock, data: uint<$width>, mask: uint<1>>
-        } }""", "instruction-storage")
-      val memory = container.getFirstRegion.getFirstBlock.getFirstOperation.getFirstRegion.getFirstBlock.getFirstOperation
-      memory.removeFromParent()
-      container.destroy()
-      val block = summon[Block]
-      block.appendOwnedOperation(memory)
-      val location = summon[LocationApi].locationUnknownGet
-      def field(port: Int, fieldIndex: Int): Value =
-        val subfield = summon[SubfieldApi].op(memory.getResult(port), BigInt(fieldIndex), location)
-        block.appendOwnedOperation(subfield.operation)
-        subfield.result
-      def connect(sink: Value, source: Value): Unit =
-        block.appendOwnedOperation(summon[ConnectApi].op(source, sink, location).operation)
-      connect(field(0, 0), readAddress.refer)
-      connect(field(0, 1), reading.refer)
-      connect(field(0, 2), io.clock.refer)
-      connect(output.refer, field(0, 3))
-      connect(field(1, 0), writeAddress.refer)
-      connect(field(1, 1), writeEnable.refer)
-      connect(field(1, 2), io.clock.refer)
-      connect(field(1, 3), writeData.refer)
-      connect(field(1, 4), true.B.refer)
-      output
-
-    val wordRead = array("instructions", parameter.iCacheBytes / 4, 32,
+    val wordRead = StorageArray("instructions", parameter.iCacheBytes / 4, 32,
       up.request.bits.address.asBits.bits(indexBits + 5, 2).asUInt,
-      (index.asBits ## word.asBits).asUInt, down.response.bits.data.asBits.bits(31, 0).asUInt, filling)
-    val tagRead = array("tags", lines, tagBits,
+      (index.asBits ## word.asBits).asUInt, down.response.bits.data.asBits.bits(31, 0).asUInt, filling, reading, io.clock)
+    val tagRead = StorageArray("tags", lines, tagBits,
       up.request.bits.address.asBits.bits(indexBits + 5, 6).asUInt, index,
-      address.asBits.bits(parameter.physicalAddressBits - 1, indexBits + 6).asUInt, filling & complete)
+      address.asBits.bits(parameter.physicalAddressBits - 1, indexBits + 6).asUInt, filling & complete, reading, io.clock)
     val hit = (valid.asUInt >> index).asBits.bit(0) &
       (tagRead === address.asBits.bits(parameter.physicalAddressBits - 1, indexBits + 6).asUInt)
 

@@ -28,7 +28,15 @@ object DitDahA1Module extends Generator[DitDahA1Parameter, DitDahA1Layers, DitDa
           core.io.interrupts.get.software := io.interrupts.get(hart).software | fabric.io.localInterrupts.get(hart).software
           core.io.interrupts.get.timer := io.interrupts.get(hart).timer | fabric.io.localInterrupts.get(hart).timer
       fabric.io.instruction(hart) :<>= core.io.instruction
-      fabric.io.data(hart) :<>= core.io.data
+      if parameter.dCacheBytes == 0 then fabric.io.data(hart) :<>= core.io.data
+      else
+        given sourcecode.Name.Machine = sourcecode.Name.Machine(s"data_cache_$hart")
+        val cache = DitDahA1DataCache.instantiate(parameter)
+        cache.io.clock := io.clock
+        cache.io.reset := io.reset
+        cache.io.upstream :<>= core.io.data
+        fabric.io.data(hart) :<>= cache.io.downstream
+        cache.io.invalidate :<>= fabric.io.invalidate.get(hart)
     fabric.io.clock := io.clock
     fabric.io.reset := io.reset
     if parameter.localInterruptBase.nonEmpty then fabric.io.timeTick.get := io.timeTick.get
@@ -57,12 +65,19 @@ object DitDahA1MemoryFabric extends Generator[DitDahA1Parameter, DitDahA1UnitLay
       arbiter.io.ports(2 * hart) :<>= io.instruction(hart)
       arbiter.io.ports(2 * hart + 1) :<>= io.data(hart)
     memory.io.upstream :<>= arbiter.io.downstream
-    if parameter.localInterruptBase.isEmpty then axi.io.memory :<>= memory.io.downstream
+    val physical = if parameter.dCacheBytes == 0 then memory.io.downstream else
+      val coherence = DitDahA1Coherence.instantiate(parameter)
+      coherence.io.clock := io.clock
+      coherence.io.reset := io.reset
+      coherence.io.upstream :<>= memory.io.downstream
+      io.invalidate.get :<>= coherence.io.invalidate
+      coherence.io.downstream
+    if parameter.localInterruptBase.isEmpty then axi.io.memory :<>= physical
     else
       given ClockScope = ClockScope.posedge(io.clock)
       given ResetScope = ResetScope.syncActiveHigh(io.reset)
       val localInterrupts = DitDahA1LocalInterrupts.instantiate(parameter)
-      val port = memory.io.downstream
+      val port = physical
       val base = parameter.localInterruptBase.get
       val selected = (port.request.bits.address >= base.U(64)) & (port.request.bits.address < (base + 65536).U(64))
       val responseLocal = RegInit(false.B)

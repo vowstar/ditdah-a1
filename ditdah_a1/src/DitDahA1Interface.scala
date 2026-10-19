@@ -170,6 +170,7 @@ class DitDahA1FrontendIO(parameter: DitDahA1Parameter) extends HWBundle(paramete
   val memory = Aligned(new MemoryPort)
 
 class DitDahA1MemoryFabricIO(parameter: DitDahA1Parameter) extends HWBundle(parameter):
+  val invalidate = Option.when(parameter.dCacheBytes != 0)(Aligned(Vec(parameter.hartCount, new Decoupled(UInt(64)))))
   val timeTick = Option.when(parameter.localInterruptBase.nonEmpty)(Flipped(Bool()))
   val localInterrupts = Option.when(parameter.localInterruptBase.nonEmpty)(Aligned(Vec(parameter.hartCount, new InterruptBundle)))
   val clock = Flipped(Clock())

@@ -41,7 +41,8 @@ def configuration(width):
             (0x7000, 0x1000, True, True, False, False),
             (0x8000, 0x1000, False, False, True, False)):
         regions.append(dict(base=str(base + offset), size=str(size), readable=read,
-                            writable=write, executable=execute, device=device, atomic=offset == 0))
+                            writable=write, executable=execute, device=device, atomic=offset == 0,
+                            dataCacheable=False))
     return dict(resetVector=str(base), axiDataBits=width, physicalAddressBits=32 if width == 64 else 56,
                 virtualAddressBits=0, iCacheBytes=0, dCacheBytes=0, l2CacheBytes=0, pmpEntries=0,
                 memoryRegions=regions)
@@ -76,6 +77,25 @@ def compile_tb(rtl, directory, width, pa, top='core_tb', source=None, extra_file
         {fetch}.output_bits_fault, {fetch}.output_bits_instruction, {fetch}.output_bits_tag);
     end
   end''')
+        if top == 'core_tb' and parameters['dCacheBytes']:
+            core, sample = f'dut.core_{hart}.data', f'dut.data_cache_{hart}.dV'
+            observers.append(f'''  always @(posedge clock) if (!reset) begin
+    if ({core}_request_valid && {core}_request_ready) begin
+      {prefix}$display("ARCH_DATA_REQUEST %s %016h %0d %016h %02h %01h",
+        {core}_request_bits_atomic ? "atomic" : ({core}_request_bits_write ? "write" : "read"),
+        {core}_request_bits_address, 1 << {core}_request_bits_size,
+        {core}_request_bits_write ? {core}_request_bits_data & access_mask({core}_request_bits_size) : 64'b0,
+        {core}_request_bits_tag, {core}_request_bits_privileged);
+    end
+    if ({sample}.sampleValid) begin
+      {prefix}$display("CACHE_SAMPLE %016h %016h %02h", {sample}.sampleAddress,
+        {sample}.sampleData, {sample}.sampleTag);
+    end
+    if ({core}_response_valid && {core}_response_ready) begin
+      {prefix}$display("ARCH_DATA_RESPONSE %016h %01h %02h", {core}_response_bits_data,
+        {core}_response_bits_fault, {core}_response_bits_tag);
+    end
+  end''')
     (directory / 'fetch_observers.svh').write_text('\n'.join(observers) + '\n')
     if top == 'core_tb':
         names = re.findall(r'\bDitDahA1Core\s+(\w+)\s*\(', (rtl / 'DitDahA1.sv').read_text())
@@ -88,11 +108,12 @@ def compile_tb(rtl, directory, width, pa, top='core_tb', source=None, extra_file
             bindings.append(f'assign multiply_busy[{hart}] = {core}.backend.multiply.busy;')
             for kind, port in enumerate(('instruction', 'data')):
                 index = 2 * hart + kind
+                physical = f'dut.fabric.{port}_{hart}'
                 for channel in ('request', 'response'):
                     for field in ('valid', 'ready'):
-                        bindings.append(f'assign {channel}_{field}[{index}] = {core}.{port}_{channel}_{field};')
+                        bindings.append(f'assign {channel}_{field}[{index}] = {physical}_{channel}_{field};')
                     for field in (('address', 'data', 'size', 'mask', 'tag', 'write', 'fetch', 'atomic', 'atomicOperation', 'scEligible', 'privileged') if channel == 'request' else ('data', 'fault', 'tag')):
-                        bindings.append(f'assign {channel}s[{index}].{field} = {core}.{port}_{channel}_bits_{field};')
+                        bindings.append(f'assign {channel}s[{index}].{field} = {physical}_{channel}_bits_{field};')
             if interrupts:
                 ports += [f'.interrupts_{hart}_{name}(irq_by_hart[{hart}][{index}]),'
                           for index, name in enumerate(('software', 'timer', 'external'))]
@@ -415,8 +436,10 @@ def compare(binary, directory, config, transport='axi', selected=()):
                 assert observed == wanted, f'{name} trace {index}:\nactual {observed}\nexpected {wanted}'
             data_bus = [event for event in bus if event[0] != 'fetch']
             expected_bus = [event for event in model.bus if event[0] != 'fetch']
-            if transport == 'axi' and (any(event[0] == 'atomic' for event in model.requests) or name in ('fence_ordering', 'synchronization')):
-                check_multicore(lines, config, program, name, atomic_metadata=True)
+            cache_report = None
+            if transport == 'axi' and (config.get('dCacheBytes') or any(event[0] == 'atomic' for event in model.requests) or name in ('fence_ordering', 'synchronization')):
+                checked = check_multicore(lines, config, program, name, atomic_metadata=True)
+                cache_report = checked.get('dataCache')
             else:
                 assert data_bus == expected_bus, f'{name}: unexpected data accesses\nactual {data_bus}\nexpected {expected_bus}'
             if transport == 'memory':
@@ -424,7 +447,7 @@ def compare(binary, directory, config, transport='axi', selected=()):
                 requests = [(v[1], int(v[2], 16), int(v[3]), int(v[4], 16)) for line in lines
                             if line.startswith('REQUEST ') for v in [line.split()] if v[1] != 'fetch']
                 assert requests == [r for r in model.requests if r[0] != 'fetch'], f'{name}: unexpected Core requests'
-            if config.get('enableUserMode') or any(line.startswith('ACCESS_PRIVILEGE ') for line in lines):
+            if not config.get('dCacheBytes') and (config.get('enableUserMode') or any(line.startswith('ACCESS_PRIVILEGE ') for line in lines)):
                 check_access_privileges(lines, expected_modes, model.requests, model.request_privileges, config.get('enableUserMode', False))
             fetches = check_fetches(lines, config, program.faults, model.local_fetch_faults)
             if name == 'pipeline_redirect':
@@ -444,7 +467,8 @@ def compare(binary, directory, config, transport='axi', selected=()):
                     dependency_stalls += stalls
             count += len(actual)
             elapsed = next(int(line.split()[1]) for line in lines if line.startswith('CYCLES '))
-            reports.append(dict(test=name, seed=seed, events=len(actual), cycles=elapsed, busTransactions=len(bus), fetches=fetches))
+            reports.append(dict(test=name, seed=seed, events=len(actual), cycles=elapsed, busTransactions=len(bus), fetches=fetches,
+                                **(dict(dataCache=cache_report) if cache_report is not None else {})))
         print(f'  {name}: {len(expected)} events, three bus schedules', flush=True)
     assert reports, 'No selected scalar program'
     if not selected:
@@ -467,6 +491,9 @@ def check_multicore(lines, config, program, name, atomic_metadata=False, softwar
     for model in models:
         model.memory = memory
     pending, finished = [None] * harts, set()
+    architectural, cache_counts = [None] * harts, [Counter() for _ in range(harts)]
+    hit_addresses = [Counter() for _ in range(harts)]
+    data_cache = bool(config.get('dCacheBytes'))
     fetch_privileges, retired_privileges = [3] * harts, [3] * harts
     fetch_checks = [fetch_checker(config, program.faults, model.local_fetch_faults) for model in models]
     for checker in fetch_checks:
@@ -527,6 +554,8 @@ def check_multicore(lines, config, program, name, atomic_metadata=False, softwar
                 console_events.append((hart, data))
                 return 0
             old = sum(memory.get(address + byte, 0) << (byte * 8) for byte in range(size))
+            if kind == 'read':
+                response = (old, 0)
             if kind == 'write' or (kind == 'atomic' and operation != 2):
                 value = atomic_value(operation, old, data, size) if kind == 'atomic' and operation != 3 else data
                 for byte in range(size):
@@ -541,6 +570,16 @@ def check_multicore(lines, config, program, name, atomic_metadata=False, softwar
         models[hart].external_access = no_service
         assert len(accesses) == 1, 'Bus service did not match an architectural access'
         return response
+
+    def complete_data(hart):
+        access = architectural[hart]
+        if 'expected' not in access or 'response' not in access:
+            return
+        data, fault, tag = access['response']
+        expected, expected_fault = access['expected']
+        assert tag == access['tag'] and fault == expected_fault and (fault or data == expected), 'Architectural data response differs from independent service'
+        architectural[hart] = None
+        cache_counts[hart]['completed'] += 1
 
     for line in log_lines(lines):
         fields = line.split()
@@ -594,7 +633,7 @@ def check_multicore(lines, config, program, name, atomic_metadata=False, softwar
             continue
         if fields[:1] == ['HART']:
             hart, fields = int(fields[1]), fields[2:]
-        elif harts == 1 and fields and fields[0] in ('REQUEST', 'ACCESS_PRIVILEGE', 'ATOMIC', 'BUS', 'READ', 'WRITE', 'INTERFERE', 'RESPONSE', 'FETCH', 'IRQ', 'TRACE', 'ARCH_REQUEST', 'ARCH_FETCH', 'ARCH_CANCEL', 'LOCAL_REQUEST', 'LOCAL_RESPONSE'):
+        elif harts == 1 and fields and fields[0] in ('REQUEST', 'ACCESS_PRIVILEGE', 'ATOMIC', 'BUS', 'READ', 'WRITE', 'INTERFERE', 'RESPONSE', 'FETCH', 'IRQ', 'TRACE', 'ARCH_REQUEST', 'ARCH_FETCH', 'ARCH_CANCEL', 'LOCAL_REQUEST', 'LOCAL_RESPONSE', 'ARCH_DATA_REQUEST', 'ARCH_DATA_RESPONSE', 'CACHE_SAMPLE'):
             hart = 0
         else:
             continue
@@ -607,13 +646,52 @@ def check_multicore(lines, config, program, name, atomic_metadata=False, softwar
                 fetch_privileges[hart] = retired_privileges[hart]
             assert kind != 'ARCH_REQUEST' or not waiting[hart], 'New architectural fetch while waiting'
             continue
-        assert kind in ('REQUEST', 'ACCESS_PRIVILEGE', 'ATOMIC', 'BUS', 'READ', 'WRITE', 'INTERFERE', 'RESPONSE', 'FETCH', 'IRQ', 'TRACE', 'LOCAL_REQUEST', 'LOCAL_RESPONSE'), 'Unknown hart event'
-        if kind == 'REQUEST':
+        assert kind in ('REQUEST', 'ACCESS_PRIVILEGE', 'ATOMIC', 'BUS', 'READ', 'WRITE', 'INTERFERE', 'RESPONSE', 'FETCH', 'IRQ', 'TRACE', 'LOCAL_REQUEST', 'LOCAL_RESPONSE', 'ARCH_DATA_REQUEST', 'ARCH_DATA_RESPONSE', 'CACHE_SAMPLE'), 'Unknown hart event'
+        if kind == 'ARCH_DATA_REQUEST':
+            assert data_cache and architectural[hart] is None and pending[hart] is None, 'Overlapping architectural data requests'
+            event = fields[1], int(fields[2], 16), int(fields[3]), int(fields[4], 16)
+            assert event[0] in ('read', 'write', 'atomic') and int(fields[6], 16) == (models[hart].data_privilege() == 3), 'Architectural access context'
+            architectural[hart] = dict(event=event, tag=int(fields[5], 16))
+            cache_counts[hart]['accepted'] += 1
+            cache_counts[hart]['reads'] += int(event[0] == 'read')
+        elif kind == 'CACHE_SAMPLE':
+            access = architectural[hart]
+            address, value, tag = (int(field, 16) for field in fields[1:])
+            assert data_cache and access and not access.get('physical') and 'expected' not in access, 'Unowned, duplicate or physically serviced cache sample'
+            assert access['event'] == ('read', address, 8, 0) and access['tag'] == tag and address % 8 == 0, 'Cache sample request identity'
+            assert any(region.get('dataCacheable', False) and not region['device'] and region['readable']
+                       and int(region['base']) <= address and address + 8 <= int(region['base']) + int(region['size'])
+                       for region in config['memoryRegions']), 'Cache sample outside permitted cacheable RAM'
+            expected = service(hart, access['event'])
+            assert expected == (value, 0), 'Cache sample differs from independent shared memory'
+            access['expected'] = expected
+            cache_counts[hart]['hits'] += 1
+            hit_addresses[hart][address] += 1
+            cache_counts[hart]['hitsDuringPeerService'] += int(active is not None and active['hart'] != hart)
+            complete_data(hart)
+        elif kind == 'ARCH_DATA_RESPONSE':
+            access = architectural[hart]
+            assert data_cache and access and 'response' not in access, 'Unowned or duplicate architectural response'
+            access['response'] = tuple(int(field, 16) for field in fields[1:])
+            if not access.get('physical') and 'expected' not in access:
+                assert access['response'][1] and pending[hart] is None, 'Architectural response without a cache sample or physical service'
+                first = len(models[hart].requests)
+                pending[hart] = models[hart].step()
+                assert pending[hart][7] and [event for event in models[hart].requests[first:] if event[0] != 'fetch'] == [access['event']], 'Unexpected cache-local rejection'
+                access['expected'] = (0, 1)
+                cache_counts[hart]['rejectedReads'] += int(access['event'][0] == 'read')
+            complete_data(hart)
+        elif kind == 'REQUEST':
             assert active is None, 'Overlapping source ownership'
             event = fields[1], int(fields[2], 16), int(fields[3]), int(fields[4], 16)
             tag = int(fields[5], 16)
             privilege = fetch_privileges[hart] if event[0] == 'fetch' else models[hart].data_privilege() if hasattr(models[hart], 'data_privilege') else 3
             active = dict(hart=hart, event=event, tag=tag, bus=False, response=None, expectedPrivileged=privilege == 3)
+            if data_cache and event[0] != 'fetch':
+                access = architectural[hart]
+                assert access and access['event'] == event and access['tag'] == tag and 'expected' not in access and not access.get('physical'), 'Physical request lacks unique architectural ownership'
+                access['physical'] = True
+                cache_counts[hart]['physicalReads'] += int(event[0] == 'read')
             if event[0] == 'atomic':
                 instruction = sum(memory.get(models[hart].pc + byte, 0) << (8 * byte) for byte in range(4))
                 operation = instruction >> 27
@@ -745,10 +823,17 @@ def check_multicore(lines, config, program, name, atomic_metadata=False, softwar
                 expected_data, expected_fault = active['response']
                 assert fault == expected_fault and (fault or data == expected_data), 'Response data or fault mismatch'
                 assert not active.get('local') or active.get('localResponse'), 'Core response preceded local service'
+            if data_cache and channel:
+                access = architectural[hart]
+                assert access and access.get('physical') and 'expected' not in access
+                access['expected'] = active['response'] if active['bus'] else (1, 0) if not fault else (0, 1)
+                complete_data(hart)
             active = None
         elif kind == 'IRQ':
             if device is None:
                 models[hart].set_interrupts(int(fields[1], 16))
+                if models[hart].csrs[0x304] & models[hart].csrs[0x344]:
+                    waiting[hart] = False
             else:
                 assert int(fields[1], 16) == sum((bool(models[hart].csrs[0x344] & (1 << bit)) << index)
                                                for index, bit in enumerate((3, 7, 11))), 'Retirement IRQ disagrees with cycle sample'
@@ -758,13 +843,16 @@ def check_multicore(lines, config, program, name, atomic_metadata=False, softwar
             eligible, owned = models[hart].interrupt_cause(), pending[hart] is not None
             if pending[hart] is not None:
                 assert active is None or active['hart'] != hart or active['event'][0] == 'fetch', 'Memory operation retired before its response'
+                assert not data_cache or architectural[hart] is None, 'Memory operation retired before architectural response'
                 wanted, pending[hart] = pending[hart], None
             elif observed[8] >> 63:
                 wanted = models[hart].interrupt()
                 interrupts[hart] += 1
                 causes[hart, wanted[8] & 63] += 1
             else:
+                first = len(models[hart].requests)
                 wanted = models[hart].step()
+                assert not data_cache or not any(event[0] != 'fetch' for event in models[hart].requests[first:]), 'Retirement omitted an architectural data request'
             if eligible and not wanted[7]:
                 deferred[hart] += 1
                 assert owned and deferred[hart] == 1, 'Interrupt deferred beyond its memory owner'
@@ -802,12 +890,13 @@ def check_multicore(lines, config, program, name, atomic_metadata=False, softwar
                 sleep_cycles[hart] += device.cycle - wait_started[hart] + 1
     assert finished == set(range(harts)) and all(record is None for record in pending)
     assert active is None or active['event'][0] == 'fetch', 'Unretired data access at completion'
+    assert all(access is None for access in architectural), 'Uncompleted architectural data access'
     assert failures == 0, 'Exclusive failure stimulus was not consumed'
     assert not atomic_metadata or observed_reservations == reservation_max, 'Exclusive monitor coverage differs from independent reservations'
     if harts > 1:
         assert sources == set(range(2 * harts)) and collisions, 'Missing source or cross-hart tag collision'
     expected_interrupts = (Counter({hart: 2 * program.platform['rounds'] for hart in range(harts)}) if hasattr(program, 'platform') else
-                           Counter({getattr(program, 'interrupts', {}).get('hart', 0): 1}) if hasattr(program, 'interrupts') else Counter())
+                           Counter({program.interrupts.get('hart', 0): program.interrupts['mask'].bit_count()}) if hasattr(program, 'interrupts') else Counter())
     if software and software['kind'] == 'zephyr':
         assert all(causes[hart, 3] and causes[hart, 7] and not causes[hart, 11] for hart in range(harts)), 'Missing per-hart software/timer progress'
     else:
@@ -855,7 +944,7 @@ def check_multicore(lines, config, program, name, atomic_metadata=False, softwar
             assert model.registers[19] == tasks * (tasks + 1) // 2, 'Distributed work checksum'
         elif harts > 1 and 'atomic' in name and not hasattr(program, 'lrsc'):
             assert model.registers[18] == harts * (harts + 1) // 2, 'Release/acquire publication'
-        elif harts > 1 and not hasattr(program, 'lrsc') and not name.startswith('user_'):
+        elif harts > 1 and not hasattr(program, 'lrsc') and not hasattr(program, 'data_cache') and not name.startswith('user_'):
             assert model.registers[8] == (hart + 1) % harts + 1, 'Mailbox exchange did not complete'
             assert model.registers[12] == 1 and effects[hart, base + 0x5100] == 1, 'Private data or device effect'
             assert model.registers[17] == hart and (name == 'interrupt' or model.registers[19] == hart), 'Hart identity or read-only CSR'
@@ -865,8 +954,21 @@ def check_multicore(lines, config, program, name, atomic_metadata=False, softwar
             fetch_checks[hart].send(None)
         except StopIteration:
             pass
+    if data_cache:
+        assert all(count['accepted'] == count['completed'] and count['reads'] == count['hits'] + count['physicalReads'] + count['rejectedReads'] for count in cache_counts), 'Cached read accounting differs from architectural requests'
+    if data_cache and hasattr(program, 'data_cache'):
+        job = program.data_cache
+        for hart, count in enumerate(cache_counts):
+            addresses = job.get('addresses', ())
+            count['witnessHits'] = sum(hit_addresses[hart][address] for address in addresses) if addresses else count['hits']
+            assert count['witnessHits'] >= job['minHits'] and all(hit_addresses[hart][address] for address in addresses), 'Missing target-address private-cache hits'
+        for hart, registers in enumerate(job.get('finalRegisters', [job.get('expectedRegisters', {})] * harts)):
+            assert all(models[hart].registers[int(register)] == value for register, value in registers.items()), 'Cache program register result'
+        if 'witnesses' in job:
+            assert all(sum(memory.get(job['witnesses'] + hart * job['stride'] + 8 * index + byte, 0) << (8 * byte) for byte in range(8)) == value
+                       for hart in range(harts) for index, value in enumerate(job['values'])), 'Coherence publication witness'
     assert not console_events, 'Console service was not printed'
-    return dict(**(dict(results=results) if software_output else {}), events=events, activeHarts=len(finished), sources=sorted(sources),
+    return dict(**(dict(results=results) if software_output else {}), **(dict(dataCache=[dict(count) for count in cache_counts]) if data_cache else {}), events=events, activeHarts=len(finished), sources=sorted(sources),
                 cycles=elapsed_cycles, transactions=transactions, axiTransactions=axi_transactions,
                 collidingTags=len(collisions), readsBeforePeerRetirement=overtaken, concurrency=dict(concurrent),
                 platformCycles=device.cycle + 1 if device is not None else 0,
@@ -906,7 +1008,7 @@ def compare_multicore(binary, directory, config, selected=(), platform=False):
             lines = log.read_text().splitlines()
             assert 'PASS' in lines, f'{name}: incomplete multicore run'
             reports.append(dict(test=name, seed=seed, **check_multicore(lines, config, program, name, atomic_metadata=True)))
-        if harts > 1 and 'atomic' not in name and not hasattr(program, 'synchronization') and not platform and not name.startswith('user_'):
+        if harts > 1 and 'atomic' not in name and not hasattr(program, 'synchronization') and not hasattr(program, 'data_cache') and not platform and not name.startswith('user_'):
             concurrent = Counter()
             for report in reports[first:]:
                 concurrent.update(report['concurrency'])
@@ -916,11 +1018,96 @@ def compare_multicore(binary, directory, config, selected=(), platform=False):
     return dict(events=sum(report['events'] for report in reports), cases=reports)
 
 
+def check_data_oracle():
+    config = dict(configuration(64), hartCount=2, enableInterrupts=False, dCacheBytes=8192)
+    config['memoryRegions'][0]['dataCacheable'] = True
+    instructions = (0x10000093, 0x0000b103, 0x0000b183, 0x00000013)
+    memory = {4 * index + byte: (word >> (8 * byte)) & 255 for index, word in enumerate(instructions) for byte in range(4)}
+    memory[0x100] = 42
+    program = SimpleNamespace(memory=memory, faults={}, stop=12,
+                              data_cache=dict(minHits=1, addresses=[0x100], expectedRegisters={'2': 42, '3': 42}))
+    models = [Model(config, memory, {}) for _ in range(2)]
+    lines = []
+
+    def emit(hart, event):
+        lines.append(f'HART {hart} {event}')
+
+    def fetch(hart, index, complete=True):
+        address, word = index * 4, instructions[index]
+        emit(hart, f'REQUEST fetch {address:x} 4 0 {index:x}')
+        emit(hart, 'ACCESS_PRIVILEGE 1')
+        emit(hart, f'BUS fetch {address:x} 4 0')
+        if complete:
+            fetch_response(hart, index)
+
+    def fetch_response(hart, index):
+        address, word = index * 4, instructions[index]
+        emit(hart, f'READ {address:x} 0 {word:x}')
+        emit(hart, f'FETCH {address:x} 0 {word:x}')
+        emit(hart, f'RESPONSE 0 {word:x} 0 {index:x}')
+
+    def trace(hart):
+        emit(hart, 'TRACE ' + ' '.join(f'{field:x}' for field in models[hart].step()))
+
+    for hart in range(2):
+        fetch(hart, 0)
+        trace(hart)
+        fetch(hart, 1)
+        emit(hart, 'ARCH_DATA_REQUEST read 100 8 0 1 1')
+        emit(hart, 'REQUEST read 100 8 0 1')
+        emit(hart, 'ACCESS_PRIVILEGE 1')
+        emit(hart, 'BUS read 100 8 0')
+        emit(hart, 'READ 100 0 2a')
+        emit(hart, 'RESPONSE 1 2a 0 1')
+        emit(hart, 'ARCH_DATA_RESPONSE 2a 0 1')
+        trace(hart)
+        fetch(hart, 2)
+        emit(hart, 'ARCH_DATA_REQUEST read 100 8 0 2 1')
+    fetch(1, 3, complete=False)
+    for hart in range(2):
+        emit(hart, 'CACHE_SAMPLE 100 2a 2')
+        emit(hart, 'ARCH_DATA_RESPONSE 2a 0 2')
+        trace(hart)
+    fetch_response(1, 3)
+    fetch(0, 3)
+    trace(0)
+    trace(1)
+    lines += ['COVER 1 1 1 1 1 1', 'EXCLUSIVE 0', 'PASS']
+    report = check_multicore(lines, config, program, 'data_oracle', atomic_metadata=True)
+    assert report['dataCache'][0]['hitsDuringPeerService'] == 1
+    sample = lines.index('HART 0 CACHE_SAMPLE 100 2a 2')
+    request = lines.index('HART 0 ARCH_DATA_REQUEST read 100 8 0 2 1')
+    response = sample + 1
+    mutations = dict(
+        staleSample=(sample, ['HART 0 CACHE_SAMPLE 100 29 2']),
+        sampleTag=(sample, ['HART 0 CACHE_SAMPLE 100 2a 3']),
+        duplicateSample=(sample, [lines[sample], lines[sample]]),
+        missingRequest=(request, []),
+        missingSample=(sample, []),
+        wrongResponse=(response, ['HART 0 ARCH_DATA_RESPONSE 29 0 2']),
+        missingResponse=(response, []),
+        responseTag=(response, ['HART 0 ARCH_DATA_RESPONSE 2a 0 3']))
+    for name, (index, replacement) in mutations.items():
+        try:
+            check_multicore([*lines[:index], *replacement, *lines[index + 1:]], config, program, 'data_oracle', atomic_metadata=True)
+        except AssertionError:
+            continue
+        raise AssertionError(f'Data oracle accepted {name}')
+    program.data_cache['addresses'] = [0x108]
+    try:
+        check_multicore(lines, config, program, 'data_oracle', atomic_metadata=True)
+    except AssertionError:
+        return [*mutations, 'missingTargetHit']
+    raise AssertionError('Data oracle credited unrelated cache hits')
+
+
 def load_software(image, config_path):
     from elftools.elf.elffile import ELFFile
 
     document = json.loads(config_path.read_text())
     config = document.get('parameters', document)
+    for region in config['memoryRegions']:
+        region.setdefault('dataCacheable', False)
     manifest = json.loads(image.with_name('manifest.json').read_text())
     assert hashlib.sha256(config_path.read_bytes()).hexdigest() == manifest['configurationHash'], 'Software configuration changed'
     assert hashlib.sha256(image.read_bytes()).hexdigest() == manifest['imageHash'], 'Software image changed'
@@ -1128,6 +1315,7 @@ def main():
     parser.add_argument('--interrupts', action='store_true', help='Run only enabled interrupt profiles')
     parser.add_argument('--pmp-entries', type=int, choices=(0, 16))
     parser.add_argument('--icache-bytes', type=int, choices=(0, 8192, 16384, 32768, 65536), default=0)
+    parser.add_argument('--dcache-bytes', type=int, choices=(0, 8192), default=0)
     parser.add_argument('--case', dest='selected', action='append', default=[])
     parser.add_argument('--traffic-baseline', type=Path)
     args = parser.parse_args()
@@ -1148,7 +1336,7 @@ def main():
     summary_path.unlink(missing_ok=True)
     test_hashes = test_source_hashes()
     summary = {'scope': 'implemented scalar subset; simulation and assertions', 'selectedCases': args.selected,
-               'fetchOracleGuards': check_fetch_oracle(), 'configurations': []}
+               'fetchOracleGuards': check_fetch_oracle(), 'dataOracleGuards': check_data_oracle(), 'configurations': []}
     frozen_sources = None
 
     def freeze_sources(manifest):
@@ -1169,7 +1357,8 @@ def main():
         directory = args.output / f'{"irq-" if interrupts else ""}{"pmp16-" if entries else ""}axi{width}'
         directory.mkdir(parents=True, exist_ok=True)
         config = configuration(width)
-        config.update(pmpEntries=entries, enableInterrupts=interrupts, iCacheBytes=args.icache_bytes)
+        config.update(pmpEntries=entries, enableInterrupts=interrupts, iCacheBytes=args.icache_bytes, dCacheBytes=args.dcache_bytes)
+        config['memoryRegions'][0]['dataCacheable'] = bool(args.dcache_bytes)
         if args.user_mode:
             config['enableUserMode'] = True
         config_path = directory / 'input.json'
@@ -1193,10 +1382,10 @@ def main():
         report = compare(binary, directory, manifest['parameters'], selected=args.selected)
         report['interfaceContracts'] = interface_contracts
         report['instructionStorage'] = storage
-        report.update(axiDataBits=width, physicalAddressBits=config['physicalAddressBits'], pmpEntries=entries, enableInterrupts=interrupts, iCacheBytes=args.icache_bytes)
+        report.update(axiDataBits=width, physicalAddressBits=config['physicalAddressBits'], pmpEntries=entries, enableInterrupts=interrupts, iCacheBytes=args.icache_bytes, dCacheBytes=args.dcache_bytes)
         summary['configurations'].append(report)
         core = directory / 'core'
-        core_config = dict(config, axiDataBits=256)
+        core_config = dict(config, axiDataBits=256, dCacheBytes=0)
         core_key = json.dumps(core_config, sort_keys=True)
         if core_key in core_profiles:
             report['coreReuse'] = core_profiles[core_key]
@@ -1225,14 +1414,15 @@ def main():
                 continue
             directory = args.output / f'harts{harts}-axi{width}'
             directory.mkdir(parents=True, exist_ok=True)
-            config = dict(configuration(width), hartCount=harts, pmpEntries=entries, enableInterrupts=interrupts, iCacheBytes=args.icache_bytes)
+            config = dict(configuration(width), hartCount=harts, pmpEntries=entries, enableInterrupts=interrupts, iCacheBytes=args.icache_bytes, dCacheBytes=args.dcache_bytes)
+            config['memoryRegions'][0]['dataCacheable'] = bool(args.dcache_bytes)
             if args.user_mode:
                 config['enableUserMode'] = True
             if args.platform_only:
                 local_base = int(config['resetVector']) + 0x10000
                 config.update(localInterruptBase=str(local_base))
                 config['memoryRegions'].append(dict(base=str(local_base), size=str(65536), readable=True,
-                                                    writable=True, executable=False, device=True, atomic=False))
+                                                    writable=True, executable=False, device=True, atomic=False, dataCacheable=False))
             config_path, rtl = directory / 'input.json', directory / 'rtl'
             config_path.write_text(json.dumps(config, indent=2) + '\n')
             if not args.use_generated:
@@ -1246,10 +1436,11 @@ def main():
             report = compare_multicore(binary, directory, manifest['parameters'], args.selected, args.platform_only)
             report['interfaceContracts'] = verify_contracts(
                 rtl, directory / 'contracts', modules=('DitDahA1MemoryArbiter', 'DitDahA1MemoryFabric',
+                                                      *(('DitDahA1DataCache', 'DitDahA1Coherence') if args.dcache_bytes else ()),
                                                       *(('DitDahA1LocalInterrupts',) if args.platform_only else ())))
             report['instructionStorage'] = verify_storage(rtl, directory / 'storage')
-            report.update(hartCount=harts, axiDataBits=width, pmpEntries=entries, enableInterrupts=interrupts, iCacheBytes=args.icache_bytes)
-            if not args.icache_bytes and not args.platform_only:
+            report.update(hartCount=harts, axiDataBits=width, pmpEntries=entries, enableInterrupts=interrupts, iCacheBytes=args.icache_bytes, dCacheBytes=args.dcache_bytes)
+            if not args.icache_bytes and not args.dcache_bytes and not args.platform_only:
                 for count in ((15, 16) if harts == 16 else (harts,)):
                     Path(f'result/harts{count}-input.json').write_text(json.dumps(dict(config, hartCount=count), indent=2) + '\n')
             summary['configurations'].append(report)
