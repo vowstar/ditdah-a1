@@ -63,8 +63,8 @@ External writers require platform coordination; no DMA coherence is implemented.
 Set `pmpEntries` to 16 to enable protection; successful PMP writes restart younger execution while accepted fetches drain.
 Set `enableUserMode` for Bare M/U execution and effective data privilege via MPRV.
 Set `enableSupervisorMode` with user mode and interrupts for M/S/U, standard trap delegation and SRET.
-Set `virtualAddressBits` to 39 for Sv39/Svade with 4 KiB/2 MiB/1 GiB pages, ASIDLEN=0 and no TLB; zero selects Bare.
-Page-table reads share the data path under S-mode PMP/PMA; SFENCE.VMA orders local translation and drains canceled reads.
+Set `virtualAddressBits` to 39 for Sv39/Svade with 4 KiB/2 MiB/1 GiB pages and ASIDLEN=0; zero selects Bare. PTE reads share the data path under S-mode PMP/PMA.
+Set `tlbEntries` to 0/2/4 for uncached/two/four-entry per-hart I/D translation; local SFENCE.VMA, satp and PMP maintenance invalidate entries and exclude stale refills while canceled reads drain.
 Set `enableInterrupts` to true for precise machine interrupt entry and return; platform logic owns interrupt sources.
 System interrupt inputs are indexed by hart; each hart has independent CSR and PMP state.
 An optional `localInterruptBase` maps protected software-interrupt and 64-bit timer registers; `timeTick` supplies the synchronous timebase.

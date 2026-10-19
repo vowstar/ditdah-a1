@@ -13,11 +13,12 @@ import subprocess
 def load_configuration(args):
     sv39 = getattr(args, 'sv39', False)
     supervisor_mode = getattr(args, 'supervisor_mode', False) or sv39
+    tlb_entries = getattr(args, 'tlb_entries', None)
     original = args.config
     content = original.read_bytes()
     document = json.loads(content)
     config = document.get('parameters', document)
-    if args.harts is None and args.icache_bytes is None and args.dcache_bytes is None and not supervisor_mode:
+    if args.harts is None and args.icache_bytes is None and args.dcache_bytes is None and not supervisor_mode and tlb_entries is None:
         return config, {}
     if args.harts is not None:
         config['hartCount'] = args.harts
@@ -29,6 +30,8 @@ def load_configuration(args):
         config.update(enableSupervisorMode=True, enableUserMode=True, enableInterrupts=True)
     if sv39:
         config['virtualAddressBits'] = 39
+    if tlb_entries is not None:
+        config['tlbEntries'] = tlb_entries
     args.config = args.output / 'input.json'
     assert args.config.resolve() != original.resolve(), 'Derived configuration would overwrite its source'
     args.config.write_text(json.dumps(config, indent=2) + '\n')
@@ -48,6 +51,7 @@ def main():
     parser.add_argument('--dcache-bytes', type=int, choices=(0, 8192))
     parser.add_argument('--supervisor-mode', action='store_true')
     parser.add_argument('--sv39', action='store_true')
+    parser.add_argument('--tlb-entries', type=int, choices=(0, 2, 4))
     parser.add_argument('--expected-interrupt', type=int, choices=(1, 3, 5, 7, 9, 11), action='append', default=[])
     args = parser.parse_args()
     args.output.mkdir(parents=True, exist_ok=True)
@@ -70,6 +74,8 @@ def main():
     image = args.output / 'software.elf'
     definitions = dict(__ram_base=base, __ram_bytes=int(ram['size']), __hart_count=harts,
                        __stack_bytes=args.stack_bytes, __console_base=console)
+    if config.get('localInterruptBase') is not None:
+        definitions['__local_interrupt_base'] = int(config['localInterruptBase'])
     command = [args.tool_prefix + 'gcc', '-march=rv64i_zicsr_zifencei',
                f'-DDITDAH_RAM_BASE={base}', f'-DDITDAH_RAM_BYTES={int(ram["size"])}',
                f'-DDITDAH_CONSOLE_BASE={console}', '-mabi=lp64', '-mcmodel=medany',

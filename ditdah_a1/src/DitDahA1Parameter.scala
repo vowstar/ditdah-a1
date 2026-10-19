@@ -10,6 +10,7 @@ case class DitDahA1Parameter(
   hartCount: Int = 1,
   physicalAddressBits: Int = 56,
   virtualAddressBits: Int = 39,
+  tlbEntries: Int = 0,
   iCacheBytes: Int = 32768,
   dCacheBytes: Int = 32768,
   l2CacheBytes: Int = 262144,
@@ -28,6 +29,7 @@ case class DitDahA1Parameter(
   require(hartCount >= 1 && hartCount <= 16, "hartCount must be between 1 and 16")
   require(physicalAddressBits >= 32 && physicalAddressBits <= 56, "physicalAddressBits must be between 32 and 56")
   require(Set(0, 39, 48).contains(virtualAddressBits), "virtualAddressBits must select Bare, Sv39 or Sv48")
+  require(Set(0, 2, 4).contains(tlbEntries), "tlbEntries must be zero, two or four")
   require(resetVector >= 0 && resetVector < (BigInt(1) << physicalAddressBits), "resetVector must fit the physical address space")
   require((resetVector & 1) == 0, "resetVector must be halfword aligned")
   require(iCacheBytes == 0 || (powerOfTwo(iCacheBytes) && iCacheBytes >= 8192 && iCacheBytes <= 65536), "iCacheBytes must be a power of two between 8192 and 65536")
@@ -52,6 +54,7 @@ case class DitDahA1Parameter(
 
   def validateCore(): Unit =
     require(Set(0, 39).contains(virtualAddressBits), "RTL supports Bare or Sv39 addressing")
+    require(tlbEntries == 0 || enableTranslation, "Translation cache requires Sv39")
     validateFrontend()
     validateBackend()
 

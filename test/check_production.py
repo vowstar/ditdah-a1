@@ -16,6 +16,7 @@ parser.add_argument('--harts', type=int, nargs='+', choices=(2, 3, 15, 16), defa
 parser.add_argument('--data-cache', action='store_true')
 parser.add_argument('--supervisor', action='store_true')
 parser.add_argument('--sv39', action='store_true')
+parser.add_argument('--tlb-entries', type=int, choices=(0, 2, 4), default=0)
 args = parser.parse_args()
 
 load_configuration = runpy.run_path('scripts/build_software.py')['load_configuration']
@@ -23,7 +24,7 @@ source = Path('software/platform.json')
 original = source.read_bytes()
 baseline = json.loads(original)
 directory = Path('result/software-config-checks') / ('sv39' if args.sv39 else 'supervisor' if args.supervisor else 'data-cache' if args.data_cache else 'base')
-for name, overrides in (('unchanged', {}), ('derived', dict(harts=2)), ('supervisor', dict(harts=2, supervisor_mode=True)), ('sv39', dict(harts=2, sv39=True))):
+for name, overrides in (('unchanged', {}), ('derived', dict(harts=2)), ('supervisor', dict(harts=2, supervisor_mode=True)), ('sv39', dict(harts=2, sv39=True)), ('cache', dict(tlb_entries=2))):
     output = directory / name
     output.mkdir(parents=True, exist_ok=True)
     selection = SimpleNamespace(config=source, output=output, harts=None, icache_bytes=None, dcache_bytes=None)
@@ -32,6 +33,7 @@ for name, overrides in (('unchanged', {}), ('derived', dict(harts=2)), ('supervi
     assert selected['hartCount'] == overrides.get('harts', baseline['hartCount'])
     assert bool(selected.get('enableSupervisorMode')) == bool(overrides.get('supervisor_mode') or overrides.get('sv39'))
     assert selected['virtualAddressBits'] == (39 if overrides.get('sv39') else baseline['virtualAddressBits'])
+    assert selected.get('tlbEntries', 0) == overrides.get('tlb_entries', 0)
     if overrides.get('supervisor_mode') or overrides.get('sv39'):
         assert selected['enableUserMode'] and selected['enableInterrupts']
     if selection.config != source:
@@ -48,7 +50,7 @@ if args.data_cache:
     profiles = (('production-dcache', 'DitDahA1'), ('production-dcache-harts16', 'DitDahA1'),
                 ('fabric-dcache', 'DitDahA1MemoryFabric'))
 if args.supervisor or args.sv39:
-    profiles = (('production-sv39' if args.sv39 else 'production-supervisor', 'DitDahA1'),)
+    profiles = (('production-sv39' + (f'-tlb{args.tlb_entries}' if args.tlb_entries else '') if args.sv39 else 'production-supervisor', 'DitDahA1'),)
 for directory, top in profiles:
     rtl = Path("result") / directory
     manifest = json.loads((rtl / 'ditdah_a1_config.json').read_text())
@@ -75,6 +77,9 @@ for directory, top in profiles:
         assert count == 16 and manifest['parameters']['enableSupervisorMode']
         assert manifest['implementation']['privilege'] == 'MSU' and 'sret' in manifest['implementation']['instructions']
     assert ('DitDahA1Translation.sv' in files) == args.sv39
+    assert manifest['implementation']['tlbEntries'] == args.tlb_entries
+    if args.sv39:
+        assert ('tlbValid' in (rtl / 'DitDahA1Translation.sv').read_text()) == bool(args.tlb_entries)
     if args.sv39:
         assert manifest['parameters']['virtualAddressBits'] == 39
         assert manifest['implementation']['translation'] == 'Sv39/Svade'
@@ -127,7 +132,8 @@ for index, (top, overrides, diagnostic) in enumerate((
         ('DitDahA1Frontend', {'resetVector': '2'}, 'Frontend requires a word-aligned resetVector'),
         ('DitDahA1MemoryFabric', {'axiDataBits': 96}, 'axiDataBits must be'),
         ('DitDahA1MemoryFabric', {'memoryRegions': [{'base': '0', 'size': '16'}, {'base': '8', 'size': '8'}]}, 'Memory regions must not overlap'),
-        ('DitDahA1Core', {'virtualAddressBits': 48}, 'RTL supports Bare or Sv39 addressing'))):
+        ('DitDahA1Core', {'virtualAddressBits': 48}, 'RTL supports Bare or Sv39 addressing'),
+        ('DitDahA1Core', {'tlbEntries': 2}, 'Translation cache requires Sv39'))):
     config = directory / f'{top}-{index}.json'
     config.write_text(json.dumps(dict(parameters, **overrides)) + '\n')
     result = subprocess.run(['build-ditdah-a1', '--top', top, '--config', str(config),

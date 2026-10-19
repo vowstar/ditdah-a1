@@ -59,6 +59,17 @@ object DitDahA1ParameterCheck:
     assert(DitDahA1Config.parameter(DitDahA1Config.document(paged)) == paged)
     assert(DitDahA1Config.document(paged)("implementation")("translation").str == "Sv39/Svade")
     assert(DitDahA1Config.document(paged)("implementation")("instructions").arr.exists(_.str == "sfence.vma"))
+    for entries <- Seq(0, 2, 4) do
+      val cached = paged.copy(tlbEntries = entries)
+      cached.validateCore()
+      assert(DitDahA1Config.parameter(DitDahA1Config.document(cached)) == cached)
+      assert(DitDahA1Config.document(cached)("implementation")("tlbEntries").num == entries)
+    rejects { paged.copy(tlbEntries = 1); () }
+    rejects { paged.copy(tlbEntries = 8); () }
+    rejects { supervisor.copy(tlbEntries = 2).validateCore() }
+    supervisor.copy(tlbEntries = 2).validateFrontend()
+    supervisor.copy(tlbEntries = 2).validateBackend()
+    supervisor.copy(tlbEntries = 2).validateFabric()
     rejects { paged.copy(enableSupervisorMode = false).validateRtl() }
     rejects { paged.copy(enableSupervisorMode = false).validateCore() }
     rejects { paged.copy(enableSupervisorMode = false).validateFrontend() }

@@ -1480,6 +1480,7 @@ def translation_contract(parameters):
     base, pa = int(parameters['resetVector']), parameters['physicalAddressBits']
     root, middle, bottom = base + 0x1000, base + 0x2000, base + 0x3000
     body = '    reset = 1; tick(); reset = 0; tick();\n'
+    flush = '    invalidate = 1; tick(); invalidate = 0; tick();\n' if parameters.get('tlbEntries') else ''
     if parameters['pmpEntries']:
         body += f"    pmp_config = 'h1f; pmp_address = 'h{(1 << (pa - 2)) - 1:x};\n"
     vectors = []
@@ -1512,6 +1513,7 @@ def translation_contract(parameters):
         except Fault as error:
             fault, cause = True, error.cause
         port = index % 2
+        body += flush
         body += f'''    state_satp = 64'h{(8 << 60) | root >> 12:x}; state_sum = {int(bool(status & (1 << 18)))}; state_mxr = {int(bool(status & (1 << 19)))};
     ports_{port}_request_bits_address = 64'h{address:x}; ports_{port}_request_bits_privilege = {privilege};
     ports_{port}_request_bits_fetch = {int(kind == 'fetch')}; ports_{port}_request_bits_write = {int(kind == 'write')};
@@ -1530,6 +1532,25 @@ def translation_contract(parameters):
         body += f'''    while (!ports_{port}_response_valid) tick();
     repeat (2) begin
       check(!ports_{1-port}_response_valid && ports_{port}_response_bits_fault == {int(fault)} && ports_{port}_response_bits_cause == {cause} && ports_{port}_response_bits_address == 64'h{physical:x} && !memory_request_valid, "Independent page walk and retained response"); tick();
+    end
+    ports_{port}_response_ready = 1; tick(); ports_{port}_response_ready = 0;
+'''
+        if parameters.get('tlbEntries') and reads and not fault:
+            hit_address = address + (8 if address <= MASK - 15 and address % 4096 < 4088 else 0)
+            for hit_kind, hit_privilege, hit_status in ((kind, privilege, status), ('write', privilege, status),
+                    ('read', privilege, status ^ (1 << 19)), (kind, 1 - privilege, status ^ (1 << 18))):
+                hit_fault, hit_cause, hit_physical = False, 0, hit_address
+                try:
+                    hit_physical = sv39_walk(hit_address, hit_kind, hit_privilege, (8 << 60) | root >> 12, hit_status, lambda physical: entries.get(physical, 0))
+                except Fault as error:
+                    hit_fault, hit_cause = True, error.cause
+                body += f'''    state_satp = 64'h{(8 << 60) | root >> 12:x}; state_sum = {int(bool(hit_status & (1 << 18)))}; state_mxr = {int(bool(hit_status & (1 << 19)))};
+    ports_{port}_request_bits_address = 64'h{hit_address:x}; ports_{port}_request_bits_privilege = {hit_privilege};
+    ports_{port}_request_bits_fetch = {int(hit_kind == 'fetch')}; ports_{port}_request_bits_write = {int(hit_kind == 'write')};
+    ports_{port}_request_valid = 1; #1; while (!ports_{port}_request_ready) tick(); tick(); ports_{port}_request_valid = 0;
+    while (!ports_{port}_response_valid) begin check(!memory_request_valid, "Warm translation repeated page-table service"); tick(); end
+    repeat (2) begin
+      check(!memory_request_valid && ports_{port}_response_bits_fault == {int(hit_fault)} && ports_{port}_response_bits_cause == {hit_cause} && ports_{port}_response_bits_address == 64'h{hit_physical:x}, "Cached page size, offset and current permissions"); tick();
     end
     ports_{port}_response_ready = 1; tick(); ports_{port}_response_ready = 0;
 '''

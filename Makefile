@@ -1,12 +1,13 @@
 # SPDX-FileCopyrightText: 2026 Huang Rui <vowstar@gmail.com>
 # SPDX-License-Identifier: MIT
 
-.PHONY: config check rtl software verify-software verify-data-software verify-supervisor-software zephyr verify-zephyr verify-zephyr-long verify-signoff verify-simulation verify-production verify-cache verify-platform verify-user verify-data-cache verify-supervisor verify-formal verify-scalar-formal verify-user-formal verify-data-formal verify-supervisor-formal verify-translation verify-translation-formal verify-translation-software clean
+.PHONY: config check rtl software verify-software verify-data-software verify-supervisor-software zephyr verify-zephyr verify-zephyr-long verify-signoff verify-simulation verify-production verify-cache verify-platform verify-user verify-data-cache verify-supervisor verify-formal verify-scalar-formal verify-user-formal verify-data-formal verify-supervisor-formal verify-translation verify-translation-formal verify-translation-software verify-translation-cache verify-translation-cache-formal verify-translation-cache-software clean
 
 HART_COUNTS ?= 2 3 15 16
 ICACHE_CASES := pipeline_reuse cache_replacement fence_ordering fence_i_prefetch synchronization atomic_ordering atomic_denied atomic_retry bus_fetch pipeline_redirect pmp_fetch pmp_update interrupt_fence interrupt_fence_i interrupt_fetch_fault
 USER_CASES := user_access user_system user_wait user_protection user_fetch user_mprv
 SUPERVISOR_CASES := supervisor_traps supervisor_csr supervisor_mprv
+TRANSLATION_CASES := sv39_data sv39_reuse sv39_protection sv39_large sv39_gigantic sv39_accessed sv39_dirty sv39_user_denied sv39_sum sv39_mxr sv39_canonical sv39_context
 SOFTWARE_HARTS ?= 2
 SOFTWARE_CONFIG ?= software/platform.json
 SOFTWARE_OUTPUT ?= result/software
@@ -118,17 +119,36 @@ verify-data-cache: verify-user
 	python3 test/check_production.py --data-cache
 	$(MAKE) verify-data-software
 
-verify-formal: verify-translation-formal
+verify-formal: verify-translation-cache-formal
+
+verify-translation-cache: verify-translation-formal
+	python3 test/verify.py --sv39 --tlb-entries 2 --width 64 --pmp-entries 16 --output result/translation-cache-small $(foreach name,$(TRANSLATION_CASES),--case $(name))
+	python3 test/verify.py --sv39 --tlb-entries 2 --width 64 --pmp-entries 0 --output result/translation-cache-pmp0 --case sv39_reuse --case sv39_context
+	python3 test/verify.py --sv39 --tlb-entries 4 --width 512 --pmp-entries 16 --icache-bytes 8192 --dcache-bytes 8192 --output result/translation-tlb --case sv39_reuse --case sv39_protection --case sv39_sum --case sv39_mxr --case sv39_context
+	$(MAKE) verify-translation-cache-software
+	build-ditdah-a1 --no-trace --config $(SOFTWARE_OUTPUT)/translation-cache/harts16-cache8192/input.json --output result/production-sv39-tlb4
+	python3 test/check_production.py --sv39 --tlb-entries 4
+
+verify-translation-cache-formal: verify-translation-cache
+	python3 test/formal.py --rtl result/translation-cache-small/irq-pmp16-axi64/rtl --output result/formal/translation-cache-small --modules Translation
+	python3 test/formal.py --rtl result/translation-cache-pmp0/irq-axi64/rtl --output result/formal/translation-cache-pmp0 --modules Translation
+	python3 test/formal.py --rtl result/translation-tlb/irq-pmp16-axi512/rtl --output result/formal/translation-tlb --modules Translation
+
+verify-translation-cache-software:
+	$(MAKE) verify-translation-software SOFTWARE_TLB_ENTRIES=4 TRANSLATION_SOFTWARE_DIR=translation-cache
+
+SOFTWARE_TLB_ENTRIES ?= 0
+TRANSLATION_SOFTWARE_DIR ?= translation
 
 verify-translation-software:
 	for count in 1 2 16; do for cache in 0 8192; do \
-		image=$(SOFTWARE_OUTPUT)/translation/harts$$count-cache$$cache; \
-		python3 scripts/build_software.py --config $(SOFTWARE_CONFIG) --sv39 --harts $$count --icache-bytes $$cache --dcache-bytes $$cache --console-base 0x10000000 --program software/tests/virtual_memory.S --stack-bytes 512 --output $$image && \
+		image=$(SOFTWARE_OUTPUT)/$(TRANSLATION_SOFTWARE_DIR)/harts$$count-cache$$cache; \
+		python3 scripts/build_software.py --config $(SOFTWARE_CONFIG) --sv39 --tlb-entries $(SOFTWARE_TLB_ENTRIES) --expected-interrupt 3 --harts $$count --icache-bytes $$cache --dcache-bytes $$cache --console-base 0x10000000 --program software/tests/virtual_memory.S --stack-bytes 512 --output $$image && \
 		python3 test/verify.py --elf $$image/software.elf --config $$image/input.json --output $$image/verification --software-transactions $$((4096 * count)) --jobs $(SOFTWARE_JOBS) || exit $$?; \
 	done; done
 
 verify-translation: verify-supervisor-formal
-	python3 test/verify.py --sv39 --width 64 --pmp-entries 16 --output result/translation --case sv39_data --case sv39_large --case sv39_gigantic --case sv39_accessed --case sv39_dirty --case sv39_user_denied --case sv39_sum --case sv39_mxr --case sv39_canonical --case sv39_context
+	python3 test/verify.py --sv39 --width 64 --pmp-entries 16 --output result/translation $(foreach name,$(TRANSLATION_CASES),--case $(name))
 	python3 test/verify.py --sv39 --width 512 --pmp-entries 16 --icache-bytes 8192 --dcache-bytes 8192 --output result/translation-cache --case sv39_data --case sv39_sum --case sv39_mxr --case sv39_context
 	$(MAKE) verify-translation-software
 	build-ditdah-a1 --no-trace --config $(SOFTWARE_OUTPUT)/translation/harts16-cache8192/input.json --output result/production-sv39

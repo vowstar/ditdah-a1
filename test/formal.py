@@ -831,6 +831,79 @@ def translation_case(parameters):
       end
     end
 ''' for port in range(2)) + '  end\n'
+    if parameters.get('tlbEntries'):
+        count = parameters['tlbEntries']
+        hit = [f"(tlbValid[{i}] && (virtual_address[38:12] >> (9 * tlb_{i}_level)) == (tlb_{i}_vpn >> (9 * tlb_{i}_level)))" for i in range(count)]
+        cached_pte = ''.join(f'{hit[i]} ? tlb_{i}_pte : ' for i in range(count)) + "64'd0"
+        cached_level = ''.join(f'{hit[i]} ? tlb_{i}_level : ' for i in range(count)) + "2'd0"
+        declarations = f'''
+  wire cached_hit = ({' || '.join(hit)}) && !invalidate;
+  wire [63:0] cached_pte = {cached_pte};
+  wire [1:0] cached_level = {cached_level};
+  wire [63:0] cached_mask = cached_level == 2 ? 64'h3fffffff : cached_level == 1 ? 64'h1fffff : 64'hfff;
+  wire [63:0] cached_address = ((cached_pte >> 10 << 12) & ~cached_mask) | (virtual_address & cached_mask);
+  wire cached_access = fetch_access ? cached_pte[3] : write_access ? cached_pte[2] : cached_pte[1] || allow_mxr && cached_pte[3];
+  wire cached_mode = effective_privilege == 0 ? cached_pte[4] : !cached_pte[4] || allow_sum && !fetch_access;
+  wire cached_denied = !cached_access || !cached_mode || !cached_pte[6] || write_access && !cached_pte[7];
+  reg cache_refill_allowed = 0;
+  wire cache_leaf = bus_owned && memory_response_valid && memory_response_ready && !cancel_now &&
+    !memory_response_bits_fault && memory_response_bits_tag == 0 && !bad_pte && leaf_pte;
+  wire cache_fill = cache_leaf && cache_refill_allowed && !invalidate;
+'''
+        body = body.replace('  always @(posedge clock) begin\n    translation_past', declarations + '  always @(posedge clock) begin\n    translation_past')
+        body = body.replace('assert(state <= 4', 'assert(state <= 5')
+        body = body.replace('if (active && !done && !offered && !bus_owned && !memory_request_valid && (!ordinary || !formal_permit))', 'if (state == 1 && active && !done && !offered && !bus_owned && !memory_request_valid && (!ordinary || !formal_permit))')
+        body = body.replace('      if (any_response) begin', '''      if (state == 5 && (cached_hit || cancel_now)) begin
+        done <= 1;
+        expected_address <= cancel_now || cached_denied ? virtual_address : cached_address;
+        expected_fault <= !cancel_now && cached_denied;
+        expected_page_fault <= !cancel_now && cached_denied;
+        completed_leaf <= !cancel_now && !cached_denied;
+        walk_level <= cached_level;
+      end
+      if (any_response) begin''')
+        body += '''
+  always @(posedge clock) begin
+    if (reset) cache_refill_allowed <= 0;
+    else if (invalidate) cache_refill_allowed <= 0;
+    else if (ports_0_request_valid && ports_0_request_ready || ports_1_request_valid && ports_1_request_ready)
+      cache_refill_allowed <= 1;
+    if (translation_past) begin
+      assert(refillAllowed == cache_refill_allowed);
+      if ($past(reset || invalidate)) assert(tlbValid == 0 && replacement == 0);
+      else begin
+        if ($past(cache_fill)) assert(replacement == ($past(replacement) + 1) % CACHE_COUNT);
+        else assert($stable({tlbValid, replacement}));
+'''.replace('CACHE_COUNT', str(count))
+        for i in range(count):
+            overlap = f'((tlb_{i}_vpn >> (9 * (tlb_{i}_level > walk_level ? tlb_{i}_level : walk_level))) == (virtual_address[38:12] >> (9 * (tlb_{i}_level > walk_level ? tlb_{i}_level : walk_level))))'
+            body += f'''
+        if ($past(cache_fill)) begin
+          assert(tlbValid[{i}] == ($past(replacement) == {i} || $past(tlbValid[{i}] && !{overlap})));
+          if ($past(replacement) == {i}) begin
+            assert(tlb_{i}_vpn == $past(virtual_address[38:12]) && tlb_{i}_pte == $past(memory_response_bits_data));
+            assert(tlb_{i}_level == $past(walk_level));
+          end else assert($stable({{tlb_{i}_vpn, tlb_{i}_pte, tlb_{i}_level}}));
+        end else assert($stable({{tlb_{i}_vpn, tlb_{i}_pte, tlb_{i}_level}}));
+'''
+        body += '''      end
+      cover(state == 5 && cached_hit && !cached_denied && !cancel_now);
+      cover(state == 5 && cached_hit && cached_denied && write_access && !cancel_now);
+      cover(cache_leaf && cache_refill_allowed && invalidate);
+      cover(any_response && !cache_refill_allowed && !fault);
+    end
+  end
+'''
+        for i in range(count):
+            body += f'''
+  always @* if (translation_past && tlbValid[{i}]) begin
+    assert(tlb_{i}_level <= 2 && tlb_{i}_pte[63:54] == 0 && tlb_{i}_pte[0] && tlb_{i}_pte[6]);
+    assert((tlb_{i}_pte[1] || tlb_{i}_pte[3]) && (tlb_{i}_pte[1] || !tlb_{i}_pte[2]));
+    assert(tlb_{i}_level != 2 || tlb_{i}_pte[27:10] == 0);
+    assert(tlb_{i}_level != 1 || tlb_{i}_pte[18:10] == 0);
+  end
+'''
+    body = re.sub(r'\bpte\b', 'formal_pte', body)
     return ('Translation', body, 'assign memory_request_bits_size = 3\'h3;', "assign memory_request_bits_size = 3'h2;")
 
 
@@ -2381,6 +2454,14 @@ def verify(rtl, directory, modules=None):
             if enabled:
                 checks += [('mutation-permission', re.search(r'&\s+_pmp_allowed', original).group(), "& 1'h1"),
                            ('mutation-privilege', "wire [1:0] formal_pmp_privilege = 2'h1;", "wire [1:0] formal_pmp_privilege = 2'h3;")]
+            if manifest['parameters'].get('tlbEntries'):
+                invalidate = re.search(r'(if \(invalidate\)(?: begin)?\s+)tlbValid <= [^;]+;', original)
+                denied = re.search(r'wire\s+leafDenied\s*=\s*[^;]+;', original).group()
+                checks += [('mutation-tlb-flush', invalidate.group(), invalidate[1] + 'tlbValid <= tlbValid;'),
+                           ('mutation-tlb-refill', 'refillAllowed & ~invalidate', "1'h1"),
+                           ('mutation-tlb-permission', denied, "wire leafDenied = 1'h0;"),
+                           ('mutation-tlb-ppn', 'tlb_0_pte <= memory_response_bits_data;', "tlb_0_pte <= memory_response_bits_data & 64'hffffffff;"),
+                           ('mutation-tlb-page', 'tlb_0_level <= level;', "tlb_0_level <= 2'h0;")]
         if name == 'UserExecute':
             checks += [('mutation-return', 'assign output_bits_instruction_fault =', 'assign output_bits_instruction_fault = 0 &')]
         if name == 'SupervisorExecute':
@@ -2508,6 +2589,23 @@ def verify(rtl, directory, modules=None):
             work = directory / f'{name.lower()}-{mode}'
             work.mkdir(exist_ok=True)
             for filename, text in files.items():
+                if unit == 'Translation' and mode == 'mutation-alias' and filename == module + '.sv':
+                    base = int(manifest['parameters']['resetVector'])
+                    witness = f'''
+  always @* begin
+    assume(!ports_0_request_valid && ports_1_request_valid && ports_1_response_ready);
+    assume(ports_1_request_bits_address == 64'h12345100 && ports_1_request_bits_privilege == 1);
+    assume(!ports_1_request_bits_fetch && !ports_1_request_bits_write && !cancelInstruction);
+    assume(state_satp == 64'h{(8 << 60) | (base >> 12):x} && !state_sum && !state_mxr);
+    assume(memory_request_ready && memory_response_valid == memory_response_ready);
+    assume(!memory_response_bits_fault && memory_response_bits_tag == 0 && formal_permit);
+    assume(memory_response_bits_data == (walk_level == 2 ? 64'h{(((base + 4096) >> 12) << 10) | 1:x} :
+      walk_level == 1 ? 64'h{(((base + 8192) >> 12) << 10) | 1:x} : 64'h400000cf));
+  end
+'''
+                    if manifest['parameters'].get('tlbEntries'):
+                        witness += '  always @* assume(!invalidate);\n'
+                    text = text.replace('endmodule', witness + 'endmodule', 1)
                 if name == 'SupervisorFetch' and mutating and filename == module + '.sv':
                     text = text.replace('endmodule', "  always @* assume(privilege == (state == 0 ? 2'd1 : 2'd3));\nendmodule", 1)
                 if name == 'SynchronizationBackend' and mode != 'prove' and filename == module + '.sv':
@@ -2664,8 +2762,7 @@ def verify(rtl, directory, modules=None):
                 task = 'prove'
             engine = 'abc pdr' if task == 'prove' and unit not in ('Multiply', 'Pmp', 'PmpDecode', 'PmpInterval', 'Csr', 'Memory', 'Axi', 'InstructionCache', 'DataCache', 'Coherence', 'Decode', 'Execute', 'LocalInterrupts', 'Translation') and name not in ('SynchronizationBackend', 'WfiBackend') else 'smtbmc z3'
             timeout = 180 if name == 'InterruptBackend' and task == 'cover' else 60
-            if (unit == 'Axi' and task == 'prove' and manifest['parameters'].get('enableUserMode')
-                    and manifest['parameters']['axiDataBits'] == 512):
+            if unit == 'Axi' and task == 'prove' and manifest['parameters']['axiDataBits'] == 512:
                 timeout = 120
             witness_option = 'aigsmt z3\n' if engine == 'abc pdr' else ''
             preparation = (f'hierarchy -check -top {top}\nproc\nflatten\nopt_expr -keepdc\nopt_clean\nwreduce\nopt_clean\ncheck'
@@ -2732,6 +2829,8 @@ read -formal -sv {' '.join(files)}
         supervisorMode='M/S/U trap target and bank isolation, shared CSR aliases, interrupt target priority, effective data mode and legal return effects; legal retired CSR/return inputs, unrestricted pending levels and trap causes' if 'SupervisorCsr' in proved else None,
         addressTranslation='independent accepted VA/access/status, PTE interpreter and physical ownership; all Sv39 page sizes, permission/reserved/A-D faults, physical read authorization, original access fault classes, cancellation drain and fair client ownership; arbitrary response data/errors/tags/delays, no service progress assumption' if 'Translation' in proved else None,
         translationProtection='PMP outcome abstracted with arbitrary permit; actual full-width address, size=8 bytes, S effective privilege and read type checked before each first offer; separate PMP proofs and simulation compose the concrete protection function' if 'Translation' in proved else None,
+        translationCache='actual small register entries, complete PTE/VPN/page-size storage, independent lookup permissions and offsets, overlap eviction, local invalidation and stale-refill exclusion' if 'Translation' in proved and manifest['parameters'].get('tlbEntries') else None,
+        translationMutationGuidance='alias mutant only: fixed legal S read, three page levels, immediate successful service and a high leaf PPN; prove and cover inputs remain unrestricted by this witness' if 'Translation' in proved else None,
         wfi='raw retired encoding drives independent wait/continuation model; wake priority, younger flush, no new work while waiting, frontend halt and retained requests; sleep is architectural wait, not physical idle' if 'WfiBackend' in proved else None,
         wfiWitnessGuidance='cover/mutations only: mie software enable, WFI with immediate/delayed pending or fetch fault, younger multiply, fixed PC/tag and no data service; safety inputs unrestricted' if 'WfiBackend' in proved else None,
         wordMutationGuidance='mutations only: SW/LW at address4 or valid D LR/SC/ADD sequences at address8, high-EA SC alias, faulted LR, matching tag37, immediate memory service and permission grant except denial mutant; unrestricted prove and cover' if 'Lsu' in proved else None,

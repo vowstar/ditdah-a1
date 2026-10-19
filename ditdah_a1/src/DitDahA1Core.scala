@@ -39,6 +39,7 @@ object DitDahA1Core extends Generator[DitDahA1Parameter, DitDahA1Layers, DitDahA
       translation.io.reset := io.reset
       translation.io.state :<= backend.io.translationState.get
       translation.io.cancelInstruction := backend.io.redirect
+      if parameter.tlbEntries != 0 then translation.io.invalidate.get := backend.io.invalidateTranslation.get
       if parameter.pmpEntries != 0 then translation.io.pmp.get :<= backend.io.pmp.get
       translation.io.ports(0) :<>= frontend.io.translation.get
       translation.io.ports(1) :<>= backend.io.translation.get
@@ -141,6 +142,7 @@ object DitDahA1Backend extends Generator[DitDahA1Parameter, DitDahA1Layers, DitD
         ((retire.bits.csrAddress >= 0x3b0.U(12)) & (retire.bits.csrAddress <= 0x3ef.U(12))))
     val translationUpdate = if parameter.enableTranslation then
       retire.bits.sfenceVma | (retire.bits.csrWrite & (retire.bits.csrAddress === 0x180.U(12))) else false.B
+    io.invalidateTranslation.foreach(_ := retired & (translationUpdate | pmpUpdate))
     val redirect = takeInterrupt | (retired & (retire.bits.instruction.fault | retire.bits.mret | retire.bits.sret |
       pmpUpdate | translationUpdate | retire.bits.fenceI | (retire.bits.nextPc =/= sequentialPc))) | enterWfi
     if parameter.iCacheBytes != 0 then io.invalidate.get := retired & (retire.bits.fenceI | pmpUpdate | translationUpdate)

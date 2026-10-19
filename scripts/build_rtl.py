@@ -52,6 +52,7 @@ def main():
         manifest["implementation"]["machineInterrupts"] = bool(manifest["parameters"]["enableInterrupts"] and args.top in ("DitDahA1", "DitDahA1Core", "DitDahA1Backend"))
         manifest["implementation"]["localInterrupts"] = bool(manifest["parameters"]["localInterruptBase"] and args.top in ("DitDahA1", "DitDahA1MemoryFabric", "DitDahA1LocalInterrupts"))
         manifest["implementation"]["iCacheBytes"] = manifest["parameters"]["iCacheBytes"] if args.top in ("DitDahA1", "DitDahA1Core", "DitDahA1Frontend", "DitDahA1Fetch") else 0
+        manifest["implementation"]["tlbEntries"] = manifest["parameters"]["tlbEntries"] if args.top in ("DitDahA1", "DitDahA1Core", "DitDahA1Translation") else 0
         manifest["implementation"]["dCacheBytes"] = manifest["parameters"]["dCacheBytes"] if args.top in ("DitDahA1", "DitDahA1DataCache") else 0
         manifest["implementation"]["dataCoherence"] = args.top == "DitDahA1Coherence" or bool(manifest["parameters"]["dCacheBytes"] and args.top in ("DitDahA1", "DitDahA1MemoryFabric"))
         manifest["sourceHashes"] = hashes

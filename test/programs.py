@@ -260,6 +260,8 @@ def cases(base, protection=False, interrupts=False, user=False, local_interrupt_
 def sv39_cases(base, protection):
     for name, flags, status, address, levels in (
             ('data', 0xcf, 0x20800, 0x40000100, 0),
+            ('reuse', 0xcf, 0x20800, 0x40000100, 0),
+            ('protection', 0xcf, 0x20800, 0x40000100, 0),
             ('large', 0xcf, 0x20800, 0x40000100, 1),
             ('gigantic', 0xcf, 0x20800, 0x40000100, 2),
             ('accessed', 0x8f, 0x20800, 0x40000100, 0),
@@ -268,6 +270,8 @@ def sv39_cases(base, protection):
             ('sum', 0xdf, 0x60800, 0x40000100, 0),
             ('mxr', 0xc9, 0xa0800, 0x40000100, 0),
             ('canonical', 0xcf, 0x20800, 1 << 39, 0)):
+        if name == 'protection' and not protection:
+            continue
         p = Program(base)
         def word(physical, value):
             for byte in range(8):
@@ -283,8 +287,16 @@ def sv39_cases(base, protection):
         word(base + 0x600, (8 << 60) | (root >> 12))
         word(base + 0x608, address)
         word(base + 0x610, status)
-        p.emit(ld(2, 10), csr(0, 0x180, 2), 0x12000073, ld(11, 10, 8), ld(2, 10, 16), csr(0, 0x300, 2),
-               ld(3, 11), sd(3, 11), csr(0, 0x300, 0))
+        p.emit(ld(2, 10), csr(0, 0x180, 2), 0x12000073, ld(11, 10, 8), ld(2, 10, 16), csr(0, 0x300, 2))
+        if name == 'reuse':
+            p.emit(addi(4, 0, 32), ld(3, 11), addi(4, 4, -1), beq(4, 0, -8) ^ (1 << 12))
+        else:
+            p.emit(ld(3, 11))
+        if name == 'protection':
+            p.address(12, 0x1000)
+            p.emit(csr(0, 0x300, 0), alu(12, 12, 2, 5, immediate=True), csr(0, 0x3b0, 12),
+                   addi(12, 0, 0xf), csr(0, 0x3a0, 12), csr(0, 0x300, 2), ld(4, 11))
+        p.emit(sd(3, 11), csr(0, 0x300, 0))
         yield 'sv39_' + name, p.finish()
     p = Program(base)
     root, other, middle, alternate, leaf, changed = (base + offset for offset in (0x1000, 0, 0x2000, 0x3000, 0x4000, 0x7000))

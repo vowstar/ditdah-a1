@@ -388,11 +388,20 @@ def check_access_privileges(lines, modes, requests, privileges, required):
     assert not required or next(expected, None) is None, 'Missing architectural data request privilege'
 
 
-def check_translation_result(walk, result, config, model):
-    reads = iter(walk['reads'])
-    def read_pte(address):
+def translation_maintenance(trace):
+    instruction = trace[2]
+    funct3, address = (instruction >> 12) & 7, instruction >> 20
+    write = instruction & 127 == 0x73 and funct3 in (1, 2, 3, 5, 6, 7) and (funct3 & 3 == 1 or (instruction >> 15) & 31)
+    return not trace[7] and (instruction & 0xfe007fff == 0x12000073 or write and
+        (address == 0x180 or 0x3a0 <= address <= 0x3ae or 0x3b0 <= address <= 0x3ef))
+
+
+def check_translation_result(walk, result, config, model, history):
+    def read_pte(address, reads):
         entry = next(reads, None)
         if entry is None:
+            if walk.get('cancelled'):
+                raise StopIteration
             assert not any(int(r['base']) <= address and address + 8 <= int(r['base']) + int(r['size']) and r['readable'] and not r['device'] for r in config['memoryRegions']) or not pmp_allowed(
                 [model.pmp_config(i) for i in range(config['pmpEntries'])], [model.csrs[0x3b0+i] for i in range(config['pmpEntries'])], address, 8, 'read', config['physicalAddressBits'], 1), 'Permitted PTE omitted physical service'
             raise Fault(5, address)
@@ -400,17 +409,32 @@ def check_translation_result(walk, result, config, model):
         if entry[2]:
             raise Fault(5, address)
         return entry[1]
-    expected, fault, cause = walk['address'], False, 0
-    try:
-        expected = sv39_walk(walk['address'], walk['kind'], walk['privilege'], walk['satp'], walk['status'], read_pte)
-    except Fault as error:
-        fault, cause = True, error.cause
-    assert result == (expected, fault, cause), 'Translation result differs from independent walk'
-    assert next(reads, None) is None, 'Unexpected extra page-table read'
+    paged = walk['privilege'] != 3 and walk['satp'] >> 60 == 8
+    cached = [reads for satp, vpn, bits, reads in history if satp == walk['satp'] and walk['address'] >> bits == vpn]
+    candidates = [walk['reads']] if walk['reads'] or not paged else cached or [[]]
+    matches = bool(walk.get('cancelled'))
+    for candidate in candidates:
+        reads = iter(candidate)
+        expected, fault, cause = walk['address'], False, 0
+        try:
+            expected = sv39_walk(walk['address'], walk['kind'], walk['privilege'], walk['satp'], walk['status'], lambda address: read_pte(address, reads))
+        except StopIteration:
+            continue
+        except Fault as error:
+            fault, cause = True, error.cause
+        matches |= result == (expected, fault, cause) and next(reads, None) is None
+        if config.get('tlbEntries') and paged and walk['reads'] and not fault and not walk.get('stale'):
+            bits = 12 + 9 * (3 - len(walk['reads']))
+            entry = walk['satp'], walk['address'] >> bits, bits, tuple(walk['reads'])
+            if entry not in history:
+                history.append(entry)
+    assert matches, 'Translation result lacks a matching walk or authorized cached leaf'
+    return paged and not walk['reads'] and bool(cached)
 
 
 def check_core_translations(lines, config, program, expected_requests):
     model, walk, request, architectural = Model(config, program.memory, program.faults), None, None, []
+    history = []
     for line in lines:
         fields = line.split()
         if fields[:1] == ['TRANSLATE_REQUEST']:
@@ -433,14 +457,17 @@ def check_core_translations(lines, config, program, expected_requests):
         elif fields[:1] == ['TRANSLATE_RESPONSE']:
             port, physical, fault, cause = (int(value, 16) for value in fields[1:])
             assert walk and walk['port'] == port and request is None, 'Unowned Core translation response'
-            if not walk.get('cancelled'):
-                check_translation_result(walk, (physical, fault, cause), config, model)
+            check_translation_result(walk, (physical, fault, cause), config, model, history)
             walk = None
         elif fields[:1] == ['ARCH_DATA_REQUEST']:
             architectural.append((fields[1], int(fields[2], 16), int(fields[3]), int(fields[4], 16)))
         elif fields[:1] == ['IRQ']:
             model.set_interrupts(int(fields[1], 16))
         elif fields[:1] == ['TRACE']:
+            if translation_maintenance(tuple(int(v, 16) for v in fields[1:])):
+                history.clear()
+                if walk:
+                    walk['stale'] = True
             (model.interrupt if int(fields[9], 16) >> 63 else model.step)()
     assert architectural == [event for event in expected_requests if event[0] != 'fetch'], 'Core LSU physical requests differ from architectural translation'
 
@@ -527,11 +554,15 @@ def compare(binary, directory, config, transport='axi', selected=()):
             data_bus = [event for event in bus if event[0] != 'fetch']
             expected_bus = [event for event in model.bus if event[0] != 'fetch']
             cache_report = None
+            translation_report = None
             if config.get('virtualAddressBits') == 39 and transport == 'memory':
                 check_core_translations(lines, config, program, model.requests)
             elif transport == 'axi' and (config.get('virtualAddressBits') == 39 or config.get('dCacheBytes') or any(event[0] == 'atomic' for event in model.requests) or name in ('fence_ordering', 'synchronization')):
                 checked = check_multicore(lines, config, program, name, atomic_metadata=True)
                 cache_report = checked.get('dataCache')
+                translation_report = checked.get('translation')
+                if name == 'sv39_reuse':
+                    assert translation_report['pteReads'] == (3 if config.get('tlbEntries') else 99), 'Repeated page walk count'
             else:
                 assert data_bus == expected_bus, f'{name}: unexpected data accesses\nactual {data_bus}\nexpected {expected_bus}'
             if transport == 'memory':
@@ -561,6 +592,7 @@ def compare(binary, directory, config, transport='axi', selected=()):
             count += len(actual)
             elapsed = next(int(line.split()[1]) for line in lines if line.startswith('CYCLES '))
             reports.append(dict(test=name, seed=seed, events=len(actual), cycles=elapsed, busTransactions=len(bus), fetches=fetches,
+                                **(dict(translation=translation_report) if translation_report is not None else {}),
                                 **(dict(dataCache=cache_report) if cache_report is not None else {})))
         print(f'  {name}: {len(expected)} events, three bus schedules', flush=True)
     assert reports, 'No selected scalar program'
@@ -590,6 +622,7 @@ def check_multicore(lines, config, program, name, atomic_metadata=False, softwar
     translated = config.get('virtualAddressBits') == 39
     observed_data = data_cache or translated
     implicit, walks = [None] * harts, [None] * harts
+    translation_history = [[] for _ in range(harts)]
     translation_counts = Counter()
     fetch_privileges, retired_privileges = [3] * harts, [3] * harts
     fetch_checks = [fetch_checker(config, program.faults, model.local_fetch_faults) for model in models]
@@ -774,8 +807,7 @@ def check_multicore(lines, config, program, name, atomic_metadata=False, softwar
             port, physical, fault, cause = (int(value, 16) for value in fields[1:])
             walk = walks[hart]
             assert translated and walk and walk['port'] == port and implicit[hart] is None, 'Unowned translation response'
-            if not walk.get('cancelled'):
-                check_translation_result(walk, (physical, fault, cause), config, models[hart])
+            translation_counts['hits'] += check_translation_result(walk, (physical, fault, cause), config, models[hart], translation_history[hart])
             walks[hart] = None
             translation_counts['responses'] += 1
         elif kind == 'WALK_REQUEST':
@@ -983,6 +1015,10 @@ def check_multicore(lines, config, program, name, atomic_metadata=False, softwar
         elif kind == 'TRACE':
             assert not waiting[hart], 'Architectural event while waiting without a wakeup'
             observed = tuple(int(v, 16) for v in fields[1:])
+            if translated and translation_maintenance(observed):
+                translation_history[hart].clear()
+                if walks[hart]:
+                    walks[hart]['stale'] = True
             eligible, owned = models[hart].interrupt_cause(), pending[hart] is not None
             if pending[hart] is not None:
                 assert active is None or active['hart'] != hart or active['event'][0] == 'fetch', 'Memory operation retired before its response'
@@ -1390,15 +1426,35 @@ def check_software_output(lines, config, program, console):
 
 
 def check_translation_guards(lines, config, program):
+    cached_response, paged, walked, cancelled, port = None, False, False, False, 0
+    for index, line in enumerate(lines):
+        fields = line.split()
+        if not fields:
+            continue
+        if fields[0] == 'HART':
+            fields = fields[2:]
+        if fields[0] == 'TRANSLATE_REQUEST':
+            paged, walked = int(fields[3], 16) != 3 and int(fields[6], 16) >> 60 == 8, False
+            cancelled, port = False, int(fields[1])
+        elif fields[0] == 'WALK_REQUEST':
+            walked = True
+        elif fields[0] == 'ARCH_CANCEL' and port == 0:
+            cancelled = True
+        elif fields[0] == 'TRANSLATE_RESPONSE' and paged and not walked and not cancelled and not int(fields[3], 16):
+            cached_response = index
+            break
     mutations = (('contextPrivilege', 'TRANSLATE_REQUEST', 3, 1),
                  ('contextRoot', 'TRANSLATE_REQUEST', 6, 1),
                  ('physicalResult', 'TRANSLATE_RESPONSE', 2, 0x1000),
                  ('pteAddress', 'WALK_REQUEST', 1, 8),
                  ('pteData', 'WALK_RESPONSE', 1, 1),
                  ('lsuAddress', 'ARCH_DATA_REQUEST', 2, 8))
+    if config.get('tlbEntries'):
+        assert cached_response is not None, 'Translation cache was not exercised'
+        mutations += (('cachedResult', 'TRANSLATE_RESPONSE', 2, 8),)
     for name, event, field, mask in mutations:
         changed = list(lines)
-        index = next(i for i, line in enumerate(lines) if line.split()[2 if line.startswith('HART ') else 0] == event)
+        index = cached_response if name == 'cachedResult' else next(i for i, line in enumerate(lines) if line.split()[2 if line.startswith('HART ') else 0] == event)
         fields = changed[index].split()
         field += 2 if fields[0] == 'HART' else 0
         fields[field] = f'{int(fields[field], 16) ^ mask:x}'
@@ -1408,7 +1464,21 @@ def check_translation_guards(lines, config, program):
         except AssertionError:
             continue
         raise AssertionError(f'Translation oracle accepted {name}')
-    return [item[0] for item in mutations]
+    guards = [item[0] for item in mutations]
+    if config.get('tlbEntries'):
+        fields = next(line.split()[2:] if line.startswith('HART ') else line.split() for line in lines
+                      if 'TRANSLATE_REQUEST' in line and int(line.split()[-3], 16) >> 60 == 8 and int(line.split()[-6], 16) != 3)
+        context = dict(port=int(fields[1]), address=int(fields[2], 16), privilege=int(fields[3], 16),
+                       kind='fetch' if int(fields[4]) else 'write' if int(fields[5]) else 'read',
+                       satp=int(fields[6], 16), status=(int(fields[7]) << 18) | (int(fields[8]) << 19), reads=[])
+        permitted = dict(config, pmpEntries=0)
+        try:
+            check_translation_result(context, (context['address'], False, 0), permitted, Model(permitted, {}, {}), [])
+        except AssertionError:
+            guards.append('fabricatedHit')
+        else:
+            raise AssertionError('Translation oracle accepted an unfilled cache hit')
+    return guards
 
 
 def software_schedule(task):
@@ -1482,6 +1552,7 @@ def main():
     parser.add_argument('--user-mode', action='store_true')
     parser.add_argument('--supervisor-mode', action='store_true')
     parser.add_argument('--sv39', action='store_true')
+    parser.add_argument('--tlb-entries', type=int, choices=(0, 2, 4), default=0)
     parser.add_argument('--multicore-only', action='store_true')
     parser.add_argument('--platform-only', action='store_true')
     parser.add_argument('--harts', type=int, choices=(1, 2, 3, 16), action='append')
@@ -1493,6 +1564,8 @@ def main():
     parser.add_argument('--case', dest='selected', action='append', default=[])
     parser.add_argument('--traffic-baseline', type=Path)
     args = parser.parse_args()
+    if args.tlb_entries and not args.sv39:
+        parser.error('--tlb-entries requires --sv39')
     if args.sv39:
         args.supervisor_mode = True
     if args.supervisor_mode:
@@ -1539,7 +1612,7 @@ def main():
         directory = args.output / f'{"irq-" if interrupts else ""}{"pmp16-" if entries else ""}axi{width}'
         directory.mkdir(parents=True, exist_ok=True)
         config = configuration(width)
-        config.update(pmpEntries=entries, enableInterrupts=interrupts, iCacheBytes=args.icache_bytes, dCacheBytes=args.dcache_bytes)
+        config.update(pmpEntries=entries, enableInterrupts=interrupts, iCacheBytes=args.icache_bytes, dCacheBytes=args.dcache_bytes, tlbEntries=args.tlb_entries)
         config['memoryRegions'][0]['dataCacheable'] = bool(args.dcache_bytes)
         if args.user_mode:
             config['enableUserMode'] = True
@@ -1600,7 +1673,7 @@ def main():
                 continue
             directory = args.output / f'harts{harts}-axi{width}'
             directory.mkdir(parents=True, exist_ok=True)
-            config = dict(configuration(width), hartCount=harts, pmpEntries=entries, enableInterrupts=interrupts, iCacheBytes=args.icache_bytes, dCacheBytes=args.dcache_bytes)
+            config = dict(configuration(width), hartCount=harts, pmpEntries=entries, enableInterrupts=interrupts, iCacheBytes=args.icache_bytes, dCacheBytes=args.dcache_bytes, tlbEntries=args.tlb_entries)
             config['memoryRegions'][0]['dataCacheable'] = bool(args.dcache_bytes)
             if args.user_mode:
                 config['enableUserMode'] = True

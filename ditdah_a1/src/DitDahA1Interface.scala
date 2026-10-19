@@ -202,6 +202,7 @@ class DitDahA1MemoryFabricIO(parameter: DitDahA1Parameter) extends HWBundle(para
 class DitDahA1BackendIO(parameter: DitDahA1Parameter) extends HWBundle(parameter):
   val translation = Option.when(parameter.enableTranslation)(Aligned(new TranslationPort))
   val translationState = Option.when(parameter.enableTranslation)(Aligned(new TranslationState))
+  val invalidateTranslation = Option.when(parameter.enableTranslation && parameter.tlbEntries != 0)(Aligned(Bool()))
   val privilege = Aligned(UInt(2))
   val hartId = Flipped(UInt(4))
   val interrupts = Option.when(parameter.enableInterrupts)(Flipped(new InterruptBundle))

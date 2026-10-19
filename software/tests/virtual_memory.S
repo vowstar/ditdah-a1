@@ -16,6 +16,9 @@ main:
     sd s3, 32(sp)
     sd s4, 40(sp)
     sd s5, 48(sp)
+    sd s6, 56(sp)
+    la s6, .Lhart_count
+    ld s6, 0(s6)
     csrr s0, mhartid
     csrr s2, mtvec
     csrr s3, mstatus
@@ -94,6 +97,8 @@ main:
     or t0, t0, t1
     csrw satp, t0
     sfence.vma
+    li t0, 8
+    csrw mie, t0
     la t0, .Lsupervisor
     csrw mepc, t0
     li t0, 0x1800
@@ -107,14 +112,33 @@ main:
     jalr ra, t0, 0
     li t0, 1
     bne a0, t0, .Lfail_supervisor
-    li t0, 16384
-    add t0, s1, t0
-    srli t1, t0, 2
-    ori t1, t1, 0xcf
-    li t0, 8192
-    add t0, s1, t0
+    la t0, .Lready
+    slli t1, s0, 3
+    add t0, t0, t1
+    li t1, 1
     sd t1, 0(t0)
-    sfence.vma
+    fence rw, rw
+    bne s0, zero, .Lwait_remap
+    la t0, .Lready
+    li t1, 0
+.Lwait_ready:
+    ld t2, 0(t0)
+    beq t2, zero, .Lwait_ready
+    addi t0, t0, 8
+    addi t1, t1, 1
+    bltu t1, s6, .Lwait_ready
+.Lrequest_remap:
+    ecall
+.Lwait_remap:
+    la t0, .Lacknowledged
+    li t1, 0
+.Lwait_ack:
+    ld t2, 0(t0)
+    beq t2, zero, .Lwait_ack
+    addi t0, t0, 8
+    addi t1, t1, 1
+    bltu t1, s6, .Lwait_ack
+    fence rw, rw
     addi a2, s0, 32
     li t0, 0x40000000
     jalr ra, t0, 0
@@ -146,10 +170,22 @@ main:
     j .Lprint
 2:  ret
 .Ltrap:
+    addi sp, sp, -64
+    sd t0, 0(sp)
+    sd t1, 8(sp)
+    sd t2, 16(sp)
+    sd t3, 24(sp)
+    sd t4, 32(sp)
+    sd t5, 40(sp)
+    sd t6, 48(sp)
     csrr t0, mcause
+    li t1, 0x8000000000000003
+    beq t0, t1, .Linterrupt
     li t1, 9
     bne t0, t1, .Lfailure
     csrr t0, mepc
+    la t1, .Lrequest_remap
+    beq t0, t1, .Lremap
     la t1, .Ldone
     bne t0, t1, .Lfailure
     li t0, 12288
@@ -169,8 +205,60 @@ main:
     li t0, 0x1800
     csrs mstatus, t0
     mret
+.Lremap:
+    la t0, .Lspaces
+    li t1, 0
+.Lupdate:
+    li t2, 16384
+    add t2, t0, t2
+    srli t2, t2, 2
+    ori t2, t2, 0xcf
+    li t3, 8192
+    add t3, t0, t3
+    sd t2, 0(t3)
+    li t2, 20480
+    add t0, t0, t2
+    addi t1, t1, 1
+    bltu t1, s6, .Lupdate
+    fence rw, rw
+    la t0, __local_interrupt_base
+    mv t1, s6
+    li t2, 1
+.Lnotify:
+    sw t2, 0(t0)
+    addi t0, t0, 4
+    addi t1, t1, -1
+    bne t1, zero, .Lnotify
+    csrr t0, mepc
+    addi t0, t0, 4
+    csrw mepc, t0
+    j .Lreturn
+.Linterrupt:
+    la t0, __local_interrupt_base
+    slli t1, s0, 2
+    add t0, t0, t1
+    sw zero, 0(t0)
+    sfence.vma
+    fence rw, rw
+    la t0, .Lacknowledged
+    slli t1, s0, 3
+    add t0, t0, t1
+    li t1, 1
+    sd t1, 0(t0)
+    fence rw, rw
+.Lreturn:
+    ld t0, 0(sp)
+    ld t1, 8(sp)
+    ld t2, 16(sp)
+    ld t3, 24(sp)
+    ld t4, 32(sp)
+    ld t5, 40(sp)
+    ld t6, 48(sp)
+    addi sp, sp, 64
+    mret
 .Lfinish:
     mv sp, s5
+    csrw mie, zero
     csrw satp, zero
     sfence.vma
     csrw pmpcfg0, zero
@@ -184,6 +272,7 @@ main:
     ld s3, 32(sp)
     ld s4, 40(sp)
     ld s5, 48(sp)
+    ld s6, 56(sp)
     addi sp, sp, 64
     ret
 .balign 4
@@ -206,6 +295,15 @@ main:
     .word 104, 97, 114, 116, 32, 0
 .Lsuffix:
     .word 32, 111, 110, 108, 105, 110, 101, 10, 0
+.balign 8
+.Lhart_count:
+    .dword __hart_count
+.section .bss,"aw",@nobits
+.balign 8
+.Lready:
+    .zero 128
+.Lacknowledged:
+    .zero 128
 .section .data,"aw",@progbits
 .balign 4096
 .Lspaces:
