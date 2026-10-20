@@ -32,16 +32,28 @@ object DitDahA1Axi extends Generator[DitDahA1Parameter, DitDahA1UnitLayers, DitD
     val fault = RegInit(false.B)
     val awDone = RegInit(false.B)
     val wDone = RegInit(false.B)
+    val line = if parameter.enableBurstRefill then request.fetch & !request.write & !request.atomic & (request.size === 6.U(3)) else false.B
+    val beat = Option.when(parameter.enableBurstRefill)(RegInit(0.U(3)))
+    val terminal = Option.when(parameter.enableBurstRefill)(Reg(Bool()))
+    val slices = parameter.axiDataBits / 64
+    val sliceBits = math.max(1, Integer.numberOfTrailingZeros(slices))
+    val slice = Option.when(parameter.enableBurstRefill && slices > 1)(RegInit(0.U(sliceBits)))
+    val block = Option.when(slice.isDefined)(Reg(UInt(parameter.axiDataBits)))
+    val finalSlice = slice.map(_ === (slices - 1).U(sliceBits)).getOrElse(true.B)
     val aw = io.axi.aw
     val w = io.axi.w
     val b = io.axi.b
     val ar = io.axi.ar
     val r = io.axi.r
     io.memory.request.ready := state === 0.U(3)
-    io.memory.response.valid := state === 4.U(3)
+    io.memory.response.valid := (state === 4.U(3)) | (if parameter.enableBurstRefill then state === 5.U(3) else false.B)
     io.memory.response.bits.data := data
+    block.foreach { value =>
+      when(state === 5.U(3)) { io.memory.response.bits.data := (value >> (slice.get.asBits ## 0.B(6)).asUInt).asBits.bits(63, 0).asUInt }
+    }
     io.memory.response.bits.fault := fault
     io.memory.response.bits.tag := request.tag
+    io.memory.response.bits.last := terminal.map(last => (state =/= 5.U(3)) | (last & finalSlice)).getOrElse(true.B)
     for channel <- Seq(aw, ar) do
       channel.bits.addr := request.address.asBits.bits(parameter.physicalAddressBits - 1, 0).asUInt
       channel.bits.id := hartId
@@ -53,6 +65,11 @@ object DitDahA1Axi extends Generator[DitDahA1Parameter, DitDahA1UnitLayers, DitD
       val privileged = if parameter.enableUserMode then request.privileged else true.B
       channel.bits.prot := (request.fetch.asBits ## 0.B(1) ## privileged.asBits).asUInt
       channel.bits.qos := 0.U(4)
+    if parameter.enableBurstRefill then
+      when(line) {
+        ar.bits.len := (512 / parameter.axiDataBits - 1).U(8)
+        ar.bits.size := Integer.numberOfTrailingZeros(parameter.axiDataBits / 8).U(3)
+      }
     ar.valid := (state === 1.U(3)) & !request.write
     aw.valid := (state === 1.U(3)) & request.write & !awDone
     w.valid := (state === 1.U(3)) & request.write & !wDone
@@ -71,7 +88,7 @@ object DitDahA1Axi extends Generator[DitDahA1Parameter, DitDahA1UnitLayers, DitD
     readData := 0.U(64)
     for size <- 0 to 3 do
       when(request.size === size.U(3)) { readData := shiftedReadData.asBits.bits((8 << size) - 1, 0).asUInt }
-    r.ready := state === 2.U(3)
+    r.ready := (state === 2.U(3)) | (if parameter.enableBurstRefill then state === 6.U(3) else false.B)
     b.ready := state === 3.U(3)
     when(io.memory.request.valid & io.memory.request.ready) {
       request :<= io.memory.request.bits
@@ -82,6 +99,7 @@ object DitDahA1Axi extends Generator[DitDahA1Parameter, DitDahA1UnitLayers, DitD
       wDone := false.B
       fault := false.B
       data := 0.U(64)
+      beat.foreach(_ := 0.U(3))
       state := 1.U(3)
       when(inputSc & !io.memory.request.bits.scEligible) { data := 1.U(64); state := 4.U(3) }
     }
@@ -97,6 +115,21 @@ object DitDahA1Axi extends Generator[DitDahA1Parameter, DitDahA1UnitLayers, DitD
         when(amo & !readFault) { request.write := true.B; state := 1.U(3) }
           .otherwise { state := 4.U(3) }
       }
+      if parameter.enableBurstRefill then
+        when(line & (state === 2.U(3))) {
+          block.foreach(_ := r.bits.data)
+          slice.foreach(_ := 0.U(sliceBits))
+          terminal.get := r.bits.last
+          data := r.bits.data.asBits.bits(63, 0).asUInt
+          fault := fault | (r.bits.resp =/= 0.U(2)) | (r.bits.id =/= hartId) |
+            (r.bits.last =/= (beat.get === (512 / parameter.axiDataBits - 1).U(3)))
+          state := 5.U(3)
+        }
+        when(state === 6.U(3)) {
+          fault := true.B
+          data := 0.U(64)
+          when(r.bits.last) { state := 4.U(3) }
+        }
     }
     when(b.valid & b.ready) {
       when(amo & (b.bits.resp === 0.U(2)) & (b.bits.id === hartId)) {
@@ -113,4 +146,15 @@ object DitDahA1Axi extends Generator[DitDahA1Parameter, DitDahA1UnitLayers, DitD
         state := 4.U(3)
       }
     }
-    when(io.memory.response.valid & io.memory.response.ready) { state := 0.U(3) }
+    when(io.memory.response.valid & io.memory.response.ready) {
+      state := 0.U(3)
+      if parameter.enableBurstRefill then
+        when(state === 5.U(3)) {
+          slice.foreach(value => value := (value + 1.U(sliceBits)).asBits.bits(sliceBits - 1, 0).asUInt)
+          state := 5.U(3)
+          when(finalSlice) {
+            beat.get := (beat.get + 1.U(3)).asBits.bits(2, 0).asUInt
+            state := terminal.get.?(0.U(3), (beat.get === (512 / parameter.axiDataBits - 1).U(3)).?(6.U(3), 2.U(3)))
+          }
+        }
+    }

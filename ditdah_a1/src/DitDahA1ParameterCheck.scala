@@ -38,6 +38,12 @@ object DitDahA1ParameterCheck:
     rejects { baseline.copy(pmpEntries = 65); () }
     rejects { DitDahA1Config.parameter(ujson.Obj("unused" -> 1)); () }
     val rtl = DitDahA1Parameter.uncached
+    rejects { rtl.copy(enableBurstRefill = true).validateFrontend() }
+    rtl.copy(enableBurstRefill = true).validateBackend()
+    rtl.copy(enableBurstRefill = true).validateFabric()
+    val burst = rtl.copy(iCacheBytes = 8192, enableBurstRefill = true)
+    burst.validateRtl()
+    assert(DitDahA1Config.parameter(DitDahA1Config.document(burst)) == burst)
     for count <- 1 to 16 do rtl.copy(hartCount = count).validateRtl()
     assert(!rtl.enableInterrupts)
     assert(!rtl.enableUserMode)

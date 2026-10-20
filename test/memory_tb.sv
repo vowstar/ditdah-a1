@@ -9,7 +9,7 @@ typedef struct packed {
   logic [4:0] atomicOperation;
   logic scEligible;
 } request_t;
-typedef struct packed { logic [63:0] data; logic fault; logic [7:0] tag; } response_t;
+typedef struct packed { logic [63:0] data; logic fault; logic [7:0] tag; logic last; } response_t;
 interface memory_port;
   logic request_ready, request_valid, response_ready, response_valid = 0;
   request_t request;
@@ -24,7 +24,7 @@ endinterface
   .P``_request_bits_privileged(B.request.privileged), \
   .P``_request_bits_atomicOperation(B.request.atomicOperation), .P``_request_bits_scEligible(B.request.scEligible), .P``_response_ready(B.response_ready), \
   .P``_response_valid(B.response_valid), .P``_response_bits_data(B.response.data), \
-  .P``_response_bits_fault(B.response.fault), .P``_response_bits_tag(B.response.tag)
+  .P``_response_bits_fault(B.response.fault), .P``_response_bits_tag(B.response.tag), .P``_response_bits_last(B.response.last)
 `undef CORE_TRACE
 `define CORE_TRACE dut.backend.dV
 module memory_tb;
@@ -100,6 +100,7 @@ module memory_tb;
     logic reservation_valid = 0, service_fault, successful_write;
     logic [2:0] reservation_size;
     logic [7:0] owner_tag;
+    integer chunk = 0;
     integer delay = 0, stalls = 0, delayed = 0, rejected = 0, wraps = 0, requests = 0;
     always @(negedge clock) begin
       physical_port[p].request_ready = !reset && !pending && !physical_port[p].response_valid && random_state[p];
@@ -113,7 +114,7 @@ module memory_tb;
       if (core_port[p].request_valid && core_port[p].request_ready) begin
         if (core_pending[p]) $fatal(1, "Overlapping requests on one port");
         if (core_port[p].request.fetch != (p == 0) ||
-            (p == 0 ? core_port[p].request.size != 2 : core_port[p].request.size > 3) ||
+            (p == 0 ? (core_port[p].request.size != 2 && core_port[p].request.size != 6) : core_port[p].request.size > 3) ||
             core_port[p].request.mask != (core_port[p].request.write ? ((1 << (1 << core_port[p].request.size)) - 1) : 0) ||
             (p == 0 && (core_port[p].request.write || core_port[p].request.atomic)) ||
             (core_port[p].request.atomic && (core_port[p].request.size != 3 ||
@@ -132,12 +133,13 @@ module memory_tb;
       end
       if (core_port[p].response_valid && core_port[p].response_ready) begin
         if (!core_pending[p] || core_port[p].response.tag != owner_tag) $fatal(1, "Response ownership");
-        core_pending[p] <= 0;
+        if (core_port[p].response.last) core_pending[p] <= 0;
       end
       if (physical_port[p].request_valid && physical_port[p].request_ready) begin
         if (pending || physical_port[p].response_valid) $fatal(1, "Overlapping physical requests");
         if (physical_port[p].request.address < base_address || physical_port[p].request.address > base_address + 65536 - (1 << physical_port[p].request.size)) $fatal(1, "Memory bounds");
         captured <= physical_port[p].request;
+        chunk <= 0;
         pending <= 1;
         delay <= p == 0 ? integer'(random_state[5:4]) : 32 + integer'(random_state[7:4]);
 `ifdef ENABLE_INTERRUPTS
@@ -189,19 +191,28 @@ module memory_tb;
               updated_data[i*8 +: 8];
         end
       end
-      if (pending) begin
+      if (pending && !physical_port[p].response_valid) begin
         if (delay > 0) begin delay <= delay - 1; delayed <= delayed + 1; end
         else begin
           physical_port[p].response.data <= captured.atomic ? atomic_result : 0;
           if (!captured.write && !captured.atomic)
-            for (integer i = 0; i < (1 << captured.size); i++)
-              physical_port[p].response.data[i*8 +: 8] <= memory[integer'(captured.address - base_address) + i];
+            for (integer i = 0; i < (captured.size == 6 ? 8 : (1 << captured.size)); i++)
+              physical_port[p].response.data[i*8 +: 8] <= memory[integer'(captured.address - base_address) + 8 * chunk + i];
+          physical_port[p].response.last <= captured.size != 6 || chunk == 7;
+          if (captured.size == 6) physical_port[p].response.fault <= captured.address + 8 * chunk <= fault_fetch && fault_fetch < captured.address + 8 * chunk + 8;
           physical_port[p].response_valid <= 1;
-          pending <= 0;
         end
       end
       if (physical_port[p].response_valid && physical_port[p].response_ready) begin
-        if (p == 0) $display("FETCH %016h %01h %08h", captured.address, physical_port[p].response.fault ? 2 : 0, 32'(physical_port[p].response.data));
+        if (p == 0) begin
+          if (captured.size == 6) $display("LINE_BEAT %016h %01h %016h %01h", captured.address + 8 * chunk,
+            physical_port[p].response.fault ? 2 : 0, physical_port[p].response.data, physical_port[p].response.last);
+          for (integer word_index = 0; word_index < (captured.size == 6 ? 2 : 1); word_index++)
+            $display("FETCH %016h %01h %08h", captured.address + 8 * chunk + 4 * word_index,
+              physical_port[p].response.fault ? 2 : 0, 32'(physical_port[p].response.data >> (32 * word_index)));
+        end
+        if (physical_port[p].response.last) pending <= 0;
+        else begin chunk <= chunk + 1; delay <= integer'(random_state[5:4]); end
         physical_port[p].response_valid <= 0;
       end
     end

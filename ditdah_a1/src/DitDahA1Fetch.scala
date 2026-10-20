@@ -30,6 +30,7 @@ object DitDahA1Fetch extends Generator[DitDahA1Parameter, DitDahA1UnitLayers, Di
     val state = RegInit(0.U(stateBits))
     val packet = Reg(new FetchPacket)
     val killed = RegInit(false.B)
+    val flush = io.cancel | io.invalidate.getOrElse(false.B)
     val privilege = Option.when(parameter.enableUserMode)(Reg(UInt(2)))
     val physicalAddress = Option.when(parameter.enableTranslation)(Reg(UInt(64)))
     val cache = Option.when(parameter.iCacheBytes != 0)(DitDahA1InstructionCache.instantiate(parameter))
@@ -41,7 +42,8 @@ object DitDahA1Fetch extends Generator[DitDahA1Parameter, DitDahA1UnitLayers, Di
       pmp.io.state :<= io.pmp.get
       val checkAddress = cache.map(c => (state === 0.U(stateBits)).?(io.request.bits.pc, c.io.checkAddress)).getOrElse(io.request.bits.pc)
       pmp.io.address := io.translation.map(t => (state === 5.U(stateBits)).?(t.response.bits.address, checkAddress)).getOrElse(checkAddress)
-      pmp.io.size := 2.U(3)
+      val checkingDemand = (state === 0.U(stateBits)) | (if parameter.enableTranslation then state === 5.U(stateBits) else false.B)
+      pmp.io.size := cache.map(c => checkingDemand.?(2.U(3), c.io.checkSize)).getOrElse(2.U(3))
       pmp.io.write := false.B
       pmp.io.fetch := true.B
       pmp.io.atomic := false.B
@@ -52,12 +54,15 @@ object DitDahA1Fetch extends Generator[DitDahA1Parameter, DitDahA1UnitLayers, Di
       c.io.reset := io.reset
       c.io.cancel := io.cancel
       c.io.invalidate := io.invalidate.get
-      c.io.allowed := permitted & DitDahA1Memory.executable(parameter, c.io.checkAddress, 4)
+      val ordinary = if parameter.enableBurstRefill then (c.io.checkSize === 6.U(3)).?(
+        DitDahA1Memory.executable(parameter, c.io.checkAddress, 64), DitDahA1Memory.executable(parameter, c.io.checkAddress, 4))
+      else DitDahA1Memory.executable(parameter, c.io.checkAddress, 4)
+      c.io.allowed := permitted & ordinary
       io.memory :<>= c.io.downstream
     }
     val demandPermitted = if cache.isDefined then permitted & DitDahA1Memory.executable(parameter, io.request.bits.pc, 4) else permitted
-    io.request.ready := (state === 0.U(stateBits)) & !io.cancel
-    io.output.valid := (state === 3.U(stateBits)) & !killed & !io.cancel
+    io.request.ready := (state === 0.U(stateBits)) & !flush
+    io.output.valid := (state === 3.U(stateBits)) & !killed & !flush
     io.output.bits :<= packet
     request.valid := state === 1.U(stateBits)
     request.bits.address := physicalAddress.getOrElse(packet.pc)
@@ -73,14 +78,14 @@ object DitDahA1Fetch extends Generator[DitDahA1Parameter, DitDahA1UnitLayers, Di
     request.bits.scEligible := false.B
     response.ready := state === 2.U(stateBits)
     io.translation.foreach { t =>
-      t.request.valid := (state === 4.U(stateBits)) & !killed & !io.cancel
+      t.request.valid := (state === 4.U(stateBits)) & !killed & !flush
       t.request.bits.address := packet.pc
       t.request.bits.privilege := privilege.get
       t.request.bits.fetch := true.B
       t.request.bits.write := false.B
       t.response.ready := state === 5.U(stateBits)
       when(t.request.valid & t.request.ready) { state := 5.U(stateBits) }
-      when((state === 4.U(stateBits)) & (killed | io.cancel)) { state := 0.U(stateBits) }
+      when((state === 4.U(stateBits)) & (killed | flush)) { state := 0.U(stateBits) }
       when(t.response.valid & t.response.ready) {
         physicalAddress.get := t.response.bits.address
         packet.fault := t.response.bits.fault
@@ -93,7 +98,7 @@ object DitDahA1Fetch extends Generator[DitDahA1Parameter, DitDahA1UnitLayers, Di
           packet.tval := packet.pc
           state := 3.U(stateBits)
         }
-        when(t.response.bits.fault | killed | io.cancel) { state := 3.U(stateBits) }
+        when(t.response.bits.fault | killed | flush) { state := 3.U(stateBits) }
       }
     }
     when(io.request.valid & io.request.ready) {
@@ -130,5 +135,5 @@ object DitDahA1Fetch extends Generator[DitDahA1Parameter, DitDahA1UnitLayers, Di
       packet.tval := fault.?(packet.pc, 0.U(64))
       state := 3.U(stateBits)
     }
-    when(io.cancel & (state =/= 0.U(stateBits))) { killed := true.B }
-    when((state === 3.U(stateBits)) & (killed | io.cancel | io.output.ready)) { state := 0.U(stateBits) }
+    when(flush & (state =/= 0.U(stateBits))) { killed := true.B }
+    when((state === 3.U(stateBits)) & (killed | flush | io.output.ready)) { state := 0.U(stateBits) }

@@ -14,11 +14,12 @@ def load_configuration(args):
     sv39 = getattr(args, 'sv39', False)
     supervisor_mode = getattr(args, 'supervisor_mode', False) or sv39
     tlb_entries = getattr(args, 'tlb_entries', None)
+    burst_refill = getattr(args, 'burst_refill', None)
     original = args.config
     content = original.read_bytes()
     document = json.loads(content)
     config = document.get('parameters', document)
-    if args.harts is None and args.icache_bytes is None and args.dcache_bytes is None and not supervisor_mode and tlb_entries is None:
+    if args.harts is None and args.icache_bytes is None and args.dcache_bytes is None and not supervisor_mode and tlb_entries is None and burst_refill is None:
         return config, {}
     if args.harts is not None:
         config['hartCount'] = args.harts
@@ -32,6 +33,8 @@ def load_configuration(args):
         config['virtualAddressBits'] = 39
     if tlb_entries is not None:
         config['tlbEntries'] = tlb_entries
+    if burst_refill is not None:
+        config['enableBurstRefill'] = burst_refill
     args.config = args.output / 'input.json'
     assert args.config.resolve() != original.resolve(), 'Derived configuration would overwrite its source'
     args.config.write_text(json.dumps(config, indent=2) + '\n')
@@ -52,6 +55,7 @@ def main():
     parser.add_argument('--supervisor-mode', action='store_true')
     parser.add_argument('--sv39', action='store_true')
     parser.add_argument('--tlb-entries', type=int, choices=(0, 2, 4))
+    parser.add_argument('--burst-refill', action=argparse.BooleanOptionalAction, default=None)
     parser.add_argument('--expected-interrupt', type=int, choices=(1, 3, 5, 7, 9, 11), action='append', default=[])
     args = parser.parse_args()
     args.output.mkdir(parents=True, exist_ok=True)

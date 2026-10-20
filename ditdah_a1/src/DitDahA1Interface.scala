@@ -63,6 +63,7 @@ class MemoryResponse extends Bundle:
   val data = Aligned(UInt(64))
   val fault = Aligned(Bool())
   val tag = Aligned(UInt(8))
+  val last = Aligned(Bool())
 class MemoryPort extends Bundle:
   val request = Aligned(new Decoupled(new MemoryRequest))
   val response = Flipped(new Decoupled(new MemoryResponse))

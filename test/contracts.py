@@ -334,6 +334,20 @@ def arbiter_contract(parameters):
     end
     ports_{owner}_response_ready = 1; tick(); downstream_response_valid = 0;
 '''
+    if parameters.get('enableBurstRefill'):
+        body += ''.join(f"    ports_{i}_request_valid = 0;\n" for i in range(count))
+        body += "    ports_0_request_valid = 1; ports_0_request_bits_size = 6; tick(); ports_0_request_valid = 0;\n"
+        body += "    downstream_request_ready = 1; tick(); downstream_request_ready = 0; ports_1_request_valid = 1;\n"
+        body += "    for (integer chunk = 0; chunk < 8; chunk++) begin\n"
+        body += f"""    downstream_response_bits_last = chunk == 7; downstream_response_bits_data = chunk;
+    downstream_response_valid = 1; ports_0_response_ready = 0;
+    repeat (3) begin
+      check(ports_0_response_valid && !ports_1_response_valid && !ports_1_request_ready && ports_0_response_bits_data == chunk && ports_0_response_bits_last == (chunk == 7) && hartId == 0, "Stream retains owner and stalled chunk"); tick();
+    end
+    ports_0_response_ready = 1; tick(); downstream_response_valid = 0;
+    end
+    check(ports_1_request_ready, "Peer is served after terminal chunk");
+"""
     return body
 
 
@@ -487,6 +501,10 @@ def memory_contract(parameters):
               (0x1000, 3, 1, 0, 255, 1, 2, 0, False), (0x1000, 3, 0, 0, 0, 1, 3, 1, False))
     cases += tuple((0x1000, 3, 1, 0, 255, 1, op, 0, False) for op in (4, 5, 12, 16, 20, 24, 28))
     cases += tuple((0x1000, 2, int(op != 2), 0, 0 if op == 2 else 15, 1, op, 0, False) for op in (1, 2, 3, 8))
+    if parameters.get('enableBurstRefill'):
+        cases += tuple((offset, 6, write, fetch, 0, atomic, 0, 0, allowed) for offset, write, fetch, atomic, allowed in
+                       ((0x1000, 0, 1, 0, True), (0x1004, 0, 1, 0, False), (0x1000, 0, 0, 0, False),
+                        (0x1000, 1, 1, 0, False), (0x1000, 0, 1, 1, False), (0x5000, 0, 1, 0, False), (0x3fe0, 0, 1, 0, False)))
     body = ''
     for tag, (offset, size, write, fetch, mask, atomic, operation, eligible, allowed) in enumerate(cases, 1):
         body += f'''    upstream_request_bits_address = 64'h{base + offset:x};
@@ -509,11 +527,14 @@ def memory_contract(parameters):
         else:
             body += '    tick();\n'
         body += f'''    upstream_request_valid = 0;
+    for (integer chunk = 0; chunk < {8 if allowed and size == 6 else 1}; chunk++) begin
+    downstream_response_bits_last = chunk == {7 if allowed and size == 6 else 0};
     repeat (3) begin
-      check(upstream_response_valid && upstream_response_bits_fault == {int(not allowed)} && upstream_response_bits_tag == {tag} && !downstream_request_valid && !upstream_request_ready, "Memory response backpressure {tag}");
+      check(upstream_response_valid && upstream_response_bits_fault == {int(not allowed)} && upstream_response_bits_tag == {tag} && upstream_response_bits_last == {"downstream_response_bits_last" if allowed else "1"} && !downstream_request_valid && !upstream_request_ready, "Memory response backpressure {tag}");
       tick();
     end
     upstream_response_ready = 1; tick(); upstream_response_ready = 0;
+    end
     downstream_response_valid = 0;
 '''
     return body
@@ -765,6 +786,99 @@ def cached_fetch_contract(parameters, frontend=False):
     for address, cause in ((line + 2, 0), (base + 0x6000, 1)):
         body += request(address, 27) + output(address, '0', 1)
         body += f'    check(output_bits_cause == {cause}, "Local instruction authorization fault");\n'
+    return body
+
+
+def burst_fetch_contract(parameters, frontend=False):
+    base = int(parameters['resetVector']) + (0 if frontend else 0x100)
+
+    def request(address, tag):
+        return f"    request_bits_pc = 'h{address:x}; request_bits_tag = {tag}; request_valid = 1; #1; while (!request_ready) tick(); tick(); request_valid = 0;\n"
+
+    def line(address, fault=-1, cancel=-1, invalidate=-1, wrong_tag=False):
+        body = f"""    while (!memory_request_valid) tick();
+    check(memory_request_bits_address == 'h{address:x} && memory_request_bits_size == 6 && memory_request_bits_fetch && !memory_request_bits_write && !memory_request_bits_atomic, "Aligned protected line request");
+    memory_response_bits_tag = memory_request_bits_tag ^ {int(wrong_tag)};
+    memory_request_ready = 1; tick(); memory_request_ready = 0;
+"""
+        for chunk in range(8):
+            body += f"""    repeat (2) begin check(!output_valid && !memory_request_valid, "Incomplete line cannot escape or relinquish ownership"); tick(); end
+    memory_response_bits_data = 64'h{(0x10000001 + 2 * chunk) << 32 | (0x10000000 + 2 * chunk):x};
+    memory_response_bits_last = {int(chunk == 7)}; memory_response_bits_fault = {int(chunk == fault)};
+    memory_response_valid = 1; while (!memory_response_ready) tick();
+    cancel = {int(chunk == cancel)}; invalidate = {int(chunk == invalidate)}; tick();
+    memory_response_valid = 0; memory_response_bits_fault = 0; cancel = 0; invalidate = 0;
+""".replace('cancel =', 'redirect =' if frontend else 'cancel =')
+        return body
+
+    def output(address, word, fault=0):
+        return f"""    while (!output_valid) tick();
+    repeat (3) begin check(output_bits_pc == 'h{address:x} && output_bits_instruction == 32'h{word:x} && output_bits_fault == {fault} && !memory_request_valid, "Demand word and output retention"); tick(); end
+    output_ready = 1; tick(); output_ready = 0;
+"""
+
+    def scalar(address, fault=0):
+        return f"""    while (!memory_request_valid) tick();
+    check(memory_request_bits_address == 'h{address:x} && memory_request_bits_size == 2, "Line failure retries only original demand");
+    memory_response_bits_tag = memory_request_bits_tag; memory_request_ready = 1; tick(); memory_request_ready = 0;
+    memory_response_bits_data = 'habcdef13; memory_response_bits_fault = {fault}; memory_response_bits_last = 1;
+    memory_response_valid = 1; tick(); memory_response_valid = 0; memory_response_bits_fault = 0;
+"""
+
+    body = '' if frontend else request(base + 4, 21)
+    body += line(base) + output(base if frontend else base + 4, 0x10000000 if frontend else 0x10000001)
+    if frontend:
+        return body + output(base + 4, 0x10000001)
+    for word in range(16):
+        body += request(base + 4 * word, 22) + output(base + 4 * word, 0x10000000 + word)
+    for index, failure in enumerate((dict(fault=7), dict(fault=0), dict(wrong_tag=True))):
+        body += '    invalidate = 1; tick(); invalidate = 0;\n'
+        body += request(base + 8, 23 + index) + line(base, **failure) + scalar(base + 8) + output(base + 8, 0xabcdef13)
+    for index, event in enumerate((dict(cancel=0), dict(cancel=7), dict(invalidate=7))):
+        body += '    invalidate = 1; tick(); invalidate = 0;\n'
+        body += request(base + 8, 30 + index) + line(base, **event)
+        body += '    while (!request_ready) begin check(!output_valid, "Cancelled line cannot publish"); tick(); end\n'
+        body += request(base + 8, 40 + index) + line(base) + output(base + 8, 0x10000002)
+    if parameters['pmpEntries']:
+        body += f"    invalidate = 1; tick(); invalidate = 0; pmp_config = 'h90; pmp_address = 'h{(base + 4) >> 2:x};\n"
+        body += request(base + 8, 50) + scalar(base + 8) + output(base + 8, 0xabcdef13)
+        body += request(base + 4, 51) + output(base + 4, 0, 1)
+        body += '    pmp_config = 0; pmp_address = 0;\n'
+    return body
+
+
+def burst_axi_contract(parameters):
+    width, bus_bytes = parameters['axiDataBits'], parameters['axiDataBits'] // 8
+    beats, slices = 64 // bus_bytes, width // 64
+    body = ''
+    for error in ('none', 'response', 'id', 'early', 'missing'):
+        if error == 'early' and beats == 1:
+            continue
+        body += f"""    hartId = 0; memory_request_bits_address = 'h1000; memory_request_bits_size = 6;
+    memory_request_bits_write = 0; memory_request_bits_fetch = 1; memory_request_bits_atomic = 0;
+    memory_request_bits_tag = 219; memory_request_valid = 1; tick(); memory_request_valid = 0;
+    repeat (3) begin check(axi_ar_valid && axi_ar_bits_len == {beats - 1} && axi_ar_bits_size == {bus_bytes.bit_length() - 1} && axi_ar_bits_burst == 1 && !axi_ar_bits_lock, "Line AXI shape and address retention"); tick(); end
+    axi_ar_ready = 1; tick(); axi_ar_ready = 0;
+"""
+        for beat in range(1 if error == 'early' else beats):
+            data = sum((byte + beat * bus_bytes + 1) << (8 * byte) for byte in range(bus_bytes))
+            terminal = error == 'early' or (beat == beats - 1 and error != 'missing')
+            bad = error in ('response', 'id', 'early') or error == 'missing' and beat == beats - 1
+            body += f"""    axi_r_bits_data = {width}'h{data:x}; axi_r_bits_id = {int(error == 'id')}; axi_r_bits_resp = {2 if error == 'response' else 0}; axi_r_bits_last = {int(terminal)};
+    axi_r_valid = 1; while (!axi_r_ready) tick(); tick(); axi_r_valid = 0;
+"""
+            for part in range(slices):
+                body += f"""    while (!memory_response_valid) tick();
+    repeat (3) begin check(memory_response_bits_data == 64'h{(data >> (64 * part)) & MASK:x} && memory_response_bits_tag == 219 && memory_response_bits_fault == {int(bad)} && memory_response_bits_last == {int(terminal and part == slices - 1)} && !memory_request_ready && !axi_ar_valid, "Serialized chunk data, error, last and retained ownership"); tick(); end
+    memory_response_ready = 1; tick(); memory_response_ready = 0;
+"""
+        if error == 'missing':
+            body += """    check(axi_r_ready && !memory_request_ready && !memory_response_valid, "Malformed line retains drain ownership");
+    axi_r_bits_last = 1; axi_r_valid = 1; tick(); axi_r_valid = 0;
+    check(memory_response_valid && memory_response_bits_fault && memory_response_bits_last, "Late terminal beat faults without silent owner reuse");
+    memory_response_ready = 1; tick(); memory_response_ready = 0;
+"""
+        body += '    check(memory_request_ready, "Terminal line releases bridge");\n'
     return body
 
 
@@ -1200,7 +1314,7 @@ def bench(module, body):
         new_direction, new_width, name = match.groups()
         if new_direction:
             direction, width = new_direction, new_width or ''
-        initial = (" = 3" if name == 'privilege' else " = 1" if name == 'wfiLegal' or name.endswith('_privileged') else " = '0") if direction == 'input' else ''
+        initial = (" = 3" if name == 'privilege' else " = 1" if name == 'wfiLegal' or name.endswith(('_privileged', '_response_bits_last')) else " = '0") if direction == 'input' else ''
         declarations.append(f'  logic {width} {name}{initial};')
         connections.append(f'.{name}({name})')
         names.append(name)
@@ -1238,6 +1352,10 @@ def pmp_contract(parameters):
                     addresses[index - 1] = 0x400
                 tests.append((configs, addresses, address, 3, 'read'))
                 tests.append((configs, addresses, address, 3, 'atomic'))
+    if parameters.get('enableBurstRefill'):
+        for address in (0xfc0, 0xffc, 0x1000, 0x103c, (1 << pa) - 64, (1 << pa) - 32, (1 << 64) - 32):
+            for config in (0, 0x9c, 0x98, 0x94, 0x8c):
+                tests.append(([config] + [0x9f] + [0] * 14, [0x407, (1 << width) - 1] + [0] * 14, address, 6, 'fetch'))
     for _ in range(320):
         configs = [rng.randrange(256) & 0x9f for _ in range(16)]
         addresses = [rng.choice((0, 0x400 + rng.randrange(16), (1 << width) - 1)) for _ in range(16)]
@@ -1634,12 +1752,15 @@ def translated_consumer_contract(parameters, fetch):
 '''
     def complete(virtual, address, operation=None, eligible=False):
         nonlocal body
-        for word in range(16 if fetch and parameters['iCacheBytes'] else 1):
+        burst = fetch and parameters['iCacheBytes'] and parameters.get('enableBurstRefill')
+        for word in range(1 if burst else 16 if fetch and parameters['iCacheBytes'] else 1):
             body += f'''    while (!memory_request_valid) tick();
     check(memory_request_bits_address == 64'h{address + 4*word:x} && memory_request_bits_privileged && memory_request_bits_scEligible == {int(eligible)}, "Physical request address and reservation qualification");
     memory_request_ready = 1; tick(); memory_request_ready = 0;
-    memory_response_bits_tag = 37; memory_response_bits_data = 'h13; memory_response_valid = 1; tick(); memory_response_valid = 0;
+    memory_response_bits_tag = 37;
 '''
+            for chunk in range(8 if burst else 1):
+                body += f"    memory_response_bits_data = 'h13; memory_response_bits_last = {int(not burst or chunk == 7)}; memory_response_valid = 1; while (!memory_response_ready) tick(); tick(); memory_response_valid = 0;\n"
         body += f'''    while (!output_valid) tick();
     check(!output_bits_{'fault' if fetch else 'instruction_fault'} && output_bits_{'pc' if fetch else 'address'} == 'h{virtual:x}, "Architectural output retains virtual identity");
     output_ready = 1; tick(); output_ready = 0;
@@ -1875,17 +1996,17 @@ def verify(rtl, directory, modules=None):
     verified = []
     enabled = parameters['pmpEntries'] != 0
     cached = bool(parameters['iCacheBytes'])
-    suites = (('DitDahA1Fetch', cached_fetch_contract(parameters) if cached else FETCH + (protection_contract(True) if enabled else '')),
+    suites = (('DitDahA1Fetch', (burst_fetch_contract(parameters) if parameters.get('enableBurstRefill') else cached_fetch_contract(parameters)) if cached else FETCH + (protection_contract(True) if enabled else '')),
                        ('DitDahA1Lsu', LSU + lsu_reservation_contract(parameters) + (protection_contract(False) if enabled else '')),
                        ('DitDahA1Multiply', multiply_contract()),
-                       ('DitDahA1Frontend', cached_fetch_contract(parameters, True) if cached else frontend_contract(parameters)),
+                       ('DitDahA1Frontend', (burst_fetch_contract(parameters, True) if parameters.get('enableBurstRefill') else cached_fetch_contract(parameters, True)) if cached else frontend_contract(parameters)),
                        ('DitDahA1Decode', decode_contract(parameters)),
                        ('DitDahA1Execute', execute_contract()),
                        ('DitDahA1Backend', backend_contract() + backend_fence_contract() + (backend_protection_contract() if enabled else '') +
                         (backend_interrupt_contract() if parameters['enableInterrupts'] else '')),
                        ('DitDahA1MemoryArbiter', arbiter_contract(parameters)),
                        ('DitDahA1Memory', memory_contract(parameters)),
-                       ('DitDahA1Axi', axi_contract(parameters['axiDataBits'], parameters['hartCount'])),
+                       ('DitDahA1Axi', axi_contract(parameters['axiDataBits'], parameters['hartCount']) + (burst_axi_contract(parameters) if parameters.get('enableBurstRefill') else '')),
                        ('DitDahA1MemoryFabric', fabric_contract(parameters)))
     if parameters.get('localInterruptBase'):
         suites += (('DitDahA1LocalInterrupts', local_interrupt_contract(parameters)),)

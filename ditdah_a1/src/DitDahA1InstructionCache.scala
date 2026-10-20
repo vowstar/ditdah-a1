@@ -15,6 +15,7 @@ class DitDahA1InstructionCacheIO(parameter: DitDahA1Parameter) extends HWBundle(
   val cancel = Flipped(Bool())
   val invalidate = Flipped(Bool())
   val checkAddress = Aligned(UInt(64))
+  val checkSize = Aligned(UInt(3))
   val allowed = Flipped(Bool())
 
 @generator
@@ -37,23 +38,29 @@ object DitDahA1InstructionCache extends Generator[DitDahA1Parameter, DitDahA1Uni
     val word = Reg(UInt(4))
     val bypass = Reg(Bool())
     val killed = RegInit(false.B)
+    val upperWord = Option.when(parameter.enableBurstRefill)(Reg(UInt(32)))
+    val terminal = Option.when(parameter.enableBurstRefill)(Reg(Bool()))
     val up = io.upstream
     val down = io.downstream
     val index = address.asBits.bits(indexBits + 5, 6).asUInt
     val mask = (1.U(lines) << index).asBits.bits(lines - 1, 0)
     val demandWord = address.asBits.bits(5, 2).asUInt
-    val candidate = bypass.?(address, (address.asBits.bits(63, 6) ## word.asBits ## 0.B(2)).asUInt)
+    val burst = if parameter.enableBurstRefill then !bypass else false.B
+    val refillWord = if parameter.enableBurstRefill then 0.U(4) else word
+    val candidate = bypass.?(address, (address.asBits.bits(63, 6) ## refillWord.asBits ## 0.B(2)).asUInt)
     val abort = killed | io.cancel | io.invalidate
     up.request.ready := state === 0.U(3)
     up.response.valid := state === 5.U(3)
     up.response.bits.data := data
     up.response.bits.tag := tag
     up.response.bits.fault := fault
+    up.response.bits.last := true.B
     io.checkAddress := candidate
+    io.checkSize := burst.?(6.U(3), 2.U(3))
     down.request.valid := state === 3.U(3)
     down.request.bits.address := candidate
     down.request.bits.data := 0.U(64)
-    down.request.bits.size := 2.U(3)
+    down.request.bits.size := io.checkSize
     down.request.bits.mask := 0.U(8)
     down.request.bits.tag := tag
     down.request.bits.write := false.B
@@ -65,12 +72,18 @@ object DitDahA1InstructionCache extends Generator[DitDahA1Parameter, DitDahA1Uni
     down.response.ready := state === 4.U(3)
     val reading = up.request.valid & up.request.ready
     val responseFault = down.response.bits.fault | (down.response.bits.tag =/= tag)
-    val filling = down.response.valid & down.response.ready & !responseFault & !bypass & !abort
+    val received = down.response.valid & down.response.ready
+    val lineFault = fault | responseFault | (down.response.bits.last =/= (word === 14.U(4)))
+    val filling = if parameter.enableBurstRefill then
+      !bypass & !abort & (((state === 6.U(3)) & !fault) | (received & !lineFault))
+    else received & !responseFault & !bypass & !abort
+    val writeData = upperWord.map(value => (state === 6.U(3)).?(value, down.response.bits.data.asBits.bits(31, 0).asUInt))
+      .getOrElse(down.response.bits.data.asBits.bits(31, 0).asUInt)
     val complete = word === 15.U(4)
 
     val wordRead = StorageArray("instructions", parameter.iCacheBytes / 4, 32,
       up.request.bits.address.asBits.bits(indexBits + 5, 2).asUInt,
-      (index.asBits ## word.asBits).asUInt, down.response.bits.data.asBits.bits(31, 0).asUInt, filling, reading, io.clock)
+      (index.asBits ## word.asBits).asUInt, writeData, filling, reading, io.clock)
     val tagRead = StorageArray("tags", lines, tagBits,
       up.request.bits.address.asBits.bits(indexBits + 5, 6).asUInt, index,
       address.asBits.bits(parameter.physicalAddressBits - 1, indexBits + 6).asUInt, filling & complete, reading, io.clock)
@@ -99,14 +112,17 @@ object DitDahA1InstructionCache extends Generator[DitDahA1Parameter, DitDahA1Uni
     when(state === 2.U(3)) {
       when(abort) { state := 5.U(3) }.otherwise {
         when(io.allowed) { state := 3.U(3) }.otherwise {
-          when(bypass | (word === demandWord)) { fault := true.B; state := 5.U(3) }.otherwise {
-            bypass := true.B
-          }
+          if parameter.enableBurstRefill then
+            when(bypass) { fault := true.B; state := 5.U(3) }.otherwise { bypass := true.B }
+          else
+            when(bypass | (word === demandWord)) { fault := true.B; state := 5.U(3) }.otherwise {
+              bypass := true.B
+            }
         }
       }
     }
     when(down.request.valid & down.request.ready) { state := 4.U(3) }
-    when(down.response.valid & down.response.ready) {
+    when(received & !burst) {
       when(abort) { state := 5.U(3) }.otherwise {
         when(responseFault) {
           when(bypass | (word === demandWord)) { fault := true.B; state := 5.U(3) }.otherwise {
@@ -124,6 +140,27 @@ object DitDahA1InstructionCache extends Generator[DitDahA1Parameter, DitDahA1Uni
         }
       }
     }
+    if parameter.enableBurstRefill then
+      when(received & burst) {
+        upperWord.get := down.response.bits.data.asBits.bits(63, 32).asUInt
+        terminal.get := down.response.bits.last
+        fault := lineFault
+        when(word =/= 15.U(4)) { word := (word + 1.U(4)).asBits.bits(3, 0).asUInt }
+        when((word === demandWord) & !abort & !lineFault) { data := down.response.bits.data.asBits.bits(31, 0).asUInt }
+        state := 6.U(3)
+      }
+      when(state === 6.U(3)) {
+        when((word === demandWord) & !abort & !fault) { data := upperWord.get }
+        state := 4.U(3)
+        when(word =/= 15.U(4)) { word := (word + 1.U(4)).asBits.bits(3, 0).asUInt }
+        when(terminal.get) {
+          state := 5.U(3)
+          when(!abort) {
+            when(fault) { bypass := true.B; fault := false.B; state := 2.U(3) }
+              .otherwise { valid := valid | mask }
+          }
+        }
+      }
     when(up.response.valid & up.response.ready) { state := 0.U(3) }
     when((io.cancel | io.invalidate) & (state =/= 0.U(3))) { killed := true.B }
     when(io.invalidate) { valid := 0.B(lines) }

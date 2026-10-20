@@ -56,6 +56,9 @@ object DitDahA1Memory extends Generator[DitDahA1Parameter, DitDahA1UnitLayers, D
             }
           }
       }
+    if parameter.enableBurstRefill then
+      when(request.fetch & !request.write & !request.atomic & (request.size === 6.U(3)) &
+        (request.address.asBits.bits(5, 0) === 0.B(6))) { allowed := executable(parameter, request.address, 64) }
     allowed
   def architecture(parameter: DitDahA1Parameter) =
     val io = summon[Interface[DitDahA1MemoryIO]]
@@ -75,6 +78,7 @@ object DitDahA1Memory extends Generator[DitDahA1Parameter, DitDahA1UnitLayers, D
     up.response.bits.data := localFault.?(0.U(64), down.response.bits.data)
     up.response.bits.fault := localFault | down.response.bits.fault
     up.response.bits.tag := localFault.?(tag, down.response.bits.tag)
+    up.response.bits.last := localFault | down.response.bits.last
     down.response.ready := pending & !localFault & up.response.ready
     when(up.request.valid & up.request.ready) { pending := true.B; localFault := !allowed; tag := request.tag }
-    when(up.response.valid & up.response.ready) { pending := false.B }
+    when(up.response.valid & up.response.ready & up.response.bits.last) { pending := false.B }

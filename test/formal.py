@@ -35,7 +35,7 @@ FETCH = r'''
       assume(!memory_response_valid || outstanding);
       if (past_valid && $past(!reset && memory_response_valid && !memory_response_ready)) begin
         assume(memory_response_valid);
-        assume($stable({memory_response_bits_data, memory_response_bits_fault, memory_response_bits_tag}));
+        assume($stable({memory_response_bits_data, memory_response_bits_fault, memory_response_bits_tag, memory_response_bits_last}));
       end
       if (memory_request_valid && memory_request_ready) begin
         assert(!outstanding);
@@ -200,6 +200,7 @@ def header(text):
 
 def protection_cases(parameters):
     width = parameters['physicalAddressBits'] - 2
+    line_size = ' || (size == 6 && fetch && !write && !atomic)' if parameters.get('enableBurstRefill') else ''
     machine = "privilege == 3" if parameters.get('enableUserMode') else "1'b1"
     decode = f'''
   reg expected, any_byte, every_byte, carry, hit;
@@ -230,6 +231,8 @@ def protection_cases(parameters):
     decode += '      case (i)\n' + ''.join(
         f"        {i}: assert({('base' if i == 15 else f'base_{14-i}')} == low && {('limit' if i == 15 else f'limit_{14-i}')} == high);\n"
         for i in range(16)) + '      endcase\n    end\n    assert(start == {1\'b0, address});\n    assert(end_0 == (size <= 3 ? {1\'b0, address} + (65\'d1 << size) : {1\'b0, address}));\n    cover(state_config[4:3] == 3 && state_address[0]);\n  end\n'
+    if line_size:
+        decode = decode.replace('size <= 3 ?', '(size <= 3 || size == 6) ?')
     interval = r'''
   reg any_byte, every_byte, hit;
   reg [64:0] cursor;
@@ -248,6 +251,25 @@ def protection_cases(parameters):
       assert(!any_byte || every_byte == ({1'b0, address} >= low && finish <= high));
     end
     cover(any_byte && !every_byte && size == 3);
+  end
+'''
+    if line_size:
+        interval = r'''
+  (* anyconst *) reg [5:0] offset;
+  wire supported = size <= 3 || size == 6;
+  wire [64:0] begin_address = {1'b0, address};
+  wire [64:0] finish = begin_address + (65'd1 << size);
+  wire [64:0] selected = begin_address + offset;
+  wire overlap = high > low && begin_address < high && finish > low;
+  wire contained = begin_address >= low && finish <= high;
+  wire [64:0] first = begin_address >= low ? begin_address : low;
+  wire [64:0] outside = begin_address < low ? begin_address : finish - 1;
+  always @* if (supported) begin
+    if (offset < (1 << size) && selected >= low && selected < high) assert(overlap);
+    if (overlap) assert(first >= begin_address && first < finish && first >= low && first < high);
+    if (offset < (1 << size) && contained) assert(selected >= low && selected < high);
+    if (overlap && !contained) assert(outside >= begin_address && outside < finish && (outside < low || outside >= high));
+    cover(overlap && !contained && size == 6);
   end
 '''
     pmp = f'''
@@ -275,7 +297,7 @@ def protection_cases(parameters):
         (atomic ? state_config[i*8] && state_config[i*8+1] :
           fetch ? state_config[i*8+2] : write ? state_config[i*8+1] : state_config[i*8]));
     end
-    assert(allowed == (expected && size <= 3 &&
+    assert(allowed == (expected && (size <= 3{line_size}) &&
       ({{1'b0, address}} + (65'd1 << size)) <= (65'd1 << {width + 2})));
     cover(allowed && fetch);
     cover(!allowed && write);
@@ -284,6 +306,17 @@ def protection_cases(parameters):
     cover(atomic && !allowed && write);
   end
 '''
+    if line_size:
+        start = pmp.index('      for (b = 0;')
+        end = pmp.index('      if (any_byte) expected', start)
+        pmp = pmp[:start] + '''
+      any_byte = state_config[i*8+3 +: 2] != 0 && decoded_high[i*65 +: 65] > decoded_low[i*65 +: 65] &&
+        {1'b0, address} < decoded_high[i*65 +: 65] && ({1'b0, address} + (65'd1 << size)) > decoded_low[i*65 +: 65];
+      every_byte = {1'b0, address} >= decoded_low[i*65 +: 65] &&
+        ({1'b0, address} + (65'd1 << size)) <= decoded_high[i*65 +: 65];
+''' + pmp[end:]
+        pmp = pmp.replace("({1'b0, address} + (65'd1 << size))", 'end_0').replace("{1'b0, address}", 'start')
+        pmp += "  always @* begin cover(allowed && size == 6 && fetch); cover(!allowed && size == 6 && fetch); end\n"
     csr = '''
   reg past_valid = 0;
   always @(posedge clock) begin
@@ -671,7 +704,7 @@ def supervisor_cases(parameters):
   end
 '''
     fetch = r'''
-  reg context_past = 0, context_owned = 0;
+  reg context_past = 0, context_owned = 0, context_cancelled = 0;
   reg [1:0] retained_fetch_mode;
   always @(posedge clock) begin
     context_past <= 1;
@@ -679,9 +712,11 @@ def supervisor_cases(parameters):
     if (reset) context_owned <= 0;
     else begin
       if (request_valid && request_ready) begin
-        context_owned <= 1;
+        context_owned <= 1; context_cancelled <= 0;
         retained_fetch_mode <= privilege;
       end else if (state == 0) context_owned <= 0;
+      if (context_owned && cancel) context_cancelled <= 1;
+      if (cancel || context_cancelled) assert(!output_valid);
       if (state != 0) assert(context_owned && formal_fetch_mode == retained_fetch_mode);
       if (formal_fetch_request_valid) assert(formal_fetch_privileged == (retained_fetch_mode != 0));
       cover(state != 0 && retained_fetch_mode == 1 && privilege == 3);
@@ -749,7 +784,7 @@ def translation_case(parameters):
       assume(!memory_response_valid || bus_owned);
       if ($past(!reset && memory_response_valid && !memory_response_ready)) begin
         assume(memory_response_valid);
-        assume($stable({memory_response_bits_data, memory_response_bits_fault, memory_response_bits_tag}));
+        assume($stable({memory_response_bits_data, memory_response_bits_fault, memory_response_bits_tag, memory_response_bits_last}));
       end
       assert(!(ports_0_request_ready && ports_1_request_ready));
       assert(ports_0_request_ready == (!active && !data_selected && !cancelInstruction));
@@ -1614,6 +1649,92 @@ def local_interrupt_case(parameters):
 
 def instruction_cache_case(parameters):
     index_bits = (parameters['iCacheBytes'] // 64 - 1).bit_length()
+    if parameters.get('enableBurstRefill'):
+        body = r'''
+  reg cache_past = 0, cache_owned, cache_bus, cache_killed, cache_authorized, cache_sent, cache_fault;
+  reg [63:0] cache_address, cache_permission;
+  reg [7:0] cache_tag;
+  reg [15:0] cache_filled;
+  reg [3:0] cache_word;
+  reg [31:0] cache_upper;
+  reg cache_terminal;
+  (* anyconst *) reg [INDEX-1:0] cache_watched;
+  wire cache_reply = downstream_response_valid && downstream_response_ready;
+  wire cache_error = downstream_response_bits_fault || downstream_response_bits_tag != cache_tag;
+  wire cache_abort = cache_killed || cancel || invalidate;
+  wire cache_line_error = cache_fault || cache_error || downstream_response_bits_last != (cache_word == 14);
+  wire cache_write = !bypass && !cache_abort && ((state == 6 && !cache_fault) || (cache_reply && !cache_line_error));
+  always @(posedge clock) begin
+    cache_past <= 1;
+    if (!cache_past) assume(reset); else assume(!reset);
+    if (upstream_request_valid) assume(upstream_request_bits_address[1:0] == 0);
+    if (reset) begin cache_owned <= 0; cache_bus <= 0; cache_killed <= 0; cache_authorized <= 0; cache_filled <= 0; cache_sent <= 0; cache_fault <= 0; cache_word <= 0; end
+    else begin
+      assume(!downstream_response_valid || cache_bus);
+      if ($past(!reset && downstream_response_valid && !downstream_response_ready)) begin assume(downstream_response_valid); assume($stable({downstream_response_bits_data, downstream_response_bits_fault, downstream_response_bits_tag, downstream_response_bits_last})); end
+      assert(state <= 6 && cache_owned == (state != 0));
+      assert(downstream_response_ready == (cache_bus && state == 4));
+      if (cache_bus) assert(cache_owned && (state == 4 || state == 6));
+      if (state == 6) assert(cache_bus == !cache_terminal);
+      if (cache_owned) assert(address == cache_address && tag == cache_tag && killed == cache_killed && word == cache_word && fault == cache_fault);
+      assert(filling_0 == cache_write);
+      if (filling_0) assert(formal_cache_write_data == (state == 6 ? cache_upper : downstream_response_bits_data[31:0]));
+      if (upstream_request_valid && upstream_request_ready) begin
+        assert(!cache_owned && !cache_bus); cache_owned <= 1; cache_address <= upstream_request_bits_address; cache_tag <= upstream_request_bits_tag;
+        cache_killed <= cancel || invalidate; cache_authorized <= 0; cache_filled <= 0; cache_sent <= 0; cache_fault <= 0; cache_word <= 0;
+      end
+      if (cache_owned && (cancel || invalidate)) cache_killed <= 1;
+      if (state == 2 && allowed && !cache_abort) begin cache_authorized <= 1; cache_permission <= checkAddress; end
+      assert(checkSize == (bypass ? 2 : 6));
+      if (!bypass && (state == 2 || state == 3)) assert(cache_word == 0 && cache_filled == 0);
+      if (!bypass && !cache_fault && (state == 4 || state == 6)) assert(cache_word[0] == (state == 6));
+      if (downstream_request_valid) begin
+        assert(cache_owned && cache_authorized && !cache_bus);
+        assert(downstream_request_bits_address == cache_permission && downstream_request_bits_address == (bypass ? cache_address : {cache_address[63:6], 6'b0}) && downstream_request_bits_tag == cache_tag);
+        assert(downstream_request_bits_fetch && !downstream_request_bits_write && !downstream_request_bits_atomic && !downstream_request_bits_atomicOperation && !downstream_request_bits_scEligible);
+        assert(downstream_request_bits_size == (bypass ? 2 : 6) && downstream_request_bits_mask == 0 && downstream_request_bits_data == 0);
+      end
+      if (downstream_request_valid && downstream_request_ready) begin cache_bus <= 1; cache_sent <= 1; cache_authorized <= 0; end
+      if (cache_reply) begin
+        assert(cache_owned && cache_bus);
+        if (downstream_response_bits_last || bypass) cache_bus <= 0;
+        if (!bypass) begin cache_fault <= cache_line_error; cache_upper <= downstream_response_bits_data[63:32]; cache_terminal <= downstream_response_bits_last; if (cache_word != 15) cache_word <= cache_word + 1; end
+        else if (!cache_abort && cache_error) cache_fault <= 1;
+      end
+      if (state == 6) begin
+        if (cache_terminal && cache_fault && !cache_abort) cache_fault <= 0;
+        assert(upperWord == cache_upper && terminal == cache_terminal);
+        if (cache_word != 15) cache_word <= cache_word + 1;
+      end
+      if (!bypass && !cache_fault && !cache_killed && (state == 2 || state == 3 || state == 4 || state == 6)) assert(cache_filled == ((16'h1 << cache_word) - 1));
+      if (cache_write) cache_filled[cache_word] <= 1;
+      if (state == 2 && !allowed && bypass && !cache_abort) cache_fault <= 1;
+      if (upstream_response_valid) begin
+        assert(cache_owned && !cache_bus && !downstream_request_valid && upstream_response_bits_last);
+        assert(upstream_response_bits_tag == cache_tag && upstream_response_bits_fault == cache_fault);
+        if (upstream_response_ready) cache_owned <= 0;
+      end
+      if ($past(!reset)) begin
+        if ($past(invalidate)) assert(valid == 0);
+        if ($past(state == 1 && !cache_abort && !hit_0)) assert(!valid[cache_address[INDEX+5:6]]);
+        if (valid[cache_watched] && !$past(valid[cache_watched])) assert($past(state == 6 && cache_terminal && !fault && !cache_abort && !bypass && cache_filled == 16'h7fff && cache_word == 15 && cache_address[INDEX+5:6] == cache_watched));
+        if ($past(downstream_request_valid && !downstream_request_ready)) begin assert(downstream_request_valid); assert($stable({downstream_request_bits_address, downstream_request_bits_tag, downstream_request_bits_size, downstream_request_bits_privileged})); end
+        if ($past(upstream_response_valid && !upstream_response_ready)) begin assert(upstream_response_valid); assert($stable({upstream_response_bits_data, upstream_response_bits_fault, upstream_response_bits_tag, upstream_response_bits_last})); end
+        if ($past(state == 6 && cache_terminal && fault && !cache_abort)) assert(bypass && state == 2 && checkAddress == cache_address && !upstream_response_valid);
+        if ($past(state == 2 && !allowed && !bypass && !cache_abort)) assert(bypass && state == 2 && checkAddress == cache_address && !downstream_request_valid);
+      end
+      cover(upstream_response_valid && !cache_fault && cache_filled == 16'hffff);
+      cover(upstream_response_valid && !cache_fault && !cache_sent && !cache_killed);
+      cover(downstream_request_valid && !downstream_request_ready && cancel);
+      cover(cache_bus && cancel && !downstream_response_valid);
+      cover(state == 6 && cache_terminal && invalidate && !fault);
+      cover(bypass && state == 2 && !allowed);
+      cover(upstream_response_valid && cache_fault && cache_sent);
+      cover(upstream_response_valid && cache_killed && !upstream_response_ready);
+    end
+  end
+'''.replace('INDEX', str(index_bits))
+        return ('InstructionCache', body, '~(filling & terminal & ~abort)', '~(filling & terminal)')
     body = r'''
   reg cache_past = 0, cache_owned, cache_bus, cache_killed, cache_authorized, cache_sent, cache_fault;
   reg [63:0] cache_address, cache_permission, cache_beat;
@@ -1626,7 +1747,6 @@ def instruction_cache_case(parameters):
   always @(posedge clock) begin
     cache_past <= 1;
     if (!cache_past) assume(reset); else assume(!reset);
-    assume(!invalidate || cancel);
     if (upstream_request_valid) assume(upstream_request_bits_address[1:0] == 0);
     if (reset) begin
       cache_owned <= 0; cache_bus <= 0; cache_killed <= 0; cache_authorized <= 0;
@@ -1668,7 +1788,7 @@ def instruction_cache_case(parameters):
       if (state >= 2 && state <= 4 && !bypass && !cache_killed)
         assert(cache_filled == ((16'h1 << word) - 1));
       if (upstream_response_valid) begin
-        assert(cache_owned && !cache_bus && !downstream_request_valid);
+        assert(cache_owned && !cache_bus && !downstream_request_valid && upstream_response_bits_last);
         assert(upstream_response_bits_tag == cache_tag && upstream_response_bits_fault == cache_fault);
         if (upstream_response_ready) cache_owned <= 0;
       end
@@ -1743,7 +1863,7 @@ def data_cache_case(parameters):
       assume(!downstream_response_valid || cache_bus);
       if ($past(!reset && downstream_response_valid && !downstream_response_ready)) begin
         assume(downstream_response_valid);
-        assume($stable({{downstream_response_bits_data, downstream_response_bits_fault, downstream_response_bits_tag}}));
+        assume($stable({{downstream_response_bits_data, downstream_response_bits_fault, downstream_response_bits_tag, downstream_response_bits_last}}));
       end
       assert(state <= 4 && cache_owned == (state != 0) && cache_bus == (state == 3));
       assert(cache_finished == (state == 4));
@@ -1856,9 +1976,9 @@ def coherence_case(parameters):
       end
       assert(upstream_response_valid == downstream_response_valid);
       assert(downstream_response_ready == upstream_response_ready);
-      if (upstream_response_valid) assert({{upstream_response_bits_data, upstream_response_bits_fault, upstream_response_bits_tag}} ==
-        {{downstream_response_bits_data, downstream_response_bits_fault, downstream_response_bits_tag}});
-      if (downstream_response_valid && downstream_response_ready) coherent_bus <= 0;
+      if (upstream_response_valid) assert({{upstream_response_bits_data, upstream_response_bits_fault, upstream_response_bits_tag, upstream_response_bits_last}} ==
+        {{downstream_response_bits_data, downstream_response_bits_fault, downstream_response_bits_tag, downstream_response_bits_last}});
+      if (downstream_response_valid && downstream_response_ready && downstream_response_bits_last) coherent_bus <= 0;
       cover(coherent_started && |coherent_completed && !(&coherent_completed));
       cover(downstream_request_valid && coherent_write && !downstream_request_ready);
       cover(downstream_request_valid && !coherent_write);
@@ -1968,7 +2088,7 @@ def arbiter_case(parameters):
   wire [{count-1}:0] responses = {vector('response_valid')};
   wire [{count-1}:0] consumers = {vector('response_ready')};
   wire [{count-1}:0] accepted = requests & ready;
-  wire completed = downstream_response_valid && downstream_response_ready;
+  wire completed = downstream_response_valid && downstream_response_ready && downstream_response_bits_last;
   wire [{bits}:0] distance = watched >= next ? watched - next : {count} + watched - next;
   always @(posedge clock) begin
     past_valid <= 1;
@@ -1980,7 +2100,7 @@ def arbiter_case(parameters):
       assume(!downstream_response_valid || sent);
       if ($past(!reset && downstream_response_valid && !downstream_response_ready)) begin
         assume(downstream_response_valid);
-        assume($stable({{downstream_response_bits_data, downstream_response_bits_fault, downstream_response_bits_tag}}));
+        assume($stable({{downstream_response_bits_data, downstream_response_bits_fault, downstream_response_bits_tag, downstream_response_bits_last}}));
       end
       assert($onehot0(accepted) && $onehot0(responses));
       assert(pending == (state != 0) && sent == (state == 2));
@@ -2020,8 +2140,8 @@ def arbiter_case(parameters):
       if (accepted[{i}]) begin
         assert(!pending); pending <= 1; expected_owner <= {i}; captured <= {payload(prefix)};
       end
-      if (ports_{i}_response_valid) assert({{ports_{i}_response_bits_data, ports_{i}_response_bits_fault, ports_{i}_response_bits_tag}} ==
-        {{downstream_response_bits_data, downstream_response_bits_fault, downstream_response_bits_tag}});
+      if (ports_{i}_response_valid) assert({{ports_{i}_response_bits_data, ports_{i}_response_bits_fault, ports_{i}_response_bits_tag, ports_{i}_response_bits_last}} ==
+        {{downstream_response_bits_data, downstream_response_bits_fault, downstream_response_bits_tag, downstream_response_bits_last}});
 '''
     body += '    end\n  end\n'
     return ('MemoryArbiter', body, 'assign ports_0_response_valid =',
@@ -2046,9 +2166,10 @@ def memory_case(parameters):
     m_allowed = 0;
     case (upstream_request_bits_size)
 '''
-    for size in range(4):
+    for size in (*range(4), *((6,) if parameters.get('enableBurstRefill') else ())):
         count = 1 << size
-        body += f"      {size}: if (m_shape && (m_address & 64'd{count-1}) == 0 && (!m_write || (m_mask != 0 && (m_mask & 8'h{255 ^ ((1 << count) - 1):x}) == 0))) begin\n"
+        line_shape = 'm_fetch && !m_write && !m_atomic && ' if size == 6 else ''
+        body += f"      {size}: if ({line_shape}m_shape && (m_address & 64'd{count-1}) == 0 && (!m_write || (m_mask != 0 && (m_mask & 8'h{(255 ^ ((1 << count) - 1)) if size != 6 else 0:x}) == 0))) begin\n"
         for region in parameters['memoryRegions']:
             rights = {key: int(region[key]) for key in ('readable', 'writable', 'executable', 'device', 'atomic')}
             if int(region['size']) >= count:
@@ -2077,7 +2198,8 @@ def memory_case(parameters):
         assert(upstream_response_bits_data == (memory_denied ? 0 : downstream_response_bits_data));
         assert(upstream_response_bits_tag == (memory_denied ? memory_tag : downstream_response_bits_tag));
         assert(upstream_response_bits_fault == (memory_denied || downstream_response_bits_fault));
-        if (upstream_response_ready) memory_owned <= 0;
+        assert(upstream_response_bits_last == (memory_denied || downstream_response_bits_last));
+        if (upstream_response_ready && upstream_response_bits_last) memory_owned <= 0;
       end
       cover(memory_owned && memory_denied && !upstream_response_ready);
       cover(upstream_request_valid && m_atomic && !m_shape && upstream_request_ready);
@@ -2223,12 +2345,12 @@ def axi_case(parameters):
       if (memory_response_valid) begin
         assert(held && complete && !can_read && !can_write && !read_owned && !address_sent && !data_sent);
         assert(memory_response_bits_tag == accepted_tag && memory_response_bits_data == old_value);
-        assert(memory_response_bits_fault == expected_fault);
+        assert(memory_response_bits_fault == expected_fault && memory_response_bits_last);
         if (memory_response_ready) begin held <= 0; complete <= 0; end
       end
       if ($past(!reset && memory_response_valid && !memory_response_ready)) begin
         assert(memory_response_valid);
-        assert($stable({memory_response_bits_data, memory_response_bits_fault, memory_response_bits_tag}));
+        assert($stable({memory_response_bits_data, memory_response_bits_fault, memory_response_bits_tag, memory_response_bits_last}));
       end
       cover(is_atomic && complete && !expected_fault && retried);
       cover(is_atomic && read_reply && axi_r_bits_resp == 0 && axi_r_bits_last);
@@ -2249,6 +2371,85 @@ def axi_case(parameters):
     end
   end
 '''
+    if parameters.get('enableBurstRefill'):
+        body = body.replace('reg checked_past = 0;', '''
+  wire input_line = memory_request_bits_fetch && !memory_request_bits_write && !memory_request_bits_atomic && memory_request_bits_size == 6;
+  reg line_owned = 0;
+  reg line_address_sent, line_buffered, line_draining, line_done, line_fault, line_terminal, line_last_seen;
+  reg [2:0] line_beat, line_slice;
+  reg [WIDTH-1:0] line_block;
+  wire [63:0] line_value = line_block >> (line_slice * 64);
+  reg [63:0] line_address;
+  reg [7:0] line_tag;
+  reg [ID-1:0] line_id;
+  reg [2:0] line_protection;
+  reg checked_past = 0;''')
+        body = body.replace('    end else begin\n      assume(!axi_r_valid', '    end else if (!line_owned) begin\n      assert(state <= 4); if (held) assert(!line);\n      assume(!axi_r_valid', 1)
+        body = body.replace('if (memory_request_valid && memory_request_ready) begin', 'if (memory_request_valid && memory_request_ready && !input_line) begin', 1)
+        body += r'''
+  always @(posedge clock) begin
+    if (!reset) begin assert(!(held && line_owned)); assert((held || line_owned) == (state != 0)); end
+    if (reset) begin line_owned <= 0; line_buffered <= 0; line_address_sent <= 0; line_draining <= 0; line_done <= 0; line_fault <= 0; line_last_seen <= 0; end
+    else begin
+      if (memory_request_valid && memory_request_ready && input_line) begin
+        assert(!held && !line_owned);
+        line_owned <= 1; line_address_sent <= 0; line_buffered <= 0; line_draining <= 0; line_done <= 0; line_fault <= 0; line_last_seen <= 0;
+        line_address <= memory_request_bits_address; line_tag <= memory_request_bits_tag; line_id <= hartId;
+        line_protection <= {memory_request_bits_fetch, 1'b0, PRIVILEGED}; line_beat <= 0; line_slice <= 0;
+      end
+      if (line_owned) begin
+        assume(!axi_r_valid || (line_address_sent && !line_last_seen)); assume(!axi_b_valid);
+        if ($past(!reset && axi_r_valid && !axi_r_ready)) begin assume(axi_r_valid); assume($stable({axi_r_bits_data, axi_r_bits_resp, axi_r_bits_id, axi_r_bits_last})); end
+        assert(state == (!line_address_sent ? 1 : line_done ? 4 : line_buffered ? 5 : line_draining ? 6 : 2));
+        assert(line && !(can_read || can_write || complete || read_owned || address_sent || data_sent));
+        assert(line_slice < SLICES);
+        if (!line_address_sent) assert(!line_buffered && !line_draining && !line_done && !line_last_seen && line_beat == 0);
+        if (line_buffered) assert(line_address_sent && terminal == line_terminal);
+        if (line_draining) assert(line_address_sent && !line_buffered && line_beat == BEATS-1);
+        if (line_done) assert(line_draining && line_last_seen);
+        assert(line_last_seen == (line_done || (line_buffered && line_terminal)));
+        if (!line_draining && !line_done) assert(beat == line_beat);
+        assert(!memory_request_ready && !axi_aw_valid && !axi_w_valid && !axi_b_ready);
+        assert(request_address == line_address && request_tag == line_tag && hartId_0 == line_id);
+        assert(axi_ar_valid == !line_address_sent && axi_r_ready == (line_address_sent && !line_buffered && !line_done));
+        assert(memory_response_valid == (line_buffered || line_done));
+        assert(fault == line_fault);
+        if (axi_ar_valid) assert(axi_ar_bits_addr == line_address[PHYSICAL:0] && axi_ar_bits_id == line_id && axi_ar_bits_len == BEATS-1 && axi_ar_bits_size == BUSSIZE && axi_ar_bits_burst == 1 && !axi_ar_bits_lock && axi_ar_bits_prot == line_protection);
+        if (read_fire) line_address_sent <= 1;
+        if (read_reply) begin
+          if (axi_r_bits_last) line_last_seen <= 1;
+          if (line_draining) begin line_fault <= 1; if (axi_r_bits_last) line_done <= 1; end
+          else begin
+            line_block <= axi_r_bits_data; line_buffered <= 1; line_slice <= 0; line_terminal <= axi_r_bits_last;
+            line_fault <= line_fault || axi_r_bits_resp != 0 || axi_r_bits_id != line_id || axi_r_bits_last != (line_beat == BEATS-1);
+          end
+        end
+        if (memory_response_valid) begin
+          assert(memory_response_bits_tag == line_tag && memory_response_bits_fault == line_fault);
+          assert(memory_response_bits_last == (line_done || (line_terminal && line_slice == SLICES-1)));
+          assert(memory_response_bits_data == (line_done ? 0 : line_value));
+          if (memory_response_ready) begin
+            if (memory_response_bits_last) line_owned <= 0;
+            else if (line_slice == SLICES-1) begin
+              line_buffered <= 0;
+              if (line_beat == BEATS-1) line_draining <= 1;
+              else line_beat <= line_beat + 1;
+            end else line_slice <= line_slice + 1;
+          end
+        end
+        if ($past(!reset && memory_response_valid && !memory_response_ready)) begin assert(memory_response_valid); assert($stable({memory_response_bits_data, memory_response_bits_fault, memory_response_bits_tag, memory_response_bits_last})); end
+        cover(memory_response_valid && memory_response_ready && memory_response_bits_last && !line_fault && line_beat == BEATS-1);
+        cover(line_buffered && !memory_response_ready);
+        cover(line_draining && line_done && memory_response_valid && memory_response_bits_fault);
+        if (BEATS > 1) cover(line_terminal && line_beat != BEATS-1 && memory_response_valid && memory_response_bits_last && memory_response_bits_fault);
+      end
+    end
+  end
+'''
+        if width > 64:
+            body += '  always @(posedge clock) if (!reset && line_owned && line_buffered) assert(slice == line_slice && block == line_block);\n'
+        for token, value in (('BEATS', 512 // width), ('SLICES', width // 64), ('BUSSIZE', lane_bits)):
+            body = body.replace(token, str(value))
     for channel, fields in (('ar', ('addr', 'id', 'len', 'size', 'burst', 'lock', 'cache', 'prot', 'qos')),
                             ('aw', ('addr', 'id', 'len', 'size', 'burst', 'lock', 'cache', 'prot', 'qos')),
                             ('w', ('data', 'strb', 'last'))):
@@ -2310,8 +2511,54 @@ def verify(rtl, directory, modules=None):
             continue
         unit = name.removeprefix('Interrupt').removeprefix('Synchronization').removeprefix('Word').removeprefix('Integer').removeprefix('Wfi').removeprefix('User').removeprefix('Supervisor')
         machine = 'privilege != 0' if manifest['parameters'].get('enableUserMode') else "1'b1"
+        if name in ('Pmp', 'PmpDecode') and manifest['parameters'].get('enableBurstRefill'):
+            span = re.search(r'&\s+(\w+\[size\]) > base', sources['DitDahA1Pmp.sv']).group(1)
+            body = body.replace('end_0', span)
         if unit == 'Fetch':
             body = body.replace('PRIVILEGED', machine)
+            if manifest['parameters'].get('iCacheBytes'):
+                body = re.sub(r'\bcancel\b', '(cancel || invalidate)', body)
+                body = re.sub(r'\bkilled\b', 'observed_killed', body)
+                if name == 'Fetch':
+                    original = sources['DitDahA1Fetch.sv']
+                    ordinary = ' || '.join(f"(request_bits_pc >= 64'h{int(region['base']):x} && request_bits_pc <= 64'h{int(region['base']) + int(region['size']) - 4:x})" for region in manifest['parameters']['memoryRegions'] if region['executable'] and not region['device'] and int(region['size']) >= 4) or "1'b0"
+                    if enabled:
+                        body = body.replace('local_denied <= !_pmp_allowed;', f'local_denied <= !(_pmp_allowed && ({ordinary}));')
+                    else:
+                        body = body.replace('reg outstanding;', 'reg outstanding; reg local_denied;')
+                        body = body.replace('accepted_pc <= request_bits_pc;', f'local_denied <= !({ordinary}); accepted_pc <= request_bits_pc;')
+                        body = body.replace('response_seen || accepted_pc[1:0] != 0', 'response_seen || accepted_pc[1:0] != 0 || local_denied')
+                    body = body.replace('assume(!memory_response_valid || outstanding);', 'assert(!memory_response_valid || outstanding);')
+                    body = body.replace('assume(memory_response_valid);', 'assert(memory_response_valid);').replace('assume($stable({memory_response_', 'assert($stable({memory_response_')
+                    body = re.sub(r'      cover\(past_valid && \$past\(!reset && memory_request_valid && !memory_request_ready\)\n\s+&&[^;]+;', '', body)
+                    body = re.sub(r'      cover\(observed_killed && outstanding && memory_response_valid && memory_response_ready && memory_response_bits_fault\);', '', body)
+                    bindings = {}
+                    for token in set(re.findall(r'\bmemory_(?:request|response)(?:_bits_\w+|_valid|_ready)\b', body)):
+                        port = token.replace('memory_', 'upstream_', 1)
+                        connection = re.findall(rf'\.{port}\s*\(([^()]*)\)', original)
+                        assert len(connection) == 1, (port, connection)
+                        bindings[token] = "1'b1" if 'unused' in connection[0] else connection[0]
+                    body = re.sub(r'\bmemory_(?:request|response)(?:_bits_\w+|_valid|_ready)\b', lambda match: '(' + bindings[match[0]] + ')', body)
+                    body += r'''
+  reg fetch_physical_owned = 0, fetch_physical_line;
+  always @(posedge clock) if (reset) fetch_physical_owned <= 0;
+  else begin
+    assume(!memory_response_valid || fetch_physical_owned);
+    cover(observed_killed && fetch_physical_owned && memory_response_valid && memory_response_ready && memory_response_bits_fault);
+    cover($past(!reset && memory_request_valid && !memory_request_ready) && (cancel || invalidate) && memory_request_valid && !memory_request_ready);
+    if ($past(!reset && memory_request_valid && !memory_request_ready)) begin assert(memory_request_valid); assert($stable({memory_request_bits_address, memory_request_bits_size, memory_request_bits_tag, memory_request_bits_privileged})); end
+    assume(!memory_response_valid || fetch_physical_line || memory_response_bits_last);
+    if ($past(!reset && memory_response_valid && !memory_response_ready)) begin assume(memory_response_valid); assume($stable({memory_response_bits_data, memory_response_bits_tag, memory_response_bits_fault, memory_response_bits_last})); end
+    if (memory_request_valid && memory_request_ready) begin assert(!fetch_physical_owned); fetch_physical_owned <= 1; fetch_physical_line <= memory_request_bits_size == 6; end
+    if (memory_response_valid && memory_response_ready && memory_response_bits_last) fetch_physical_owned <= 0;
+  end
+'''
+        if unit == 'InstructionCache':
+            write_enable = re.search(r'\.W0_en\s*\(([^()]*)\)', sources['DitDahA1InstructionCache.sv']).group(1)
+            body = body.replace('filling_0', write_enable)
+        if unit == 'InstructionCache' and manifest['parameters'].get('enableBurstRefill'):
+            write = re.search(r'\.W0_data\s*\(([^()]*)\)', sources['DitDahA1InstructionCache.sv']).group(1)
+            body += f'\n  wire [31:0] formal_cache_write_data = {write};\n'
         if unit in ('Lsu', 'InstructionCache'):
             request = 'input' if unit == 'Lsu' else 'upstream_request'
             output = 'memory_request' if unit == 'Lsu' else 'downstream_request'
@@ -2383,7 +2630,7 @@ def verify(rtl, directory, modules=None):
                 assert len(connections) == 1, (port, connections)
                 files[module + '.sv'] = re.sub(pattern, f'.{port}(formal_pmp_{port})', files[module + '.sv'])
                 body += f'\n  wire [{width-1}:0] formal_pmp_{port} = {connections[0]};\n  always @(posedge clock) if (!reset && memory_request_valid && !offered) assert($past(formal_pmp_{port} == ({expected})));\n'
-        if unit in ('Backend', 'Frontend', 'Multiply', 'Csr', 'MemoryArbiter', 'Memory', 'Axi', 'InstructionCache', 'DataCache', 'Coherence', 'Lsu', 'LocalInterrupts', 'Translation') or (enabled and unit not in ('Decode', 'Execute')):
+        if unit in ('Backend', 'Frontend', 'Multiply', 'Csr', 'MemoryArbiter', 'Memory', 'Axi', 'InstructionCache', 'DataCache', 'Coherence', 'Lsu', 'LocalInterrupts', 'Translation') or (enabled and unit not in ('Decode', 'Execute')) or unit == 'Fetch' and manifest['parameters'].get('iCacheBytes'):
             if unit == 'Backend':
                 files['DitDahA1Multiply.sv'] = license + header(sources['DitDahA1Multiply.sv']) + RESOURCE + 'endmodule\n'
             if name == 'InterruptBackend':
@@ -2400,7 +2647,19 @@ def verify(rtl, directory, modules=None):
         else:
             top = 'formal_top'
             files['wrapper.sv'] = license + header(files[module + '.sv']).replace(module, top, 1) + f'\n  {module} dut (.*);\n' + body + 'endmodule\n'
+        if name == 'PmpDecode':
+            before = re.search(r"mask = (\w+) \^ \1 \+ 62'h1;", sources[module + '.sv']).group()
+            after = before.replace("62'h1", "62'h3")
+        if name == 'Fetch' and manifest['parameters'].get('iCacheBytes'):
+            before = re.search(r'assign output_valid\s*=\s*[^;]+;', sources[module + '.sv']).group()
+            after = before.replace('~flush', "1'h1").replace('~cancel', "1'h1")
+            assert before != after, before
+        if unit == 'InstructionCache' and not manifest['parameters'].get('enableBurstRefill'):
+            before = re.search(r': ~\w+ \| abort \| responseFault \| bypass \| ~complete', sources[module + '.sv']).group()
+            after = before.replace(' | abort', '')
         checks = [('prove', before, after), ('cover', before, after), ('mutation', before, after)]
+        if name == 'Fetch' and manifest['parameters'].get('iCacheBytes'):
+            checks += [('mutation-invalidate', before, before.replace('~flush', '~cancel'))]
         if name == 'WfiBackend' and not manifest['parameters'].get('enableInterrupts'):
             checks[2] = ('mutation', before, "assign status_sleep = 1'h1 |")
         if name == 'WordDecode':
@@ -2486,25 +2745,34 @@ def verify(rtl, directory, modules=None):
             advance = re.findall(r'next <= [^;]+;', sources[module + '.sv'])[-1]
             ready = re.search(r'assign downstream_response_ready = (\w+);', sources[module + '.sv']).group(1)
             checks += [('mutation-release', 'downstream_response_valid & ' + ready, 'downstream_response_valid'),
+                       ('mutation-terminal', ' & downstream_response_bits_last', ''),
                        ('mutation-priority', advance, "next <= '0;")]
             if manifest['parameters']['hartCount'] > 1:
                 checks += [('mutation-identity', 'assign hartId =', "assign hartId = 4'h0 &")]
         if unit == 'Memory' and any(region['atomic'] for region in manifest['parameters']['memoryRegions']):
             shape = re.search(r'wire\s+atomicShape\w*\s*=\s*[^;]*upstream_request_bits_atomicOperation[^;]+;', sources[module + '.sv']).group()
             checks += [('mutation-shape', shape, shape.split('=', 1)[0] + "= 1'h1;")]
+        if unit == 'Memory':
+            original = sources[module + '.sv']
+            terminal = re.search(r'& upstream_response_bits_last\w*', original).group()
+            checks += [('mutation-terminal', terminal, '')]
+        if name == 'PmpDecode' and manifest['parameters'].get('enableBurstRefill'):
+            checks += [('mutation-line-range', "65'h40", "65'h8")]
         if unit == 'Axi':
             original = sources[module + '.sv']
             retry_state = re.findall(r"state <= \w+ \? 3'h1 : 3'h4;", original)[0]
+            read_fault = re.search(r'amo & ~\w+', original).group()
+            response_data = re.search(r'assign memory_response_bits_data\s*=\s*([^;]+);', original).group()
+            checks[2] = ('mutation', 'request_atomic <= memory_request_bits_atomic;', 'request_atomic <= 0;')
             read_update = re.search(r'if \((\w+)\)\n\s+data <=', original).group(0)
             checks += [('mutation-retry', retry_state, "state <= 3'h4;"),
                        ('mutation-stale', read_update, read_update.replace(')', ' && !retried)', 1)),
-                       ('mutation-read-error', 'amo & ~readFault', 'amo'),
+                       ('mutation-read-error', read_fault, 'amo'),
                        ('mutation-write-error', "axi_b_bits_resp == 2'h0", "axi_b_bits_resp != 2'h1"),
-                       ('mutation-old-value', 'assign memory_response_bits_data = data;',
-                        'assign memory_response_bits_data = request_atomic ? data + request_data : data;'),
+                       ('mutation-old-value', response_data, response_data.replace('=', '= request_atomic ? data + request_data :', 1)),
                        ('mutation-or', "request_atomicOperation == 5'h8", "1'h0"),
                        ('mutation-swap', "request_atomicOperation == 5'h1", "1'h0"),
-                       ('mutation-lr-write', 'amo & ~readFault', 'request_atomic & ~readFault'),
+                       ('mutation-lr-write', read_fault, read_fault.replace('amo', 'request_atomic', 1)),
                        ('mutation-sc-empty', 'inputSc & ~memory_request_bits_scEligible', "1'h0")]
             if manifest['parameters'].get('enableUserMode'):
                 checks += [('mutation-privilege', 'assign axi_ar_bits_prot =', "assign axi_ar_bits_prot = 3'h1 |")]
@@ -2516,6 +2784,13 @@ def verify(rtl, directory, modules=None):
                 checks += [('mutation-read-identity', re.search(r'assign axi_ar_bits_id\s*=\s*[^;]+;', original).group(),
                             f"assign axi_ar_bits_id = hartId[{max(1, (manifest['parameters']['hartCount'] - 1).bit_length())-1}:0];"),
                            ('mutation-write-identity', 'assign axi_aw_bits_id =', "assign axi_aw_bits_id = 1'h0 &")]
+        if unit == 'Axi' and manifest['parameters'].get('enableBurstRefill'):
+            last = re.search(r'assign memory_response_bits_last\s*=\s*[^;]+;', original).group()
+            checks += [('mutation-line-last', last, 'assign memory_response_bits_last = 1;'),
+                       ('mutation-line-data', response_data, response_data.replace('=', '= line ? 0 :', 1))]
+            if manifest['parameters']['axiDataBits'] > 64:
+                step = re.search(r"slice <= slice \+ \d+'h1;", original).group()
+                checks += [('mutation-line-order', step, step.replace("'h1", "'h0"))]
         if name == 'Pmp':
             checks += [('mutation-atomic-read', 'state_config[0] & state_config[1]', 'state_config[1]'),
                        ('mutation-atomic-write', 'state_config[0] & state_config[1]', 'state_config[0]')]
@@ -2563,12 +2838,20 @@ def verify(rtl, directory, modules=None):
                        ('mutation-fault', '~input_bits_instruction_fault & input_bits_fenceI',
                         'input_bits_fenceI', 'DitDahA1Commit.sv'),
                        ('mutation-order', '~memoryOperation | memoryPending & _lsu_output_valid', "1'h1")]
-        if unit == 'InstructionCache':
+        if unit == 'InstructionCache' and not manifest['parameters'].get('enableBurstRefill'):
             checks += [('mutation-hold', 'assign downstream_request_valid = downstream_request_valid_0;',
                         'assign downstream_request_valid = downstream_request_valid_0 & ~cancel;'),
                        ('mutation-word', "word <= word + 4'h1;", "word <= word + 4'h2;"),
                        ('mutation-invalidate', 'invalidate\n          ?', "1'h0\n          ?"),
-                       ('mutation-denied', '_GEN_10 & ~(abort | allowed) & _GEN_12', "1'h0")]
+                       ('mutation-denied', 'else if (allowed)', 'else if (1)')]
+        if unit == 'InstructionCache' and manifest['parameters'].get('enableBurstRefill'):
+            original = sources[module + '.sv']
+            step = re.search(r"if \(filling & ~\w+\)\n\s+word <= word \+ 4'h1;", original).group()
+            checks += [('mutation-hold', 'assign downstream_request_valid = downstream_request_valid_0;', 'assign downstream_request_valid = downstream_request_valid_0 & ~cancel;'),
+                       ('mutation-word', step, step.replace("4'h1", "4'h2")),
+                       ('mutation-invalidate', 'invalidate\n          ?', "1'h0\n          ?"),
+                       ('mutation-denied', 'else if (allowed)', 'else if (1)'),
+                       ('mutation-line-fault', '? lineFault', "? 1'h0")]
         if unit == 'DataCache':
             checks += [('mutation-hold', 'assign downstream_request_valid =',
                         'assign downstream_request_valid = ~invalidate_valid &'),
@@ -2621,6 +2904,7 @@ def verify(rtl, directory, modules=None):
                         for i in range(2 * manifest['parameters']['hartCount']))
                     guidance += f'''    assume(downstream_request_ready == (witness_age != 1));
     assume(downstream_response_valid == sent);
+    assume(downstream_response_bits_last == {"1" if mode == "mutation-release" else "(witness_age >= 5)"});
     assume(consumers == (witness_age == 3 ? 0 : {2 * manifest['parameters']['hartCount']}'d{(1 << (2 * manifest['parameters']['hartCount'])) - 1}));
 '''
                     text = text.replace('endmodule', '''  reg [2:0] witness_age = 0;
@@ -2628,7 +2912,7 @@ def verify(rtl, directory, modules=None):
   else if (witness_age != 7) witness_age <= witness_age + 1;
   always @* begin
 ''' + guidance + '  end\nendmodule', 1)
-                if unit == 'Axi' and mutating and filename == module + '.sv':
+                if unit == 'Axi' and mutating and not mode.startswith('mutation-line-') and filename == module + '.sv':
                     width = manifest['parameters']['axiDataBits']
                     atomic_operation = {'mutation-or': 8, 'mutation-swap': 1, 'mutation-lr-write': 2,
                                         'mutation-sc-empty': 3, 'mutation-sc-retry': 3, 'mutation-sc-status': 3,
@@ -2653,6 +2937,19 @@ def verify(rtl, directory, modules=None):
                     text = text.replace('endmodule', guidance + '\nendmodule', 1)
                     if mode == 'mutation-privilege':
                         text = text.replace('endmodule', '  always @* assume(!memory_request_bits_privileged);\nendmodule', 1)
+                if unit == 'Axi' and mode.startswith('mutation-line-') and filename == module + '.sv':
+                    width = manifest['parameters']['axiDataBits']
+                    words = sum((index + 1) << (64 * index) for index in range(width // 64))
+                    guidance = f'''
+  always @* begin
+    assume(memory_request_valid && memory_request_bits_fetch && !memory_request_bits_write && !memory_request_bits_atomic && memory_request_bits_size == 6 && memory_request_bits_address == 0);
+    assume(memory_response_ready && axi_ar_ready && !axi_b_valid);
+    assume(axi_r_valid == (line_owned && line_address_sent && !line_last_seen && !line_buffered));
+    assume(axi_r_bits_last == (line_beat == {512 // width - 1}) && axi_r_bits_id == line_id && axi_r_bits_resp == 0);
+    assume(axi_r_bits_data == {width}'h{words:x});
+  end
+'''
+                    text = text.replace('endmodule', guidance + '\nendmodule', 1)
                 if unit == 'Lsu' and mutating and filename == module + '.sv':
                     load = mode == 'mutation-extension'
                     atomic = mode in ('mutation-consume', 'mutation-pair', 'mutation-alias', 'mutation-lr-fault', 'mutation-pmp-direction')
@@ -2711,7 +3008,7 @@ def verify(rtl, directory, modules=None):
                     text = text.replace('endmodule', f"  always @* assume(input_valid && !input_bits_fault && input_bits_instruction == 32'h{instruction:x});\nendmodule", 1)
                 if unit == 'InstructionCache' and mode != 'prove' and filename == module + '.sv':
                     scenario = {'mutation': 7, 'mutation-hold': 1, 'mutation-word': 0,
-                                'mutation-invalidate': 6, 'mutation-denied': 3}.get(mode)
+                                'mutation-invalidate': 6, 'mutation-denied': 3, 'mutation-line-fault': 4}.get(mode)
                     guidance = '''
   (* anyconst *) reg [2:0] cache_scenario;
   reg cache_waited = 0;
@@ -2730,6 +3027,11 @@ def verify(rtl, directory, modules=None):
       (cache_scenario == 7 && state == 4 && word == 15) || invalidate));
   end
 '''
+                    if manifest['parameters'].get('enableBurstRefill'):
+                        guidance = guidance.replace('downstream_response_valid == (cache_bus &&', 'downstream_response_valid == (cache_bus && state == 4 &&')
+                        guidance = guidance.replace('assume(allowed == !(cache_scenario == 3 && word == 1));', 'assume(allowed == (cache_scenario != 3));')
+                        guidance = guidance.replace('state == 4 && word == 15', 'state == 6 && word == 15')
+                        guidance += "  always @* assume(downstream_response_bits_last == (bypass || word >= 14));\n"
                     guidance = guidance.replace('SCENARIO_MAX', '4' if scenario is None else '7')
                     if scenario is not None:
                         guidance += f'  always @* assume(cache_scenario == {scenario});\n'
@@ -2809,7 +3111,7 @@ read -formal -sv {' '.join(files)}
         backendAbstraction='arbitrary multiply result and completion delay under the separately proved resource protocol',
         synchronization='raw barrier encodings, independent accepted-data ownership until retirement, sequential instruction synchronization redirect and younger flush; no data response timing assumptions' if 'SynchronizationBackend' in proved else None,
         synchronizationWitnessGuidance='cover/mutations only: aligned zero-address SD, FENCE/FENCE.I, one request and response stall, faulted FENCE.I and quiescent interrupts; unrestricted safety proof' if 'SynchronizationBackend' in proved else None,
-        instructionCache='control proof at configured geometry; arbitrary native SRAM read outputs; independent upstream/downstream ownership, authorization, cancellation drain, full-fill publication, invalidation and precise fallback; functional array contents require separate simulation' if 'InstructionCache' in proved else None,
+        instructionCache='control proof at configured geometry; arbitrary native SRAM read outputs; independent ownership, authorization, response fault/tag/last history, native write data, complete publication, invalidation and precise fallback; functional array contents require separate simulation' if 'InstructionCache' in proved else None,
         dataCache='control safety with arbitrary native SRAM reads; independently captured requests, physical ownership, valid-sector/tag-qualified sampling, fault/tag attribution, index invalidation and sector publication; functional SRAM contents require separate simulation' if 'DataCache' in proved else None,
         dataCacheWitnessGuidance='tag-lifetime mutation only: two permitted sectors, successful immediate service, lookup tag match and unrelated later SRAM output; safety and cover remain unrestricted' if 'DataCache' in proved else None,
         coherence='broadcast completion before cacheable writes; held upstream request and one physical transaction supplied by the shared arbiter; no endpoint progress assumption or DMA coherence claim' if 'Coherence' in proved else None,
@@ -2818,6 +3120,8 @@ read -formal -sv {' '.join(files)}
         interruptProgress='with eligibility held, successful matching data response reaches interrupt entry or priority synchronous trap within three cycles; memory service itself is external' if any(r['propertyGroup'] == 'InterruptBackend' for r in reports) else None,
         witnessGuidance='InterruptBackend cover/mutations use ADDI and mie/mstatus initialization then SD, AMOADD.D, MUL, SD-to-MUL, SD-to-FENCE.I or FENCE.I, fixed PCs/tag zero, successful data replies, retained request stall and software interrupt scenarios; unrestricted proof' if any(r['propertyGroup'] == 'InterruptBackend' for r in reports) else None,
         arbiterWitnessGuidance='cover/mutations hold all requesters valid with zero payloads, one request stall and one response stall then immediate service; unrestricted proof' if 'MemoryArbiter' in proved else None,
+        readStreaming='one accepted line and external AR; independent beat/chunk counters, buffered data ordering, response-last ownership, stalled payloads and malformed-last drain; endpoint R data, ID, status, last and delays unrestricted' if 'Axi' in proved and manifest['parameters'].get('enableBurstRefill') else None,
+        cachedFetch='actual cache upstream scalar connections retain request/response ownership; external scalar responses terminate, line responses may fault or end early/late; cancel and invalidate are independent' if 'Fetch' in proved and manifest['parameters'].get('iCacheBytes') else None,
         atomicTransport='independent request and AXI channel ownership and retained hart identity; LR read-only, one-shot SC status/no-bus failure, ADD/OR/SWAP exclusive retry and error isolation; no external-memory atomicity or eventual-success theorem' if 'Axi' in proved else None,
         axiAssumptions='initial reset only; R requires accepted AR, B requires accepted AW and W; blocked response payloads persist; all request metadata, hart/response IDs, data, responses, last and delays unrestricted' if 'Axi' in proved else None,
         axiMutationGuidance='mutations only: aligned D ADD/OR/SWAP/LR/SC at address8, operand1, values7 then11 after retry, immediate service, per-fault codes, SC eligibility and valid hart1 with changing live sideband for retained-ID check; prove and cover unrestricted' if 'Axi' in proved else None,

@@ -20,6 +20,7 @@ case class DitDahA1Parameter(
   enableInterrupts: Boolean = false,
   enableUserMode: Boolean = false,
   enableSupervisorMode: Boolean = false,
+  enableBurstRefill: Boolean = false,
   enableTrace: Boolean = false,
   localInterruptBase: Option[BigInt] = None,
   memoryRegions: Seq[MemoryRegion] = Seq(MemoryRegion())
@@ -46,6 +47,7 @@ case class DitDahA1Parameter(
 
   def validateFrontend(): Unit =
     validateProtection()
+    require(!enableBurstRefill || iCacheBytes != 0, "Burst refill requires an instruction cache")
     require((resetVector & 3) == 0, "Frontend requires a word-aligned resetVector")
 
   def validateBackend(): Unit =

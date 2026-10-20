@@ -63,4 +63,5 @@ object DitDahA1LocalInterrupts extends Generator[DitDahA1Parameter, DitDahA1Unit
       response.data := (valid & !request.write).?(data, 0.U(64))
       response.fault := !valid
       response.tag := request.tag
+      response.last := true.B
     }

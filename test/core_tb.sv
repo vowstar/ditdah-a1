@@ -45,7 +45,7 @@ module core_tb;
     logic [4:0] atomicOperation;
     logic scEligible;
   } core_request_t;
-  typedef struct packed { logic [63:0] data; logic fault; logic [7:0] tag; } core_response_t;
+  typedef struct packed { logic [63:0] data; logic fault; logic [7:0] tag; logic last; } core_response_t;
   trace_t traces[HARTS];
   core_request_t requests[2*HARTS];
   core_response_t responses[2*HARTS];
@@ -144,6 +144,8 @@ module core_tb;
   logic [2:0] read_size, write_size;
   logic [DW-1:0] write_data;
   logic [DW/8-1:0] write_mask;
+  integer read_remaining = 0;
+  logic read_line = 0;
   integer read_delay = 0, write_delay = 0, cycles = 0;
   integer aw_first = 0, w_first = 0, together = 0;
   integer ar_stall = 0, aw_stall = 0, w_stall = 0;
@@ -207,14 +209,16 @@ module core_tb;
       if (awvalid && !awready) aw_stall <= aw_stall + 1;
       if (wvalid && !wready) w_stall <= w_stall + 1;
       if (arvalid && arready) begin
-        if (!console_address(64'(araddr)) && (64'(araddr) < base_address || 64'(araddr) + (1 << arsize) > base_address + MB)) $fatal(1, "Truncated or unexpected read address");
-        if (arid != IDW'(bus_owner / 2) || arlen != 0 || arburst != 1 || (arlock && arprot[2]) || arcache != 0 || arqos != 0) $fatal(1, "Read attributes");
+        if (!console_address(64'(araddr)) && (64'(araddr) < base_address || 64'(araddr) + (1 << arsize) * (1 + integer'(arlen)) > base_address + MB)) $fatal(1, "Truncated or unexpected read address");
+        if (arid != IDW'(bus_owner / 2) || arlen != (requests[bus_owner].size == 6 ? 64 / (DW/8) - 1 : 0) || arburst != 1 || (arlock && arprot[2]) || arcache != 0 || arqos != 0) $fatal(1, "Read attributes");
         if (arprot != {requests[bus_owner].fetch, 1'b0, requests[bus_owner].privileged}) $fatal(1, "Read privilege");
-        if ((arprot[2] ? arsize != 2 : arsize > 3) ||
+        if ((arprot[2] ? arsize != (requests[bus_owner].size == 6 ? $clog2(DW/8) : 2) : arsize > 3) ||
             (arlock && arsize != 3) || (araddr & ((1 << arsize) - 1)) != 0) $fatal(1, "Read alignment");
         if (HARTS > 1) $write("HART %0d ", bus_owner / 2);
-        $display("BUS %s %016h %0d %016h", arlock ? "exclusive_read" : (arprot[2] ? "fetch" : "read"), 64'(araddr), 1 << arsize, 64'b0);
+        $display("BUS %s %016h %0d %016h", arlock ? "exclusive_read" : (arprot[2] ? "fetch" : "read"), 64'(araddr), requests[bus_owner].size == 6 ? 64 : 1 << arsize, 64'b0);
         read_pending <= 1;
+        read_remaining <= integer'(arlen);
+        read_line <= requests[bus_owner].size == 6;
         read_address <= 64'(araddr);
         read_id <= arid;
         read_size <= arsize;
@@ -230,7 +234,7 @@ module core_tb;
         else begin
           for (integer i = 0; i < DW/8; i++)
             rdata[i*8 +: 8] <= console_address(read_address) ? 0 : memory[integer'((read_address - base_address) & ~(64'(DW/8) - 1)) + i];
-          rresp <= ((read_fetch && read_address == fault_fetch) || (!read_fetch && read_address == fault_read) || console_address(read_address)) ? 2 :
+          rresp <= ((read_fetch && read_address <= fault_fetch && fault_fetch < read_address + (1 << read_size)) || (!read_fetch && read_address == fault_read) || console_address(read_address)) ? 2 :
             (read_exclusive && read_address != fault_exclusive ? 1 : 0);
           if (read_exclusive && read_address != fault_read && read_address != fault_exclusive && !console_address(read_address)) begin
             reservation_address[read_id] <= read_address;
@@ -239,18 +243,27 @@ module core_tb;
             if ($countones(reservation_valid | (HARTS'(1) << read_id)) > reservation_max)
               reservation_max <= $countones(reservation_valid | (HARTS'(1) << read_id));
           end
+          rlast <= read_remaining == 0;
           rvalid <= 1;
-          read_pending <= 0;
         end
       end
       if (rvalid && rready) begin
         if (HARTS > 1) $write("HART %0d ", bus_owner / 2);
-        $display("READ %016h %01h %016h", read_address, rresp,
+        if (read_line) $display("LINE_BEAT %016h %01h %h %01h", read_address, rresp, rdata, rlast);
+        else $display("READ %016h %01h %016h", read_address, rresp,
           64'(rdata >> (8 * (read_address % (DW/8)))) & access_mask(read_size));
         if (read_fetch) begin
-          if (HARTS > 1) $write("HART %0d ", bus_owner / 2);
-          $display("FETCH %016h %01h %08h", read_address, rresp,
-            32'(rdata >> (8 * (read_address % (DW/8)))));
+          for (integer word_index = 0; word_index < (read_line ? DW/32 : 1); word_index++) begin
+            if (HARTS > 1) $write("HART %0d ", bus_owner / 2);
+            $display("FETCH %016h %01h %08h", read_address + 4 * word_index, rresp,
+              32'(rdata >> (8 * (read_address % (DW/8)) + 32 * word_index)));
+          end
+        end
+        if (rlast) read_pending <= 0;
+        else begin
+          read_address <= read_address + (1 << read_size);
+          read_remaining <= read_remaining - 1;
+          read_delay <= integer'(random_state[5:4]);
         end
         rvalid <= 0;
       end
@@ -388,12 +401,14 @@ module core_tb;
       if (response_valid[source] && response_ready[source]) begin
         if (active_source != source || responses[source].tag != accepted_tag)
           $fatal(1, "Response source or tag");
-        active_source = -1;
-        completed_transactions = completed_transactions + 1;
+        if (responses[source].last) begin
+          active_source = -1;
+          completed_transactions = completed_transactions + 1;
+        end
         if (completed_transactions > transaction_limit) $fatal(1, "Transaction budget");
         if (HARTS > 1) $write("HART %0d ", source / 2);
-        $display("RESPONSE %0d %016h %01h %02h", source % 2,
-          responses[source].data, responses[source].fault, responses[source].tag);
+        $display("RESPONSE %0d %016h %01h %02h %01h", source % 2,
+          responses[source].data, responses[source].fault, responses[source].tag, responses[source].last);
       end
     end
   end

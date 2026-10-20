@@ -59,7 +59,7 @@ object DitDahA1MemoryArbiter extends Generator[DitDahA1Parameter, DitDahA1UnitLa
       (owner === i.U(bits)) & ports(i).response.ready
     }.reduce(_ | _)
     when(down.request.valid & down.request.ready) { state := 2.U(2) }
-    when(down.response.valid & down.response.ready) {
+    when(down.response.valid & down.response.ready & down.response.bits.last) {
       next := (owner === (count - 1).U(bits)).?(0.U(bits), (owner + 1.U(bits)).asBits.bits(bits - 1, 0).asUInt)
       state := 0.U(2)
     }

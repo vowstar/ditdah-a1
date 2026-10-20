@@ -70,6 +70,7 @@ object DitDahA1DataCache extends Generator[DitDahA1Parameter, DitDahA1Layers, Di
     up.response.bits.data := data
     up.response.bits.fault := fault
     up.response.bits.tag := request.tag
+    up.response.bits.last := true.B
     down.request.valid := state === 2.U(3)
     down.request.bits :<= request
     down.response.ready := state === 3.U(3)
