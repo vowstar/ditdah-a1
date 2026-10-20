@@ -10,7 +10,7 @@ import me.jiuyang.zaozi.valuetpe.*
 class DitDahA1InstructionCacheIO(parameter: DitDahA1Parameter) extends HWBundle(parameter):
   val clock = Flipped(Clock())
   val reset = Flipped(Reset())
-  val upstream = Flipped(new MemoryPort)
+  val upstream = Flipped(new InstructionCachePort(parameter))
   val downstream = Aligned(new MemoryPort)
   val cancel = Flipped(Bool())
   val invalidate = Flipped(Bool())
@@ -28,11 +28,15 @@ object DitDahA1InstructionCache extends Generator[DitDahA1Parameter, DitDahA1Uni
     val indexBits = Integer.numberOfTrailingZeros(parameter.iCacheBytes) - 6
     val lines = parameter.iCacheBytes / 64
     val tagBits = parameter.physicalAddressBits - indexBits - 6
+    val banks = parameter.fetchWords
+    val bankBits = Integer.numberOfTrailingZeros(banks)
     val state = RegInit(0.U(3))
     val address = Reg(UInt(64))
     val tag = Reg(UInt(8))
     val privileged = Option.when(parameter.enableUserMode)(Reg(Bool()))
-    val data = Reg(UInt(32))
+    val data = Reg(UInt(32 * banks))
+    val count = Option.when(banks > 1)(Reg(UInt(parameter.fetchCountBits)))
+    val wide = Option.when(banks > 1)(Reg(Bool()))
     val fault = Reg(Bool())
     val valid = RegInit(0.B(lines))
     val word = Reg(UInt(4))
@@ -49,11 +53,7 @@ object DitDahA1InstructionCache extends Generator[DitDahA1Parameter, DitDahA1Uni
     val refillWord = if parameter.enableBurstRefill then 0.U(4) else word
     val candidate = bypass.?(address, (address.asBits.bits(63, 6) ## refillWord.asBits ## 0.B(2)).asUInt)
     val abort = killed | io.cancel | io.invalidate
-    up.request.ready := state === 0.U(3)
-    up.response.valid := state === 5.U(3)
-    up.response.bits.data := data
     up.response.bits.tag := tag
-    up.response.bits.fault := fault
     up.response.bits.last := true.B
     io.checkAddress := candidate
     io.checkSize := burst.?(6.U(3), 2.U(3))
@@ -81,29 +81,42 @@ object DitDahA1InstructionCache extends Generator[DitDahA1Parameter, DitDahA1Uni
       .getOrElse(down.response.bits.data.asBits.bits(31, 0).asUInt)
     val complete = word === 15.U(4)
 
-    val wordRead = StorageArray("instructions", parameter.iCacheBytes / 4, 32,
-      up.request.bits.address.asBits.bits(indexBits + 5, 2).asUInt,
-      (index.asBits ## word.asBits).asUInt, writeData, filling, reading, io.clock)
+    val wordReads = (0 until banks).map { bank =>
+      val selected = if banks == 1 then true.B else up.request.bits.address.asBits.bits(bankBits + 1, 2).asUInt === bank.U(bankBits)
+      val writing = if banks == 1 then filling else filling & (word.asBits.bits(bankBits - 1, 0).asUInt === bank.U(bankBits))
+      val writeWord = if banks == 1 then word else word.asBits.bits(3, bankBits).asUInt
+      val full = if banks == 1 then false.B else up.request.bits.size === (bankBits + 2).U(3)
+      StorageArray("instructions", parameter.iCacheBytes / (4 * banks), 32,
+        up.request.bits.address.asBits.bits(indexBits + 5, bankBits + 2).asUInt,
+        (index.asBits ## writeWord.asBits).asUInt, writeData, writing, reading & (full | selected), io.clock)
+    }
+    val wordRead = if banks == 1 then wordReads.head else
+      val block = wordReads.reverse.map(_.asBits).reduce(_ ## _).asUInt
+      val shift = (address.asBits.bits(bankBits + 1, 2) ## 0.B(5)).asUInt
+      val suffix = (block >> shift).asBits.bits(32 * banks - 1, 0).asUInt
+      wide.get.?(suffix, suffix.asBits.bits(31, 0).asUInt)
+    val lookupCount = if banks == 1 then 1.U(1) else wide.get.?(
+      (banks.U(parameter.fetchCountBits) - address.asBits.bits(bankBits + 1, 2).asUInt).asBits.bits(parameter.fetchCountBits - 1, 0).asUInt,
+      1.U(parameter.fetchCountBits))
     val tagRead = StorageArray("tags", lines, tagBits,
       up.request.bits.address.asBits.bits(indexBits + 5, 6).asUInt, index,
       address.asBits.bits(parameter.physicalAddressBits - 1, indexBits + 6).asUInt, filling & complete, reading, io.clock)
     val hit = (valid.asUInt >> index).asBits.bit(0) &
       (tagRead === address.asBits.bits(parameter.physicalAddressBits - 1, indexBits + 6).asUInt)
+    val lookupHit = (state === 1.U(3)) & hit & !abort
+    up.response.valid := lookupHit | (state === 5.U(3))
+    up.response.bits.data := lookupHit.?(wordRead, data)
+    up.response.bits.fault := !lookupHit & fault
+    up.response.bits.count.foreach(_ := lookupHit.?(lookupCount, count.get))
+    up.request.ready := !io.cancel & !io.invalidate & ((state === 0.U(3)) | (!killed & up.response.valid & up.response.ready))
 
-    when(reading) {
-      privileged.foreach(_ := up.request.bits.privileged)
-      address := up.request.bits.address
-      tag := up.request.bits.tag
-      data := 0.U(32)
-      fault := false.B
-      word := 0.U(4)
-      bypass := false.B
-      killed := io.cancel | io.invalidate
-      state := (io.cancel | io.invalidate).?(5.U(3), 1.U(3))
-    }
     when(state === 1.U(3)) {
       when(abort) { state := 5.U(3) }.otherwise {
-        when(hit) { data := wordRead; state := 5.U(3) }.otherwise {
+        when(hit) {
+          data := wordRead
+          count.foreach(_ := lookupCount)
+          state := up.response.ready.?(0.U(3), 5.U(3))
+        }.otherwise {
           valid := valid & ~mask
           state := 2.U(3)
         }
@@ -164,3 +177,16 @@ object DitDahA1InstructionCache extends Generator[DitDahA1Parameter, DitDahA1Uni
     when(up.response.valid & up.response.ready) { state := 0.U(3) }
     when((io.cancel | io.invalidate) & (state =/= 0.U(3))) { killed := true.B }
     when(io.invalidate) { valid := 0.B(lines) }
+    when(reading) {
+      privileged.foreach(_ := up.request.bits.privileged)
+      address := up.request.bits.address
+      tag := up.request.bits.tag
+      data := 0.U(32 * banks)
+      count.foreach(_ := 1.U(parameter.fetchCountBits))
+      wide.foreach(_ := up.request.bits.size === (bankBits + 2).U(3))
+      fault := false.B
+      word := 0.U(4)
+      bypass := false.B
+      killed := false.B
+      state := 1.U(3)
+    }

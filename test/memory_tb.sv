@@ -25,9 +25,9 @@ endinterface
   .P``_request_bits_atomicOperation(B.request.atomicOperation), .P``_request_bits_scEligible(B.request.scEligible), .P``_response_ready(B.response_ready), \
   .P``_response_valid(B.response_valid), .P``_response_bits_data(B.response.data), \
   .P``_response_bits_fault(B.response.fault), .P``_response_bits_tag(B.response.tag), .P``_response_bits_last(B.response.last)
-`undef CORE_TRACE
-`define CORE_TRACE dut.backend.dV
+`define CORE_TRACE traces[0][0]
 module memory_tb;
+  `include "retire_bindings.svh"
   logic clock = 0, reset = 1;
   always #5 clock = ~clock;
   memory_port core_port[2](), physical_port[2]();
@@ -59,7 +59,7 @@ module memory_tb;
     8: irq_activate = service[1].pending && service[1].captured.atomic;
     default: irq_activate = 0;
   endcase
-  always @(posedge clock) irq_retired <= !reset && `CORE_TRACE.traceValid && `CORE_TRACE.tracePc == irq_target;
+  always @(posedge clock) irq_retired <= !reset && retired_pc(0, irq_target);
   always @(posedge clock) irq_ack <= !reset && physical_port[1].request_valid && physical_port[1].request_ready &&
     physical_port[1].request.write && physical_port[1].request.address == base_address + 'h5008;
 `endif
@@ -69,6 +69,7 @@ module memory_tb;
   logic [31:0] random_state;
   logic [1:0] core_pending = 0;
   integer cycles = 0, overlap = 0, pipeline_max = 0, dependency_stalls = 0;
+  integer issue_run = 0, retire_run = 0, issue_max = 0, retire_max = 0;
   function automatic logic [63:0] access_mask(input logic [2:0] size);
     return 64'hffffffffffffffff >> (64 - (8 << size));
   endfunction
@@ -225,10 +226,16 @@ module memory_tb;
     cycles <= cycles + 1;
     if (cycles > 50000) $fatal(1, "Timeout");
     if (&core_pending) overlap <= overlap + 1;
-    if (`CORE_TRACE.pipelineOccupancy > 4) $fatal(1, "Pipeline occupancy");
+    if (`CORE_TRACE.pipelineOccupancy > 6 * ISSUE_WIDTH) $fatal(1, "Pipeline occupancy");
+    issue_run = issue_count[0] == ISSUE_WIDTH ? issue_run + 1 : 0;
+    retire_run = retire_count[0] == ISSUE_WIDTH && !`CORE_TRACE.traceTrap ? retire_run + 1 : 0;
+    if (issue_run > issue_max) issue_max = issue_run;
+    if (retire_run > retire_max) retire_max = retire_run;
     if (`CORE_TRACE.pipelineOccupancy > pipeline_max) pipeline_max <= `CORE_TRACE.pipelineOccupancy;
     if (`CORE_TRACE.pipelineStall) dependency_stalls <= dependency_stalls + 1;
-    if (`CORE_TRACE.traceValid) begin
+`undef CORE_TRACE
+`define CORE_TRACE traces[0][lane]
+    for (integer lane = 0; lane < ISSUE_WIDTH; lane++) if (`CORE_TRACE.traceValid) begin
 `ifdef ENABLE_INTERRUPTS
         $display("IRQ %01h", irq_levels);
 `endif
@@ -242,6 +249,7 @@ module memory_tb;
         $display("COVER %0d %0d %0d %0d %0d %0d", overlap, service[0].stalls, service[1].stalls,
           service[0].delayed + service[1].delayed, service[0].rejected + service[1].rejected, service[0].wraps);
         $display("PIPELINE %0d %0d", pipeline_max, dependency_stalls);
+        $display("THROUGHPUT %0d %0d", issue_max, retire_max);
         $display("CYCLES %0d", cycles);
         $display("PASS"); $finish;
       end

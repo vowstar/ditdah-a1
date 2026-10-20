@@ -21,12 +21,16 @@ def verify_storage(rtl, directory):
               for file in files if file.startswith(('instructions_', 'tags_', 'data_', 'dataTags_', 'mem_'))}
     assert ('DitDahA1InstructionCache.sv' in files) == bool(size)
     assert ('DitDahA1DataCache.sv' in files) == bool(data_size)
-    expected = {} if not size else {'instructions': (size // 4, 32),
+    banks = 1 << (manifest['parameters']['issueWidth'] - 1).bit_length() if size else 1
+    expected = {} if not size else {'instructions': (size // (4 * banks), 32),
         'tags': (size // 64, manifest['parameters']['physicalAddressBits'] - (size // 64).bit_length() - 5)}
     if data_size:
         expected.update(data=(data_size // 8, 64),
                         dataTags=(data_size // 64, manifest['parameters']['physicalAddressBits'] - (data_size // 64).bit_length() - 5))
     assert set(arrays.values()) == set(expected.values())
+    if size:
+        cache = (rtl / 'DitDahA1InstructionCache.sv').read_text()
+        assert len(re.findall(r'^\s*instructions_\d+x32\s+\w+\s*\(', cache, re.M)) == banks
     report = []
     directory.mkdir(parents=True, exist_ok=True)
     for module, (depth, width) in arrays.items():
@@ -725,6 +729,93 @@ def frontend_contract(parameters):
 '''
 
 
+def instruction_cache_contract(parameters):
+    base = int(parameters['resetVector'])
+    burst = parameters.get('enableBurstRefill')
+    banks = 1 << (parameters['issueWidth'] - 1).bit_length()
+    body = f'''
+    allowed = 1; upstream_request_valid = 1;
+    upstream_request_bits_address = 'h{base:x}; upstream_request_bits_tag = 33;
+    upstream_request_bits_fetch = 1; upstream_request_bits_size = {banks.bit_length()+1};
+    while (!upstream_request_ready) tick(); tick(); upstream_request_valid = 0;
+'''
+    for beat in range(8 if burst else 16):
+        if not burst or beat == 0:
+            address = base if burst else base + 4 * beat
+            body += f'''
+    while (!downstream_request_valid) tick();
+    check(downstream_request_bits_address == 'h{address:x} && downstream_request_bits_size == {6 if burst else 2}, "Native refill address");
+    downstream_request_ready = 1; tick(); downstream_request_ready = 0;
+'''
+        data = ((0x10000000 + 2 * beat + 1) << 32 | (0x10000000 + 2 * beat)) if burst else 0x10000000 + beat
+        body += f'''
+    downstream_response_bits_data = 64'h{data:x}; downstream_response_bits_tag = 33;
+    downstream_response_bits_last = {int(not burst or beat == 7)}; downstream_response_valid = 1;
+    while (!downstream_response_ready) tick(); tick(); downstream_response_valid = 0;
+'''
+    body += f'''
+    while (!upstream_response_valid) tick();
+    {f'check(upstream_response_bits_count == 1, "Miss returns the demanded word only");' if banks > 1 else ''}
+    repeat (3) begin
+      check(upstream_response_bits_data == 'h10000000 && !upstream_response_bits_fault, "Native refill completion hold"); tick();
+    end
+    upstream_response_ready = 1; upstream_request_valid = 1;
+    upstream_request_bits_address = 'h{base:x}; upstream_request_bits_tag = 64;
+    upstream_request_bits_size = 2;
+    check(upstream_request_ready, "Completion did not release lookup credit"); tick();
+    for (integer beat = 0; beat < 64; beat++) begin
+      check(upstream_response_valid && !upstream_response_bits_fault && upstream_response_bits_tag == 64 + beat &&
+        upstream_response_bits_data == 'h10000000 + (beat % 16) && !downstream_request_valid, "Native one-cycle hit stream");
+      upstream_request_bits_address = 'h{base:x} + 4 * ((beat + 1) % 16);
+      upstream_request_bits_tag = 65 + beat;
+      upstream_request_valid = beat != 63;
+      check(upstream_request_ready, "Hit response blocked the next lookup"); tick();
+    end
+    upstream_request_valid = 1; upstream_request_bits_address = 'h{base+4:x}; upstream_request_bits_tag = 7;
+    tick(); upstream_request_valid = 0; upstream_response_ready = 0;
+    repeat (3) begin
+      check(upstream_response_valid && upstream_response_bits_data == 'h10000001 && upstream_response_bits_tag == 7 &&
+        !upstream_request_ready, "Native hit under backpressure"); tick();
+    end
+'''
+    if banks > 1:
+        body += '    upstream_response_ready = 1; tick(); upstream_response_ready = 0;\n'
+        for size in (2, banks.bit_length() + 1):
+            for offset in range(16):
+                count = 1 if size == 2 else banks - offset % banks
+                value = sum((0x10000000 + offset + lane) << (32 * lane) for lane in range(count))
+                body += f'''    upstream_request_valid = 1; upstream_request_bits_address = 'h{base + 4 * offset:x};
+    upstream_request_bits_size = {size}; upstream_request_bits_tag = {offset};
+    check(upstream_request_ready, "Bank lookup admission"); tick(); upstream_request_valid = 0;
+    repeat (3) begin
+      check(upstream_response_valid && !upstream_response_bits_fault && upstream_response_bits_count == {count} &&
+        upstream_response_bits_data == 'h{value:x} && upstream_response_bits_tag == {offset} &&
+        !downstream_request_valid && !upstream_request_ready, "Bank suffix and stable return"); tick();
+    end
+    upstream_response_ready = 1; tick(); upstream_response_ready = 0;
+'''
+        body += f'''    upstream_response_ready = 1; upstream_request_valid = 1;
+    upstream_request_bits_address = 'h{base:x}; upstream_request_bits_size = {banks.bit_length()+1};
+    upstream_request_bits_tag = 64; tick();
+'''
+        for beat in range(64):
+            offset = banks * (beat % (16 // banks))
+            value = sum((0x10000000 + offset + lane) << (32 * lane) for lane in range(banks))
+            body += f'''    check(upstream_response_valid && !upstream_response_bits_fault &&
+      upstream_response_bits_count == {banks} && upstream_response_bits_data == 'h{value:x} &&
+      upstream_response_bits_tag == {64+beat} && !downstream_request_valid, "Native full-bank hit stream");
+    upstream_request_bits_address = 'h{base + 4 * banks * ((beat + 1) % (16 // banks)):x};
+    upstream_request_bits_tag = {65+beat}; upstream_request_valid = {int(beat != 63)};
+    check(upstream_request_ready, "Full-bank response blocked the next lookup"); tick();
+'''
+    return body + f'''
+    upstream_response_ready = 1; upstream_request_valid = 1;
+    upstream_request_bits_address = 'h{base+64:x}; upstream_request_bits_tag = 8; upstream_request_bits_size = 2; tick();
+    check(!upstream_request_ready && !upstream_response_valid, "Miss admitted a younger lookup");
+    upstream_request_valid = 0;
+'''
+
+
 def cached_fetch_contract(parameters, frontend=False):
     base = int(parameters['resetVector'])
     line = base if frontend else base + 0x100
@@ -759,9 +850,26 @@ def cached_fetch_contract(parameters, frontend=False):
     body += refill(line) + output(line if frontend else line + 4, "32'h10000000" if frontend else "32'h10000001")
     if frontend:
         body += output(line + 4, "32'h10000001")
+        body += f'''    while (!output_valid) tick();
+    check(output_bits_pc == 'h{line+8:x}, "Oldest unpublished frontend PC");
+    invalidate = 1; check(!output_valid, "Invalidate delivered a stale instruction"); tick(); invalidate = 0;
+'''
+        body += refill(line) + output(line + 8, "32'h10000002")
         body += f'''    redirect = 1; invalidate = 1; redirectPc = 'h{base + 0x100:x}; tick(); redirect = 0; invalidate = 0;
 '''
-        return body + refill(base + 0x100) + output(base + 0x100, "32'h10000000")
+        body += refill(base + 0x100) + output(base + 0x100, "32'h10000000")
+        forbidden = (max(int(r['base']) + int(r['size']) for r in parameters['memoryRegions']) + 3) & ~3
+        return body + f'''
+    redirect = 1; redirectPc = 'h{forbidden:x}; tick(); redirect = 0;
+    while (!output_valid) tick();
+    check(output_bits_fault && output_bits_pc == 'h{forbidden:x}, "Missing local fetch fault");
+    invalidate = 1; tick(); invalidate = 0;
+    while (!output_valid) tick();
+    check(output_bits_fault && output_bits_pc == 'h{forbidden:x}, "Unpublished fault was not retried");
+    output_ready = 1; tick(); output_ready = 0;
+    invalidate = 1; tick(); invalidate = 0;
+    repeat (3) begin check(!dut.fetch.request_valid, "Delivered fetch fault resumed after invalidate"); tick(); end
+'''
     body += request(line + 8, 22) + output(line + 8, "32'h10000002")
     if parameters['pmpEntries']:
         body += f"    pmp_config = 'h90; pmp_address = 'h{(line + 8) >> 2:x};\n"
@@ -786,6 +894,216 @@ def cached_fetch_contract(parameters, frontend=False):
     for address, cause in ((line + 2, 0), (base + 0x6000, 1)):
         body += request(address, 27) + output(address, '0', 1)
         body += f'    check(output_bits_cause == {cause}, "Local instruction authorization fault");\n'
+    return body
+
+
+def frontend_group_contract(parameters):
+    width = parameters['issueWidth']
+    base = int(parameters['resetVector'])
+    lane_checks = []
+    for lane in range(width):
+        packet = f'output_bits_packets_{lane}_'
+        lane_checks.append(f"""
+        if (held_offer && {lane} < held_count && !redirect && !invalidate) begin
+          check({packet}pc == held_pc[{lane}] && {packet}instruction == held_word[{lane}] &&
+            {packet}tag == held_tag[{lane}] && {packet}fault == held_fault[{lane}], "Stable instruction offer");
+        end
+        if (output_valid && output_ready && {lane} < output_bits_count) begin
+          check({packet}pc == next_pc && {packet}length == 4, "Ordered instruction PC");
+          if (phase == 5) begin
+            check({packet}fault && {packet}cause == 1 && {packet}tval == next_pc, "Ordered fetch fault");
+          end else begin
+            check(!{packet}fault && {packet}instruction == (32'h10000013 ^ ((next_pc - 'h{base:x}) >> 2)), "Ordered instruction data");
+          end
+          next_pc += 4; received += 1;
+        end
+        held_pc[{lane}] = {packet}pc; held_word[{lane}] = {packet}instruction;
+        held_tag[{lane}] = {packet}tag; held_fault[{lane}] = {packet}fault;
+""")
+    body = f"""
+    `undef CHECK
+    `define CHECK(ok, message) if ((ok) !== 1'b1) $fatal(1, "%s", message)
+    begin: grouped_frontend
+      integer phase, cycle, received, target, beat, full_count, partial_count;
+      logic bus_pending, bus_line, held_offer, started;
+      logic [63:0] bus_address, service_address, next_pc;
+      logic [7:0] bus_tag;
+      logic [31:0] low_word, high_word;
+      logic [63:0] held_pc [{width}]; logic [31:0] held_word [{width}];
+      logic [7:0] held_tag [{width}]; logic held_fault [{width}];
+      integer held_count;
+      bus_pending = 0; held_offer = 0; full_count = 0; partial_count = 0;
+      halt = 0; privilege = 3; memory_request_ready = 0; memory_response_valid = 0;
+      {'pmp_config = 0; pmp_address = 0;' if parameters['pmpEntries'] else ''}
+      reset = 1; tick(); tick(); reset = 0;
+      for (phase = 0; phase < 6; phase += 1) begin
+        cycle = 0; received = 0; started = 0;
+        target = phase == 0 ? 256 : phase == 1 ? {64*width} : phase == 5 ? 1 : 96;
+        if (phase == 0 || phase == 1 || phase == 4 || phase == 5)
+          next_pc = 'h{base:x} + (phase == 5 ? 'h3000 : phase == 4 ? 'h204 : 'h200);
+        while (received < target && cycle < 4000) begin
+          redirect = cycle == 0 && (phase == 0 || phase == 1 || phase == 4 || phase == 5);
+          redirectPc = next_pc;
+          invalidate = phase == 3 && cycle == 0;
+          halt = phase == 2 && cycle % 11 < 3;
+          output_ready = phase != 2 || cycle % 7 >= 3;
+          memory_request_ready = phase != 2 || cycle % 5 != 1;
+          memory_response_valid = bus_pending;
+          service_address = bus_address + (bus_line ? 8 * beat : 0);
+          low_word = 32'h10000013 ^ ((service_address - 'h{base:x}) >> 2);
+          high_word = 32'h10000013 ^ ((service_address + 4 - 'h{base:x}) >> 2);
+          memory_response_bits_data = {{high_word, low_word}};
+          memory_response_bits_tag = bus_tag;
+          memory_response_bits_last = !bus_line || beat == 7;
+          memory_response_bits_fault = bus_address >= 'h{base+0x3000:x};
+          #1;
+          if (redirect || invalidate) begin check(!output_valid, "Flush suppresses publication"); end
+          if (output_valid) begin check(output_bits_count >= 1 && output_bits_count <= {width}, "Instruction group bounds"); end
+          if (held_offer && !redirect && !invalidate) begin
+            check(output_valid && output_bits_count == held_count, "Stable group count"); end
+          if (phase == 1 && (started || output_valid)) begin
+            check(output_valid && output_bits_count == {width}, "Continuous full-width native fetch");
+            started = 1;
+          end
+          {''.join(lane_checks)}
+          held_offer = output_valid && !output_ready; held_count = output_bits_count;
+          if (output_valid && output_ready) begin
+            if (output_bits_count == {width}) full_count += 1; else partial_count += 1;
+          end
+          if (memory_response_valid && memory_response_ready) begin
+            if (memory_response_bits_last) bus_pending = 0; else beat += 1;
+          end
+          if (memory_request_valid && memory_request_ready) begin
+            check(!bus_pending, "Single physical transaction");
+            bus_pending = 1; bus_address = memory_request_bits_address; bus_tag = memory_request_bits_tag;
+            bus_line = memory_request_bits_size == 6; beat = 0;
+          end
+          tick(); cycle += 1;
+        end
+        check(received >= target, "Frontend group progress");
+      end
+      output_ready = 1; memory_response_valid = 0; redirect = 0; invalidate = 0;
+      repeat (8) begin check(!output_valid && !memory_request_valid, "Published fault stops fetching"); tick(); end
+      check(full_count >= 64 && ({width} == 1 || partial_count > 0), "Full and partial groups exercised");
+    end
+"""
+    if parameters.get('virtualAddressBits') == 39:
+        body = body.replace('integer held_count;', 'integer held_count; logic translation_pending; logic [63:0] translated_address;')
+        body = body.replace('bus_pending = 0; held_offer', 'translation_pending = 0; bus_pending = 0; held_offer')
+        body = body.replace('          #1;', """          translation_request_ready = 1; translation_response_valid = translation_pending;
+          translation_response_bits_address = translated_address; translation_response_bits_fault = 0;
+          translation_response_bits_cause = 0;
+          #1;""")
+        body = body.replace('          tick(); cycle += 1;', """          if (translation_response_valid && translation_response_ready) translation_pending = 0;
+          if (translation_request_valid && translation_request_ready) begin
+            check(!translation_pending, "Single instruction translation");
+            translation_pending = 1; translated_address = translation_request_bits_address;
+          end
+          tick(); cycle += 1;""")
+        body = body.replace('if (phase == 1 && (started || output_valid))', 'if (0)')
+    if not parameters.get('iCacheBytes'):
+        body = body.replace('invalidate', "1'b0").replace("1'b0 = phase == 3 && cycle == 0;", '').replace("1'b0 = 0;", '')
+        body = body.replace('if (phase == 1 && (started || output_valid))', 'if (0)')
+        body = body.replace('full_count >= 64 &&', 'full_count >= 0 &&')
+    return body
+
+
+def wide_fetch_contract(parameters):
+    banks = 1 << (parameters['issueWidth'] - 1).bit_length()
+    line = int(parameters['resetVector']) + 0x200
+    translated = parameters.get('virtualAddressBits') == 39
+    user_mode = bool(parameters.get('enableUserMode'))
+
+    def offer(pc, tag):
+        body = f'''    request_bits_pc = 'h{pc:x}; request_bits_tag = {tag}; request_valid = 1;
+    while (!request_ready) tick(); tick(); request_valid = 0;
+'''
+        if translated:
+            body += f'''    while (!translation_request_valid) tick();
+    check(translation_request_bits_address == 'h{pc:x}, "Wide fetch translation identity");
+    translation_request_ready = 1; tick(); translation_request_ready = 0;
+    translation_response_bits_address = 'h{pc:x}; translation_response_valid = 1;
+    tick(); translation_response_valid = 0;
+'''
+        return body
+
+    def expected(pc, tag, count, fault=False):
+        words = [f'output_bits_instruction == {0 if fault else 0x20000000 + (pc-line)//4}']
+        words += [f'output_bits_following_{i} == {0x20000000 + (pc-line)//4+i+1}' for i in range(count-1)]
+        if fault:
+            words += [f'output_bits_cause == 1 && output_bits_tval == \'h{pc:x}']
+        return f'output_valid && output_bits_pc == \'h{pc:x} && output_bits_tag == {tag} && output_bits_count == {count} && output_bits_fault == {int(fault)} && ' + ' && '.join(words)
+
+    def finish(pc, tag, count, fault=False):
+        return f'''    while (!output_valid) begin check(!memory_request_valid, "Unexpected wide lookup miss"); tick(); end
+    repeat (3) begin check({expected(pc, tag, count, fault)}, "Wide output suffix and hold"); tick(); end
+    output_ready = 1; tick(); output_ready = 0;
+'''
+
+    body = '''    request_valid = 0; cancel = 0; invalidate = 0; output_ready = 0;
+    memory_request_ready = 0; memory_response_valid = 0; memory_response_bits_fault = 0; memory_response_bits_last = 1;
+    reset = 1; tick(); reset = 0; tick(); privilege = 3;
+'''
+    if translated:
+        body += '    translation_request_ready = 0; translation_response_valid = 0; translation_response_bits_fault = 0; translation_response_bits_cause = 0;\n'
+    if parameters['pmpEntries']:
+        body += '    pmp_config = 0; pmp_address = 0;\n'
+    body += offer(line, 1)
+    burst = parameters.get('enableBurstRefill')
+    for beat in range(8 if burst else 16):
+        if not burst or beat == 0:
+            body += f'''    while (!memory_request_valid) tick();
+    check(memory_request_bits_address == 'h{line if burst else line+4*beat:x} && memory_request_bits_size == {6 if burst else 2}, "Wide cold refill stays physical");
+    memory_response_bits_tag = memory_request_bits_tag;
+    memory_request_ready = 1; tick(); memory_request_ready = 0;
+'''
+        value = ((0x20000000+2*beat+1) << 32 | (0x20000000+2*beat)) if burst else 0x20000000+beat
+        body += f'''    memory_response_bits_data = 'h{value:x}; memory_response_bits_last = {int(not burst or beat == 7)};
+    memory_response_valid = 1; while (!memory_response_ready) tick(); tick(); memory_response_valid = 0;
+'''
+    body += f'''    while (!output_valid) tick();
+    check({expected(line, 1, 1)}, "Short miss return");
+    output_ready = 1; request_valid = 1; request_bits_pc = 'h{line+64:x};
+    check(!request_ready, "Short return admitted a younger lookup"); tick();
+    request_valid = 0; output_ready = 0;
+'''
+    for offset in range(16):
+        pc, tag = line + 4*offset, offset+2
+        body += offer(pc, tag) + finish(pc, tag, banks-offset % banks)
+    if not translated:
+        body += offer(line, 64) + '    output_ready = 1;\n'
+        for beat in range(64):
+            pc = line + 4*banks*(beat % (16//banks))
+            body += f'''    check({expected(pc, 64+beat, banks)}, "Wide one-cycle hit stream");
+    request_valid = {int(beat != 63)}; request_bits_pc = 'h{line+4*banks*((beat+1) % (16//banks)):x}; request_bits_tag = {65+beat};
+    check(request_ready, "Wide hit stream credit"); tick();
+'''
+        body += '    request_valid = 0; output_ready = 0;\n'
+    if parameters['pmpEntries']:
+        for offset in range(banks):
+            pc = line + 4*offset
+            body += f"    pmp_config = 'h94; pmp_address = 'h{pc >> 2:x}; privilege = {0 if user_mode else 3};\n"
+            body += offer(pc, 200+offset) + '    privilege = 3;\n'
+            body += finish(pc, 200+offset, 1)
+        body += f"    pmp_config = 'h90; pmp_address = 'h{line >> 2:x};\n"
+        body += offer(line, 220) + finish(line, 220, 1, True)
+        body += f'    pmp_config = 0; privilege = {0 if user_mode else 3};\n'
+        body += offer(line, 221) + '    privilege = 3;\n' + finish(line, 221, 1 if user_mode else banks, user_mode)
+        body += f"    pmp_config = 'h94; pmp_address = 'h{line >> 2:x};\n"
+        body += offer(line, 222) + '''    cancel = 1; check(!output_valid, "Cancelled scalar recheck escaped"); tick(); cancel = 0;
+    repeat (3) begin check(!output_valid && !memory_request_valid, "Cancelled recheck started a lookup"); tick(); end
+    check(request_ready, "Cancelled recheck did not release ownership");
+'''
+        body += '    pmp_config = 0; pmp_address = 0;\n'
+    for region in parameters['memoryRegions']:
+        if region['executable'] and int(region['size']) == 8 and int(region['base']) % 16 == 8:
+            pc = int(region['base'])
+            body += offer(pc, 230) + f'''    while (!memory_request_valid) tick();
+    check(memory_request_bits_address == 'h{pc:x} && memory_request_bits_size == 2, "PMA scalar fallback");
+    memory_response_bits_tag = memory_request_bits_tag; memory_request_ready = 1; tick(); memory_request_ready = 0;
+    memory_response_bits_data = 'h{0x20000000 + (pc-line)//4:x}; memory_response_valid = 1;
+    while (!memory_response_ready) tick(); tick(); memory_response_valid = 0;
+''' + finish(pc, 230, 1)
     return body
 
 
@@ -1133,7 +1451,7 @@ def backend_multiply_contract():
     data_response_bits_tag = data_request_bits_tag; data_response_valid = 1;
     tick(); data_response_valid = 0; repeat (8) tick();
 '''
-    body = reset + setup + send((sd(3, 0), mul(4, 2, 3), addi(5, 4, 1)), 0x180, 10)
+    body = reset + setup + send((sd(3, 0), addi(6, 0, 0), mul(4, 2, 3), addi(5, 4, 1)), 0x180, 10)
     body += '''
     while (!data_request_valid) tick();
     while (!dut.multiply.output_valid) tick();
@@ -1174,7 +1492,13 @@ def backend_multiply_contract():
 
 def backend_contract():
     words = [(2 << 12) | (1 << 7) | 0x37, addi(2, 0, 42), sd(2, 1), 0x73, sd(2, 1, 8)]
-    body = '    instruction_bits_length = 4;\n'
+    body = f'''    instruction_bits_length = 4;
+    instruction_bits_instruction = 'h{addi(2, 0, 7):x}; instruction_valid = 1;
+    while (!instruction_ready) tick(); tick(); instruction_valid = 0;
+    for (integer stage = 0; stage < 6; stage++) begin
+      check({{dut.commitValid, dut.memoryValid, dut.resultValid, dut.issuedValid, dut.decodedValid, dut.instructionValid}} == (1 << stage), "Backend register boundaries"); tick();
+    end
+'''
     for index, word in enumerate(words):
         body += f'''
     instruction_bits_pc = 'h{0x100 + 4 * index:x}; instruction_bits_instruction = 'h{word:x};
@@ -1186,9 +1510,11 @@ def backend_contract():
     while (!data_request_valid) tick();
     instruction_bits_pc = 'h114; instruction_bits_instruction = 'h{addi(0, 0, 0):x};
     instruction_bits_tag = 5; instruction_valid = 1;
-    repeat (3) begin
-      check(!instruction_ready && data_request_valid && data_request_bits_write && data_request_bits_address == 'h2000 && data_request_bits_data == 42 && data_request_bits_mask == 255 && data_request_bits_tag == 2, "Backend RAW dependencies and blocked store"); tick();
+    repeat (8) begin
+      check(data_request_valid && data_request_bits_write && data_request_bits_address == 'h2000 && data_request_bits_data == 42 && data_request_bits_mask == 255 && data_request_bits_tag == 2, "Backend RAW dependencies and blocked store");
+      if (instruction_ready) begin tick(); instruction_bits_pc += 4; instruction_bits_tag += 1; end else tick();
     end
+    check(!instruction_ready, "Blocked backend exceeded its capacity");
     data_request_ready = 1; tick(); data_request_ready = 0;
     data_response_bits_tag = 2; data_response_valid = 1; tick(); data_response_valid = 0;
     while (!redirect) begin
@@ -1222,6 +1548,87 @@ def backend_contract():
     data_response_bits_tag = 8; data_response_valid = 1; tick(); data_response_valid = 0;
     repeat (6) begin check(!data_request_valid && !redirect, "Unexpected backend effect"); tick(); end
 ''' + backend_multiply_contract()
+
+
+def backend_group_contract(parameters):
+    if parameters['issueWidth'] == 1:
+        return ''
+    sequences = (
+        ((addi(1, 2, 1), addi(3, 2, 2)), (2,), ((1, 6), (3, 7))),
+        ((addi(1, 2, 1), addi(3, 1, 2)), (1, 1), ((1, 6), (3, 8))),
+        ((addi(1, 2, 1), addi(1, 2, 2)), (1, 1), ((1, 6), (1, 7))),
+        ((addi(1, 2, 1), addi(2, 0, 9)), (2,), ((1, 6), (2, 9))),
+        ((addi(0, 2, 1), addi(3, 0, 2)), (2,), ((0, 0), (3, 2))),
+        ((addi(1, 2, 1), 0), (1, 1), ((1, 6), (0, 0))))
+    if parameters['issueWidth'] == 3:
+        sequences += (
+            ((addi(1, 2, 1), addi(3, 2, 2), addi(4, 2, 3)), (3,), ((1, 6), (3, 7), (4, 8))),
+            ((addi(1, 2, 1), addi(3, 2, 2), addi(4, 1, 3)), (2, 1), ((1, 6), (3, 7), (4, 9))),
+            ((addi(1, 2, 1), addi(3, 2, 2), addi(4, 3, 3)), (2, 1), ((1, 6), (3, 7), (4, 10))),
+            ((addi(1, 2, 1), addi(3, 1, 2), addi(4, 2, 3)), (1, 2), ((1, 6), (3, 8), (4, 8))),
+            ((addi(1, 2, 1), addi(3, 2, 2), addi(1, 2, 3)), (2, 1), ((1, 6), (3, 7), (1, 8))),
+            ((addi(1, 2, 1), addi(3, 2, 2), addi(2, 0, 9)), (3,), ((1, 6), (3, 7), (2, 9))),
+            ((addi(0, 2, 1), addi(3, 0, 2), addi(4, 2, 3)), (3,), ((0, 0), (3, 2), (4, 8))),
+            ((addi(1, 2, 1), addi(3, 2, 2), 0), (2, 1), ((1, 6), (3, 7), (0, 0))))
+    body = ''
+    for words, groups, writes in sequences:
+        body += f'''
+    instruction_valid = 0; data_response_valid = 0;
+    reset = 1; tick(); reset = 0; tick();
+    instruction_valid = 1; instruction_bits_count = 1;
+    instruction_bits_packets_0_pc = 'h100; instruction_bits_packets_0_fault = 0;
+    instruction_bits_packets_0_length = 4; instruction_bits_packets_0_instruction = 'h{addi(2, 0, 5):x};
+    while (!instruction_ready) tick(); tick(); instruction_valid = 0; repeat (8) tick();
+    instruction_bits_count = {len(words)};
+'''
+        for lane, word in enumerate(words):
+            body += f'''    instruction_bits_packets_{lane}_pc = 'h{0x200 + lane * 4:x};
+    instruction_bits_packets_{lane}_instruction = 'h{word:x};
+    instruction_bits_packets_{lane}_length = 4; instruction_bits_packets_{lane}_fault = 0;
+'''
+        body += '    instruction_valid = 1; while (!instruction_ready) tick(); tick(); instruction_valid = 0;\n'
+        for stage in ('issued', 'commit'):
+            consumed = 0
+            for count in groups:
+                conditions = [f'dut.{stage}Count == {count}']
+                if stage == 'issued':
+                    conditions += [f"dut.issuedPackets_{lane}_decoded_instruction_pc == 'h{0x200+4*(consumed+lane):x}" for lane in range(count)]
+                else:
+                    for lane, (rd, value) in enumerate(writes[consumed:consumed+count]):
+                        conditions.append(f'dut.gpr.we_{lane} == {int(rd != 0)}')
+                        if rd:
+                            conditions.append(f'dut.gpr.waddr_{lane} == {rd} && dut.gpr.wdata_{lane} == {value}')
+                body += f'    while (dut.{stage}Count == 0) tick();\n    check(' + ' && '.join(conditions) + f', "Ordered {stage} prefix, retained tail and operands"); tick();\n'
+                if stage == 'commit' and parameters.get('enableInterrupts') and all(words[consumed:consumed+count]):
+                    body += f'    check(dut.resumePc == \'h{0x200+4*(consumed+count):x}, "Resume after youngest retired instruction");\n'
+                consumed += count
+        body += '    repeat (8) tick();\n'
+    if parameters.get('enableInterrupts'):
+        body += '''
+    instruction_valid = 0; interrupts_software = 0; interrupts_timer = 0; interrupts_external = 0;
+    reset = 1; tick(); reset = 0; tick();
+    instruction_bits_count = 1; instruction_bits_packets_0_pc = 'h100;
+    instruction_bits_packets_0_length = 4; instruction_bits_packets_0_fault = 0;
+'''
+        for word in (addi(1, 0, 8), csr(0, 0x304, 1)):
+            body += f'''    instruction_bits_packets_0_instruction = 'h{word:x}; instruction_valid = 1;
+    while (!instruction_ready) tick(); tick(); instruction_valid = 0; repeat (8) tick();
+'''
+        body += f'''
+    instruction_bits_count = 2; instruction_bits_packets_0_pc = 'h200;
+    instruction_bits_packets_0_instruction = 'h10500073;
+    instruction_bits_packets_1_pc = 'h204; instruction_bits_packets_1_instruction = 'h{mul(3, 1, 1):x};
+    instruction_bits_packets_1_length = 4; instruction_bits_packets_1_fault = 0;
+    instruction_valid = 1; while (!instruction_ready) tick(); tick(); instruction_valid = 0;
+    while (dut.commitCount == 0 || !dut.commitPackets_0_wfi) tick();
+    tick(); check(status_sleep && dut.executePending && dut.resumePc == 'h204, "WFI cancels younger multiply and retains resume PC");
+    repeat (8) begin check(status_sleep && !instruction_ready && !data_request_valid, "Sleep drains owned execution"); tick(); end
+    check(!dut.executePending, "Cancelled multiply drained");
+    interrupts_software = 1; tick();
+    check(!status_sleep && instruction_ready && !status_trap, "Locally enabled wake without global trap");
+    interrupts_software = 0;
+'''
+    return body
 
 
 def backend_interrupt_contract():
@@ -1356,18 +1763,24 @@ def pmp_contract(parameters):
         for address in (0xfc0, 0xffc, 0x1000, 0x103c, (1 << pa) - 64, (1 << pa) - 32, (1 << 64) - 32):
             for config in (0, 0x9c, 0x98, 0x94, 0x8c):
                 tests.append(([config] + [0x9f] + [0] * 14, [0x407, (1 << width) - 1] + [0] * 14, address, 6, 'fetch'))
+    block = bool(parameters.get('iCacheBytes')) and parameters['issueWidth'] == 3
+    for address in (0xff4, 0xffc, 0x1000, 0x1004, 0x100c, (1 << pa) - 16, (1 << pa) - 4, (1 << 64) - 4):
+        for config in (0, 0x9f, 0x9c, 0x98, 0x94, 0x8c):
+            for kind in ('fetch', 'read', 'write', 'atomic'):
+                tests.append(([config, 0x9f] + [0] * 14, [0x401, (1 << width) - 1] + [0] * 14, address, 4, kind))
     for _ in range(320):
         configs = [rng.randrange(256) & 0x9f for _ in range(16)]
         addresses = [rng.choice((0, 0x400 + rng.randrange(16), (1 << width) - 1)) for _ in range(16)]
         tests.append((configs, addresses, rng.choice((0, 0x1000 + rng.randrange(64), (1 << pa) - 8)),
-                      rng.randrange(4), rng.choice(('fetch', 'read', 'write', 'atomic'))))
+                      rng.randrange(8), rng.choice(('fetch', 'read', 'write', 'atomic'))))
     body = ''
     for configs, addresses, address, size, kind in tests:
         config = sum(v << (i * 8) for i, v in enumerate(configs))
         points = sum(v << (i * width) for i, v in enumerate(addresses))
         kinds = ('read', 'write') if kind == 'atomic' else (kind,)
         for privilege in ((0, 1, 3) if parameters.get('enableSupervisorMode') else (0, 3) if parameters.get('enableUserMode') else (3,)):
-            expected = int(all(pmp_allowed(configs, addresses, address, 1 << size, access, pa, privilege) for access in kinds))
+            supported = size <= 3 or kind == 'fetch' and (size == 4 and block or size == 6 and parameters.get('enableBurstRefill'))
+            expected = int(bool(supported) and all(pmp_allowed(configs, addresses, address, 1 << size, access, pa, privilege) for access in kinds))
             body += f'''    state_config = 128'h{config:x}; state_address = {16 * width}'h{points:x}; privilege = {privilege};
     address = 64'h{address:x}; size = {size}; fetch = {int(kind == 'fetch')}; write = {int(kind in ('write', 'atomic'))}; atomic = {int(kind == 'atomic')};
     check(allowed == {expected}, "PMP priority, range and permissions");
@@ -2008,6 +2421,8 @@ def verify(rtl, directory, modules=None):
                        ('DitDahA1Memory', memory_contract(parameters)),
                        ('DitDahA1Axi', axi_contract(parameters['axiDataBits'], parameters['hartCount']) + (burst_axi_contract(parameters) if parameters.get('enableBurstRefill') else '')),
                        ('DitDahA1MemoryFabric', fabric_contract(parameters)))
+    if cached:
+        suites += (('DitDahA1InstructionCache', instruction_cache_contract(parameters)),)
     if parameters.get('localInterruptBase'):
         suites += (('DitDahA1LocalInterrupts', local_interrupt_contract(parameters)),)
     if parameters.get('dCacheBytes'):
@@ -2034,17 +2449,31 @@ def verify(rtl, directory, modules=None):
         suites += (('DitDahA1Translation', translation_contract(parameters)),)
         suites += (('DitDahA1Fetch', translated_consumer_contract(parameters, True)),
                    ('DitDahA1Lsu', translated_consumer_contract(parameters, False)))
+        suites += (('DitDahA1Frontend', frontend_group_contract(parameters)),)
+    if cached and parameters['issueWidth'] > 1:
+        suites = tuple((name, body + (wide_fetch_contract(parameters) if name == 'DitDahA1Fetch' else '')) for name, body in suites)
+    suites = tuple((name, (body if parameters['issueWidth'] == 1 and parameters.get('virtualAddressBits') != 39 else '') + frontend_group_contract(parameters)
+                    if name == 'DitDahA1Frontend' else body) for name, body in suites)
     assert not modules or set(modules) <= {name for name, _ in suites}, 'Unsupported contract selection'
     for name, body in suites:
         if modules and name not in modules:
             continue
         module = rtl / (name + '.sv')
         test = directory / (name + '_tb.sv')
+        if name in ('DitDahA1Frontend', 'DitDahA1Backend'):
+            port = 'output' if name == 'DitDahA1Frontend' else 'instruction'
+            body = re.sub(rf'\b{port}_bits_(pc|tag|instruction|length|fault|cause|tval)\b', rf'{port}_bits_packets_0_\1', body)
+            if name == 'DitDahA1Backend':
+                body = '    instruction_bits_count = 1;\n' + body
+                body = re.sub(r'\bdut\.(instruction|decoded|issued|result|memory|commit)Valid\b',
+                              r'(dut.\1Count != 0)', body)
+                body += backend_group_contract(parameters)
         test.write_text(bench(module, body))
         binary = directory / name
         dependencies = [rtl / 'DitDahA1Fetch.sv'] if name == 'DitDahA1Frontend' else []
         if cached and name in ('DitDahA1Fetch', 'DitDahA1Frontend'):
             dependencies.append(rtl / 'DitDahA1InstructionCache.sv')
+        if cached and name in ('DitDahA1Fetch', 'DitDahA1Frontend', 'DitDahA1InstructionCache'):
             dependencies += [rtl / file for file in (rtl / 'filelist.f').read_text().splitlines()
                              if file.startswith(('instructions_', 'tags_', 'mem_'))]
         if name == 'DitDahA1MemoryFabric':

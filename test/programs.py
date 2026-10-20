@@ -226,6 +226,18 @@ def cases(base, protection=False, interrupts=False, user=False, local_interrupt_
     p.emit(jal(0, loop - p.offset))
     yield 'pipeline_reuse', p.finish()
 
+    for name in ('integer_stream', 'dependency_stream', 'dependency_chain'):
+        p = Program(base)
+        p.emit(addi(4, 0, 3), addi(5, 0, 7), addi(30, 0, 2))
+        loop = p.offset
+        destinations = [1, 2, 3, *range(6, 28)]
+        for index in range(204):
+            rd = destinations[index % len(destinations)] if name == 'integer_stream' else 1 + index % 3 if name == 'dependency_stream' else 1
+            p.emit(add(rd, 4 if name == 'integer_stream' else rd, 5))
+        p.emit(addi(30, 30, -1), beq(30, 0, 8))
+        p.emit(jal(0, loop - p.offset))
+        yield 'pipeline_' + name, p.finish()
+
     p = Program(base)
     p.address(10, 0x1000)
     p.address(11, 0x1800)
@@ -678,6 +690,9 @@ def interrupt_cases(base, protection):
         p.address(11, 0x5008)
         p.emit(addi(2, 0, -1), csr(0, 0x304, 2), csr(3, 0x344, 0, True),
                csr(4, 0x344, 0), csr(5, 0x344, 0, True), addi(3, 0, 8), csr(0, 0x300, 3))
+        if name in ('fetch_pending', 'fetch_fault'):
+            p.emit(jal(0, 0x400 - p.offset))
+            p.offset = 0x400
         target = base + p.offset
         if name == 'atomic':
             p.emit(amoadd(9, 10, 2, 3))

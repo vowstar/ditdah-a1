@@ -29,7 +29,9 @@ object DitDahA1Config:
       "status" -> "development",
       "implementation" -> ujson.Obj(
         "instructions" -> ujson.Arr.from(DitDahA1Isa.instructions ++ (if parameter.enableSupervisorMode then DitDahA1Isa.supervisorInstructions else Seq.empty) ++ (if parameter.enableTranslation then Seq("sfence.vma") else Seq.empty)),
-        "privilege" -> (if parameter.enableSupervisorMode then "MSU" else if parameter.enableUserMode then "MU" else "M"), "issueWidth" -> 1, "maxInflight" -> parameter.maxInflight,
+        "privilege" -> (if parameter.enableSupervisorMode then "MSU" else if parameter.enableUserMode then "MU" else "M"), "issueWidth" -> parameter.issueWidth, "maxInflight" -> parameter.maxInflight,
+        "pipelineStages" -> parameter.pipelineStages, "backendCapacity" -> parameter.backendCapacity, "frontendCapacity" -> parameter.frontendCapacity,
+        "fetchWords" -> parameter.fetchWords,
         "translation" -> (if parameter.enableTranslation then "Sv39/Svade" else "Bare"),
         "tlbEntries" -> (if parameter.enableTranslation then parameter.tlbEntries else 0),
         "enableBurstRefill" -> parameter.enableBurstRefill, "isaComplete" -> false
@@ -38,7 +40,7 @@ object DitDahA1Config:
         "isa" -> "RV64GCB", "maxHartCount" -> 16,
         "xlen" -> parameter.xlen,
         "registerCount" -> parameter.registerCount,
-        "issueWidth" -> 2,
+        "issueWidth" -> 3,
         "pipelineStages" -> parameter.pipelineStages,
         "cacheLineBytes" -> parameter.cacheLineBytes
       ),

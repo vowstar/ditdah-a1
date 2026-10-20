@@ -6,6 +6,65 @@ import me.jiuyang.zaozi.*
 import me.jiuyang.zaozi.default.{*, given}
 import me.jiuyang.zaozi.reftpe.*
 import me.jiuyang.zaozi.valuetpe.*
+import java.lang.foreign.Arena
+import org.llvm.mlir.scalalib.capi.ir.{Block, Context}
+
+object DitDahA1Alu:
+  def apply(in: Referable[IssuedPacket])(using Arena, Context, Block, InstanceContext): (Referable[UInt], Referable[UInt], Referable[UInt]) =
+    import DitDahA1Isa.*
+    val d = in.decoded
+    val insn = d.instruction
+    val op = d.operation
+    val a = in.operand1
+    val b = in.operand2
+    val imm = d.immediate
+    val encoding = insn.instruction.asBits
+    val funct3 = encoding.bits(14, 12)
+    val addImm = (a + imm).asBits.bits(63, 0).asUInt
+    val pcImm = (insn.pc + imm).asBits.bits(63, 0).asUInt
+    val value = Wire(UInt(64))
+    value := 0.U(64)
+    when(op === Lui.U(operationBits)) { value := imm }
+    when(op === Auipc.U(operationBits)) { value := pcImm }
+    when(op === Addi.U(operationBits)) { value := addImm }
+    when(op === Add.U(operationBits)) { value := (a + b).asBits.bits(63, 0).asUInt }
+    val word = (op === AluWordImmediate.U(operationBits)) | (op === AluWordRegister.U(operationBits))
+    val register = (op === AluRegister.U(operationBits)) | (op === AluWordRegister.U(operationBits))
+    val rhs = register.?(b, imm)
+    val left = word.?((a.asBits.bit(31).?(BigInt("ffffffff", 16).B(32), 0.B(32)) ## a.asBits.bits(31, 0)).asUInt, a)
+    val shift = word.?((0.B(1) ## rhs.asBits.bits(4, 0)).asUInt, rhs.asBits.bits(5, 0).asUInt)
+    val lessSigned = left.asBits.asSInt < rhs.asBits.asSInt
+    val alu = Wire(UInt(64))
+    alu := (register & encoding.bit(30)).?((left - rhs).asBits.bits(63, 0).asUInt, (left + rhs).asBits.bits(63, 0).asUInt)
+    when(funct3 === 1.B(3)) { alu := (left << shift).asBits.bits(63, 0).asUInt }
+    when(funct3 === 2.B(3)) { alu := lessSigned.asBits.asUInt }
+    when(funct3 === 3.B(3)) { alu := (left < rhs).asBits.asUInt }
+    when(funct3 === 4.B(3)) { alu := (left.asBits ^ rhs.asBits).asUInt }
+    when(funct3 === 5.B(3)) {
+      val logicalLeft = word.?((0.B(32) ## a.asBits.bits(31, 0)).asUInt, a)
+      alu := encoding.bit(30).?((left.asBits.asSInt >> shift).asBits.asUInt, logicalLeft >> shift)
+    }
+    when(funct3 === 6.B(3)) { alu := (left.asBits | rhs.asBits).asUInt }
+    when(funct3 === 7.B(3)) { alu := (left.asBits & rhs.asBits).asUInt }
+    when((op === AluImmediate.U(operationBits)) | (op === AluRegister.U(operationBits)) | word) {
+      value := word.?((alu.asBits.bit(31).?(BigInt("ffffffff", 16).B(32), 0.B(32)) ## alu.asBits.bits(31, 0)).asUInt, alu)
+    }
+    (value, addImm, pcImm)
+
+  def result(in: Referable[IssuedPacket], out: Referable[ResultPacket])(using Arena, Context, Block, InstanceContext):
+      (Referable[UInt], Referable[UInt], Referable[UInt]) =
+    val (value, addImm, pcImm) = apply(in)
+    val sequential = (in.decoded.instruction.pc + in.decoded.instruction.length).asBits.bits(63, 0).asUInt
+    out.instruction :<= in.decoded.instruction
+    out.rd := in.decoded.rd
+    out.rdWrite := in.decoded.writesRd
+    out.value := value
+    out.nextPc := sequential
+    for name <- Seq("load", "store", "atomic", "unsignedLoad", "csrWrite", "mret", "sret", "fenceI", "sfenceVma", "wfi") do
+      out.asRecord.field[Bool](name) := false.B
+    for name <- Seq("memorySize", "address", "storeData", "csrAddress", "csrData") do
+      out.asRecord.field[UInt](name) := 0.U
+    (addImm, pcImm, sequential)
 
 class DitDahA1ExecuteIO(parameter: DitDahA1Parameter) extends HWBundle(parameter):
   val input = Flipped(new Decoupled(new IssuedPacket))
@@ -33,20 +92,12 @@ object DitDahA1Execute extends Generator[DitDahA1Parameter, DitDahA1UnitLayers, 
     val out = io.output.bits
     val a = in.operand1
     val b = in.operand2
-    val imm = d.immediate
     val encoding = insn.instruction.asBits
     val funct3 = encoding.bits(14, 12)
-    val addImm = (a + imm).asBits.bits(63, 0).asUInt
-    val pcImm = (insn.pc + imm).asBits.bits(63, 0).asUInt
-    val sequential = (insn.pc + insn.length).asBits.bits(63, 0).asUInt
+    val (addImm, pcImm, sequential) = DitDahA1Alu.result(in, out)
     io.input.ready := io.output.ready
     io.output.valid := io.input.valid
     io.csrAddress := insn.instruction.asBits.bits(31, 20).asUInt
-    out.instruction :<= insn
-    out.rd := d.rd
-    out.rdWrite := d.writesRd
-    out.value := 0.U(64)
-    out.nextPc := sequential
     out.load := (op === Ld.U(operationBits)) | (op === Lw.U(operationBits)) | (op === Lwu.U(operationBits)) | (op === Load.U(operationBits)) | (op === AmoaddD.U(operationBits))
     out.store := (op === Sd.U(operationBits)) | (op === Sw.U(operationBits)) | (op === Store.U(operationBits)) | (op === AmoaddD.U(operationBits))
     out.atomic := (op === AmoaddD.U(operationBits)) | (op === Atomic.U(operationBits))
@@ -74,31 +125,6 @@ object DitDahA1Execute extends Generator[DitDahA1Parameter, DitDahA1UnitLayers, 
     out.sfenceVma := parameter.enableTranslation.B & (op === Fence.U(operationBits)) &
       ((encoding & BigInt("fe007fff", 16).B(32)) === 0x12000073.B(32))
     out.wfi := op === Wfi.U(operationBits)
-    when(op === Lui.U(operationBits)) { out.value := imm }
-    when(op === Auipc.U(operationBits)) { out.value := pcImm }
-    when(op === Addi.U(operationBits)) { out.value := addImm }
-    when(op === Add.U(operationBits)) { out.value := (a + b).asBits.bits(63, 0).asUInt }
-    val word = (op === AluWordImmediate.U(operationBits)) | (op === AluWordRegister.U(operationBits))
-    val register = (op === AluRegister.U(operationBits)) | (op === AluWordRegister.U(operationBits))
-    val rhs = register.?(b, imm)
-    val left = word.?((a.asBits.bit(31).?(BigInt("ffffffff", 16).B(32), 0.B(32)) ## a.asBits.bits(31, 0)).asUInt, a)
-    val shift = word.?((0.B(1) ## rhs.asBits.bits(4, 0)).asUInt, rhs.asBits.bits(5, 0).asUInt)
-    val lessSigned = left.asBits.asSInt < rhs.asBits.asSInt
-    val alu = Wire(UInt(64))
-    alu := (register & encoding.bit(30)).?((left - rhs).asBits.bits(63, 0).asUInt, (left + rhs).asBits.bits(63, 0).asUInt)
-    when(funct3 === 1.B(3)) { alu := (left << shift).asBits.bits(63, 0).asUInt }
-    when(funct3 === 2.B(3)) { alu := lessSigned.asBits.asUInt }
-    when(funct3 === 3.B(3)) { alu := (left < rhs).asBits.asUInt }
-    when(funct3 === 4.B(3)) { alu := (left.asBits ^ rhs.asBits).asUInt }
-    when(funct3 === 5.B(3)) {
-      val logicalLeft = word.?((0.B(32) ## a.asBits.bits(31, 0)).asUInt, a)
-      alu := encoding.bit(30).?((left.asBits.asSInt >> shift).asBits.asUInt, logicalLeft >> shift)
-    }
-    when(funct3 === 6.B(3)) { alu := (left.asBits | rhs.asBits).asUInt }
-    when(funct3 === 7.B(3)) { alu := (left.asBits & rhs.asBits).asUInt }
-    when((op === AluImmediate.U(operationBits)) | (op === AluRegister.U(operationBits)) | word) {
-      out.value := word.?((alu.asBits.bit(31).?(BigInt("ffffffff", 16).B(32), 0.B(32)) ## alu.asBits.bits(31, 0)).asUInt, alu)
-    }
     when(csr) { out.value := io.csrValue }
     val jump = (op === Jal.U(operationBits)) | (op === Jalr.U(operationBits))
     val branchCondition = Wire(Bool())

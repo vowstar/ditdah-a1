@@ -58,6 +58,26 @@ def compile_tb(rtl, directory, width, pa, top='core_tb', source=None, extra_file
     files = [(rtl / name).resolve() for name in (rtl / 'filelist.f').read_text().splitlines()]
     parameters = json.loads((rtl / 'ditdah_a1_config.json').read_text())['parameters']
     interrupts, harts = parameters['enableInterrupts'], parameters['hartCount']
+    issue_width = parameters['issueWidth']
+    probes = dict(re.findall(r'`define ref_DitDahA1Backend_(\w+) (\S+)',
+                             (rtl / 'ref_DitDahA1Backend.sv').read_text()))
+    fields = dict(pc=64, instruction=32, nextPc=64, rd=5, rdWrite=1,
+                  value=64, trap=1, cause=64, tval=64)
+    retirement = [f'''  localparam integer ISSUE_WIDTH = {issue_width};
+  typedef struct packed {{
+    logic traceValid;
+    logic [63:0] traceOrder;
+''' + '\n'.join(f'    logic [{bits - 1}:0] trace{name[0].upper() + name[1:]};' for name, bits in fields.items()) + f'''
+    logic [{(6 * issue_width).bit_length() - 1}:0] pipelineOccupancy;
+    logic pipelineStall;
+  }} trace_t;
+  trace_t traces[{harts}][ISSUE_WIDTH];
+  wire [{issue_width.bit_length() - 1}:0] retire_count[{harts}], issue_count[{harts}];
+  function automatic logic retired_pc(input integer hart, input logic [63:0] pc);
+    retired_pc = 0;
+    for (integer lane = 0; lane < ISSUE_WIDTH; lane++)
+      retired_pc |= traces[hart][lane].traceValid && traces[hart][lane].tracePc == pc;
+  endfunction''']
     bindings, ports, platform = [], [], []
     local_base = local_interrupt_base(parameters) if top == 'core_tb' else None
     observers = [f'  wire [{harts - 1}:0] architectural_fetch_busy;\n  wire [63:0] architectural_fetch_pc[{harts}];']
@@ -65,17 +85,35 @@ def compile_tb(rtl, directory, width, pa, top='core_tb', source=None, extra_file
         fetch = f'dut.core_{hart}.frontend.fetch' if top == 'core_tb' else 'dut.frontend.fetch'
         order = fetch.replace('.frontend.fetch', '.backend.dV.traceOrder')
         prefix = f'$write("HART {hart} "); ' if harts > 1 else ''
+        backend = fetch.replace('.frontend.fetch', '.backend')
+        for name, probe in (('retire_count', 'count'), ('issue_count', 'issueCount')):
+            retirement.append(f'  assign {name}[{hart}] = {backend}.{probes[probe]};')
+        if (1 << issue_width.bit_length()) - 1 > issue_width:
+            retirement.append(f'  always @(posedge clock) if (!reset && (retire_count[{hart}] > ISSUE_WIDTH || issue_count[{hart}] > ISSUE_WIDTH)) $fatal(1, "Pipeline count");')
+        for lane in range(issue_width):
+            target = f'traces[{hart}][{lane}]'
+            retirement += [f'  assign {target}.traceValid = retire_count[{hart}] > {lane};',
+                           f'  assign {target}.traceOrder = {backend}.{probes["order"]} + 64\'d{lane};']
+            for name, bits in fields.items():
+                select = f'[{lane * bits} +: {bits}]' if issue_width > 1 else ''
+                retirement.append(f'  assign {target}.trace{name[0].upper() + name[1:]} = {backend}.{probes[name]}{select};')
+            for name in ('pipelineOccupancy', 'pipelineStall'):
+                retirement.append(f'  assign {target}.{name} = {backend}.{probes[name]};')
+        fetch_words = (1 if issue_width == 1 else 2 if issue_width == 2 else 4) if parameters['iCacheBytes'] else 1
+        suffix_format = ' %01h' + ' %08h' * (fetch_words - 1) if fetch_words > 1 else ''
+        suffix_values = ', ' + ', '.join([f'{fetch}.output_bits_count',
+            *(f'{fetch}.output_bits_following_{lane - 1}' for lane in range(1, fetch_words))]) if fetch_words > 1 else ''
         observers.append(f'''  assign architectural_fetch_busy[{hart}] = !{fetch}.request_ready;
-  assign architectural_fetch_pc[{hart}] = {fetch}.request_bits_pc;
+  assign architectural_fetch_pc[{hart}] = {fetch}.packet_pc;
   always @(posedge clock) if (!reset) begin
+    if ({fetch}.output_valid && {fetch}.output_ready) begin
+      {prefix}$display("ARCH_FETCH %016h %01h %08h %02h{suffix_format}", {fetch}.output_bits_pc,
+        {fetch}.output_bits_fault, {fetch}.output_bits_instruction, {fetch}.output_bits_tag{suffix_values});
+    end
     if ({fetch}.request_valid && {fetch}.request_ready) begin
       {prefix}$display("ARCH_REQUEST %016h %02h", {fetch}.request_bits_pc, {fetch}.request_bits_tag);
     end
     if ({fetch}.cancel) begin {prefix}$display("ARCH_CANCEL %016h", {order}); end
-    if ({fetch}.output_valid && {fetch}.output_ready) begin
-      {prefix}$display("ARCH_FETCH %016h %01h %08h %02h", {fetch}.output_bits_pc,
-        {fetch}.output_bits_fault, {fetch}.output_bits_instruction, {fetch}.output_bits_tag);
-    end
   end''')
         translated = parameters.get('virtualAddressBits') == 39
         if translated:
@@ -124,14 +162,12 @@ def compile_tb(rtl, directory, width, pa, top='core_tb', source=None, extra_file
     end
   end''')
     (directory / 'fetch_observers.svh').write_text('\n'.join(observers) + '\n')
+    (directory / 'retire_bindings.svh').write_text('\n'.join(retirement) + '\n')
     if top == 'core_tb':
         names = re.findall(r'\bDitDahA1Core\s+(\w+)\s*\(', (rtl / 'DitDahA1.sv').read_text())
         assert names == [f'core_{h}' for h in range(harts)], names
         for hart, name in enumerate(names):
             core = f'dut.{name}'
-            for field in ('traceValid', 'traceOrder', 'tracePc', 'traceInstruction', 'traceNextPc', 'traceRd',
-                          'traceRdWrite', 'traceValue', 'traceTrap', 'traceCause', 'traceTval', 'pipelineOccupancy', 'pipelineStall'):
-                bindings.append(f'assign traces[{hart}].{field} = {core}.backend.dV.{field};')
             bindings.append(f'assign multiply_busy[{hart}] = {core}.backend.multiply.busy;')
             for kind, port in enumerate(('instruction', 'data')):
                 index = 2 * hart + kind
@@ -268,7 +304,13 @@ def fetch_checker(config, faults, local_faults, architectural=None, buffered=())
                 discard_outputs()
                 cancel_order = None
         elif fields[:1] == ['ARCH_FETCH']:
-            address, fault, instruction, tag = (int(value, 16) for value in fields[1:])
+            address, fault, instruction, tag = (int(value, 16) for value in fields[1:5])
+            count = int(fields[5], 16) if len(fields) > 5 else 1
+            words = [instruction, *(int(value, 16) for value in fields[6:])]
+            width = config.get('issueWidth', 1)
+            banks = (1 if width == 1 else 2 if width == 2 else 4) if config['iCacheBytes'] else 1
+            assert len(words) == banks and 1 <= count <= banks - (address // 4) % banks, 'Invalid architectural fetch suffix'
+            assert not fault or count == 1, 'Fetch fault returned younger instructions'
             assert requests.pop(tag, None) == address, 'Unrequested, repeated or cancelled architectural fetch'
             if not config['iCacheBytes']:
                 if not fault:
@@ -278,7 +320,12 @@ def fetch_checker(config, faults, local_faults, architectural=None, buffered=())
                     physical_failed[address] -= 1
                     bus_failed[address] += 1
             arch_completed += 1
-            (failed if fault else fetched)[address if fault else (address, instruction)] += 1
+            if fault:
+                failed[address] += 1
+            else:
+                for lane in range(count):
+                    fetched[address + 4 * lane, words[lane]] += 1
+            reachable.update(address + 4 * lane for lane in range(1, count + 1))
         elif fields[:2] == ['BUS', 'fetch']:
             address, size, data = int(fields[2], 16), int(fields[3]), int(fields[4], 16)
             assert pending is None, 'Overlapping instruction transactions'
@@ -634,7 +681,11 @@ def compare(binary, directory, config, transport='axi', selected=()):
                     dependency_stalls += stalls
             count += len(actual)
             elapsed = next(int(line.split()[1]) for line in lines if line.startswith('CYCLES '))
+            issue_streak, retire_streak = next(tuple(map(int, line.split()[1:])) for line in lines if line.startswith('THROUGHPUT '))
+            if name in ('pipeline_integer_stream', 'pipeline_dependency_stream', *(['pipeline_dependency_chain'] if config.get('issueWidth', 1) == 1 else [])) and config['iCacheBytes'] and config.get('virtualAddressBits') != 39:
+                assert min(issue_streak, retire_streak) >= 64, f'{name}: native cached pipeline did not sustain the configured issue and retirement width'
             reports.append(dict(test=name, seed=seed, events=len(actual), cycles=elapsed, busTransactions=len(bus), axiReadBeats=sum(line.startswith(('READ ', 'LINE_BEAT ')) for line in lines), fetches=fetches,
+                                issueStreak=issue_streak, retireStreak=retire_streak,
                                 **(dict(translation=translation_report) if translation_report is not None else {}),
                                 **(dict(dataCache=cache_report) if cache_report is not None else {})))
         print(f'  {name}: {len(expected)} events, three bus schedules', flush=True)
@@ -1623,6 +1674,7 @@ def verify_software(args):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--width', type=int, choices=(64, 128, 256, 512), action='append')
+    parser.add_argument('--issue-width', type=int, choices=(1, 2, 3), default=1)
     parser.add_argument('--use-generated', action='store_true')
     parser.add_argument('--elf', type=Path)
     parser.add_argument('--config', type=Path)
@@ -1697,7 +1749,7 @@ def main():
         directory = args.output / f'{"irq-" if interrupts else ""}{"pmp16-" if entries else ""}axi{width}'
         directory.mkdir(parents=True, exist_ok=True)
         config = configuration(width)
-        config.update(pmpEntries=entries, enableInterrupts=interrupts, iCacheBytes=args.icache_bytes, dCacheBytes=args.dcache_bytes, tlbEntries=args.tlb_entries, enableBurstRefill=args.burst_refill)
+        config.update(issueWidth=args.issue_width, pmpEntries=entries, enableInterrupts=interrupts, iCacheBytes=args.icache_bytes, dCacheBytes=args.dcache_bytes, tlbEntries=args.tlb_entries, enableBurstRefill=args.burst_refill)
         config['memoryRegions'][0]['dataCacheable'] = bool(args.dcache_bytes)
         if args.user_mode:
             config['enableUserMode'] = True
@@ -1726,7 +1778,7 @@ def main():
         report = compare(binary, directory, manifest['parameters'], selected=args.selected)
         report['interfaceContracts'] = interface_contracts
         report['instructionStorage'] = storage
-        report.update(axiDataBits=width, physicalAddressBits=config['physicalAddressBits'], pmpEntries=entries, enableInterrupts=interrupts, iCacheBytes=args.icache_bytes, dCacheBytes=args.dcache_bytes)
+        report.update(issueWidth=args.issue_width, axiDataBits=width, physicalAddressBits=config['physicalAddressBits'], pmpEntries=entries, enableInterrupts=interrupts, iCacheBytes=args.icache_bytes, dCacheBytes=args.dcache_bytes)
         summary['configurations'].append(report)
         core = directory / 'core'
         core_config = dict(config, axiDataBits=256, dCacheBytes=0)
@@ -1758,7 +1810,7 @@ def main():
                 continue
             directory = args.output / f'harts{harts}-axi{width}'
             directory.mkdir(parents=True, exist_ok=True)
-            config = dict(configuration(width), hartCount=harts, pmpEntries=entries, enableInterrupts=interrupts, iCacheBytes=args.icache_bytes, dCacheBytes=args.dcache_bytes, tlbEntries=args.tlb_entries, enableBurstRefill=args.burst_refill)
+            config = dict(configuration(width), issueWidth=args.issue_width, hartCount=harts, pmpEntries=entries, enableInterrupts=interrupts, iCacheBytes=args.icache_bytes, dCacheBytes=args.dcache_bytes, tlbEntries=args.tlb_entries, enableBurstRefill=args.burst_refill)
             config['memoryRegions'][0]['dataCacheable'] = bool(args.dcache_bytes)
             if args.user_mode:
                 config['enableUserMode'] = True
@@ -1787,7 +1839,7 @@ def main():
                                                       *(('DitDahA1DataCache', 'DitDahA1Coherence') if args.dcache_bytes else ()),
                                                       *(('DitDahA1LocalInterrupts',) if args.platform_only else ())))
             report['instructionStorage'] = verify_storage(rtl, directory / 'storage')
-            report.update(hartCount=harts, axiDataBits=width, pmpEntries=entries, enableInterrupts=interrupts, iCacheBytes=args.icache_bytes, dCacheBytes=args.dcache_bytes)
+            report.update(issueWidth=args.issue_width, hartCount=harts, axiDataBits=width, pmpEntries=entries, enableInterrupts=interrupts, iCacheBytes=args.icache_bytes, dCacheBytes=args.dcache_bytes)
             if not args.icache_bytes and not args.dcache_bytes and not args.platform_only:
                 for count in ((15, 16) if harts == 16 else (harts,)):
                     Path(f'result/harts{count}-input.json').write_text(json.dumps(dict(config, hartCount=count), indent=2) + '\n')

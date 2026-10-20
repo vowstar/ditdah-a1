@@ -7,7 +7,6 @@
 `ifndef TIME_TICK_CYCLES
 `define TIME_TICK_CYCLES 1
 `endif
-`define CORE_TRACE traces[0]
 module core_tb;
   localparam integer DW = `AXI_BITS;
   localparam integer PA = `PA_BITS;
@@ -24,19 +23,7 @@ module core_tb;
 `endif
   localparam integer CYCLE_LIMIT = HARTS == 1 ? 50000 : TRANSACTION_LIMIT * 128;
   integer transaction_limit = TRANSACTION_LIMIT, cycle_limit = CYCLE_LIMIT;
-  typedef struct packed {
-    logic traceValid;
-    logic [63:0] traceOrder, tracePc;
-    logic [31:0] traceInstruction;
-    logic [63:0] traceNextPc;
-    logic [4:0] traceRd;
-    logic traceRdWrite;
-    logic [63:0] traceValue;
-    logic traceTrap;
-    logic [63:0] traceCause, traceTval;
-    logic [2:0] pipelineOccupancy;
-    logic pipelineStall;
-  } trace_t;
+  `include "retire_bindings.svh"
   typedef struct packed {
     logic [63:0] address, data;
     logic [2:0] size;
@@ -46,7 +33,6 @@ module core_tb;
     logic scEligible;
   } core_request_t;
   typedef struct packed { logic [63:0] data; logic fault; logic [7:0] tag; logic last; } core_response_t;
-  trace_t traces[HARTS];
   core_request_t requests[2*HARTS];
   core_response_t responses[2*HARTS];
   wire [2*HARTS-1:0] request_valid, request_ready, response_valid, response_ready;
@@ -111,9 +97,9 @@ module core_tb;
     3: irq_activate = w_held && !aw_held;
     4: irq_activate = read_pending && !read_fetch;
 `ifdef ICACHE
-    5: irq_activate = architectural_fetch_busy[irq_hart] && architectural_fetch_pc[irq_hart] == irq_target && traces[irq_hart].pipelineOccupancy == 0;
+    5: irq_activate = architectural_fetch_busy[irq_hart] && architectural_fetch_pc[irq_hart] == irq_target && traces[irq_hart][0].pipelineOccupancy == 0;
 `else
-    5: irq_activate = read_pending && read_fetch && read_address == irq_target && traces[irq_hart].pipelineOccupancy == 0;
+    5: irq_activate = read_pending && read_fetch && read_address == irq_target && traces[irq_hart][0].pipelineOccupancy == 0;
 `endif
     6: irq_activate = multiply_busy[irq_hart];
     7: irq_activate = irq_retired;
@@ -122,7 +108,7 @@ module core_tb;
     default: irq_activate = 0;
   endcase
   always @(posedge clock) irq_retired <= !reset && ((irq_mode == 9 && irq_retired) ||
-    (traces[irq_hart].traceValid && traces[irq_hart].tracePc == irq_target));
+    retired_pc(irq_hart, irq_target));
   always @(posedge clock) irq_ack <= !reset && aw_held && w_held && !write_pending && !bvalid && write_address == base_address + 'h5008;
 `endif
   byte unsigned memory [0:MB-1];
@@ -150,6 +136,7 @@ module core_tb;
   integer aw_first = 0, w_first = 0, together = 0;
   integer ar_stall = 0, aw_stall = 0, w_stall = 0;
   integer pipeline_max = 0, dependency_stalls = 0;
+  integer issue_run = 0, retire_run = 0, issue_max = 0, retire_max = 0;
   function automatic bit console_address(input logic [63:0] address);
     return console_enabled && address >= console_base && address < console_base + 4 * HARTS;
   endfunction
@@ -191,6 +178,18 @@ module core_tb;
     arready = !reset && !read_pending && !rvalid && random_state[0];
     awready = !reset && !aw_held && !bvalid && random_state[1];
     wready = !reset && !w_held && !bvalid && random_state[2];
+    if (HARTS > 1 && !aw_held && !w_held
+`ifdef ENABLE_INTERRUPTS
+        && (interrupts.mask == 0 || interrupts.started)
+`endif
+    ) begin
+      if (aw_first == 0) wready = 0;
+      else if (w_first == 0) awready = 0;
+      else if (together == 0) begin
+        awready = awvalid && wvalid && awready && wready;
+        wready = awready;
+      end
+    end
 `ifdef ENABLE_INTERRUPTS
     if (interrupts.mask != 0 && !interrupts.started) begin
       if (irq_mode == 1 || irq_mode == 3) awready = 0;
@@ -343,23 +342,27 @@ module core_tb;
         w_held <= 0;
       end
       for (integer h = 0; h < HARTS; h++) begin
-        if (traces[h].pipelineOccupancy > 4) $fatal(1, "Pipeline occupancy");
-        if (traces[h].pipelineOccupancy > pipeline_max) pipeline_max <= traces[h].pipelineOccupancy;
-        if (traces[h].pipelineStall) dependency_stalls <= dependency_stalls + 1;
-        if (traces[h].traceValid) begin
+        if (traces[h][0].pipelineOccupancy > 6 * ISSUE_WIDTH) $fatal(1, "Pipeline occupancy");
+        if (traces[h][0].pipelineOccupancy > pipeline_max) pipeline_max <= traces[h][0].pipelineOccupancy;
+        if (traces[h][0].pipelineStall) dependency_stalls <= dependency_stalls + 1;
+        for (integer lane = 0; lane < ISSUE_WIDTH; lane++) if (traces[h][lane].traceValid) begin
 `ifdef ENABLE_INTERRUPTS
           if (HARTS > 1) $write("HART %0d ", h);
           $display("IRQ %01h", effective_irq[h]);
 `endif
-          if (traces[h].traceRdWrite && traces[h].traceRd == 0) $fatal(1, "x0 write");
+          if (traces[h][lane].traceRdWrite && traces[h][lane].traceRd == 0) $fatal(1, "x0 write");
           if (HARTS > 1) $write("HART %0d ", h);
           $display("TRACE %016h %016h %08h %016h %02h %01h %016h %01h %016h %016h",
-            traces[h].traceOrder, traces[h].tracePc, traces[h].traceInstruction, traces[h].traceNextPc,
-            traces[h].traceRd, traces[h].traceRdWrite, traces[h].traceValue, traces[h].traceTrap,
-            traces[h].traceCause, traces[h].traceTval);
-          if (!traces[h].traceTrap && traces[h].tracePc == stop_pc) finished[h] = 1;
+            traces[h][lane].traceOrder, traces[h][lane].tracePc, traces[h][lane].traceInstruction, traces[h][lane].traceNextPc,
+            traces[h][lane].traceRd, traces[h][lane].traceRdWrite, traces[h][lane].traceValue, traces[h][lane].traceTrap,
+            traces[h][lane].traceCause, traces[h][lane].traceTval);
+          if (!traces[h][lane].traceTrap && traces[h][lane].tracePc == stop_pc) finished[h] = 1;
         end
       end
+      issue_run = issue_count[0] == ISSUE_WIDTH ? issue_run + 1 : 0;
+      retire_run = retire_count[0] == ISSUE_WIDTH && !traces[0][0].traceTrap ? retire_run + 1 : 0;
+      if (issue_run > issue_max) issue_max = issue_run;
+      if (retire_run > retire_max) retire_max = retire_run;
       if (&finished) begin
         if (console_enabled) begin
           for (integer h = 0; h < HARTS; h++) begin
@@ -373,6 +376,7 @@ module core_tb;
         $display("COVER %0d %0d %0d %0d %0d %0d", aw_first, w_first, together, ar_stall, aw_stall, w_stall);
         $display("EXCLUSIVE %0d", reservation_max);
         $display("PIPELINE %0d %0d", pipeline_max, dependency_stalls);
+        $display("THROUGHPUT %0d %0d", issue_max, retire_max);
         $display("CYCLES %0d", cycles);
         $display("PASS"); $finish;
       end

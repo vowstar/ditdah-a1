@@ -39,7 +39,7 @@ case class DitDahA1Parameter(
   require(Set(64, 128, 256, 512).contains(axiDataBits), "axiDataBits must be 64, 128, 256, or 512")
   require(Set(0, 16, 64).contains(pmpEntries), "pmpEntries must be 0, 16 or 64")
 
-  require(Set(1, 2).contains(issueWidth), "issueWidth must be 1 or 2")
+  require(issueWidth >= 1 && issueWidth <= 3, "issueWidth must be between 1 and 3")
   memoryRegions.foreach(r => require(r.base + r.size <= (BigInt(1) << physicalAddressBits), "Memory region exceeds physical address space"))
   memoryRegions.sortBy(_.base).sliding(2).filter(_.size == 2).foreach { pair =>
     require(pair.head.base + pair.head.size <= pair.last.base, "Memory regions must not overlap")
@@ -52,7 +52,6 @@ case class DitDahA1Parameter(
 
   def validateBackend(): Unit =
     validateProtection()
-    require(issueWidth == 1, "Backend supports single issue")
 
   def validateCore(): Unit =
     require(Set(0, 39).contains(virtualAddressBits), "RTL supports Bare or Sv39 addressing")
@@ -86,7 +85,13 @@ case class DitDahA1Parameter(
   val registerCount: Int = 32
   val pipelineStages: Int = 8
   val cacheLineBytes: Int = 64
-  val maxInflight: Int = 5
+  val fetchWords: Int = if iCacheBytes == 0 then 1 else 1 << (32 - Integer.numberOfLeadingZeros(issueWidth - 1))
+  val fetchCountBits: Int = 32 - Integer.numberOfLeadingZeros(fetchWords)
+  val frontendCapacity: Int = if iCacheBytes == 0 then issueWidth else 2 * math.max(1, fetchWords - 1)
+  val issueCountBits: Int = 32 - Integer.numberOfLeadingZeros(issueWidth)
+  val backendCapacity: Int = 6 * issueWidth
+  val pipelineOccupancyBits: Int = 32 - Integer.numberOfLeadingZeros(backendCapacity)
+  val maxInflight: Int = backendCapacity + frontendCapacity
   val productName: String = "DitDah-A1"
 
 given upickle.default.ReadWriter[DitDahA1Parameter] = upickle.default.macroRW

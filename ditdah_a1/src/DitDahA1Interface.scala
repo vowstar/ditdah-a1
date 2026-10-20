@@ -59,14 +59,19 @@ class MemoryRequest extends Bundle:
   val atomic = Aligned(Bool())
   val atomicOperation = Aligned(UInt(5))
   val scEligible = Aligned(Bool())
-class MemoryResponse extends Bundle:
-  val data = Aligned(UInt(64))
+class MemoryResponse(dataBits: Int = 64, countBits: Int = 0) extends Bundle:
+  val data = Aligned(UInt(dataBits))
   val fault = Aligned(Bool())
   val tag = Aligned(UInt(8))
   val last = Aligned(Bool())
+  val count = Option.when(countBits > 0)(Aligned(UInt(countBits)))
 class MemoryPort extends Bundle:
   val request = Aligned(new Decoupled(new MemoryRequest))
   val response = Flipped(new Decoupled(new MemoryResponse))
+class InstructionCachePort(parameter: DitDahA1Parameter) extends Bundle:
+  val request = Aligned(new Decoupled(new MemoryRequest))
+  val response = Flipped(new Decoupled(new MemoryResponse(math.max(64, 32 * parameter.fetchWords),
+    if parameter.fetchWords > 1 then parameter.fetchCountBits else 0)))
 
 class TranslationState extends Bundle:
   val satp = Aligned(UInt(64))
@@ -92,7 +97,7 @@ class PmpState(parameter: DitDahA1Parameter) extends Bundle:
 class FetchRequest extends Bundle:
   val pc = Aligned(UInt(64))
   val tag = Aligned(UInt(8))
-class FetchPacket extends Bundle:
+class FetchPacket(words: Int = 1) extends Bundle:
   val pc = Aligned(UInt(64))
   val tag = Aligned(UInt(8))
   val instruction = Aligned(UInt(32))
@@ -100,6 +105,11 @@ class FetchPacket extends Bundle:
   val fault = Aligned(Bool())
   val cause = Aligned(UInt(64))
   val tval = Aligned(UInt(64))
+  val count = Option.when(words > 1)(Aligned(UInt(32 - Integer.numberOfLeadingZeros(words))))
+  val following = Option.when(words > 1)(Aligned(Vec(words - 1, UInt(32))))
+class InstructionGroup(width: Int) extends Bundle:
+  val count = Aligned(UInt(32 - Integer.numberOfLeadingZeros(width)))
+  val packets = Aligned(Vec(width, new FetchPacket))
 class DecodedPacket extends Bundle:
   val instruction = Aligned(new FetchPacket)
   val operation = Aligned(UInt(DitDahA1Isa.operationBits))
@@ -155,17 +165,19 @@ class DitDahA1SystemProbe(parameter: DitDahA1Parameter) extends DVBundle[DitDahA
 class DitDahA1Probe(parameter: DitDahA1Parameter) extends DVBundle[DitDahA1Parameter, DitDahA1Layers](parameter):
   private def dv = layers("DV")
   val valid = ProbeRead(Bool(), dv)
+  val count = ProbeRead(UInt(parameter.issueCountBits), dv)
+  val issueCount = ProbeRead(UInt(parameter.issueCountBits), dv)
   val order = ProbeRead(UInt(64), dv)
-  val pc = ProbeRead(UInt(64), dv)
-  val instruction = ProbeRead(UInt(32), dv)
-  val nextPc = ProbeRead(UInt(64), dv)
-  val rd = ProbeRead(UInt(5), dv)
-  val rdWrite = ProbeRead(Bool(), dv)
-  val value = ProbeRead(UInt(64), dv)
-  val trap = ProbeRead(Bool(), dv)
-  val cause = ProbeRead(UInt(64), dv)
-  val tval = ProbeRead(UInt(64), dv)
-  val pipelineOccupancy = ProbeRead(UInt(3), dv)
+  val pc = ProbeRead(UInt(parameter.issueWidth * 64), dv)
+  val instruction = ProbeRead(UInt(parameter.issueWidth * 32), dv)
+  val nextPc = ProbeRead(UInt(parameter.issueWidth * 64), dv)
+  val rd = ProbeRead(UInt(parameter.issueWidth * 5), dv)
+  val rdWrite = ProbeRead(UInt(parameter.issueWidth * 1), dv)
+  val value = ProbeRead(UInt(parameter.issueWidth * 64), dv)
+  val trap = ProbeRead(UInt(parameter.issueWidth * 1), dv)
+  val cause = ProbeRead(UInt(parameter.issueWidth * 64), dv)
+  val tval = ProbeRead(UInt(parameter.issueWidth * 64), dv)
+  val pipelineOccupancy = ProbeRead(UInt(parameter.pipelineOccupancyBits), dv)
   val pipelineStall = ProbeRead(Bool(), dv)
 
 class DitDahA1CoreIO(parameter: DitDahA1Parameter) extends HWBundle(parameter):
@@ -187,7 +199,7 @@ class DitDahA1FrontendIO(parameter: DitDahA1Parameter) extends HWBundle(paramete
   val redirect = Flipped(Bool())
   val halt = Flipped(Bool())
   val redirectPc = Flipped(UInt(64))
-  val output = Aligned(new Decoupled(new FetchPacket))
+  val output = Aligned(new Decoupled(new InstructionGroup(parameter.issueWidth)))
   val memory = Aligned(new MemoryPort)
 
 class DitDahA1MemoryFabricIO(parameter: DitDahA1Parameter) extends HWBundle(parameter):
@@ -211,7 +223,7 @@ class DitDahA1BackendIO(parameter: DitDahA1Parameter) extends HWBundle(parameter
   val invalidate = Option.when(parameter.iCacheBytes != 0)(Aligned(Bool()))
   val clock = Flipped(Clock())
   val reset = Flipped(Reset())
-  val instruction = Flipped(new Decoupled(new FetchPacket))
+  val instruction = Flipped(new Decoupled(new InstructionGroup(parameter.issueWidth)))
   val redirect = Aligned(Bool())
   val redirectPc = Aligned(UInt(64))
   val data = Aligned(new MemoryPort)

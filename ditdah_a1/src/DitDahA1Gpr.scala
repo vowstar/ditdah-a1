@@ -10,13 +10,13 @@ import me.jiuyang.zaozi.valuetpe.*
 class DitDahA1GprIO(parameter: DitDahA1Parameter) extends HWBundle(parameter):
   val clock = Flipped(Clock())
   val reset = Flipped(Reset())
-  val raddr1 = Flipped(UInt(5))
-  val raddr2 = Flipped(UInt(5))
-  val rdata1 = Aligned(UInt(64))
-  val rdata2 = Aligned(UInt(64))
-  val we = Flipped(Bool())
-  val waddr = Flipped(UInt(5))
-  val wdata = Flipped(UInt(64))
+  val raddr1 = Flipped(Vec(parameter.issueWidth, UInt(5)))
+  val raddr2 = Flipped(Vec(parameter.issueWidth, UInt(5)))
+  val rdata1 = Aligned(Vec(parameter.issueWidth, UInt(64)))
+  val rdata2 = Aligned(Vec(parameter.issueWidth, UInt(64)))
+  val we = Flipped(Vec(parameter.issueWidth, Bool()))
+  val waddr = Flipped(Vec(parameter.issueWidth, UInt(5)))
+  val wdata = Flipped(Vec(parameter.issueWidth, UInt(64)))
 
 @generator
 object DitDahA1Gpr extends Generator[DitDahA1Parameter, DitDahA1UnitLayers, DitDahA1GprIO, DitDahA1UnitProbe]:
@@ -26,9 +26,10 @@ object DitDahA1Gpr extends Generator[DitDahA1Parameter, DitDahA1UnitLayers, DitD
     given ClockScope = ClockScope.posedge(io.clock)
     given ResetScope = ResetScope.syncActiveHigh(io.reset)
     val registers = Seq.fill(31)(RegInit(0.U(64)))
-    io.rdata1 := 0.U(64)
-    io.rdata2 := 0.U(64)
-    for i <- 1 to 31 do
-      when(io.raddr1 === i.U(5)) { io.rdata1 := registers(i - 1) }
-      when(io.raddr2 === i.U(5)) { io.rdata2 := registers(i - 1) }
-      when(io.we & (io.waddr === i.U(5))) { registers(i - 1) := io.wdata }
+    for lane <- 0 until parameter.issueWidth do
+      io.rdata1(lane) := 0.U(64)
+      io.rdata2(lane) := 0.U(64)
+      for i <- 1 to 31 do
+        when(io.raddr1(lane) === i.U(5)) { io.rdata1(lane) := registers(i - 1) }
+        when(io.raddr2(lane) === i.U(5)) { io.rdata2(lane) := registers(i - 1) }
+        when(io.we(lane) & (io.waddr(lane) === i.U(5))) { registers(i - 1) := io.wdata(lane) }

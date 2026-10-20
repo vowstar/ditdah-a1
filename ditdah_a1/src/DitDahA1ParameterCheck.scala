@@ -100,16 +100,23 @@ object DitDahA1ParameterCheck:
       enabled.validateRtl()
       assert(DitDahA1Config.parameter(DitDahA1Config.document(enabled)) == enabled)
     rtl.copy(axiDataBits = 64).validateRtl()
-    rtl.copy(issueWidth = 2).validateFrontend()
+    for width <- 1 to 3 do
+      val cached = rtl.copy(issueWidth = width, iCacheBytes = 8192)
+      cached.validateFrontend()
+      cached.validateBackend()
+      cached.validateCore()
+      cached.validateRtl()
+      assert(cached.fetchWords == Seq(1, 2, 4)(width - 1))
+      assert((1 << cached.fetchCountBits) > cached.fetchWords)
+      assert(cached.copy(iCacheBytes = 0).fetchWords == 1)
+    rejects { rtl.copy(issueWidth = 0); () }
+    rejects { rtl.copy(issueWidth = 4); () }
     rejects { rtl.copy(resetVector = 2).validateFrontend() }
     rtl.copy(resetVector = 2, axiDataBits = 512, iCacheBytes = 8192).validateBackend()
-    rejects { rtl.copy(issueWidth = 2).validateBackend() }
     rtl.copy(axiDataBits = 256).validateCore()
     rtl.copy(iCacheBytes = 8192).validateCore()
-    rejects { rtl.copy(issueWidth = 2).validateCore() }
     rejects { rtl.copy(resetVector = 2).validateCore() }
     rejects { baseline.validateRtl() }
-    rejects { rtl.copy(issueWidth = 2).validateRtl() }
     rejects { rtl.copy(resetVector = 2).validateRtl() }
     for width <- Seq(64, 128, 256, 512) do rtl.copy(axiDataBits = width).validateRtl()
     rejects { rtl.copy(memoryRegions = Seq(MemoryRegion(), MemoryRegion())).validateRtl() }
@@ -124,7 +131,9 @@ object DitDahA1ParameterCheck:
     rejects { DitDahA1Config.parameter(ujson.Obj("resetAddress" -> 4, "resetVector" -> 8)); () }
     assert(DitDahA1Config.document(rtl)("parameters")("resetVector").str == "0")
     assert(DitDahA1Config.document(rtl)("parameters")("memoryRegions")(0)("readable").bool)
-    assert(DitDahA1Config.document(rtl)("implementation")("maxInflight").num == 5)
+    assert(DitDahA1Config.document(rtl)("implementation")("maxInflight").num == 7)
+    assert(DitDahA1Config.document(rtl.copy(iCacheBytes = 8192))("implementation")("maxInflight").num == 8)
+    assert(DitDahA1Config.document(rtl)("implementation")("pipelineStages").num == 8)
     rejects { DitDahA1Config.parameter(ujson.Obj("memoryRegions" -> ujson.Arr(ujson.Obj("execute" -> false)))); () }
     rejects { rtl.copy(virtualAddressBits = 39).validateRtl() }
     rtl.copy(pmpEntries = 16).validateRtl()

@@ -58,6 +58,7 @@ if args.burst_refill:
 for directory, top in profiles:
     rtl = Path("result") / directory
     manifest = json.loads((rtl / 'ditdah_a1_config.json').read_text())
+    assert manifest['implementation']['issueWidth'] == manifest['parameters']['issueWidth']
     count = manifest['parameters']['hartCount'] if args.supervisor or args.sv39 or args.burst_refill else int(directory.split('-harts')[1]) if '-harts' in directory else 1
     component = directory.split('-')[0]
     assert manifest['validationScope'] == {'production': 'system', 'core': 'core', 'frontend': 'frontend', 'fabric': 'fabric', 'backend': 'backend'}[component]
@@ -136,8 +137,8 @@ for index, (top, overrides, diagnostic) in enumerate((
         ('DitDahA1', {'hartCount': 17}, 'hartCount must be between 1 and 16'),
         ('DitDahA1Core', {'pmpEntries': 64}, 'RTL supports zero or sixteen PMP entries'),
         ('DitDahA1Frontend', {'pmpEntries': 64}, 'RTL supports zero or sixteen PMP entries'),
-        ('DitDahA1Core', {'issueWidth': 2}, 'Backend supports single issue'),
-        ('DitDahA1Backend', {'issueWidth': 2}, 'Backend supports single issue'),
+        ('DitDahA1Core', {'issueWidth': 0}, 'issueWidth must be between 1 and 3'),
+        ('DitDahA1Backend', {'issueWidth': 4}, 'issueWidth must be between 1 and 3'),
         ('DitDahA1Frontend', {'resetVector': '2'}, 'Frontend requires a word-aligned resetVector'),
         ('DitDahA1MemoryFabric', {'axiDataBits': 96}, 'axiDataBits must be'),
         ('DitDahA1MemoryFabric', {'memoryRegions': [{'base': '0', 'size': '16'}, {'base': '8', 'size': '8'}]}, 'Memory regions must not overlap'),

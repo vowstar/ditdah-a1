@@ -5,7 +5,7 @@
 .PHONY: verify-burst verify-burst-formal verify-burst-software
 
 HART_COUNTS ?= 2 3 15 16
-ICACHE_CASES := pipeline_reuse cache_replacement fence_ordering fence_i_prefetch synchronization atomic_ordering atomic_denied atomic_retry bus_fetch pipeline_redirect pmp_fetch pmp_update interrupt_fence interrupt_fence_i interrupt_fetch_fault
+ICACHE_CASES := pipeline_reuse pipeline_integer_stream pipeline_dependency_stream pipeline_dependency_chain cache_replacement fence_ordering fence_i_prefetch synchronization atomic_ordering atomic_denied atomic_retry bus_fetch pipeline_redirect pmp_fetch pmp_update interrupt_fence interrupt_fence_i interrupt_fetch_fault
 USER_CASES := user_access user_system user_wait user_protection user_fetch user_mprv
 SUPERVISOR_CASES := supervisor_traps supervisor_csr supervisor_mprv
 TRANSLATION_CASES := sv39_data sv39_reuse sv39_protection sv39_large sv39_gigantic sv39_accessed sv39_dirty sv39_user_denied sv39_sum sv39_mxr sv39_canonical sv39_context

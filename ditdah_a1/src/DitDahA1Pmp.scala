@@ -25,9 +25,11 @@ object DitDahA1Pmp extends Generator[DitDahA1Parameter, DitDahA1UnitLayers, DitD
     val io = summon[Interface[DitDahA1PmpIO]]
     val width = parameter.physicalAddressBits - 2
     val start = (0.B(1) ## io.address.asBits).asUInt
+    val fetchSizes = (if parameter.fetchWords == 4 then Seq(4) else Seq.empty) ++
+      (if parameter.enableBurstRefill then Seq(6) else Seq.empty)
     val end = Wire(UInt(65))
     end := start
-    for size <- (0 to 3) ++ (if parameter.enableBurstRefill then Seq(6) else Seq.empty) do
+    for size <- (0 to 3) ++ fetchSizes do
       when(io.size === size.U(3)) { end := (start + (1 << size).U(65)).asBits.bits(64, 0).asUInt }
     val addresses = (0 until parameter.pmpEntries).map { index =>
       (0.B(64 - width) ## io.state.address.asBits.bits((index + 1) * width - 1, index * width)).asUInt
@@ -60,5 +62,6 @@ object DitDahA1Pmp extends Generator[DitDahA1Parameter, DitDahA1UnitLayers, DitD
       when((mode =/= 0.U(2)) & (limit > base) & (start < limit) & (end > base)) {
         allowed := (start >= base) & (end <= limit) & ((machine & !config.bit(7)) | permission)
       }
-    val line = if parameter.enableBurstRefill then io.fetch & !io.write & !io.atomic & (io.size === 6.U(3)) else false.B
-    io.allowed := allowed & ((io.size <= 3.U(3)) | line) & (end <= (BigInt(1) << parameter.physicalAddressBits).U(65))
+    val fetchSize = fetchSizes.map(size => io.size === size.U(3)).reduceOption(_ | _).getOrElse(false.B)
+    io.allowed := allowed & ((io.size <= 3.U(3)) | (io.fetch & !io.write & !io.atomic & fetchSize)) &
+      (end <= (BigInt(1) << parameter.physicalAddressBits).U(65))

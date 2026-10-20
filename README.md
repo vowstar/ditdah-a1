@@ -7,18 +7,18 @@ DitDah-A1 targets a 64-bit RISC-V application processor with scalar execution.
 | Component | Target |
 | --- | --- |
 | Scalar ISA | RV64GCB |
-| Scalar execution | Eight-stage, dual-issue, in-order |
+| Scalar execution | Fixed eight-stage, configurable one to three issue, in-order |
 | Privilege and translation | M/S/U, Sv39 and Sv48 |
 | Memory | Private instruction/data caches, optional shared L2 |
 | Multiprocessing | One to sixteen harts with hardware cache coherence |
 | Integration | Burst-capable AXI4 and JTAG debug |
 
-The executable RTL has one to sixteen RV64 harts, M or optional M/U and M/S/U modes, an overlapped single-issue pipeline, shared AXI4,
-and precise synchronous exceptions. The generated configuration manifest lists the implemented instructions.
+The executable RTL supports one to sixteen RV64 harts, M or optional M/U and M/S/U modes, shared AXI4 and precise synchronous exceptions.
+`issueWidth` selects one to three lanes in a fixed eight-stage pipeline; pure integer ALU operations issue as an ordered prefix and other operations execute alone.
 PMP is configurable to zero or sixteen entries per hart; the default uncached configuration omits it.
-Machine software, timer, and external interrupts are optional synchronous level inputs.
 MUL uses an iterative resource; accepted operations retain their instruction owner through completion or cancellation draining.
-Sv48, dual issue, writeback caches and shared L2 remain design targets.
+Branches resolve in EX; a nonsequential next PC redirects at WB and discards younger work.
+The manifest lists implemented instructions; Sv48, writeback caches and shared L2 remain design targets.
 Core composes Frontend and Backend; Frontend owns PC sequencing and Backend owns execution and retirement.
 Non-fault Backend packets contain four-byte instructions and word-aligned PCs; producers supply fetch faults.
 Core exposes separate instruction/data memory ports; the physical fabric owns shared arbitration and AXI.
@@ -64,7 +64,7 @@ Set `enableUserMode` for Bare M/U execution and effective data privilege via MPR
 Set `enableSupervisorMode` with user mode and interrupts for M/S/U, standard trap delegation and SRET.
 Set `virtualAddressBits` to 39 for Sv39/Svade with 4 KiB/2 MiB/1 GiB pages and ASIDLEN=0; zero selects Bare. PTE reads share the data path under S-mode PMP/PMA.
 Set `tlbEntries` to 0/2/4 for uncached/two/four-entry per-hart I/D translation; local SFENCE.VMA, satp and PMP maintenance invalidate entries and exclude stale refills while canceled reads drain.
-Set `enableInterrupts` to true for precise machine interrupt entry and return; platform logic owns interrupt sources.
+Set `enableInterrupts` for precise entry and return from synchronous machine software/timer/external interrupt levels; platform logic owns the sources.
 System interrupt inputs are indexed by hart; each hart has independent CSR and PMP state.
 An optional `localInterruptBase` maps protected software-interrupt and 64-bit timer registers; `timeTick` supplies the synchronous timebase.
 All harts share the reset vector and read their index from `mhartid`; standalone Core and Backend integrations must hold `hartId` constant.
