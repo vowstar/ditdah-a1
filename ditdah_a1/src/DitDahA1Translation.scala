@@ -43,85 +43,96 @@ object DitDahA1Translation extends Generator[DitDahA1Parameter, DitDahA1UnitLaye
     val fault = Reg(Bool())
     val pageFault = Reg(Bool())
     val killed = RegInit(false.B)
+    val held = Seq.fill(2)(RegInit(false.B))
+    val heldResponse = Seq.fill(2)(Reg(new TranslationResponse))
     val tlb = Option.when(parameter.tlbEntries != 0)(Reg(Vec(parameter.tlbEntries, new TranslationEntry)))
     val tlbValid = Option.when(tlb.isDefined)(RegInit(0.B(parameter.tlbEntries)))
     val replacementBits = if tlb.isDefined then Integer.numberOfTrailingZeros(parameter.tlbEntries) else 1
     val replacement = Option.when(tlb.isDefined)(RegInit(0.U(replacementBits)))
     val refillAllowed = Option.when(tlb.isDefined)(RegInit(false.B))
     val cancelled = killed | (io.cancelInstruction & !owner)
-    val instruction = io.ports(0).request.valid & !io.cancelInstruction
-    val data = io.ports(1).request.valid
-    val selected = data & (!instruction | next)
     val accessCause = request.fetch.?(1.U(64), request.write.?(7.U(64), 5.U(64)))
     val pageCause = request.fetch.?(12.U(64), request.write.?(15.U(64), 13.U(64)))
-    def leafDenied(pte: Referable[Bits])(using Arena, Context, Block, InstanceContext): Referable[Bool] =
-      val permitted = request.fetch.?(pte.bit(3), request.write.?(pte.bit(2), pte.bit(1) | (mxr & pte.bit(3))))
-      val user = (request.privilege === 0.U(2)).?(pte.bit(4), !pte.bit(4) | (sum & !request.fetch))
-      !permitted | !user | !pte.bit(6) | (request.write & !pte.bit(7))
-    def mapped(pte: Referable[Bits], pageLevel: Referable[UInt])(using Arena, Context, Block, InstanceContext): Referable[UInt] =
-      (pageLevel === 2.U(2)).?((0.B(8) ## pte.bits(53, 28) ## request.address.asBits.bits(29, 0)).asUInt,
-        (pageLevel === 1.U(2)).?((0.B(8) ## pte.bits(53, 19) ## request.address.asBits.bits(20, 0)).asUInt,
-          (0.B(8) ## pte.bits(53, 10) ## request.address.asBits.bits(11, 0)).asUInt))
+    def leafDenied(pte: Referable[Bits], access: Referable[TranslationRequest], accessSum: Referable[Bool],
+      accessMxr: Referable[Bool])(using Arena, Context, Block, InstanceContext): Referable[Bool] =
+      val permitted = access.fetch.?(pte.bit(3), access.write.?(pte.bit(2), pte.bit(1) | (accessMxr & pte.bit(3))))
+      val user = (access.privilege === 0.U(2)).?(pte.bit(4), !pte.bit(4) | (accessSum & !access.fetch))
+      !permitted | !user | !pte.bit(6) | (access.write & !pte.bit(7))
+    def mapped(pte: Referable[Bits], pageLevel: Referable[UInt], va: Referable[UInt])
+      (using Arena, Context, Block, InstanceContext): Referable[UInt] =
+      (pageLevel === 2.U(2)).?((0.B(8) ## pte.bits(53, 28) ## va.asBits.bits(29, 0)).asUInt,
+        (pageLevel === 1.U(2)).?((0.B(8) ## pte.bits(53, 19) ## va.asBits.bits(20, 0)).asUInt,
+          (0.B(8) ## pte.bits(53, 10) ## va.asBits.bits(11, 0)).asUInt))
     def matches(left: Referable[UInt], right: Referable[UInt], pageLevel: Referable[UInt])(using Arena, Context, Block, InstanceContext): Referable[Bool] =
       (left.asBits.bits(26, 18) === right.asBits.bits(26, 18)) &
         ((pageLevel === 2.U(2)) | ((left.asBits.bits(17, 9) === right.asBits.bits(17, 9)) &
           ((pageLevel === 1.U(2)) | (left.asBits.bits(8, 0) === right.asBits.bits(8, 0)))))
+    val available = (0 until 2).map { i =>
+      !held(i) & !((state =/= 0.U(3)) & (owner === (i == 1).B)) &
+        !io.invalidate.getOrElse(false.B) & (if i == 0 then !io.cancelInstruction else true.B)
+    }
+    val lookups = (0 until 2).map { i =>
+      val incoming = io.ports(i).request.bits
+      val mode = io.state.satp.asBits.bits(63, 60).asUInt
+      val paged = (incoming.privilege =/= 3.U(2)) & (mode =/= 0.U(4))
+      val canonical = incoming.address.asBits.bits(63, 39) ===
+        incoming.address.asBits.bit(38).?(((BigInt(1) << 25) - 1).B(25), 0.B(25))
+      val invalid = paged & ((mode =/= 8.U(4)) | !canonical)
+      val hits = tlb.map { entries =>
+        (0 until parameter.tlbEntries).map(n => tlbValid.get.bit(n) &
+          matches(entries(n).vpn, incoming.address.asBits.bits(38, 12).asUInt, entries(n).level))
+      }.getOrElse(Seq(false.B))
+      val hit = hits.reduce(_ | _)
+      val pte = tlb.map(entries => hits.indices.reverse.foldLeft[Referable[UInt]](0.U(64))(
+        (value, n) => hits(n).?(entries(n).pte, value))).getOrElse(0.U(64)).asBits
+      val pageLevel = tlb.map(entries => hits.indices.reverse.foldLeft[Referable[UInt]](0.U(2))(
+        (value, n) => hits(n).?(entries(n).level, value))).getOrElse(0.U(2))
+      val failed = invalid | (paged & hit & leafDenied(pte, incoming, io.state.sum, io.state.mxr))
+      val result = Wire(new TranslationResponse)
+      result.address := (paged & hit & !failed).?(mapped(pte, pageLevel, incoming.address), incoming.address)
+      result.fault := failed
+      result.cause := failed.?(incoming.fetch.?(12.U(64), incoming.write.?(15.U(64), 13.U(64))), 0.U(64))
+      (!paged | invalid | hit, result)
+    }
+    val misses = (0 until 2).map(i => io.ports(i).request.valid & available(i) & !lookups(i)._1)
+    val selected = misses(1) & (!misses(0) | next)
     for i <- 0 until 2 do
       val port = io.ports(i)
-      port.request.ready := (state === 0.U(3)) & (selected === (i == 1).B) &
-        (if i == 0 then !io.cancelInstruction else true.B)
-      port.response.valid := (state === 4.U(3)) & (owner === (i == 1).B)
-      port.response.bits.address := address
-      port.response.bits.fault := fault
-      port.response.bits.cause := fault.?(pageFault.?(pageCause, accessCause), 0.U(64))
-      when(port.request.valid & port.request.ready) {
+      val fast = lookups(i)._1
+      val fastResponse = port.request.valid & available(i) & fast
+      val walked = (state === 4.U(3)) & (owner === (i == 1).B)
+      port.request.ready := available(i) & (fast | ((state === 0.U(3)) & (selected === (i == 1).B)))
+      port.response.valid := held(i) | walked | fastResponse
+      port.response.bits :<= lookups(i)._2
+      when(walked) {
+        port.response.bits.address := address
+        port.response.bits.fault := fault
+        port.response.bits.cause := fault.?(pageFault.?(pageCause, accessCause), 0.U(64))
+      }
+      when(held(i)) { port.response.bits :<= heldResponse(i) }
+      when(fastResponse & !port.response.ready) {
+        held(i) := true.B
+        heldResponse(i) :<= lookups(i)._2
+      }
+      when(held(i) & port.response.ready) { held(i) := false.B }
+      when(port.request.valid & port.request.ready & !fast) {
         val incoming = port.request.bits
-        val mode = io.state.satp.asBits.bits(63, 60).asUInt
-        val canonical = incoming.address.asBits.bits(63, 39) ===
-          incoming.address.asBits.bit(38).?(((BigInt(1) << 25) - 1).B(25), 0.B(25))
         owner := (i == 1).B
         request :<= incoming
         sum := io.state.sum
         mxr := io.state.mxr
-        address := incoming.address
+        address := (0.B(8) ## io.state.satp.asBits.bits(43, 0) ## incoming.address.asBits.bits(38, 30) ## 0.B(3)).asUInt
         level := 2.U(2)
         fault := false.B
         pageFault := false.B
         killed := false.B
         refillAllowed.foreach(_ := true.B)
-        state := 4.U(3)
-        when((incoming.privilege =/= 3.U(2)) & (mode =/= 0.U(4))) {
-          address := (0.B(8) ## io.state.satp.asBits.bits(43, 0) ## incoming.address.asBits.bits(38, 30) ## 0.B(3)).asUInt
-          state := (if tlb.isDefined then 5 else 1).U(3)
-          when((mode =/= 8.U(4)) | !canonical) {
-            address := incoming.address
-            fault := true.B
-            pageFault := true.B
-            state := 4.U(3)
-          }
-        }
+        state := 1.U(3)
       }
-      when(port.response.valid & port.response.ready) {
+      when(walked & port.response.ready) {
         next := !owner
         state := 0.U(3)
       }
-    tlb.foreach { entries =>
-      val vpn = request.address.asBits.bits(38, 12).asUInt
-      val hits = (0 until parameter.tlbEntries).map(i => tlbValid.get.bit(i) & matches(entries(i).vpn, vpn, entries(i).level))
-      val hit = hits.reduce(_ | _) & !io.invalidate.get
-      val pte = hits.indices.reverse.foldLeft[Referable[UInt]](0.U(64))((value, i) => hits(i).?(entries(i).pte, value)).asBits
-      val pageLevel = hits.indices.reverse.foldLeft[Referable[UInt]](0.U(2))((value, i) => hits(i).?(entries(i).level, value))
-      when(state === 5.U(3)) {
-        state := 1.U(3)
-        when(hit | cancelled) {
-          address := cancelled.?(request.address, mapped(pte, pageLevel))
-          fault := !cancelled & leafDenied(pte)
-          pageFault := !cancelled & leafDenied(pte)
-          state := 4.U(3)
-          when(!cancelled & leafDenied(pte)) { address := request.address }
-        }
-      }
-    }
     val ordinary = parameter.memoryRegions.filter(r => r.readable && !r.device && r.size >= 8)
       .foldLeft[Referable[Bool]](false.B) { (permitted, region) =>
         permitted | ((address >= region.base.U(64)) & (address <= (region.base + region.size - 8).U(64)))
@@ -152,6 +163,7 @@ object DitDahA1Translation extends Generator[DitDahA1Parameter, DitDahA1UnitLaye
     read.bits.atomic := false.B
     read.bits.atomicOperation := 0.U(5)
     read.bits.scEligible := false.B
+    read.bits.refillAllowed := false.B
     response.ready := state === 3.U(3)
     when(state === 1.U(3)) {
       state := 2.U(3)
@@ -174,14 +186,14 @@ object DitDahA1Translation extends Generator[DitDahA1Parameter, DitDahA1UnitLaye
           val invalid = !pte.bit(0) | (!pte.bit(1) & pte.bit(2)) | (pte.bits(63, 54) =/= 0.B(10))
           val aligned = ((level =/= 2.U(2)) | (pte.bits(27, 10) === 0.B(18))) &
             ((level =/= 1.U(2)) | (pte.bits(18, 10) === 0.B(9)))
-          val leafFault = leafDenied(pte) | !aligned
+          val leafFault = leafDenied(pte, request, sum, mxr) | !aligned
           val pointerFault = (level === 0.U(2)) | pte.bit(4) | pte.bit(6) | pte.bit(7)
           when(invalid | leaf.?(leafFault, pointerFault)) {
             fault := true.B
             pageFault := true.B
           }.otherwise {
             when(leaf) {
-              address := mapped(pte, level)
+              address := mapped(pte, level, request.address)
               tlb.foreach { entries =>
                 when(refillAllowed.get & !io.invalidate.get) {
                   val vpn = request.address.asBits.bits(38, 12).asUInt

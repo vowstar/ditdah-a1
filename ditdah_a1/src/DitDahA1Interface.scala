@@ -59,6 +59,7 @@ class MemoryRequest extends Bundle:
   val atomic = Aligned(Bool())
   val atomicOperation = Aligned(UInt(5))
   val scEligible = Aligned(Bool())
+  val refillAllowed = Aligned(Bool())
 class MemoryResponse(dataBits: Int = 64, countBits: Int = 0) extends Bundle:
   val data = Aligned(UInt(dataBits))
   val fault = Aligned(Bool())
@@ -100,6 +101,7 @@ class FetchRequest extends Bundle:
 class FetchPacket(words: Int = 1) extends Bundle:
   val pc = Aligned(UInt(64))
   val tag = Aligned(UInt(8))
+  val predictedTaken = Aligned(Bool())
   val instruction = Aligned(UInt(32))
   val length = Aligned(UInt(3))
   val fault = Aligned(Bool())
@@ -170,6 +172,7 @@ class DitDahA1Probe(parameter: DitDahA1Parameter) extends DVBundle[DitDahA1Param
   val order = ProbeRead(UInt(64), dv)
   val pc = ProbeRead(UInt(parameter.issueWidth * 64), dv)
   val instruction = ProbeRead(UInt(parameter.issueWidth * 32), dv)
+  val fetchTag = ProbeRead(UInt(parameter.issueWidth * 8), dv)
   val nextPc = ProbeRead(UInt(parameter.issueWidth * 64), dv)
   val rd = ProbeRead(UInt(parameter.issueWidth * 5), dv)
   val rdWrite = ProbeRead(UInt(parameter.issueWidth * 1), dv)

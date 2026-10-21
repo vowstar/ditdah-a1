@@ -21,6 +21,7 @@ case class DitDahA1Parameter(
   enableUserMode: Boolean = false,
   enableSupervisorMode: Boolean = false,
   enableBurstRefill: Boolean = false,
+  enableBranchPrediction: Boolean = false,
   enableTrace: Boolean = false,
   localInterruptBase: Option[BigInt] = None,
   memoryRegions: Seq[MemoryRegion] = Seq(MemoryRegion())

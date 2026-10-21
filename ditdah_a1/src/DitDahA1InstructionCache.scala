@@ -69,6 +69,7 @@ object DitDahA1InstructionCache extends Generator[DitDahA1Parameter, DitDahA1Uni
     down.request.bits.atomic := false.B
     down.request.bits.atomicOperation := 0.U(5)
     down.request.bits.scEligible := false.B
+    down.request.bits.refillAllowed := false.B
     down.response.ready := state === 4.U(3)
     val reading = up.request.valid & up.request.ready
     val responseFault = down.response.bits.fault | (down.response.bits.tag =/= tag)

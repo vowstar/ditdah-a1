@@ -19,6 +19,7 @@ class DitDahA1DataCacheProbe(parameter: DitDahA1Parameter) extends DVBundle[DitD
   val sampleValid = ProbeRead(Bool(), dv)
   val sampleAddress = ProbeRead(UInt(64), dv)
   val sampleData = ProbeRead(UInt(64), dv)
+  val sampleSize = ProbeRead(UInt(3), dv)
   val sampleTag = ProbeRead(UInt(8), dv)
 
 @generator
@@ -40,6 +41,7 @@ object DitDahA1DataCache extends Generator[DitDahA1Parameter, DitDahA1Layers, Di
     val valid = RegInit(0.B(words))
     val invalidated = RegInit(false.B)
     val sameTag = Reg(Bool())
+    val expanded = RegInit(false.B)
     val up = io.upstream
     val down = io.downstream
     val index = request.address.asBits.bits(indexBits + 5, 6).asUInt
@@ -51,10 +53,16 @@ object DitDahA1DataCache extends Generator[DitDahA1Parameter, DitDahA1Layers, Di
     val invalidateShift = (invalidateIndex.asBits ## 0.B(3)).asUInt
     val invalidateMask = (255.U(words) << invalidateShift).asBits.bits(words - 1, 0)
     val collision = io.invalidate.valid & (invalidateIndex === index)
-    val eligible = !request.write & !request.fetch & !request.atomic & (request.size === 3.U(3)) &
-      DitDahA1Memory.permitted(parameter, request) & DitDahA1Memory.dataCacheable(parameter, request.address, 8)
+    val refill = Wire(new MemoryRequest)
+    refill :<= request
+    refill.address := (request.address.asBits.bits(63, 3) ## 0.B(3)).asUInt
+    refill.size := 3.U(3)
+    val eligible = !request.write & !request.fetch & !request.atomic & (request.size <= 3.U(3)) &
+      DitDahA1Memory.permitted(parameter, request) & DitDahA1Memory.dataCacheable(parameter, refill.address, 8)
+    val widening = eligible & (request.size < 3.U(3)) & request.refillAllowed & DitDahA1Memory.permitted(parameter, refill)
     val responseFault = down.response.bits.fault | (down.response.bits.tag =/= request.tag)
-    val filling = (state === 3.U(3)) & down.response.valid & !responseFault & eligible & !invalidated & !collision
+    val filling = (state === 3.U(3)) & down.response.valid & !responseFault & eligible &
+      ((request.size === 3.U(3)) | expanded) & !invalidated & !collision
     val reading = up.request.valid & up.request.ready
     val tag = request.address.asBits.bits(parameter.physicalAddressBits - 1, indexBits + 6).asUInt
     val wordRead = StorageArray("data", words, 64,
@@ -64,32 +72,38 @@ object DitDahA1DataCache extends Generator[DitDahA1Parameter, DitDahA1Layers, Di
       up.request.bits.address.asBits.bits(indexBits + 5, 6).asUInt, index,
       tag, filling, reading, io.clock)
     val hit = (valid.asUInt >> word).asBits.bit(0) & (tagRead === tag) & !collision & !invalidated
+    val shift = (request.address.asBits.bits(2, 0) ## 0.B(3)).asUInt
+    val readMask = Wire(UInt(64))
+    readMask := ((BigInt(1) << 64) - 1).U(64)
+    for size <- 0 to 2 do
+      when(request.size === size.U(3)) { readMask := ((BigInt(1) << (8 << size)) - 1).U(64) }
+    val hitData = ((wordRead >> shift).asBits & readMask.asBits).asUInt
+    val refillData = ((down.response.bits.data >> shift).asBits & readMask.asBits).asUInt
+    val hitResponse = (state === 1.U(3)) & eligible & hit
     io.invalidate.ready := true.B
-    up.request.ready := state === 0.U(3)
-    up.response.valid := state === 4.U(3)
-    up.response.bits.data := data
-    up.response.bits.fault := fault
+    up.request.ready := (state === 0.U(3)) | (up.response.valid & up.response.ready)
+    up.response.valid := (state === 4.U(3)) | hitResponse
+    up.response.bits.data := hitResponse.?(hitData, data)
+    up.response.bits.fault := !hitResponse & fault
     up.response.bits.tag := request.tag
     up.response.bits.last := true.B
     down.request.valid := state === 2.U(3)
     down.request.bits :<= request
+    when(expanded) { down.request.bits :<= refill }
     down.response.ready := state === 3.U(3)
-    when(reading) {
-      request :<= up.request.bits
-      invalidated := io.invalidate.valid &
-        (invalidateIndex === up.request.bits.address.asBits.bits(indexBits + 5, 6).asUInt)
-      state := 1.U(3)
-    }
     when(state === 1.U(3)) {
       sameTag := tagRead === tag
-      when(eligible & hit) { data := wordRead; fault := false.B; state := 4.U(3) }
-        .otherwise { state := 2.U(3) }
+      when(eligible & hit) { data := hitData; fault := false.B; state := 4.U(3) }
+        .otherwise { expanded := widening; state := 2.U(3) }
     }
     when(down.request.valid & down.request.ready) { state := 3.U(3) }
     when(down.response.valid & down.response.ready) {
-      data := down.response.bits.data
-      fault := responseFault
-      state := 4.U(3)
+      when(expanded & responseFault) { expanded := false.B; state := 2.U(3) }
+        .otherwise {
+          data := expanded.?(refillData, down.response.bits.data)
+          fault := responseFault
+          state := 4.U(3)
+        }
     }
     val allocated = sameTag.?(valid, valid & ~lineMask) | mask
     val nextValid = filling.?(allocated, valid)
@@ -99,16 +113,26 @@ object DitDahA1DataCache extends Generator[DitDahA1Parameter, DitDahA1Layers, Di
       // Invalidation may conservatively evict a different tag at this index.
       when((state =/= 0.U(3)) & (invalidateIndex === index)) { invalidated := true.B }
     }
+    when(reading) {
+      request :<= up.request.bits
+      invalidated := io.invalidate.valid &
+        (invalidateIndex === up.request.bits.address.asBits.bits(indexBits + 5, 6).asUInt)
+      expanded := false.B
+      state := 1.U(3)
+    }
     layer("DV"):
       val sampleValid = Wire(Bool())
       val sampleAddress = Wire(UInt(64))
       val sampleData = Wire(UInt(64))
+      val sampleSize = Wire(UInt(3))
       val sampleTag = Wire(UInt(8))
-      sampleValid := (state === 1.U(3)) & eligible & hit
+      sampleValid := hitResponse
       sampleAddress := request.address
-      sampleData := wordRead
+      sampleData := hitData
+      sampleSize := request.size
       sampleTag := request.tag
       probe.sampleValid <== sampleValid
       probe.sampleAddress <== sampleAddress
       probe.sampleData <== sampleData
+      probe.sampleSize <== sampleSize
       probe.sampleTag <== sampleTag

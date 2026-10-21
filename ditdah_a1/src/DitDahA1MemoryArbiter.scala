@@ -36,13 +36,7 @@ object DitDahA1MemoryArbiter extends Generator[DitDahA1Parameter, DitDahA1UnitLa
     val request = Reg(new MemoryRequest)
     val idle = state === 0.U(2)
     val valid = (0 until count).map(i => ports(i).request.valid)
-    val following = (0 until count).map(i => valid(i) & (next <= i.U(bits)))
-    val choices = Seq(valid, following).map { candidates =>
-      candidates.zipWithIndex.reverse.foldLeft[Referable[UInt]](0.U(bits)) {
-        case (selected, (present, index)) => present.?(index.U(bits), selected)
-      }
-    }
-    val selected = following.reduce(_ | _).?(choices(1), choices(0))
+    val selected = select(valid, next)
     down.request.valid := state === 1.U(2)
     down.request.bits :<= request
     for i <- 0 until count do
@@ -64,3 +58,14 @@ object DitDahA1MemoryArbiter extends Generator[DitDahA1Parameter, DitDahA1UnitLa
       state := 0.U(2)
     }
     owner
+
+  def select(valid: Seq[Referable[Bool]], next: Referable[UInt])
+    (using Arena, Context, Block, InstanceContext): Referable[UInt] =
+    val bits = 32 - Integer.numberOfLeadingZeros(valid.size - 1)
+    val following = valid.indices.map(i => valid(i) & (next <= i.U(bits)))
+    val choices = Seq(valid, following).map { candidates =>
+      candidates.zipWithIndex.reverse.foldLeft[Referable[UInt]](0.U(bits)) {
+        case (selected, (present, index)) => present.?(index.U(bits), selected)
+      }
+    }
+    following.reduce(_ | _).?(choices(1), choices(0))

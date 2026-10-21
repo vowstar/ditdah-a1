@@ -96,20 +96,115 @@ class Program:
         self.emit(((upper & 0xfffff) << 12) | (rd << 7) | 0x17)
         self.emit(addi(rd, rd, distance - (upper << 12)))
 
-    def finish(self, fixed_return=False):
+    def finish(self, fixed_return=False, resume_offset=None):
         self.stop = self.base + self.offset
         self.emit(jal(0, 0))
         self.offset = 0x800
         self.emit(csr(24, 0x300, 0, True), csr(20, 0x342, 0, True), csr(21, 0x343, 0, True), csr(22, 0x341, 0, True), addi(23, 23, 1))
-        if fixed_return:
-            self.address(22, self.stop - self.base)
+        if fixed_return or resume_offset is not None:
+            self.address(22, self.stop - self.base if resume_offset is None else resume_offset)
         else:
             self.emit(addi(22, 22, 4))
         self.emit(csr(0, 0x341, 22), 0x30200073)
         return self
 
 
+def integer_stream(p, name='integer_stream'):
+    p.emit(addi(4, 0, 3), addi(5, 0, 7), addi(30, 0, 2))
+    loop = p.offset
+    destinations = [1, 2, 3, *range(6, 28)]
+    for index in range(204):
+        rd = destinations[index % len(destinations)] if name == 'integer_stream' else 1 + index % 3 if name == 'dependency_stream' else 1
+        p.emit(add(rd, 4 if name == 'integer_stream' else rd, 5))
+    p.emit(addi(30, 30, -1), beq(30, 0, 8))
+    p.emit(jal(0, loop - p.offset))
+
+
+def memory_group_cases(base, protection, interrupts, sv39):
+    p = Program(base)
+    p.address(10, 0x1000)
+    p.emit(addi(30, 0, 4))
+    p.memory[base + 0x1000] = 9
+    groups, loop = {}, p.offset
+    for instruction, tail, maximum in ((ld(2, 10), addi(3, 3, 1), 3),
+                                       (sd(2, 10, 8), addi(3, 3, 1), 3),
+                                       (ld(2, 10), addi(3, 2, 1), 1),
+                                       (ld(2, 10), addi(2, 0, 17), 1)):
+        groups[base + p.offset] = maximum
+        p.emit(instruction, tail, addi(4, 4, 1))
+    p.emit(addi(30, 30, -1), beq(30, 0, 8), jal(0, loop - p.offset - 8))
+    p.pipeline_groups = groups
+    yield 'memory_groups', p.finish()
+
+    for fault in ('alignment', 'bus_read', 'bus_write', *(('pmp',) if protection else ()), *(('page',) if sv39 else ())):
+        p = Program(base)
+        p.address(10, 0x1001 if fault == 'alignment' else 0x1000)
+        p.emit(addi(6, 0, 11), addi(7, 0, 13))
+        if fault == 'pmp':
+            p.emit(alu(2, 10, 2, 5, immediate=True), csr(0, 0x3b0, 2), addi(2, 0, 0x98), csr(0, 0x3a0, 2))
+        if fault == 'page':
+            if protection:
+                p.emit(addi(2, 0, -1), csr(0, 0x3b0, 2), addi(2, 0, 0x1f), csr(0, 0x3a0, 2))
+            p.address(11, 0x600)
+            for offset, value in ((0, (8 << 60) | ((base + 0x3000) >> 12)), (8, 0x20800), (16, 0x40000000)):
+                p.memory.update((base + 0x600 + offset + byte, (value >> (8 * byte)) & 255) for byte in range(8))
+            p.emit(ld(2, 11), csr(0, 0x180, 2), ld(10, 11, 16), ld(2, 11, 8), csr(0, 0x300, 2))
+        if fault.startswith('bus_'):
+            p.faults[fault[4:]] = base + 0x1000
+        p.pipeline_groups = {base + p.offset: 3}
+        p.emit(sd(6, 10) if fault == 'bus_write' else ld(2, 10), addi(6, 0, 99), addi(7, 0, 101))
+        resume = p.offset
+        p.emit(addi(8, 6, 0), addi(9, 7, 0))
+        p.expected_registers = {6: 11, 7: 13, 8: 11, 9: 13, 23: 1}
+        yield 'memory_group_' + fault, p.finish(resume_offset=resume)
+
+    if interrupts:
+        p = Program(base)
+        p.address(10, 0x1000)
+        p.address(11, 0x5008)
+        p.emit(addi(2, 0, 8), csr(0, 0x304, 2), csr(0, 0x300, 2))
+        target = base + p.offset
+        p.emit(ld(2, 10), addi(6, 6, 1), addi(7, 7, 1), sd(6, 10, 8), sd(7, 10, 16))
+        p.finish()
+        p.offset = 0x800
+        p.emit(addi(23, 23, 1), sd(0, 11), 0x30200073)
+        p.interrupts = dict(mode=4, mask=1, target=target)
+        p.pipeline_groups = {target: 3}
+        p.expected_registers = {6: 1, 7: 1, 23: 1}
+        yield 'memory_group_interrupt', p
+
+
 def cases(base, protection=False, interrupts=False, user=False, local_interrupt_base=None, supervisor=False, sv39=False):
+    yield from memory_group_cases(base, protection, interrupts, sv39)
+    for fault in (False, True):
+        p = Program(base)
+        p.address(10, 0x1000)
+        p.address(11, 0x1080)
+        p.emit(addi(30, 0, 4))
+        p.memory[base + 0x1000] = 9
+        loop = p.offset
+        p.emit(ld(2, 10), addi(3, 3, 1), addi(4, 4, 1))
+        branch = base + p.offset
+        p.emit(beq(0, 0, 12), sd(2, 11), 0, addi(7, 7, 1), addi(30, 30, -1))
+        back = base + p.offset
+        p.emit(beq(30, 0, loop - p.offset) ^ (1 << 12))
+        direct = base + p.offset
+        p.emit(jal(5, 12), sd(2, 11), 0, addi(8, 8, 1))
+        p.address(12, p.offset + 20)
+        indirect = base + p.offset
+        p.emit(jalr(9, 12), sd(2, 11), 0)
+        p.pipeline_recovery = {branch: [branch + 12], back: [base + loop, back + 4],
+                               direct: [direct + 12], indirect: [indirect + 12]}
+        if not fault:
+            p.recovery_counts = {branch: (4, 4), back: (3, 1), direct: (1, 0), indirect: (1, 1)}
+        resume = p.offset
+        p.emit(addi(12, 3, 0), addi(13, 4, 0), addi(14, 7, 0), addi(15, 8, 0))
+        p.expected_registers = {7: 0 if fault else 4, 8: 0 if fault else 1, 23: int(fault)}
+        if fault:
+            p.faults['read'] = base + 0x1000
+            p.recovery_fault_pc = base + loop
+            p.expected_registers.update({register: 0 for register in range(12, 16)})
+        yield 'pipeline_recovery_fault' if fault else 'pipeline_recovery', p.finish(resume_offset=resume if fault else None)
     if not interrupts:
         p = Program(base)
         p.emit(0x10500073, addi(2, 0, 17))
@@ -208,7 +303,7 @@ def cases(base, protection=False, interrupts=False, user=False, local_interrupt_
     for wrong_path in (sd(2, 10), ld(3, 10), csr(0, 0x340, 0), fence(), fence(True), 0):
         p.emit(jal(0, 12), wrong_path, 0)
     p.faults['fetch'] = base + p.offset + 4
-    p.emit(jal(0, 12), 0, 0, csr(4, 0x340, 0, True))
+    p.emit(beq(0, 0, 12), 0, 0, csr(4, 0x340, 0, True))
     yield 'pipeline_redirect', p.finish()
 
     p = Program(base)
@@ -228,14 +323,7 @@ def cases(base, protection=False, interrupts=False, user=False, local_interrupt_
 
     for name in ('integer_stream', 'dependency_stream', 'dependency_chain'):
         p = Program(base)
-        p.emit(addi(4, 0, 3), addi(5, 0, 7), addi(30, 0, 2))
-        loop = p.offset
-        destinations = [1, 2, 3, *range(6, 28)]
-        for index in range(204):
-            rd = destinations[index % len(destinations)] if name == 'integer_stream' else 1 + index % 3 if name == 'dependency_stream' else 1
-            p.emit(add(rd, 4 if name == 'integer_stream' else rd, 5))
-        p.emit(addi(30, 30, -1), beq(30, 0, 8))
-        p.emit(jal(0, loop - p.offset))
+        integer_stream(p, name)
         yield 'pipeline_' + name, p.finish()
 
     p = Program(base)
@@ -256,6 +344,7 @@ def cases(base, protection=False, interrupts=False, user=False, local_interrupt_
     yield from integer_cases(base)
     yield from synchronization_cases(base)
     yield 'data_cache', data_cache_program(base)
+    yield from data_cache_access_cases(base, protection)
     yield from atomic_cases(base, protection)
     if protection:
         yield from pmp_cases(base)
@@ -270,6 +359,23 @@ def cases(base, protection=False, interrupts=False, user=False, local_interrupt_
 
 
 def sv39_cases(base, protection):
+    p = Program(base)
+    root, middle, leaf, virtual = base + 0x1000, base + 0x2000, base + 0x3000, 0x40000000
+    values = [(root + 8, ((middle >> 12) << 10) | 1), (middle, ((leaf >> 12) << 10) | 1),
+              (leaf, ((base >> 12) << 10) | 0xcf), (base + 0x600, (8 << 60) | root >> 12), (base + 0x610, 0x800)]
+    if protection:
+        p.emit(addi(2, 0, -1), csr(0, 0x3b0, 2), addi(2, 0, 0x1f), csr(0, 0x3a0, 2))
+    p.address(10, 0x600)
+    p.emit(ld(2, 10), csr(0, 0x180, 2), 0x12000073, ld(2, 10, 16), csr(0, 0x300, 2),
+           ld(2, 10, 8), csr(0, 0x341, 2), 0x30200073)
+    values.append((base + 0x608, virtual + p.offset))
+    integer_stream(p)
+    stop = virtual + p.offset
+    for address, value in values:
+        p.memory.update((address + byte, (value >> (8 * byte)) & 255) for byte in range(8))
+    p.finish()
+    p.stop = stop
+    yield 'sv39_integer_stream', p
     for name, flags, status, address, levels in (
             ('data', 0xcf, 0x20800, 0x40000100, 0),
             ('reuse', 0xcf, 0x20800, 0x40000100, 0),
@@ -722,6 +828,20 @@ def interrupt_cases(base, protection):
 
 
 def multicore_cases(base, harts, protection=False, interrupts=False, user=False):
+    p = Program(base)
+    p.emit(csr(2, 0xf14, 0, True), alu(3, 2, 3, 1, immediate=True))
+    p.address(10, 0x1800)
+    p.emit(add(10, 10, 3), addi(4, 0, 16))
+    p.address(11, 0x2000)
+    p.emit(add(11, 11, 3), add(11, 11, 3), addi(7, 2, 1))
+    loop = p.offset
+    p.emit(ld(5, 10), add(6, 6, 5), addi(10, 10, 8 * harts), addi(4, 4, -1), beq(4, 0, 8), jal(0, loop - p.offset - 20))
+    p.emit(sd(6, 11), sd(7, 11, 8))
+    for hart in range(harts):
+        for iteration in range(16):
+            p.memory[base + 0x1800 + 8 * (iteration * harts + hart)] = hart + 1
+    p.parallel_reads = dict(rounds=16, results=base + 0x2000)
+    yield 'parallel_reads', p.finish()
     if user:
         p = Program(base)
         if protection:
@@ -812,6 +932,46 @@ def data_cache_program(base):
                                            '20': narrowed + 1, '21': narrowed + 1, '24': 0,
                                            '25': narrowed + 2, '26': narrowed + 2})
     return p.finish()
+
+
+def data_cache_access_cases(base, protection):
+    p = Program(base)
+    initial = 0x8877665544332211
+    for size in range(3):
+        offset = 0x1000 + 8 * size
+        p.memory.update((base + offset + byte, (initial >> (8 * byte)) & 255) for byte in range(8))
+        p.address(10, offset)
+        p.emit(load(2, 10, 8 - (1 << size), size))
+        for width in range(3):
+            p.emit(load(3 + 2 * width, 10, 8 - (1 << width), width),
+                   load(4 + 2 * width, 10, 8 - (1 << width), width, True))
+        p.emit(ld(9, 10))
+    p.data_cache = dict(minHits=21, minExpandedReads=3,
+                        expectedRegisters={'3': (1 << 64) - 120, '4': 0x88,
+                                           '5': (1 << 64) - 0x7789, '6': 0x8877,
+                                           '7': (1 << 64) - 0x778899ab, '8': 0x88776655, '9': initial})
+    yield 'data_cache_narrow', p.finish()
+
+    p = Program(base)
+    p.address(10, 0x1000)
+    p.memory[base + 0x1001] = 0x5a
+    p.faults['read'] = base + 0x1007
+    p.emit(load(3, 10, 1, 0), load(4, 10, 1, 0))
+    p.data_cache = dict(minHits=0, minRefillRetries=2, maxExpandedReads=0,
+                        expectedRegisters={'3': 0x5a, '4': 0x5a})
+    yield 'data_cache_retry', p.finish()
+
+    if protection:
+        p = Program(base)
+        p.address(10, 0x1000)
+        p.address(11, 0x1800)
+        p.memory[base + 0x1004] = 0x5a
+        p.memory[base + 0x1800], p.memory[base + 0x1801] = 0x90, 0x91
+        p.emit(alu(2, 10, 2, 5, immediate=True), csr(0, 0x3b0, 2),
+               addi(2, 2, 1), csr(0, 0x3b1, 2), ld(2, 11), csr(0, 0x3a0, 2),
+               lw(3, 10, 4), lw(4, 10, 4), lw(5, 10))
+        p.data_cache = dict(minHits=0, maxExpandedReads=0, expectedRegisters={'3': 0x5a, '4': 0x5a})
+        yield 'data_cache_boundary', p.finish()
 
 
 def data_coherence_program(base, harts):

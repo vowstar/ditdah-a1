@@ -34,6 +34,8 @@ object DitDahA1Config:
         "fetchWords" -> parameter.fetchWords,
         "translation" -> (if parameter.enableTranslation then "Sv39/Svade" else "Bare"),
         "tlbEntries" -> (if parameter.enableTranslation then parameter.tlbEntries else 0),
+        "fabricReadSlots" -> (if parameter.hartCount > 1 then 2 else 0),
+        "enableBranchPrediction" -> parameter.enableBranchPrediction,
         "enableBurstRefill" -> parameter.enableBurstRefill, "isaComplete" -> false
       ),
       "target" -> ujson.Obj(

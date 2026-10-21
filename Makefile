@@ -2,10 +2,11 @@
 # SPDX-License-Identifier: MIT
 
 .PHONY: config check rtl software verify-software verify-data-software verify-supervisor-software zephyr verify-zephyr verify-zephyr-long verify-signoff verify-simulation verify-production verify-cache verify-platform verify-user verify-data-cache verify-supervisor verify-formal verify-scalar-formal verify-user-formal verify-data-formal verify-supervisor-formal verify-translation verify-translation-formal verify-translation-software verify-translation-cache verify-translation-cache-formal verify-translation-cache-software clean
-.PHONY: verify-burst verify-burst-formal verify-burst-software
+.PHONY: verify-burst verify-burst-formal verify-burst-software verify-widths verify-width-software
 
 HART_COUNTS ?= 2 3 15 16
 ICACHE_CASES := pipeline_reuse pipeline_integer_stream pipeline_dependency_stream pipeline_dependency_chain cache_replacement fence_ordering fence_i_prefetch synchronization atomic_ordering atomic_denied atomic_retry bus_fetch pipeline_redirect pmp_fetch pmp_update interrupt_fence interrupt_fence_i interrupt_fetch_fault
+PIPELINE_CASES := memory_groups memory_group_alignment memory_group_bus_read memory_group_bus_write pipeline_recovery pipeline_recovery_fault
 USER_CASES := user_access user_system user_wait user_protection user_fetch user_mprv
 SUPERVISOR_CASES := supervisor_traps supervisor_csr supervisor_mprv
 TRANSLATION_CASES := sv39_data sv39_reuse sv39_protection sv39_large sv39_gigantic sv39_accessed sv39_dirty sv39_user_denied sv39_sum sv39_mxr sv39_canonical sv39_context
@@ -65,6 +66,30 @@ verify-zephyr-long:
 	for count in 1 2 16; do $(MAKE) verify-zephyr SOFTWARE_HARTS=$$count || exit $$?; done
 
 verify-signoff: verify-formal
+	$(MAKE) verify-widths
+
+verify-widths:
+	for width in 1 2 3; do \
+		python3 test/verify.py --issue-width $$width --width 64 --pmp-entries 0 --icache-bytes 8192 --dcache-bytes 8192 --output result/widths/w$$width \
+			--case pipeline_integer_stream --case pipeline_dependency_stream --case pipeline_dependency_chain --case pipeline_redirect --case memory_word --case data_cache --case data_cache_narrow --case data_cache_retry $(foreach name,$(PIPELINE_CASES),--case $(name)) || exit $$?; \
+	done
+	python3 test/verify.py --issue-width 3 --branch-prediction --width 64 --pmp-entries 0 --icache-bytes 8192 --output result/widths/prediction $(foreach name,$(PIPELINE_CASES),--case $(name)) --case pipeline_redirect --case pipeline_older_fault --case pipeline_integer_stream
+	python3 test/verify.py --issue-width 3 --width 64 --pmp-entries 0 --output result/widths/uncached --case pipeline_redirect --case memory_word
+	python3 test/verify.py --issue-width 1 --branch-prediction --width 64 --pmp-entries 0 --output result/widths/prediction-uncached --case pipeline_recovery --case pipeline_redirect
+	for profile in 2:64:2 3:512:4; do \
+		width=$${profile%%:*}; rest=$${profile#*:}; bus=$${rest%%:*}; entries=$${rest#*:}; \
+		python3 test/verify.py --issue-width $$width --sv39 --tlb-entries $$entries --width $$bus --pmp-entries 16 --icache-bytes 8192 --dcache-bytes 8192 --output result/widths/translation-w$$width \
+			--case sv39_integer_stream --case sv39_reuse --case sv39_protection --case sv39_sum --case sv39_mxr --case sv39_context --case data_cache_boundary --case memory_group_pmp --case memory_group_page --case memory_group_interrupt || exit $$?; \
+	done
+	python3 test/formal.py --rtl result/widths/translation-w2/irq-pmp16-axi64/rtl --output result/formal/pipeline-w2 --modules PipelineBackend WfiFrontend
+	python3 test/formal.py --rtl result/widths/prediction/irq-axi64/rtl --output result/formal/pipeline-prediction --modules PipelineBackend WfiFrontend
+	build-ditdah-a1 --no-trace --config result/widths/w2/irq-axi64/input.json --output result/production-width2
+	build-ditdah-a1 --no-trace --config result/widths/prediction/irq-axi64/input.json --output result/production-prediction
+	python3 test/check_production.py --pipeline
+	$(MAKE) verify-width-software
+
+verify-width-software:
+	python3 test/verify.py --software-matrix --config $(SOFTWARE_CONFIG) --icache-bytes 8192 --dcache-bytes 8192 --output $(SOFTWARE_OUTPUT)/widths --jobs $(SOFTWARE_JOBS)
 
 verify-simulation: config check
 	python3 test/verify.py $(VERIFY_ARGS)
@@ -121,6 +146,8 @@ verify-data-cache: verify-user
 	$(MAKE) verify-data-software
 
 verify-formal: verify-burst-formal
+	python3 test/formal.py --rtl result/multicore/harts2-axi64/rtl --output result/formal/read-fabric --modules ReadQueue MemoryFabric
+	python3 test/formal.py --rtl result/multicore/harts16-axi512/rtl --output result/formal/read-queue-wide --modules ReadQueue
 
 verify-burst: verify-translation-cache-formal
 	python3 test/verify.py --burst-refill --icache-bytes 8192 --user-mode --width 64 --pmp-entries 16 --output result/burst
@@ -176,7 +203,7 @@ verify-translation: verify-supervisor-formal
 
 verify-translation-formal: verify-translation
 	python3 test/formal.py --rtl result/translation/irq-pmp16-axi64/rtl --output result/formal/translation --modules Translation SupervisorCsr SupervisorExecute IntegerDecode
-	python3 test/formal.py --rtl result/translation-cache/irq-pmp16-axi512/rtl --output result/formal/translation-cache --modules Translation SupervisorCsr SupervisorExecute
+	python3 test/formal.py --rtl result/translation-cache/irq-pmp16-axi512/rtl --output result/formal/translation-cache --modules Translation SupervisorCsr SupervisorExecute Lsu
 
 verify-supervisor: verify-data-formal
 	python3 test/verify.py --supervisor-mode --width 64 --pmp-entries 16 --output result/supervisor $(foreach name,$(SUPERVISOR_CASES),--case $(name))
@@ -207,7 +234,7 @@ verify-user-formal: verify-scalar-formal
 
 verify-data-formal: verify-user-formal
 	python3 test/formal.py --rtl result/data-cache/axi64/rtl --output result/formal/data-cache --modules DataCache Coherence
-	python3 test/formal.py --rtl result/data-cache-user/irq-pmp16-axi512/rtl --output result/formal/data-cache-user --modules DataCache
+	python3 test/formal.py --rtl result/data-cache-user/irq-pmp16-axi512/rtl --output result/formal/data-cache-user --modules DataCache Lsu
 	for profile in 2:64 3:64 16:512; do \
 		count=$${profile%:*}; width=$${profile#*:}; \
 		python3 test/formal.py --rtl result/data-coherence/harts$$count-axi$$width/rtl --output result/formal/coherence-harts$$count --modules Coherence || exit $$?; \

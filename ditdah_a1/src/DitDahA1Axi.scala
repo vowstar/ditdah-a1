@@ -6,6 +6,8 @@ import me.jiuyang.zaozi.*
 import me.jiuyang.zaozi.default.{*, given}
 import me.jiuyang.zaozi.reftpe.*
 import me.jiuyang.zaozi.valuetpe.*
+import java.lang.foreign.Arena
+import org.llvm.mlir.scalalib.capi.ir.{Block, Context}
 
 class DitDahA1AxiIO(parameter: DitDahA1Parameter) extends HWBundle(parameter):
   val clock = Flipped(Clock())
@@ -17,6 +19,28 @@ class DitDahA1AxiIO(parameter: DitDahA1Parameter) extends HWBundle(parameter):
 @generator
 object DitDahA1Axi extends Generator[DitDahA1Parameter, DitDahA1UnitLayers, DitDahA1AxiIO, DitDahA1UnitProbe]:
   override def moduleName(parameter: DitDahA1Parameter): String = "DitDahA1Axi"
+  def address(parameter: DitDahA1Parameter, channel: Referable[AxiAddress], request: Referable[MemoryRequest],
+    hart: Referable[UInt])(using Arena, Context, Block, InstanceContext): Unit =
+    channel.addr := request.address.asBits.bits(parameter.physicalAddressBits - 1, 0).asUInt
+    channel.id := hart
+    channel.len := 0.U(8)
+    channel.size := request.size
+    channel.burst := 1.U(2)
+    channel.lock := request.atomic
+    channel.cache := 0.U(4)
+    val privileged = if parameter.enableUserMode then request.privileged else true.B
+    channel.prot := (request.fetch.asBits ## 0.B(1) ## privileged.asBits).asUInt
+    channel.qos := 0.U(4)
+
+  def readData(size: Referable[UInt], data: Referable[UInt], shift: Referable[UInt])
+    (using Arena, Context, Block, InstanceContext): Referable[UInt] =
+    val shifted = (data >> shift).asBits.bits(63, 0)
+    val result = Wire(UInt(64))
+    result := 0.U(64)
+    for width <- 0 to 3 do
+      when(size === width.U(3)) { result := shifted.bits((8 << width) - 1, 0).asUInt }
+    result
+
   def architecture(parameter: DitDahA1Parameter) =
     val io = summon[Interface[DitDahA1AxiIO]]
     given ClockScope = ClockScope.posedge(io.clock)
@@ -54,17 +78,7 @@ object DitDahA1Axi extends Generator[DitDahA1Parameter, DitDahA1UnitLayers, DitD
     io.memory.response.bits.fault := fault
     io.memory.response.bits.tag := request.tag
     io.memory.response.bits.last := terminal.map(last => (state =/= 5.U(3)) | (last & finalSlice)).getOrElse(true.B)
-    for channel <- Seq(aw, ar) do
-      channel.bits.addr := request.address.asBits.bits(parameter.physicalAddressBits - 1, 0).asUInt
-      channel.bits.id := hartId
-      channel.bits.len := 0.U(8)
-      channel.bits.size := request.size
-      channel.bits.burst := 1.U(2)
-      channel.bits.lock := request.atomic
-      channel.bits.cache := 0.U(4)
-      val privileged = if parameter.enableUserMode then request.privileged else true.B
-      channel.bits.prot := (request.fetch.asBits ## 0.B(1) ## privileged.asBits).asUInt
-      channel.bits.qos := 0.U(4)
+    for channel <- Seq(aw, ar) do address(parameter, channel.bits, request, hartId)
     if parameter.enableBurstRefill then
       when(line) {
         ar.bits.len := (512 / parameter.axiDataBits - 1).U(8)
@@ -83,11 +97,7 @@ object DitDahA1Axi extends Generator[DitDahA1Parameter, DitDahA1UnitLayers, DitD
     val writeData = amo.?(update, request.data)
     w.bits.data := (writeData << byteShift).asBits.bits(parameter.axiDataBits - 1, 0).asUInt
     w.bits.strb := (request.mask << lane).asBits.bits(parameter.axiDataBits / 8 - 1, 0).asUInt
-    val shiftedReadData = (r.bits.data >> byteShift).asBits.bits(63, 0).asUInt
-    val readData = Wire(UInt(64))
-    readData := 0.U(64)
-    for size <- 0 to 3 do
-      when(request.size === size.U(3)) { readData := shiftedReadData.asBits.bits((8 << size) - 1, 0).asUInt }
+    val readValue = readData(request.size, r.bits.data, byteShift)
     r.ready := (state === 2.U(3)) | (if parameter.enableBurstRefill then state === 6.U(3) else false.B)
     b.ready := state === 3.U(3)
     when(io.memory.request.valid & io.memory.request.ready) {
@@ -108,7 +118,7 @@ object DitDahA1Axi extends Generator[DitDahA1Parameter, DitDahA1UnitLayers, DitD
     when(w.valid & w.ready) { wDone := true.B }
     when((state === 1.U(3)) & request.write & (awDone | (aw.valid & aw.ready)) & (wDone | (w.valid & w.ready))) { state := 3.U(3) }
     when(r.valid & r.ready) {
-      data := readData
+      data := readValue
       val readFault = fault | (r.bits.resp =/= request.atomic.?(1.U(2), 0.U(2))) | (r.bits.id =/= hartId) | !r.bits.last
       fault := readFault
       when(r.bits.last) {

@@ -197,7 +197,7 @@ class Model:
                     int(r['base']) <= physical and physical + 8 <= int(r['base']) + int(r['size'])
                     and r['readable'] and not r['device'] for r in self.config['memoryRegions']):
                 raise Fault(5, physical)
-            if physical == self.faults.get('read'):
+            if physical <= self.faults.get('read', -1) < physical + 8:
                 raise Fault(5, physical)
             return sum(self.memory.get(physical + i, 0) << (8 * i) for i in range(8))
         return sv39_walk(address, kind, privilege, self.csrs[0x180], self.csrs[0x300], read_pte)
@@ -243,7 +243,9 @@ class Model:
         if kind == 'atomic' and self.atomic_operation == 3 and not self.sc_eligible:
             return 1
         stages = ('read', 'exclusive') if self.atomic_operation == 2 else ('write',) if self.atomic_operation == 3 else ('read', 'write', 'exclusive')
-        if address == self.faults.get(kind) or (kind == 'atomic' and address in [self.faults.get(k) for k in stages]):
+        failed = address <= self.faults.get(kind, -1) < address + size if kind in ('read', 'fetch') else address == self.faults.get(kind)
+        if failed or (kind == 'atomic' and any(
+                address <= self.faults.get(k, -1) < address + size if k == 'read' else address == self.faults.get(k) for k in stages)):
             raise Fault(cause, virtual)
         old = sum(self.memory.get(address + i, 0) << (8 * i) for i in range(size))
         if kind == 'atomic':

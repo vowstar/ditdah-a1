@@ -30,7 +30,7 @@ module core_tb;
     logic [7:0] mask, tag;
     logic write, fetch, privileged, atomic;
     logic [4:0] atomicOperation;
-    logic scEligible;
+    logic scEligible, refillAllowed;
   } core_request_t;
   typedef struct packed { logic [63:0] data; logic fault; logic [7:0] tag; logic last; } core_response_t;
   core_request_t requests[2*HARTS];
@@ -38,8 +38,9 @@ module core_tb;
   wire [2*HARTS-1:0] request_valid, request_ready, response_valid, response_ready;
   wire [HARTS-1:0] multiply_busy;
   logic [HARTS-1:0] finished = 0;
-  integer bus_owner = 0, active_source = -1, completed_transactions = 0;
-  logic [7:0] accepted_tag;
+  integer bus_owner = 0, active_source[HARTS], completed_transactions = 0;
+  core_request_t accepted_request[HARTS];
+  initial for (integer h = 0; h < HARTS; h++) active_source[h] = -1;
   `include "core_bindings.svh"
   logic clock = 0;
   logic reset = 1;
@@ -47,7 +48,7 @@ module core_tb;
   logic arvalid, arready = 0, rvalid = 0, rready, rlast = 1;
   logic awvalid, awready = 0, wvalid, wready = 0, wlast, bvalid = 0, bready;
   logic [PA-1:0] araddr, awaddr;
-  logic [IDW-1:0] arid, awid, read_id, write_id;
+  logic [IDW-1:0] arid, awid, write_id;
   logic arlock, awlock;
   logic [7:0] arlen, awlen;
   logic [2:0] arsize, awsize, arprot, awprot;
@@ -95,16 +96,16 @@ module core_tb;
     1: irq_activate = awvalid || wvalid;
     2: irq_activate = aw_held && !w_held;
     3: irq_activate = w_held && !aw_held;
-    4: irq_activate = read_pending && !read_fetch;
+    4: irq_activate = pending_data;
 `ifdef ICACHE
     5: irq_activate = architectural_fetch_busy[irq_hart] && architectural_fetch_pc[irq_hart] == irq_target && traces[irq_hart][0].pipelineOccupancy == 0;
 `else
-    5: irq_activate = read_pending && read_fetch && read_address == irq_target && traces[irq_hart][0].pipelineOccupancy == 0;
+    5: irq_activate = pending_instruction_target && traces[irq_hart][0].pipelineOccupancy == 0;
 `endif
     6: irq_activate = multiply_busy[irq_hart];
     7: irq_activate = irq_retired;
-    8: irq_activate = read_pending && read_exclusive && bus_owner / 2 == irq_hart;
-    9: irq_activate = irq_retired && read_pending && !read_fetch && bus_owner / 2 != irq_hart;
+    8: irq_activate = pending_exclusive_target;
+    9: irq_activate = irq_retired && pending_peer;
     default: irq_activate = 0;
   endcase
   always @(posedge clock) irq_retired <= !reset && ((irq_mode == 9 && irq_retired) ||
@@ -121,18 +122,48 @@ module core_tb;
   logic [63:0] reservation_address[HARTS], interference, interference_value;
   logic [2:0] reservation_size[HARTS];
   logic [HARTS-1:0] reservation_valid = 0;
-  logic read_exclusive = 0, write_exclusive = 0, exclusive_success, write_success;
+  logic write_exclusive = 0, exclusive_success, write_success;
   integer reservation_max = 0;
   integer exclusive_failures;
   logic [31:0] random_state;
-  logic read_pending = 0, read_fetch = 0, aw_held = 0, w_held = 0, write_pending = 0;
-  logic [63:0] read_address, write_address;
-  logic [2:0] read_size, write_size;
+  logic aw_held = 0, w_held = 0, write_pending = 0;
+  logic [63:0] write_address;
+  logic [2:0] write_size;
   logic [DW-1:0] write_data;
   logic [DW/8-1:0] write_mask;
-  integer read_remaining = 0;
-  logic read_line = 0;
-  integer read_delay = 0, write_delay = 0, cycles = 0;
+  typedef struct packed {
+    logic valid, fetch, exclusive, line;
+    logic [63:0] address;
+    logic [IDW-1:0] id;
+    logic [2:0] size;
+    logic [7:0] remaining;
+    integer delay, order;
+  } read_context_t;
+  read_context_t read_context[2];
+  integer read_slot = 0, accept_read_slot, read_serial = 0, data_reads = 0;
+  integer read_peak = 0, read_reordered = 0, reorder_reads = 0;
+  wire read_pending = read_context[read_slot].valid;
+  wire read_fetch = read_context[read_slot].fetch;
+  wire read_exclusive = read_context[read_slot].exclusive;
+  wire read_line = read_context[read_slot].line;
+  wire [63:0] read_address = read_context[read_slot].address;
+  wire [IDW-1:0] read_id = read_context[read_slot].id;
+  wire [2:0] read_size = read_context[read_slot].size;
+  wire [7:0] read_remaining = read_context[read_slot].remaining;
+  integer write_delay = 0, cycles = 0;
+  initial for (integer slot = 0; slot < 2; slot++) read_context[slot] = '0;
+`ifdef ENABLE_INTERRUPTS
+  logic pending_data, pending_instruction_target, pending_exclusive_target, pending_peer;
+  always_comb begin
+    pending_data = 0; pending_instruction_target = 0; pending_exclusive_target = 0; pending_peer = 0;
+    for (integer slot = 0; slot < 2; slot++) if (read_context[slot].valid) begin
+      pending_data |= !read_context[slot].fetch;
+      pending_instruction_target |= read_context[slot].fetch && read_context[slot].address == irq_target;
+      pending_exclusive_target |= read_context[slot].exclusive && read_context[slot].id == irq_hart;
+      pending_peer |= !read_context[slot].fetch && read_context[slot].id != irq_hart;
+    end
+  end
+`endif
   integer aw_first = 0, w_first = 0, together = 0;
   integer ar_stall = 0, aw_stall = 0, w_stall = 0;
   integer pipeline_max = 0, dependency_stalls = 0;
@@ -148,6 +179,7 @@ module core_tb;
     if (!$value$plusargs("BASE=%h", base_address)) $fatal(1, "Missing base");
     if (!$value$plusargs("STOP=%h", stop_pc)) $fatal(1, "Missing stop");
     if (!$value$plusargs("SEED=%d", random_state)) random_state = 1;
+    if (!$value$plusargs("REORDER_READS=%d", reorder_reads)) reorder_reads = 0;
     if (!$value$plusargs("FAULT_FETCH=%h", fault_fetch)) fault_fetch = '1;
     if (!$value$plusargs("FAULT_READ=%h", fault_read)) fault_read = '1;
     if (!$value$plusargs("FAULT_WRITE=%h", fault_write)) fault_write = '1;
@@ -175,7 +207,12 @@ module core_tb;
     random_state = random_state ^ (random_state << 13);
     random_state = random_state ^ (random_state >> 17);
     random_state = random_state ^ (random_state << 5);
-    arready = !reset && !read_pending && !rvalid && random_state[0];
+    arready = !reset && !(read_context[0].valid && read_context[1].valid) && random_state[0];
+    if (!rvalid) begin
+      if (read_context[0].valid && read_context[0].delay == 0) read_slot = 0;
+      if (read_context[1].valid && read_context[1].delay == 0 &&
+          (!read_context[0].valid || read_context[0].delay != 0 || random_state[3])) read_slot = 1;
+    end
     awready = !reset && !aw_held && !bvalid && random_state[1];
     wready = !reset && !w_held && !bvalid && random_state[2];
     if (HARTS > 1 && !aw_held && !w_held
@@ -199,6 +236,7 @@ module core_tb;
   end
   always @(posedge clock) begin
     if (!reset) begin
+      observe_metrics();
 `ifdef LOCAL_INTERRUPTS
       observe_platform();
 `endif
@@ -207,35 +245,46 @@ module core_tb;
       if (arvalid && !arready) ar_stall <= ar_stall + 1;
       if (awvalid && !awready) aw_stall <= aw_stall + 1;
       if (wvalid && !wready) w_stall <= w_stall + 1;
+      for (integer slot = 0; slot < 2; slot++)
+        if (read_context[slot].valid && read_context[slot].delay > 0) read_context[slot].delay <= read_context[slot].delay - 1;
       if (arvalid && arready) begin
         if (!console_address(64'(araddr)) && (64'(araddr) < base_address || 64'(araddr) + (1 << arsize) * (1 + integer'(arlen)) > base_address + MB)) $fatal(1, "Truncated or unexpected read address");
-        if (arid != IDW'(bus_owner / 2) || arlen != (requests[bus_owner].size == 6 ? 64 / (DW/8) - 1 : 0) || arburst != 1 || (arlock && arprot[2]) || arcache != 0 || arqos != 0) $fatal(1, "Read attributes");
-        if (arprot != {requests[bus_owner].fetch, 1'b0, requests[bus_owner].privileged}) $fatal(1, "Read privilege");
-        if ((arprot[2] ? arsize != (requests[bus_owner].size == 6 ? $clog2(DW/8) : 2) : arsize > 3) ||
+        if (arid >= HARTS || active_source[arid] < 0 || arlen != (accepted_request[arid].size == 6 ? 64 / (DW/8) - 1 : 0) || arburst != 1 || (arlock && arprot[2]) || arcache != 0 || arqos != 0) $fatal(1, "Read attributes");
+        if (arprot != {accepted_request[arid].fetch, 1'b0, accepted_request[arid].privileged}) $fatal(1, "Read privilege");
+        if ((arprot[2] ? arsize != (accepted_request[arid].size == 6 ? $clog2(DW/8) : 2) : arsize > 3) ||
             (arlock && arsize != 3) || (araddr & ((1 << arsize) - 1)) != 0) $fatal(1, "Read alignment");
-        if (HARTS > 1) $write("HART %0d ", bus_owner / 2);
-        $display("BUS %s %016h %0d %016h", arlock ? "exclusive_read" : (arprot[2] ? "fetch" : "read"), 64'(araddr), requests[bus_owner].size == 6 ? 64 : 1 << arsize, 64'b0);
-        read_pending <= 1;
-        read_remaining <= integer'(arlen);
-        read_line <= requests[bus_owner].size == 6;
-        read_address <= 64'(araddr);
-        read_id <= arid;
-        read_size <= arsize;
-        read_fetch <= arprot[2];
-        read_exclusive <= arlock;
-        read_delay <= arprot[2] ? integer'(random_state[5:4]) : 32 + integer'(random_state[7:4]);
+        if (HARTS > 1) $write("HART %0d ", arid);
+        $display("BUS %s %016h %0d %016h", arlock ? "exclusive_read" : (arprot[2] ? "fetch" : "read"), 64'(araddr), accepted_request[arid].size == 6 ? 64 : 1 << arsize, 64'b0);
+        accept_read_slot = read_context[0].valid ? 1 : 0;
+        if (read_context[accept_read_slot].valid ||
+            (read_context[1 - accept_read_slot].valid && read_context[1 - accept_read_slot].id == arid)) $fatal(1, "Overlapping AXI read identity");
+        read_context[accept_read_slot].valid <= 1;
+        read_context[accept_read_slot].remaining <= arlen;
+        read_context[accept_read_slot].line <= accepted_request[arid].size == 6;
+        read_context[accept_read_slot].address <= 64'(araddr);
+        read_context[accept_read_slot].id <= arid;
+        read_context[accept_read_slot].size <= arsize;
+        read_context[accept_read_slot].fetch <= arprot[2];
+        read_context[accept_read_slot].exclusive <= arlock;
+        read_context[accept_read_slot].order <= read_serial;
+        read_serial = read_serial + 1;
+        read_context[accept_read_slot].delay <= arprot[2] ? integer'(random_state[5:4]) : 32 + integer'(random_state[7:4]);
+        if (!arprot[2] && !arlock) begin
+          if (reorder_reads && data_reads % 2 == 0) read_context[accept_read_slot].delay <= 96;
+          data_reads = data_reads + 1;
+        end
+        if (1 + integer'(read_context[1 - accept_read_slot].valid) > read_peak)
+          read_peak = 1 + integer'(read_context[1 - accept_read_slot].valid);
 `ifdef ENABLE_INTERRUPTS
-        if (irq_mode == 5 && 64'(araddr) == irq_target) read_delay <= 48;
+        if (irq_mode == 5 && 64'(araddr) == irq_target) read_context[accept_read_slot].delay <= 48;
 `endif
       end
-      if (read_pending && !rvalid) begin
-        if (read_delay > 0) read_delay <= read_delay - 1;
-        else begin
+      if (read_pending && read_context[read_slot].delay == 0 && !rvalid) begin
           for (integer i = 0; i < DW/8; i++)
             rdata[i*8 +: 8] <= console_address(read_address) ? 0 : memory[integer'((read_address - base_address) & ~(64'(DW/8) - 1)) + i];
-          rresp <= ((read_fetch && read_address <= fault_fetch && fault_fetch < read_address + (1 << read_size)) || (!read_fetch && read_address == fault_read) || console_address(read_address)) ? 2 :
+          rresp <= ((read_fetch && read_address <= fault_fetch && fault_fetch < read_address + (1 << read_size)) || (!read_fetch && read_address <= fault_read && fault_read < read_address + (1 << read_size)) || console_address(read_address)) ? 2 :
             (read_exclusive && read_address != fault_exclusive ? 1 : 0);
-          if (read_exclusive && read_address != fault_read && read_address != fault_exclusive && !console_address(read_address)) begin
+          if (read_exclusive && !(read_address <= fault_read && fault_read < read_address + (1 << read_size)) && read_address != fault_exclusive && !console_address(read_address)) begin
             reservation_address[read_id] <= read_address;
             reservation_size[read_id] <= read_size;
             reservation_valid[read_id] <= 1;
@@ -244,32 +293,35 @@ module core_tb;
           end
           rlast <= read_remaining == 0;
           rvalid <= 1;
-        end
       end
       if (rvalid && rready) begin
-        if (HARTS > 1) $write("HART %0d ", bus_owner / 2);
+        if (HARTS > 1) $write("HART %0d ", read_id);
         if (read_line) $display("LINE_BEAT %016h %01h %h %01h", read_address, rresp, rdata, rlast);
         else $display("READ %016h %01h %016h", read_address, rresp,
           64'(rdata >> (8 * (read_address % (DW/8)))) & access_mask(read_size));
         if (read_fetch) begin
           for (integer word_index = 0; word_index < (read_line ? DW/32 : 1); word_index++) begin
-            if (HARTS > 1) $write("HART %0d ", bus_owner / 2);
+            if (HARTS > 1) $write("HART %0d ", read_id);
             $display("FETCH %016h %01h %08h", read_address + 4 * word_index, rresp,
               32'(rdata >> (8 * (read_address % (DW/8)) + 32 * word_index)));
           end
         end
-        if (rlast) read_pending <= 0;
+        if (rlast) begin
+          if (read_context[1 - read_slot].valid && read_context[1 - read_slot].order < read_context[read_slot].order)
+            read_reordered = read_reordered + 1;
+          read_context[read_slot].valid <= 0;
+        end
         else begin
-          read_address <= read_address + (1 << read_size);
-          read_remaining <= read_remaining - 1;
-          read_delay <= integer'(random_state[5:4]);
+          read_context[read_slot].address <= read_address + (1 << read_size);
+          read_context[read_slot].remaining <= read_remaining - 1;
+          read_context[read_slot].delay <= integer'(random_state[5:4]);
         end
         rvalid <= 0;
       end
       if (awvalid && awready) begin
         if (!console_address(64'(awaddr)) && (64'(awaddr) < base_address || 64'(awaddr) + (1 << awsize) > base_address + MB)) $fatal(1, "Truncated or unexpected write address");
-        if (awid != IDW'(bus_owner / 2) || awlen != 0 || awsize > 3 || (awlock && awsize != 3) ||
-            awburst != 1 || awcache != 0 || awprot != {2'b0, requests[bus_owner].privileged} || awqos != 0 ||
+        if (awid >= HARTS || active_source[awid] < 0 || awid != IDW'(bus_owner / 2) || awlen != 0 || awsize > 3 || (awlock && awsize != 3) ||
+            awburst != 1 || awcache != 0 || awprot != {2'b0, accepted_request[awid].privileged} || awqos != 0 ||
             (awaddr & ((1 << awsize) - 1)) != 0) $fatal(1, "Write attributes");
         aw_held <= 1;
         write_address <= 64'(awaddr);
@@ -352,6 +404,8 @@ module core_tb;
 `endif
           if (traces[h][lane].traceRdWrite && traces[h][lane].traceRd == 0) $fatal(1, "x0 write");
           if (HARTS > 1) $write("HART %0d ", h);
+          $display("FETCH_RETIRE %016h %02h %0d %0d", traces[h][lane].traceOrder, retire_tag[h][lane], lane, retire_count[h]);
+          if (HARTS > 1) $write("HART %0d ", h);
           $display("TRACE %016h %016h %08h %016h %02h %01h %016h %01h %016h %016h",
             traces[h][lane].traceOrder, traces[h][lane].tracePc, traces[h][lane].traceInstruction, traces[h][lane].traceNextPc,
             traces[h][lane].traceRd, traces[h][lane].traceRdWrite, traces[h][lane].traceValue, traces[h][lane].traceTrap,
@@ -378,17 +432,26 @@ module core_tb;
         $display("PIPELINE %0d %0d", pipeline_max, dependency_stalls);
         $display("THROUGHPUT %0d %0d", issue_max, retire_max);
         $display("CYCLES %0d", cycles);
+        $display("READ_CONCURRENCY %0d %0d", read_peak, read_reordered);
         $display("PASS"); $finish;
       end
     end
   end
   always @(posedge clock) if (!reset) begin
+    integer pending_sources;
     for (integer source = 0; source < 2*HARTS; source++) begin
       if (request_valid[source] && request_ready[source]) begin
-        if (active_source != -1) $fatal(1, "Overlapping accepted sources");
-        active_source = source;
-        accepted_tag = requests[source].tag;
-        bus_owner <= source;
+        if (active_source[source / 2] != -1) $fatal(1, "Overlapping accepted hart sources");
+        pending_sources = 0;
+        for (integer hart = 0; hart < HARTS; hart++) if (active_source[hart] >= 0) begin
+          pending_sources = pending_sources + 1;
+          if (exclusive_request(requests[source]) || exclusive_request(accepted_request[hart]))
+            $fatal(1, "Exclusive request overlapped physical service");
+        end
+        if (pending_sources >= 2) $fatal(1, "Physical read slots exceeded");
+        active_source[source / 2] = source;
+        accepted_request[source / 2] = requests[source];
+        if (exclusive_request(requests[source])) bus_owner <= source;
         if (HARTS > 1) $write("HART %0d ", source / 2);
         $display("REQUEST %s %016h %0d %016h %02h",
           requests[source].atomic ? "atomic" : (source % 2 == 0 ? "fetch" : (requests[source].write ? "write" : "read")),
@@ -403,10 +466,10 @@ module core_tb;
         end
       end
       if (response_valid[source] && response_ready[source]) begin
-        if (active_source != source || responses[source].tag != accepted_tag)
+        if (active_source[source / 2] != source || responses[source].tag != accepted_request[source / 2].tag)
           $fatal(1, "Response source or tag");
         if (responses[source].last) begin
-          active_source = -1;
+          active_source[source / 2] = -1;
           completed_transactions = completed_transactions + 1;
         end
         if (completed_transactions > transaction_limit) $fatal(1, "Transaction budget");

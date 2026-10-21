@@ -7,7 +7,7 @@ typedef struct packed {
   logic [7:0] mask, tag;
   logic write, fetch, privileged, atomic;
   logic [4:0] atomicOperation;
-  logic scEligible;
+  logic scEligible, refillAllowed;
 } request_t;
 typedef struct packed { logic [63:0] data; logic fault; logic [7:0] tag; logic last; } response_t;
 interface memory_port;
@@ -22,7 +22,8 @@ endinterface
   .P``_request_bits_tag(B.request.tag), .P``_request_bits_write(B.request.write), \
   .P``_request_bits_fetch(B.request.fetch), .P``_request_bits_atomic(B.request.atomic), \
   .P``_request_bits_privileged(B.request.privileged), \
-  .P``_request_bits_atomicOperation(B.request.atomicOperation), .P``_request_bits_scEligible(B.request.scEligible), .P``_response_ready(B.response_ready), \
+  .P``_request_bits_atomicOperation(B.request.atomicOperation), .P``_request_bits_scEligible(B.request.scEligible), \
+  .P``_request_bits_refillAllowed(B.request.refillAllowed), .P``_response_ready(B.response_ready), \
   .P``_response_valid(B.response_valid), .P``_response_bits_data(B.response.data), \
   .P``_response_bits_fault(B.response.fault), .P``_response_bits_tag(B.response.tag), .P``_response_bits_last(B.response.last)
 `define CORE_TRACE traces[0][0]
@@ -147,12 +148,14 @@ module memory_tb;
         if (p == 0 && irq_mode == 5 && physical_port[p].request.address == irq_target) delay <= 48;
 `endif
         physical_port[p].response.tag <= physical_port[p].request.tag;
-        service_fault = physical_port[p].request.address == (p == 0 ? fault_fetch : (physical_port[p].request.write ? fault_write : fault_read));
+        service_fault = physical_port[p].request.write ? physical_port[p].request.address == fault_write :
+          physical_port[p].request.address <= (p == 0 ? fault_fetch : fault_read) &&
+          (p == 0 ? fault_fetch : fault_read) < physical_port[p].request.address + (64'd1 << physical_port[p].request.size);
         if (physical_port[p].request.atomic) begin
           case (physical_port[p].request.atomicOperation)
-            2: service_fault = physical_port[p].request.address == fault_read || physical_port[p].request.address == fault_exclusive;
+            2: service_fault = (physical_port[p].request.address <= fault_read && fault_read < physical_port[p].request.address + 8) || physical_port[p].request.address == fault_exclusive;
             3: service_fault = physical_port[p].request.scEligible && physical_port[p].request.address == fault_write;
-            default: service_fault = service_fault || physical_port[p].request.address == fault_read || physical_port[p].request.address == fault_exclusive;
+            default: service_fault = service_fault || (physical_port[p].request.address <= fault_read && fault_read < physical_port[p].request.address + 8) || physical_port[p].request.address == fault_exclusive;
           endcase
         end
         physical_port[p].response.fault <= service_fault;
@@ -223,6 +226,7 @@ module memory_tb;
       physical_port[p].response_valid && !physical_port[p].response_ready |=> physical_port[p].response_valid && $stable(physical_port[p].response));
   end
   always @(posedge clock) if (!reset) begin
+    observe_metrics();
     cycles <= cycles + 1;
     if (cycles > 50000) $fatal(1, "Timeout");
     if (&core_pending) overlap <= overlap + 1;
@@ -241,6 +245,7 @@ module memory_tb;
 `endif
 
       if (`CORE_TRACE.traceRdWrite && `CORE_TRACE.traceRd == 0) $fatal(1, "x0 write");
+      $display("FETCH_RETIRE %016h %02h %0d %0d", `CORE_TRACE.traceOrder, retire_tag[0][lane], lane, retire_count[0]);
       $display("TRACE %016h %016h %08h %016h %02h %01h %016h %01h %016h %016h",
         `CORE_TRACE.traceOrder, `CORE_TRACE.tracePc, `CORE_TRACE.traceInstruction, `CORE_TRACE.traceNextPc,
         `CORE_TRACE.traceRd, `CORE_TRACE.traceRdWrite, `CORE_TRACE.traceValue, `CORE_TRACE.traceTrap,

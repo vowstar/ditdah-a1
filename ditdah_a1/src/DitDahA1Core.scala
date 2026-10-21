@@ -52,6 +52,7 @@ object DitDahA1Core extends Generator[DitDahA1Parameter, DitDahA1Layers, DitDahA
       probe.order <== backend.probe.order
       probe.pc <== backend.probe.pc
       probe.instruction <== backend.probe.instruction
+      probe.fetchTag <== backend.probe.fetchTag
       probe.nextPc <== backend.probe.nextPc
       probe.rd <== backend.probe.rd
       probe.rdWrite <== backend.probe.rdWrite
@@ -86,14 +87,17 @@ object DitDahA1Backend extends Generator[DitDahA1Parameter, DitDahA1Layers, DitD
     val resultValid = resultCount =/= 0.U
     val resultPackets = Reg(Vec(width, new ResultPacket))
     val resultPacket = resultPackets(0)
+    val resultResolved = RegInit(false.B)
     val memoryCount = RegInit(0.U(countBits))
     val memoryValid = memoryCount =/= 0.U
     val memoryPackets = Reg(Vec(width, new ResultPacket))
     val memoryPacket = memoryPackets(0)
+    val memoryResolved = RegInit(false.B)
     val commitCount = RegInit(0.U(countBits))
     val commitValid = commitCount =/= 0.U
     val commitPackets = Reg(Vec(width, new ResultPacket))
     val commitPacket = commitPackets(0)
+    val commitResolved = RegInit(false.B)
     val memoryPending = RegInit(false.B)
     val executePending = RegInit(false.B)
     val resumePc = Option.when(parameter.enableInterrupts)(RegInit(parameter.resetVector.U(64)))
@@ -148,7 +152,7 @@ object DitDahA1Backend extends Generator[DitDahA1Parameter, DitDahA1Layers, DitD
     commit.io.returnPc := csr.io.returnPc
     val retire = commit.io.output
     val retired = retire.valid & retire.ready
-    val retireCount = retired.?(commitCount, 0.U(countBits))
+    val retireCount = retired.?(retire.bits.instruction.fault.?(1.U(countBits), commitCount), 0.U(countBits))
     val retirement = Wire(Vec(width, new ResultPacket))
     retirement(0) :<= retire.bits
     for lane <- 1 until width do
@@ -163,7 +167,7 @@ object DitDahA1Backend extends Generator[DitDahA1Parameter, DitDahA1Layers, DitD
       retire.bits.sfenceVma | (retire.bits.csrWrite & (retire.bits.csrAddress === 0x180.U(12))) else false.B
     io.invalidateTranslation.foreach(_ := retired & (translationUpdate | pmpUpdate))
     val redirect = takeInterrupt | (retired & (retire.bits.instruction.fault | retire.bits.mret | retire.bits.sret |
-      pmpUpdate | translationUpdate | retire.bits.fenceI | (retire.bits.nextPc =/= sequentialPc))) | enterWfi
+      pmpUpdate | translationUpdate | retire.bits.fenceI | (!commitResolved & (retire.bits.nextPc =/= sequentialPc)))) | enterWfi
     if parameter.iCacheBytes != 0 then io.invalidate.get := retired & (retire.bits.fenceI | pmpUpdate | translationUpdate)
     val commitReady = !commitValid | retired
     val memoryOperation = (resultPacket.load | resultPacket.store) & !resultPacket.instruction.fault
@@ -184,6 +188,15 @@ object DitDahA1Backend extends Generator[DitDahA1Parameter, DitDahA1Layers, DitD
     execution(0) :<= execute.io.output.bits
     when(isMultiply) { execution(0).value := multiply.io.output.bits }
     for lane <- 1 until width do DitDahA1Alu.result(issuedPackets(lane), execution(lane))
+    val control = Seq(DitDahA1Isa.Beq, DitDahA1Isa.Branch, DitDahA1Isa.Jal, DitDahA1Isa.Jalr)
+      .map(op => issuedPacket.decoded.operation === op.U(DitDahA1Isa.operationBits)).reduce(_ | _)
+    val resolved = control & !execution(0).instruction.fault
+    val predictedOffset = if parameter.enableBranchPrediction then issuedPacket.decoded.instruction.predictedTaken
+      .?(issuedPacket.decoded.immediate, issuedPacket.decoded.instruction.length) else issuedPacket.decoded.instruction.length
+    val predictedPc = (issuedPacket.decoded.instruction.pc + predictedOffset)
+      .asBits.bits(63, 0).asUInt
+    val earlyRedirect = executed & resolved & (execution(0).nextPc =/= predictedPc)
+    val flushYounger = redirect | earlyRedirect
     val destinations = (0 until width).map { lane =>
       val packet = commitPackets(lane)
       ((lane.U < commitCount) & packet.rdWrite, packet.rd, !packet.instruction.fault, packet.value)
@@ -210,13 +223,16 @@ object DitDahA1Backend extends Generator[DitDahA1Parameter, DitDahA1Layers, DitD
         when(valid & (rd =/= 0.U(5)) & (address === rd)) { value := data; blocked := !ready }
       (value, blocked)
     val older = issuedValid | resultValid | memoryValid | commitValid
-    val available = (!issuedValid | executed) & !executePending & !redirect & !sleeping
+    val available = (!issuedValid | executed) & !executePending & !flushYounger & !sleeping
     val prefix = Wire(Vec(width, Bool()))
     val simple = (0 until width).map { lane =>
       import DitDahA1Isa.*
       !decodedPackets(lane).instruction.fault & Seq(Lui, Auipc, Addi, Add, AluImmediate, AluRegister,
         AluWordImmediate, AluWordRegister).map(op => decodedPackets(lane).operation === op.U(operationBits)).reduce(_ | _)
     }
+    val groupedHead = simple(0) | (!decodedPackets(0).instruction.fault &
+      Seq(DitDahA1Isa.Ld, DitDahA1Isa.Lw, DitDahA1Isa.Lwu, DitDahA1Isa.Load, DitDahA1Isa.Sd, DitDahA1Isa.Sw, DitDahA1Isa.Store)
+        .map(op => decodedPackets(0).operation === op.U(DitDahA1Isa.operationBits)).reduce(_ | _))
     val dependencies = (0 until width).map { lane =>
       val unit = issues(lane)
       val packet = decodedPackets(lane)
@@ -235,8 +251,8 @@ object DitDahA1Backend extends Generator[DitDahA1Parameter, DitDahA1Layers, DitD
             (packet.writesRd & (writer.rd === packet.rd)))
       }.foldLeft[Referable[Bool]](false.B)(_ | _)
       prefix(lane) := (lane.U < decodedCount) & !blocked &
-        (if lane == 0 then true.B else prefix(lane - 1) & simple(0) & simple(lane) & !conflict)
-      unit.io.input.valid := prefix(lane) & !redirect & !sleeping
+        (if lane == 0 then true.B else prefix(lane - 1) & groupedHead & simple(lane) & !conflict)
+      unit.io.input.valid := prefix(lane) & !flushYounger & !sleeping
       unit.io.output.ready := available
       blocked
     }
@@ -246,18 +262,18 @@ object DitDahA1Backend extends Generator[DitDahA1Parameter, DitDahA1Layers, DitD
       .asBits.bits(countBits - 1, 0).asUInt, 0.U(countBits))
     val issued = issueCount =/= 0.U
     val decodedFree = width.U(countBits) - (decodedCount - issueCount)
-    val decodeCount = (!redirect & !sleeping).?((instructionCount <= decodedFree).?(instructionCount, decodedFree), 0.U(countBits))
+    val decodeCount = (!flushYounger & !sleeping).?((instructionCount <= decodedFree).?(instructionCount, decodedFree), 0.U(countBits))
       .asBits.bits(countBits - 1, 0).asUInt
     val decodedInput = Wire(Vec(width, new DecodedPacket))
     for lane <- 0 until width do
       decodes(lane).io.input.bits :<= instructionPackets(lane)
-      decodes(lane).io.input.valid := (lane.U < instructionCount) & !redirect & !sleeping
+      decodes(lane).io.input.valid := (lane.U < instructionCount) & !flushYounger & !sleeping
       decodes(lane).io.output.ready := lane.U < decodeCount
       decodedInput(lane) :<= decodes(lane).io.output.bits
-    io.instruction.ready := !redirect & !sleeping & (io.instruction.bits.count <= width.U - (instructionCount - decodeCount))
+    io.instruction.ready := !flushYounger & !sleeping & (io.instruction.bits.count <= width.U - (instructionCount - decodeCount))
     val received = io.instruction.valid & io.instruction.ready
-    io.redirect := redirect
-    io.redirectPc := retire.bits.nextPc
+    io.redirect := flushYounger
+    io.redirectPc := earlyRedirect.?(execution(0).nextPc, retire.bits.nextPc)
     lsu.io.input.valid := resultValid & memoryOperation & !memoryPending & !memoryValid & !commitValid & !redirect
     lsu.io.input.bits :<= resultPacket
     lsu.io.storeAllowed := !memoryValid & !commitValid & !redirect
@@ -296,10 +312,11 @@ object DitDahA1Backend extends Generator[DitDahA1Parameter, DitDahA1Layers, DitD
       commitCount := memoryCount
       commitPackets :<= memoryPackets
       commitPackets(0) :<= completion
+      commitResolved := memoryResolved
       memoryCount := 0.U
     }
-    when(resultAdvance) { memoryCount := resultCount; memoryPackets :<= resultPackets; resultCount := 0.U }
-    when(executed) { resultPackets :<= execution; resultCount := issuedCount; issuedCount := 0.U }
+    when(resultAdvance) { memoryCount := resultCount; memoryPackets :<= resultPackets; memoryResolved := resultResolved; resultCount := 0.U }
+    when(executed) { resultPackets :<= execution; resultResolved := resolved; resultCount := issuedCount; issuedCount := 0.U }
     // Accepted arithmetic drains before the issued group is reused.
     when(multiply.io.input.valid & multiply.io.input.ready) { executePending := true.B }
     when(multiply.io.output.valid & multiply.io.output.ready) { executePending := false.B }
@@ -321,6 +338,7 @@ object DitDahA1Backend extends Generator[DitDahA1Parameter, DitDahA1Layers, DitD
     compact(instructionCount, instructionPackets, decodeCount, io.instruction.bits.packets, received.?(io.instruction.bits.count, 0.U(countBits)))
     when(lsu.io.input.valid & lsu.io.input.ready) { memoryPending := true.B }
     when(lsu.io.output.valid & lsu.io.output.ready) { memoryPending := false.B }
+    when(earlyRedirect) { instructionCount := 0.U; decodedCount := 0.U }
     when(redirect) {
       instructionCount := 0.U
       decodedCount := 0.U
@@ -339,6 +357,7 @@ object DitDahA1Backend extends Generator[DitDahA1Parameter, DitDahA1Layers, DitD
       when(traceValid) { traceOrder := (traceOrder + traceCount).asBits.bits(63, 0).asUInt }
       val tracePc = Wire(Vec(width, UInt(64)))
       val traceInstruction = Wire(Vec(width, UInt(32)))
+      val traceFetchTag = Wire(Vec(width, UInt(8)))
       val traceNextPc = Wire(Vec(width, UInt(64)))
       val traceRd = Wire(Vec(width, UInt(5)))
       val traceRdWrite = Wire(Vec(width, Bool()))
@@ -356,6 +375,7 @@ object DitDahA1Backend extends Generator[DitDahA1Parameter, DitDahA1Layers, DitD
         val packet = retirement(lane)
         tracePc(lane) := packet.instruction.pc
         traceInstruction(lane) := packet.instruction.instruction
+        traceFetchTag(lane) := packet.instruction.tag
         traceNextPc(lane) := packet.nextPc
         traceRd(lane) := packet.rd
         traceRdWrite(lane) := packet.rdWrite
@@ -367,6 +387,7 @@ object DitDahA1Backend extends Generator[DitDahA1Parameter, DitDahA1Layers, DitD
         when(takeInterrupt) {
           tracePc(0) := resumePc.get
           traceInstruction(0) := 0.U(32)
+          traceFetchTag(0) := 0.U(8)
           traceNextPc(0) := csr.io.trapVector
           traceRd(0) := 0.U(5)
           traceRdWrite(0) := false.B
@@ -381,6 +402,7 @@ object DitDahA1Backend extends Generator[DitDahA1Parameter, DitDahA1Layers, DitD
       probe.order <== traceOrder
       probe.pc <== tracePc.asBits.asUInt
       probe.instruction <== traceInstruction.asBits.asUInt
+      probe.fetchTag <== traceFetchTag.asBits.asUInt
       probe.nextPc <== traceNextPc.asBits.asUInt
       probe.rd <== traceRd.asBits.asUInt
       probe.rdWrite <== traceRdWrite.asBits.asUInt
@@ -400,6 +422,8 @@ object DitDahA1Frontend extends Generator[DitDahA1Parameter, DitDahA1UnitLayers,
     given ClockScope = ClockScope.posedge(io.clock)
     given ResetScope = ResetScope.syncActiveHigh(io.reset)
     val pc = RegInit(parameter.resetVector.U(64))
+    val requestPc = Wire(UInt(64))
+    requestPc := pc
     val tag = RegInit(0.U(8))
     val fetch = DitDahA1Fetch.instantiate(parameter)
     if parameter.pmpEntries != 0 then fetch.io.pmp.get :<= io.pmp.get
@@ -408,7 +432,7 @@ object DitDahA1Frontend extends Generator[DitDahA1Parameter, DitDahA1UnitLayers,
     fetch.io.privilege := io.privilege
     if parameter.enableTranslation then io.translation.get :<>= fetch.io.translation.get
     fetch.io.request.valid := !io.redirect & !io.halt
-    fetch.io.request.bits.pc := pc
+    fetch.io.request.bits.pc := requestPc
     fetch.io.request.bits.tag := tag
     fetch.io.cancel := io.redirect
     if parameter.iCacheBytes != 0 then fetch.io.invalidate.get := io.invalidate.get
@@ -431,12 +455,31 @@ object DitDahA1Frontend extends Generator[DitDahA1Parameter, DitDahA1UnitLayers,
     for i <- 0 until words do
       incoming(i).pc := (fetched.pc + (4 * i).U(64)).asBits.bits(63, 0).asUInt
       incoming(i).tag := (fetched.tag + i.U(8)).asBits.bits(7, 0).asUInt
+      incoming(i).predictedTaken := false.B
       incoming(i).instruction := (if i == 0 then fetched.instruction else fetched.following.get(i - 1))
       incoming(i).length := 4.U(3)
       incoming(i).fault := (if i == 0 then fetched.fault else false.B)
       incoming(i).cause := (if i == 0 then fetched.cause else 0.U(64))
       incoming(i).tval := (if i == 0 then fetched.tval else 0.U(64))
-    val returnedCount = returned.?(fetched.count.getOrElse(1.U(1)), 0.U(parameter.fetchCountBits))
+    val returnedCount = Wire(UInt(parameter.fetchCountBits))
+    returnedCount := returned.?(fetched.count.getOrElse(1.U(1)), 0.U(parameter.fetchCountBits))
+    val predicted = Wire(Bool())
+    predicted := false.B
+    if parameter.enableBranchPrediction then
+      for i <- (0 until words).reverse do
+        val insn = incoming(i).instruction.asBits
+        val jump = insn.bits(6, 0) === 0x6f.B(7)
+        val branch = (insn.bits(6, 0) === 0x63.B(7)) &
+          ((insn.bits(14, 12) === 0.B(3)) | (insn.bits(14, 12) === 1.B(3)) | insn.bit(14))
+        val taken = jump | (branch & insn.bit(31))
+        val branchOffset = (insn.bit(31).?(((BigInt(1) << 51) - 1).B(51), 0.B(51)) ## insn.bits(31, 31) ## insn.bits(7, 7) ## insn.bits(30, 25) ## insn.bits(11, 8) ## 0.B(1)).asUInt
+        val jumpOffset = (insn.bit(31).?(((BigInt(1) << 43) - 1).B(43), 0.B(43)) ## insn.bits(31, 31) ## insn.bits(19, 12) ## insn.bits(20, 20) ## insn.bits(30, 21) ## 0.B(1)).asUInt
+        incoming(i).predictedTaken := taken & !fetched.fault
+        when(returned & !fetched.fault & (i.U < fetched.count.getOrElse(1.U(1))) & taken) {
+          predicted := true.B
+          returnedCount := (i + 1).U(parameter.fetchCountBits)
+          requestPc := (incoming(i).pc + jump.?(jumpOffset, branchOffset)).asBits.bits(63, 0).asUInt
+        }
     val available = (queued + returnedCount).asBits.bits(countBits - 1, 0).asUInt
     val view = Wire(Vec(capacity + words, new FetchPacket))
     for i <- 0 until capacity + words do
@@ -451,7 +494,7 @@ object DitDahA1Frontend extends Generator[DitDahA1Parameter, DitDahA1UnitLayers,
     for i <- 0 until width do io.output.bits.packets(i) :<= view(i)
     fetch.io.output.ready := !flush
     val expected = if words == 1 then 1.U(parameter.fetchCountBits) else
-      (words.U(parameter.fetchCountBits) - pc.asBits.bits(Integer.numberOfTrailingZeros(words) + 1, 2).asUInt)
+      (words.U(parameter.fetchCountBits) - requestPc.asBits.bits(Integer.numberOfTrailingZeros(words) + 1, 2).asUInt)
         .asBits.bits(parameter.fetchCountBits - 1, 0).asUInt
     val owned = remaining + (pending & !returned).?(reserved, 0.U(parameter.fetchCountBits))
     val queuedFault = (0 until capacity).map(i => (i.U(countBits) < queued) & buffer(i).fault).reduce(_ | _)
@@ -470,12 +513,13 @@ object DitDahA1Frontend extends Generator[DitDahA1Parameter, DitDahA1UnitLayers,
     when(returned) {
       pending := false.B
       when(returnedCount < reserved) { pc := (fetched.pc + (returnedCount << 2)).asBits.bits(63, 0).asUInt }
+      when(predicted) { pc := requestPc }
     }
     when(fetch.io.request.valid & fetch.io.request.ready) {
       pending := true.B
-      pendingPc := pc
+      pendingPc := requestPc
       reserved := expected
-      pc := (pc + (expected << 2)).asBits.bits(63, 0).asUInt
+      pc := (requestPc + (expected << 2)).asBits.bits(63, 0).asUInt
       tag := (tag + expected).asBits.bits(7, 0).asUInt
     }
     when(flush) {

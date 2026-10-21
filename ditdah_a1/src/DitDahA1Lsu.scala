@@ -25,12 +25,14 @@ object DitDahA1Lsu extends Generator[DitDahA1Parameter, DitDahA1UnitLayers, DitD
     val io = summon[Interface[DitDahA1LsuIO]]
     given ClockScope = ClockScope.posedge(io.clock)
     given ResetScope = ResetScope.syncActiveHigh(io.reset)
-    val stateBits = if parameter.enableTranslation then 3 else 2
+    val checkRefill = parameter.dCacheBytes != 0 && parameter.pmpEntries != 0
+    val stateBits = if parameter.enableTranslation || checkRefill then 3 else 2
     val state = RegInit(0.U(stateBits))
     val packet = Reg(new ResultPacket)
-    val privileged = Option.when(parameter.enableUserMode && !parameter.enableTranslation)(Reg(Bool()))
-    val privilege = Option.when(parameter.enableTranslation)(Reg(UInt(2)))
+    val privileged = Option.when(parameter.enableUserMode && !parameter.enableTranslation && !checkRefill)(Reg(Bool()))
+    val privilege = Option.when(parameter.enableTranslation || checkRefill)(Reg(UInt(2)))
     val physicalAddress = Option.when(parameter.enableTranslation)(Reg(UInt(64)))
+    val refillAllowed = Option.when(parameter.dCacheBytes != 0)(RegInit(false.B))
     val reserved = RegInit(false.B)
     val reservedWord = Reg(UInt(parameter.physicalAddressBits - 3))
     val scEligible = Reg(Bool())
@@ -39,15 +41,26 @@ object DitDahA1Lsu extends Generator[DitDahA1Parameter, DitDahA1UnitLayers, DitD
     val operation = packet.instruction.instruction.asBits.bits(31, 27).asUInt
     val request = io.memory.request
     val response = io.memory.response
+    val refilling = if checkRefill then state === 6.U(stateBits) else false.B
+    val demandAddress = io.translation.map(_.response.bits.address).getOrElse(io.input.bits.address)
+    val demandSize = if parameter.enableTranslation then packet.memorySize else io.input.bits.memorySize
+    val demandStore = if parameter.enableTranslation then packet.store else io.input.bits.store
+    val demandLoad = if parameter.enableTranslation then packet.load else io.input.bits.load
+    val demandAtomic = if parameter.enableTranslation then packet.atomic else io.input.bits.atomic
+    val refillCandidate = if parameter.dCacheBytes != 0 then
+      demandLoad & !demandStore & !demandAtomic & (demandSize < 3.U(3)) &
+        DitDahA1Memory.dataCacheable(parameter, (demandAddress.asBits.bits(63, 3) ## 0.B(3)).asUInt, 8)
+    else false.B
     val permitted = if parameter.pmpEntries == 0 then true.B else
       val pmp = DitDahA1Pmp.instantiate(parameter)
       pmp.io.state :<= io.pmp.get
-      pmp.io.address := io.translation.map(_.response.bits.address).getOrElse(io.input.bits.address)
-      pmp.io.size := (if parameter.enableTranslation then packet.memorySize else io.input.bits.memorySize)
-      pmp.io.write := (if parameter.enableTranslation then packet.store else io.input.bits.store)
+      pmp.io.address := refilling.?((physicalAddress.getOrElse(packet.address).asBits.bits(63, 3) ## 0.B(3)).asUInt, demandAddress)
+      pmp.io.size := refilling.?(3.U(3), demandSize)
+      pmp.io.write := !refilling & demandStore
       pmp.io.fetch := false.B
-      pmp.io.atomic := (if parameter.enableTranslation then packet.load & packet.store else io.input.bits.load & io.input.bits.store)
-      pmp.io.privilege := privilege.getOrElse(io.privilege)
+      pmp.io.atomic := !refilling & demandLoad & demandStore
+      pmp.io.privilege := (if parameter.enableTranslation then privilege.get
+        else if checkRefill then refilling.?(privilege.get, io.privilege) else io.privilege)
       pmp.io.allowed
     io.input.ready := (state === 0.U(stateBits)) & (io.input.bits.instruction.fault | !io.input.bits.store | io.storeAllowed)
     io.output.valid := state === 3.U(stateBits)
@@ -66,6 +79,7 @@ object DitDahA1Lsu extends Generator[DitDahA1Parameter, DitDahA1UnitLayers, DitD
     request.bits.atomic := packet.atomic
     request.bits.atomicOperation := packet.atomic.?(operation, 0.U(5))
     request.bits.scEligible := scEligible
+    request.bits.refillAllowed := refillAllowed.getOrElse(false.B)
     response.ready := state === 2.U(stateBits)
     io.translation.foreach { t =>
       t.request.valid := state === 4.U(stateBits)
@@ -81,7 +95,8 @@ object DitDahA1Lsu extends Generator[DitDahA1Parameter, DitDahA1UnitLayers, DitD
         packet.instruction.fault := t.response.bits.fault
         packet.instruction.cause := t.response.bits.fault.?(t.response.bits.cause, 0.U(64))
         packet.instruction.tval := t.response.bits.fault.?(packet.address, 0.U(64))
-        state := 1.U(stateBits)
+        state := (if checkRefill then refillCandidate.?(6.U(stateBits), 1.U(stateBits)) else 1.U(stateBits))
+        if !checkRefill then refillAllowed.foreach(_ := refillCandidate)
         when(!t.response.bits.fault & !permitted) {
           packet.instruction.fault := true.B
           packet.instruction.cause := packet.store.?(7.U(64), 5.U(64))
@@ -95,10 +110,12 @@ object DitDahA1Lsu extends Generator[DitDahA1Parameter, DitDahA1UnitLayers, DitD
       privileged.foreach(_ := (io.privilege =/= 0.U(2)))
       privilege.foreach(_ := io.privilege)
       packet :<= io.input.bits
+      refillAllowed.foreach(_ := (if !parameter.enableTranslation && !checkRefill then refillCandidate else false.B))
       scEligible := io.input.bits.atomic & (inputOperation === 3.U(5)) & reserved &
         (if parameter.enableTranslation then true.B else io.input.bits.address === reservedAddress) & (io.input.bits.memorySize === 3.U(3))
       when(io.input.bits.atomic) { reserved := false.B }
-      state := (if parameter.enableTranslation then 4 else 1).U(stateBits)
+      state := (if parameter.enableTranslation then 4.U(stateBits)
+        else if checkRefill then refillCandidate.?(6.U(stateBits), 1.U(stateBits)) else 1.U(stateBits))
       if parameter.pmpEntries != 0 && !parameter.enableTranslation then
         when(!io.input.bits.instruction.fault & !permitted) {
           packet.instruction.fault := true.B
@@ -118,6 +135,8 @@ object DitDahA1Lsu extends Generator[DitDahA1Parameter, DitDahA1UnitLayers, DitD
       }
       when(io.input.bits.instruction.fault) { state := 3.U(stateBits) }
     }
+    if checkRefill then
+      when(refilling) { refillAllowed.get := permitted; state := 1.U(stateBits) }
     when(request.valid & request.ready) { state := 2.U(stateBits) }
     when(response.valid & response.ready) {
       when(packet.load | packet.atomic) {

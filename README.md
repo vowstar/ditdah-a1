@@ -14,16 +14,16 @@ DitDah-A1 targets a 64-bit RISC-V application processor with scalar execution.
 | Integration | Burst-capable AXI4 and JTAG debug |
 
 The executable RTL supports one to sixteen RV64 harts, M or optional M/U and M/S/U modes, shared AXI4 and precise synchronous exceptions.
-`issueWidth` selects one to three lanes in a fixed eight-stage pipeline; pure integer ALU operations issue as an ordered prefix and other operations execute alone.
+`issueWidth` selects one to three lanes in a fixed eight-stage pipeline; independent integer ALUs may follow one ordinary load/store, while other resources execute alone.
 PMP is configurable to zero or sixteen entries per hart; the default uncached configuration omits it.
 MUL uses an iterative resource; accepted operations retain their instruction owner through completion or cancellation draining.
-Branches resolve in EX; a nonsequential next PC redirects at WB and discards younger work.
+Branches recover in EX while retaining older work; `enableBranchPrediction` enables static backward-branch and direct-jump prediction.
 The manifest lists implemented instructions; Sv48, writeback caches and shared L2 remain design targets.
 Core composes Frontend and Backend; Frontend owns PC sequencing and Backend owns execution and retirement.
 Non-fault Backend packets contain four-byte instructions and word-aligned PCs; producers supply fetch faults.
 Core exposes separate instruction/data memory ports; the physical fabric owns shared arbitration and AXI.
 Instruction permissions apply before cache lookup and to the complete refill request; region checks also protect external accesses.
-Harts share one outstanding physical transaction with round-robin arbitration and retained response ownership.
+The multicore fabric permits two ordinary reads from distinct harts; writes, atomics, devices and bursts wait for all accepted reads and execute exclusively.
 AXI data width is configurable to 64/128/256/512 bits; scalar requests remain at most eight bytes.
 AMOADD.D, AMOOR.D and AMOSWAP.D use AXI exclusive retry and return the old value.
 LR.D/SC.D use per-hart reservations; ordered data completion covers all aq/rl combinations.
@@ -57,13 +57,13 @@ Set `iCacheBytes` to zero for bypass or a power of two from 8 to 64 KiB for a bl
 Instruction refills use individually authorized four-byte requests; non-demand refill faults fall back to the original demand.
 Set `enableBurstRefill` with an instruction cache for protected 64-byte INCR refills; denial or line errors retry the original scalar demand without installing a line.
 Set `dCacheBytes` to 8192 for private read caches on `dataCacheable` non-device regions; zero bypasses them.
-Authorized aligned eight-byte ordinary reads fill individual sectors; other accesses bypass, and CPU writes invalidate all private copies before forwarding.
+Ordinary loads use eight-byte sectors; narrow refills require full-word permission and retry the original demand on failure. CPU writes invalidate private copies before forwarding.
 External writers require platform coordination; no DMA coherence is implemented.
 Set `pmpEntries` to 16 to enable protection; successful PMP writes restart younger execution while accepted fetches drain.
 Set `enableUserMode` for Bare M/U execution and effective data privilege via MPRV.
 Set `enableSupervisorMode` with user mode and interrupts for M/S/U, standard trap delegation and SRET.
 Set `virtualAddressBits` to 39 for Sv39/Svade with 4 KiB/2 MiB/1 GiB pages and ASIDLEN=0; zero selects Bare. PTE reads share the data path under S-mode PMP/PMA.
-Set `tlbEntries` to 0/2/4 for uncached/two/four-entry per-hart I/D translation; local SFENCE.VMA, satp and PMP maintenance invalidate entries and exclude stale refills while canceled reads drain.
+Set `tlbEntries` to 0/2/4 for a shared per-hart TLB with independent I/D hit service and one walker; SFENCE.VMA, satp and PMP maintenance exclude stale refills while accepted reads drain.
 Set `enableInterrupts` for precise entry and return from synchronous machine software/timer/external interrupt levels; platform logic owns the sources.
 System interrupt inputs are indexed by hart; each hart has independent CSR and PMP state.
 An optional `localInterruptBase` maps protected software-interrupt and 64-bit timer registers; `timeTick` supplies the synchronous timebase.
@@ -82,7 +82,7 @@ Translation checks cover page permissions, faults, context changes, protected im
 Burst checks cover all bus widths, retained ownership through last, beat data, full-line protection, invalidation and paired 1/2/16-hart software.
 Platform checks execute shared work, software interrupts and timer interrupts on 1/2/3/16 harts.
 ELF checks build freestanding software with `RISCV_PREFIX` (default `riscv64-unknown-elf-`) and validate actual console writes and per-hart results.
-`make verify-software` runs short ELF consumers; `make verify-zephyr-long SOFTWARE_JOBS=3` runs 1/2/16 harts with the pinned `ZEPHYR_BASE` checkout.
+`make verify-width-software` checks identical loaded software across 1/2/3 issue for each of 1/2/16 harts; `make verify-zephyr-long SOFTWARE_JOBS=3` uses the pinned `ZEPHYR_BASE` checkout.
 Reachability and mutation checks exercise the properties; general multiply results are checked by simulation.
 This checks the implemented instruction subset, not full ISA compliance or physical signoff.
 Use `make verify-signoff VERIFY_ARGS=--use-generated` to reuse RTL whose recorded sources and configuration still match.

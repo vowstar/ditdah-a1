@@ -54,6 +54,7 @@ object DitDahA1MemoryFabric extends Generator[DitDahA1Parameter, DitDahA1UnitLay
     val arbiter = DitDahA1MemoryArbiter.instantiate(parameter)
     val memory = DitDahA1Memory.instantiate(parameter)
     val axi = DitDahA1Axi.instantiate(parameter)
+    val readers = Option.when(parameter.hartCount > 1)(DitDahA1ReadQueue.instantiate(parameter))
     arbiter.io.clock := io.clock
     arbiter.io.reset := io.reset
     memory.io.clock := io.clock
@@ -61,9 +62,51 @@ object DitDahA1MemoryFabric extends Generator[DitDahA1Parameter, DitDahA1UnitLay
     axi.io.clock := io.clock
     axi.io.reset := io.reset
     axi.io.hartId := arbiter.io.hartId
-    for hart <- 0 until parameter.hartCount do
-      arbiter.io.ports(2 * hart) :<>= io.instruction(hart)
-      arbiter.io.ports(2 * hart + 1) :<>= io.data(hart)
+    val exclusive = readers.map { queue =>
+      given ClockScope = ClockScope.posedge(io.clock)
+      given ResetScope = ResetScope.syncActiveHigh(io.reset)
+      val active = RegInit(false.B)
+      val preferRead = RegInit(true.B)
+      queue.io.clock := io.clock
+      queue.io.reset := io.reset
+      val ports = (0 until 2 * parameter.hartCount).map(i => if i % 2 == 0 then io.instruction(i / 2) else io.data(i / 2))
+      val ordinary = ports.map { port =>
+        val request = port.request.bits
+        val device = parameter.memoryRegions.filter(_.device).foldLeft[Referable[Bool]](false.B) { (selected, region) =>
+          selected | ((request.address >= region.base.U(64)) & (request.address < (region.base + region.size).U(64)))
+        }
+        !request.write & !request.atomic & (request.size <= 3.U(3)) & !device
+      }
+      val readWaiting = ports.indices.map(i => ports(i).request.valid & ordinary(i)).reduce(_ | _)
+      val exclusiveWaiting = ports.indices.map(i => ports(i).request.valid & !ordinary(i)).reduce(_ | _)
+      val allowRead = !active & (!exclusiveWaiting | preferRead)
+      val allowExclusive = queue.io.empty & !(preferRead & readWaiting)
+      for i <- ports.indices do
+        val port = ports(i)
+        val read = queue.io.ports(i)
+        val single = arbiter.io.ports(i)
+        read.request.bits :<= port.request.bits
+        single.request.bits :<= port.request.bits
+        read.request.valid := port.request.valid & ordinary(i) & allowRead
+        single.request.valid := port.request.valid & !ordinary(i) & allowExclusive
+        port.request.ready := ordinary(i).?(read.request.ready & allowRead, single.request.ready & allowExclusive)
+        port.response.valid := read.response.valid | single.response.valid
+        port.response.bits :<= single.response.bits
+        when(read.response.valid) { port.response.bits :<= read.response.bits }
+        read.response.ready := port.response.ready
+        single.response.ready := port.response.ready
+        when(read.request.valid & read.request.ready) { preferRead := false.B }
+        when(single.request.valid & single.request.ready) { active := true.B }
+        when(single.response.valid & single.response.ready & single.response.bits.last) {
+          active := false.B
+          preferRead := true.B
+        }
+      active
+    }.getOrElse(true.B)
+    if readers.isEmpty then
+      for hart <- 0 until parameter.hartCount do
+        arbiter.io.ports(2 * hart) :<>= io.instruction(hart)
+        arbiter.io.ports(2 * hart + 1) :<>= io.data(hart)
     memory.io.upstream :<>= arbiter.io.downstream
     val physical = if parameter.dCacheBytes == 0 then memory.io.downstream else
       val coherence = DitDahA1Coherence.instantiate(parameter)
@@ -97,3 +140,13 @@ object DitDahA1MemoryFabric extends Generator[DitDahA1Parameter, DitDahA1UnitLay
       axi.io.memory.response.ready := port.response.ready & !responseLocal
       localInterrupts.io.memory.response.ready := port.response.ready & responseLocal
     io.axi :<>= axi.io.axi
+    readers.foreach { queue =>
+      io.axi.ar.valid := exclusive.?(axi.io.axi.ar.valid, queue.io.ar.valid)
+      when(!exclusive) { io.axi.ar.bits :<= queue.io.ar.bits }
+      axi.io.axi.ar.ready := io.axi.ar.ready & exclusive
+      queue.io.ar.ready := io.axi.ar.ready & !exclusive
+      queue.io.r.bits :<= io.axi.r.bits
+      queue.io.r.valid := io.axi.r.valid & !exclusive
+      axi.io.axi.r.valid := io.axi.r.valid & exclusive
+      io.axi.r.ready := exclusive.?(axi.io.axi.r.ready, queue.io.r.ready)
+    }
