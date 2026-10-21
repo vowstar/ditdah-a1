@@ -3,6 +3,7 @@
 
 .PHONY: config check rtl software verify-software verify-data-software verify-supervisor-software zephyr verify-zephyr verify-zephyr-long verify-signoff verify-simulation verify-production verify-cache verify-platform verify-user verify-data-cache verify-supervisor verify-formal verify-scalar-formal verify-user-formal verify-data-formal verify-supervisor-formal verify-translation verify-translation-formal verify-translation-software verify-translation-cache verify-translation-cache-formal verify-translation-cache-software clean
 .PHONY: verify-burst verify-burst-formal verify-burst-software verify-widths verify-width-software
+.PHONY: verify-data-line verify-data-line-software
 
 HART_COUNTS ?= 2 3 15 16
 ICACHE_CASES := pipeline_reuse pipeline_integer_stream pipeline_dependency_stream pipeline_dependency_chain cache_replacement fence_ordering fence_i_prefetch synchronization atomic_ordering atomic_denied atomic_retry bus_fetch pipeline_redirect pmp_fetch pmp_update interrupt_fence interrupt_fence_i interrupt_fetch_fault
@@ -67,6 +68,33 @@ verify-zephyr-long:
 
 verify-signoff: verify-formal
 	$(MAKE) verify-widths
+	$(MAKE) verify-data-line
+
+verify-data-line:
+	for span in 8 64; do \
+		python3 test/verify.py --interrupts --width 64 --pmp-entries 0 --dcache-bytes 8192 --dcache-refill-bytes $$span --output result/data-line-work-$$span --case data_cache_cold --case data_cache_warm --case data_cache_sparse || exit $$?; \
+	done
+	python3 test/verify.py --user-mode --interrupts --width 512 --pmp-entries 16 --dcache-bytes 8192 --dcache-refill-bytes 64 --output result/data-line-protected --case data_cache_word_boundary --case data_cache_boundary --case data_cache_narrow --case data_cache_retry --case pmp_update --case user_mprv --case interrupt_read_pending
+	python3 test/verify.py --width 128 --width 256 --width 512 --pmp-entries 0 --dcache-bytes 8192 --dcache-refill-bytes 64 --output result/data-line-wide --case data_cache_cold --case data_cache_narrow --case data_cache_retry
+	for profile in 0:64:1 2:128:2 4:512:3; do \
+		entries=$${profile%%:*}; rest=$${profile#*:}; bus=$${rest%%:*}; width=$${rest#*:}; \
+		python3 test/verify.py --sv39 --tlb-entries $$entries --width $$bus --pmp-entries 16 --issue-width $$width --icache-bytes 8192 --burst-refill --dcache-bytes 8192 --dcache-refill-bytes 64 --output result/data-line-translation-$$entries --case sv39_reuse --case sv39_protection --case sv39_sum --case sv39_mxr --case sv39_context || exit $$?; \
+	done
+	for profile in 2:512:2 16:512:3; do \
+		count=$${profile%%:*}; rest=$${profile#*:}; bus=$${rest%%:*}; width=$${rest#*:}; \
+		python3 test/verify.py --multicore-only --harts $$count --width $$bus --pmp-entries 16 --issue-width $$width --icache-bytes 8192 --burst-refill --dcache-bytes 8192 --dcache-refill-bytes 64 --output result/data-line-harts$$count --case data_coherence --case synchronization --case atomic_lrsc_shared --case atomic_lrsc_private --case atomic_interrupt || exit $$?; \
+	done
+	python3 test/formal.py --rtl result/data-line-work-64/irq-axi64/rtl --output result/formal/data-line --modules DataCache Memory Axi
+	python3 test/formal.py --rtl result/data-line-protected/irq-pmp16-axi512/rtl --output result/formal/data-line-protected --modules Pmp Lsu DataCache Memory Axi
+	python3 test/formal.py --rtl result/data-line-translation-4/irq-pmp16-axi512/rtl --output result/formal/data-line-translation --modules Translation Lsu Coherence WfiFrontend
+	python3 test/formal.py --rtl result/data-line-harts2/harts2-axi512/rtl --output result/formal/data-line-fabric --modules MemoryFabric
+	build-ditdah-a1 --no-trace --config result/data-line-protected/irq-pmp16-axi512/input.json --output result/production-data-line
+	build-ditdah-a1 --no-trace --config result/data-line-harts16/harts16-axi512/input.json --output result/production-data-line-burst
+	python3 test/check_production.py --dcache-refill-bytes 64
+	$(MAKE) verify-data-line-software
+
+verify-data-line-software:
+	python3 test/verify.py --software-refill-matrix --config $(SOFTWARE_CONFIG) --icache-bytes 8192 --burst-refill --dcache-bytes 8192 --issue-width 3 --output $(SOFTWARE_OUTPUT)/data-line --jobs $(SOFTWARE_JOBS)
 
 verify-widths:
 	for width in 1 2 3; do \

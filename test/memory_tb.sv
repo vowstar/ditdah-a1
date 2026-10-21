@@ -7,7 +7,8 @@ typedef struct packed {
   logic [7:0] mask, tag;
   logic write, fetch, privileged, atomic;
   logic [4:0] atomicOperation;
-  logic scEligible, refillAllowed;
+  logic scEligible;
+  logic [2:0] refillSize;
 } request_t;
 typedef struct packed { logic [63:0] data; logic fault; logic [7:0] tag; logic last; } response_t;
 interface memory_port;
@@ -23,7 +24,7 @@ endinterface
   .P``_request_bits_fetch(B.request.fetch), .P``_request_bits_atomic(B.request.atomic), \
   .P``_request_bits_privileged(B.request.privileged), \
   .P``_request_bits_atomicOperation(B.request.atomicOperation), .P``_request_bits_scEligible(B.request.scEligible), \
-  .P``_request_bits_refillAllowed(B.request.refillAllowed), .P``_response_ready(B.response_ready), \
+  .P``_request_bits_refillSize(B.request.refillSize), .P``_response_ready(B.response_ready), \
   .P``_response_valid(B.response_valid), .P``_response_bits_data(B.response.data), \
   .P``_response_bits_fault(B.response.fault), .P``_response_bits_tag(B.response.tag), .P``_response_bits_last(B.response.last)
 `define CORE_TRACE traces[0][0]

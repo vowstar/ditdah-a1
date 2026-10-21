@@ -56,12 +56,14 @@ object DitDahA1Axi extends Generator[DitDahA1Parameter, DitDahA1UnitLayers, DitD
     val fault = RegInit(false.B)
     val awDone = RegInit(false.B)
     val wDone = RegInit(false.B)
-    val line = if parameter.enableBurstRefill then request.fetch & !request.write & !request.atomic & (request.size === 6.U(3)) else false.B
-    val beat = Option.when(parameter.enableBurstRefill)(RegInit(0.U(3)))
-    val terminal = Option.when(parameter.enableBurstRefill)(Reg(Bool()))
+    val lineClient = (if parameter.enableBurstRefill then request.fetch else false.B) |
+      (if parameter.enableDataBurstRefill then !request.fetch else false.B)
+    val line = lineClient & !request.write & !request.atomic & (request.size === 6.U(3))
+    val beat = Option.when(parameter.enableLineRefill)(RegInit(0.U(3)))
+    val terminal = Option.when(parameter.enableLineRefill)(Reg(Bool()))
     val slices = parameter.axiDataBits / 64
     val sliceBits = math.max(1, Integer.numberOfTrailingZeros(slices))
-    val slice = Option.when(parameter.enableBurstRefill && slices > 1)(RegInit(0.U(sliceBits)))
+    val slice = Option.when(parameter.enableLineRefill && slices > 1)(RegInit(0.U(sliceBits)))
     val block = Option.when(slice.isDefined)(Reg(UInt(parameter.axiDataBits)))
     val finalSlice = slice.map(_ === (slices - 1).U(sliceBits)).getOrElse(true.B)
     val aw = io.axi.aw
@@ -70,7 +72,7 @@ object DitDahA1Axi extends Generator[DitDahA1Parameter, DitDahA1UnitLayers, DitD
     val ar = io.axi.ar
     val r = io.axi.r
     io.memory.request.ready := state === 0.U(3)
-    io.memory.response.valid := (state === 4.U(3)) | (if parameter.enableBurstRefill then state === 5.U(3) else false.B)
+    io.memory.response.valid := (state === 4.U(3)) | (if parameter.enableLineRefill then state === 5.U(3) else false.B)
     io.memory.response.bits.data := data
     block.foreach { value =>
       when(state === 5.U(3)) { io.memory.response.bits.data := (value >> (slice.get.asBits ## 0.B(6)).asUInt).asBits.bits(63, 0).asUInt }
@@ -79,7 +81,7 @@ object DitDahA1Axi extends Generator[DitDahA1Parameter, DitDahA1UnitLayers, DitD
     io.memory.response.bits.tag := request.tag
     io.memory.response.bits.last := terminal.map(last => (state =/= 5.U(3)) | (last & finalSlice)).getOrElse(true.B)
     for channel <- Seq(aw, ar) do address(parameter, channel.bits, request, hartId)
-    if parameter.enableBurstRefill then
+    if parameter.enableLineRefill then
       when(line) {
         ar.bits.len := (512 / parameter.axiDataBits - 1).U(8)
         ar.bits.size := Integer.numberOfTrailingZeros(parameter.axiDataBits / 8).U(3)
@@ -98,7 +100,7 @@ object DitDahA1Axi extends Generator[DitDahA1Parameter, DitDahA1UnitLayers, DitD
     w.bits.data := (writeData << byteShift).asBits.bits(parameter.axiDataBits - 1, 0).asUInt
     w.bits.strb := (request.mask << lane).asBits.bits(parameter.axiDataBits / 8 - 1, 0).asUInt
     val readValue = readData(request.size, r.bits.data, byteShift)
-    r.ready := (state === 2.U(3)) | (if parameter.enableBurstRefill then state === 6.U(3) else false.B)
+    r.ready := (state === 2.U(3)) | (if parameter.enableLineRefill then state === 6.U(3) else false.B)
     b.ready := state === 3.U(3)
     when(io.memory.request.valid & io.memory.request.ready) {
       request :<= io.memory.request.bits
@@ -125,7 +127,7 @@ object DitDahA1Axi extends Generator[DitDahA1Parameter, DitDahA1UnitLayers, DitD
         when(amo & !readFault) { request.write := true.B; state := 1.U(3) }
           .otherwise { state := 4.U(3) }
       }
-      if parameter.enableBurstRefill then
+      if parameter.enableLineRefill then
         when(line & (state === 2.U(3))) {
           block.foreach(_ := r.bits.data)
           slice.foreach(_ := 0.U(sliceBits))
@@ -158,7 +160,7 @@ object DitDahA1Axi extends Generator[DitDahA1Parameter, DitDahA1UnitLayers, DitD
     }
     when(io.memory.response.valid & io.memory.response.ready) {
       state := 0.U(3)
-      if parameter.enableBurstRefill then
+      if parameter.enableLineRefill then
         when(state === 5.U(3)) {
           slice.foreach(value => value := (value + 1.U(sliceBits)).asBits.bits(sliceBits - 1, 0).asUInt)
           state := 5.U(3)

@@ -935,10 +935,30 @@ def data_cache_program(base):
 
 
 def data_cache_access_cases(base, protection):
+    for name, repeats, stride in (('cold', 1, 8), ('warm', 4, 8), ('sparse', 1, 64)):
+        p = Program(base)
+        p.address(10, 0x1000)
+        for index in range(8):
+            p.memory[base + 0x1000 + index * stride] = index + 1
+        if name == 'warm':
+            p.emit(*(ld(2, 10, index * stride) for index in range(8)))
+        p.emit(addi(3, 0, 0))
+        begin = base + p.offset
+        p.emit(fence())
+        for _ in range(repeats):
+            for index in range(8):
+                p.emit(ld(2, 10, index * stride), add(3, 3, 2))
+        end = base + p.offset
+        p.emit(fence())
+        p.data_cache = dict(minHits=0, expectedRegisters={'3': 36 * repeats},
+            work=dict(begin=begin, end=end, reads={8: 0 if name == 'warm' else 8,
+                                                64: 0 if name == 'warm' else 1 if name == 'cold' else 8}))
+        yield 'data_cache_' + name, p.finish()
+
     p = Program(base)
     initial = 0x8877665544332211
     for size in range(3):
-        offset = 0x1000 + 8 * size
+        offset = 0x1000 + 64 * size
         p.memory.update((base + offset + byte, (initial >> (8 * byte)) & 255) for byte in range(8))
         p.address(10, offset)
         p.emit(load(2, 10, 8 - (1 << size), size))
@@ -964,11 +984,20 @@ def data_cache_access_cases(base, protection):
     if protection:
         p = Program(base)
         p.address(10, 0x1000)
-        p.address(11, 0x1800)
-        p.memory[base + 0x1004] = 0x5a
-        p.memory[base + 0x1800], p.memory[base + 0x1801] = 0x90, 0x91
+        p.memory[base + 0x1039] = 0x5a
         p.emit(alu(2, 10, 2, 5, immediate=True), csr(0, 0x3b0, 2),
-               addi(2, 2, 1), csr(0, 0x3b1, 2), ld(2, 11), csr(0, 0x3a0, 2),
+               addi(2, 0, 0x90), csr(0, 0x3a0, 2),
+               load(3, 10, 57, 0), ld(4, 10, 56), load(5, 10, 57, 0))
+        p.data_cache = dict(minHits=2, maxLineReads=0, minExpandedReads=1,
+                            expectedRegisters={'3': 0x5a, '4': 0x5a00, '5': 0x5a})
+        yield 'data_cache_word_boundary', p.finish()
+
+        p = Program(base)
+        p.address(10, 0x1000)
+        p.memory[base + 0x1004] = 0x5a
+        p.emit(alu(2, 10, 2, 5, immediate=True), csr(0, 0x3b0, 2),
+               addi(2, 2, 1), csr(0, 0x3b1, 2), (9 << 12) | (2 << 7) | 0x37,
+               addi(2, 2, 0x190), csr(0, 0x3a0, 2),
                lw(3, 10, 4), lw(4, 10, 4), lw(5, 10))
         p.data_cache = dict(minHits=0, maxExpandedReads=0, expectedRegisters={'3': 0x5a, '4': 0x5a})
         yield 'data_cache_boundary', p.finish()

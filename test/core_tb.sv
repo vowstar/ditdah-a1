@@ -30,7 +30,8 @@ module core_tb;
     logic [7:0] mask, tag;
     logic write, fetch, privileged, atomic;
     logic [4:0] atomicOperation;
-    logic scEligible, refillAllowed;
+    logic scEligible;
+    logic [2:0] refillSize;
   } core_request_t;
   typedef struct packed { logic [63:0] data; logic fault; logic [7:0] tag; logic last; } core_response_t;
   core_request_t requests[2*HARTS];
@@ -251,7 +252,7 @@ module core_tb;
         if (!console_address(64'(araddr)) && (64'(araddr) < base_address || 64'(araddr) + (1 << arsize) * (1 + integer'(arlen)) > base_address + MB)) $fatal(1, "Truncated or unexpected read address");
         if (arid >= HARTS || active_source[arid] < 0 || arlen != (accepted_request[arid].size == 6 ? 64 / (DW/8) - 1 : 0) || arburst != 1 || (arlock && arprot[2]) || arcache != 0 || arqos != 0) $fatal(1, "Read attributes");
         if (arprot != {accepted_request[arid].fetch, 1'b0, accepted_request[arid].privileged}) $fatal(1, "Read privilege");
-        if ((arprot[2] ? arsize != (accepted_request[arid].size == 6 ? $clog2(DW/8) : 2) : arsize > 3) ||
+        if ((accepted_request[arid].size == 6 ? arsize != $clog2(DW/8) : arprot[2] ? arsize != 2 : arsize > 3) ||
             (arlock && arsize != 3) || (araddr & ((1 << arsize) - 1)) != 0) $fatal(1, "Read alignment");
         if (HARTS > 1) $write("HART %0d ", arid);
         $display("BUS %s %016h %0d %016h", arlock ? "exclusive_read" : (arprot[2] ? "fetch" : "read"), 64'(araddr), accepted_request[arid].size == 6 ? 64 : 1 << arsize, 64'b0);

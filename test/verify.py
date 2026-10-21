@@ -82,6 +82,9 @@ def compile_tb(rtl, directory, width, pa, top='core_tb', source=None, extra_file
     retirement.append(f'''
   bit pipeline_events;
   initial pipeline_events = $test$plusargs("PIPELINE_EVENTS");
+  bit work_metrics;
+  logic [63:0] work_begin_pc, work_end_pc;
+  initial work_metrics = $value$plusargs("WORK_BEGIN=%h", work_begin_pc) && $value$plusargs("WORK_END=%h", work_end_pc);
   longint unsigned metric_cycles = 0;
   longint unsigned metric_stalls[{harts}], metric_occupancy[{harts}], metric_peak[{harts}];
   longint unsigned metric_issue[{harts}][ISSUE_WIDTH + 1], metric_retire[{harts}][ISSUE_WIDTH + 1];
@@ -95,6 +98,8 @@ def compile_tb(rtl, directory, width, pa, top='core_tb', source=None, extra_file
     integer retired;
     metric_cycles++;
     for (integer h = 0; h < {harts}; h++) begin
+      if (work_metrics && retired_pc(h, work_begin_pc)) $display("WORK_CYCLE %0d 0 %0d", h, metric_cycles);
+      if (work_metrics && retired_pc(h, work_end_pc)) $display("WORK_CYCLE %0d 1 %0d", h, metric_cycles);
       metric_issue[h][issue_count[h]]++;
       retired = 0;
       for (integer lane = 0; lane < ISSUE_WIDTH; lane++)
@@ -194,9 +199,11 @@ def compile_tb(rtl, directory, width, pa, top='core_tb', source=None, extra_file
         {core}_request_bits_atomic ? "atomic" : ({core}_request_bits_write ? "write" : "read"),
         {core}_request_bits_address, 1 << {core}_request_bits_size,
         {core}_request_bits_write ? {core}_request_bits_data & access_mask({core}_request_bits_size) : 64'b0,
-        {core}_request_bits_tag, {core}_request_bits_privileged, {core}_request_bits_refillAllowed);
+        {core}_request_bits_tag, {core}_request_bits_privileged, {core}_request_bits_refillSize);
     end
-''' + (f'''    if ({sample}.sampleValid) begin
+''' + (f'''    if (dut.data_cache_{hart}.invalidate_valid && dut.data_cache_{hart}.invalidate_ready)
+      $display("INVALIDATE {hart} %016h %0d", dut.data_cache_{hart}.invalidate_bits, cycles);
+''' if top == 'core_tb' and parameters.get('dCacheRefillBytes', 8) == 64 else '') + (f'''    if ({sample}.sampleValid) begin
       {prefix}$display("CACHE_SAMPLE %016h %016h %02h %0d", {sample}.sampleAddress,
         {sample}.sampleData, {sample}.sampleTag, 1 << {sample}.sampleSize);
     end
@@ -206,6 +213,12 @@ def compile_tb(rtl, directory, width, pa, top='core_tb', source=None, extra_file
         {core}_response_bits_fault, {core}_response_bits_tag);
     end
   end''')
+        if top == 'core_tb' and parameters.get('dCacheRefillBytes', 8) == 64:
+            port = f'dut.fabric.data_{hart}_request'
+            observers.append(f'''  longint unsigned data_line_wait_{hart} = 0;
+  always @(posedge clock) if (!reset && {port}_valid && !{port}_ready && {port}_bits_size == 6)
+    data_line_wait_{hart}++;
+  final $display("REFILL_WAIT {hart} %0d", data_line_wait_{hart});''')
     (directory / 'fetch_observers.svh').write_text('\n'.join(observers) + '\n')
     (directory / 'retire_bindings.svh').write_text('\n'.join(retirement) + '\n')
     if top == 'core_tb':
@@ -225,7 +238,7 @@ def compile_tb(rtl, directory, width, pa, top='core_tb', source=None, extra_file
                 for channel in ('request', 'response'):
                     for field in ('valid', 'ready'):
                         bindings.append(f'assign {channel}_{field}[{index}] = {physical}_{channel}_{field};')
-                    for field in (('address', 'data', 'size', 'mask', 'tag', 'write', 'fetch', 'atomic', 'atomicOperation', 'scEligible', 'privileged', 'refillAllowed') if channel == 'request' else ('data', 'fault', 'tag', 'last')):
+                    for field in (('address', 'data', 'size', 'mask', 'tag', 'write', 'fetch', 'atomic', 'atomicOperation', 'scEligible', 'privileged', 'refillSize') if channel == 'request' else ('data', 'fault', 'tag', 'last')):
                         bindings.append(f'assign {channel}s[{index}].{field} = {physical}_{channel}_bits_{field};')
             if interrupts:
                 ports += [f'.interrupts_{hart}_{name}(irq_by_hart[{hart}][{index}]),'
@@ -299,7 +312,7 @@ def log_lines(source):
 def performance_metrics(lines, config):
     harts, width = config.get('hartCount', 1), config.get('issueWidth', 1)
     samples, histograms, retired, traps = {}, {}, Counter(), Counter()
-    elapsed = None
+    elapsed, refill_wait = None, {}
     for line in log_lines(lines):
         fields, hart = line.split(), 0
         if fields[:1] == ['HART']:
@@ -317,7 +330,12 @@ def performance_metrics(lines, config):
             hart, lanes, issued, completed = map(int, fields[1:])
             assert (hart, lanes) not in histograms, 'Duplicate pipeline histogram'
             histograms[hart, lanes] = issued, completed
+        elif fields[:1] == ['REFILL_WAIT']:
+            hart, cycles = map(int, fields[1:])
+            assert hart not in refill_wait and cycles >= 0, 'Invalid refill wait sample'
+            refill_wait[hart] = cycles
     assert set(samples) == set(range(harts)), 'Missing per-hart pipeline metrics'
+    assert set(refill_wait) == (set(range(harts)) if config.get('dCacheBytes') and config.get('dCacheRefillBytes', 8) == 64 else set()), 'Missing or unexpected data line wait samples'
     assert set(histograms) == {(hart, lanes) for hart in range(harts) for lanes in range(width + 1)}, 'Missing pipeline histogram'
     cycles = samples[0][0]
     assert elapsed is not None and cycles == elapsed + 1 and cycles > 0, 'Hardware cycles were not sampled exactly once'
@@ -329,6 +347,7 @@ def performance_metrics(lines, config):
         assert 0 <= stalls <= cycles and 0 <= occupancy <= cycles * peak and 0 <= peak <= 6 * width, 'Invalid occupancy or stall metrics'
         assert all(value >= 0 for value in (*issued, *completed)), 'Negative pipeline histogram'
         reports.append(dict(hart=hart, retiredInstructions=retired[hart], trapEvents=traps[hart],
+                            dataLineWaitCycles=refill_wait.get(hart, 0),
                             issueCycles=issued, retireCycles=completed, dependencyStallCycles=stalls,
                             occupancySum=occupancy, maxOccupancy=peak))
     return dict(sampledCycles=cycles, retiredInstructions=sum(retired.values()),
@@ -627,14 +646,25 @@ def check_burst_guards(lines, config, program, name):
     guards = []
     beat = next(index for index, line in enumerate(lines) if 'LINE_BEAT ' in line)
     response = next(index for index in range(beat + 1, len(lines)) if 'RESPONSE ' in lines[index] and 'ARCH_DATA_RESPONSE ' not in lines[index])
-    for label, index, field, mask in (('beatData', beat, 3, 1), ('beatOrder', beat, 1, 8),
-                                      ('beatLast', beat, 4, 1), ('chunkLast', response, 5, 1),
-                                      ('chunkTag', response, 4, 1)):
+    mutations = [('beatData', beat, 3, 1), ('beatOrder', beat, 1, 8),
+                 ('beatLast', beat, 4, 1), ('chunkLast', response, 5, 1), ('chunkTag', response, 4, 1)]
+    certificate = next((index for index, line in enumerate(lines[:beat]) if 'ARCH_DATA_REQUEST read ' in line and line.split()[-1] == '6'), None)
+    if certificate is not None:
+        mutations.append(('refillSpan', certificate, 7, 5))
+    invalidation = next((index for index, line in enumerate(lines) if line.startswith('INVALIDATE ')), None)
+    if invalidation is not None:
+        mutations += [('invalidationAddress', invalidation, 2, 64),
+                      ('invalidationRecipient', invalidation, 1, config['hartCount']),
+                      ('missingInvalidation', invalidation, None, 0), ('duplicateInvalidation', invalidation, None, 2)]
+    for label, index, field, mask in mutations:
         changed = list(lines)
-        fields = changed[index].split()
-        offset = 2 if fields[0] == 'HART' else 0
-        fields[offset + field] = f'{int(fields[offset + field], 16) ^ mask:x}'
-        changed[index] = ' '.join(fields)
+        if field is None:
+            changed[index:index + 1] = [changed[index]] * mask
+        else:
+            fields = changed[index].split()
+            offset = 2 if fields[0] == 'HART' else 0
+            fields[offset + field] = f'{int(fields[offset + field], 16) ^ mask:x}'
+            changed[index] = ' '.join(fields)
         try:
             check_multicore(changed, config, program, name, atomic_metadata=True)
         except AssertionError:
@@ -839,6 +869,8 @@ def compare(binary, directory, config, transport='axi', selected=()):
                        f'+STOP={program.stop:x}', f'+SEED={seed}']
             command.extend(f'+FAULT_{kind.upper()}={address:x}' for kind, address in program.faults.items())
             command += [f'+{key.upper()}={getattr(program, key, 0)}' for key in ('exclusive_failures', 'interference')]
+            if hasattr(program, 'data_cache') and 'work' in program.data_cache:
+                command += [f'+WORK_{key.upper()}={program.data_cache["work"][key]:x}' for key in ('begin', 'end')]
             if hasattr(program, 'pipeline_groups') or hasattr(program, 'pipeline_recovery'):
                 command.append('+PIPELINE_EVENTS')
             if hasattr(program, 'interrupts'):
@@ -902,7 +934,7 @@ def compare(binary, directory, config, transport='axi', selected=()):
                 check_core_translations(lines, config, program, model.requests)
             elif transport == 'axi' and (config.get('virtualAddressBits') == 39 or config.get('dCacheBytes') or any(event[0] == 'atomic' for event in model.requests) or config.get('enableBurstRefill') or name in ('fence_ordering', 'synchronization')):
                 checked = check_multicore(lines, config, program, name, atomic_metadata=True)
-                if config.get('enableBurstRefill') and not burst_guards and any('LINE_BEAT ' in line for line in lines):
+                if not burst_guards and any('LINE_BEAT ' in line for line in lines):
                     burst_guards = check_burst_guards(lines, config, program, name)
                 if config.get('enableBurstRefill') and name == 'pmp_fetch':
                     fault_trace = next(tuple(int(value, 16) for value in line.split()[1:]) for line in lines
@@ -986,6 +1018,7 @@ def check_multicore(lines, config, program, name, atomic_metadata=False, softwar
         model.memory = memory
     pending, finished = [None] * harts, set()
     architectural, cache_counts = [None] * harts, [Counter() for _ in range(harts)]
+    work_samples = {}
     hit_addresses = [Counter() for _ in range(harts)]
     data_cache = bool(config.get('dCacheBytes'))
     translated = config.get('virtualAddressBits') == 39
@@ -1034,7 +1067,7 @@ def check_multicore(lines, config, program, name, atomic_metadata=False, softwar
         read_reordered += int(read_order[hart] != min(read_order.values()))
         del read_order[hart]
 
-    def service(hart, event, atomic_fault=False, local=False):
+    def service(hart, event, atomic_fault=False, local=False, read_value=None):
         nonlocal interrupt_dirty
         assert pending[hart] is None, 'Second memory operation before retirement'
         accesses, response = [], None
@@ -1074,6 +1107,8 @@ def check_multicore(lines, config, program, name, atomic_metadata=False, softwar
                 return 0
             old = sum(memory.get(address + byte, 0) << (byte * 8) for byte in range(size))
             if kind == 'read':
+                if read_value is not None:
+                    old = read_value
                 response = (old, 0)
             if kind == 'write' or (kind == 'atomic' and operation != 2):
                 value = atomic_value(operation, old, data, size) if kind == 'atomic' and operation != 3 else data
@@ -1092,6 +1127,9 @@ def check_multicore(lines, config, program, name, atomic_metadata=False, softwar
 
     def complete_data(hart):
         access = architectural[hart]
+        if 'lineValue' in access and 'response' in access:
+            access['expected'] = service(hart, access['event'], read_value=access.pop('lineValue'))
+            cache_counts[hart]['expandedReads'] += 1
         if 'expected' not in access or 'response' not in access:
             return
         data, fault, tag = access['response']
@@ -1113,9 +1151,9 @@ def check_multicore(lines, config, program, name, atomic_metadata=False, softwar
         check_translation_result(walk, None, config, models[hart], translation_history[hart])
         implicit[hart] = None
 
-    def cacheable(address):
+    def cacheable(address, size=8):
         return any(region.get('dataCacheable', False) and not region['device'] and region['readable']
-                   and int(region['base']) <= address and address + 8 <= int(region['base']) + int(region['size'])
+                   and int(region['base']) <= address and address + size <= int(region['base']) + int(region['size'])
                    for region in config['memoryRegions'])
 
     def protected_read(hart, address, size):
@@ -1124,11 +1162,16 @@ def check_multicore(lines, config, program, name, atomic_metadata=False, softwar
             [models[hart].csrs[0x3b0+i] for i in range(config['pmpEntries'])], address, size, 'read',
             config['physicalAddressBits'], models[hart].data_privilege())
 
+    def invalidating_write(owner):
+        return owner and cacheable(owner['event'][1], 1) and (owner['event'][0] == 'write' or
+            owner['event'][0] == 'atomic' and owner['operation'] != 2)
+
     def data_owner(hart, event, tag, expanded=False):
         candidates = [access for access in (implicit[hart], architectural[hart])
                       if access and access['tag'] == tag and 'expected' not in access and
-                      (access['event'] == event or expanded and access.get('refillAllowed') and
-                       event == ('read', access['event'][1] & ~7, 8, 0))]
+                      (access['event'] == event or expanded and event[2] in (8, 64) and
+                       event[2] <= 1 << access.get('refillSize', 0) and
+                       event == ('read', access['event'][1] & -event[2], event[2], 0))]
         assert len(candidates) == 1, 'Physical data service lacks unique LSU or page-table owner'
         return candidates[0]
 
@@ -1136,6 +1179,24 @@ def check_multicore(lines, config, program, name, atomic_metadata=False, softwar
         fields = line.split()
         if fields[:1] == ['COVER']:
             covers.append(list(map(int, fields[1:])))
+            continue
+        if fields[:1] == ['WORK_CYCLE']:
+            hart, terminal, cycle = map(int, fields[1:])
+            assert 0 <= hart < harts and terminal in (0, 1) and (hart, terminal) not in work_samples, 'Duplicate or malformed work interval'
+            work_samples[hart, terminal] = cycle, dict(cache_counts[hart])
+            continue
+        if fields[:1] == ['INVALIDATE']:
+            recipient, address, cycle = int(fields[1]), int(fields[2], 16), int(fields[3])
+            assert data_cache and config.get('dCacheRefillBytes', 8) == 64 and 0 <= recipient < harts and cycle >= 0, 'Invalid cache invalidation recipient'
+            writers = [owner for owner in owners if invalidating_write(owner) and owner['event'][1] == address]
+            assert len(writers) == 1, 'Invalidation lacks a unique accepted CPU write'
+            recipients = writers[0].setdefault('invalidated', set())
+            assert recipient not in recipients and not writers[0]['bus'], 'Duplicate or late write invalidation'
+            recipients.add(recipient)
+            access = architectural[recipient]
+            if access and access['event'][0] == 'read' and 'lineValue' not in access and (
+                    address // 64) % (config['dCacheBytes'] // 64) == (access['event'][1] // 64) % (config['dCacheBytes'] // 64):
+                access['invalidated'] = True
             continue
         if fields[:1] == ['RESULT']:
             results.append((int(fields[1]), int(fields[2], 16)))
@@ -1247,11 +1308,13 @@ def check_multicore(lines, config, program, name, atomic_metadata=False, softwar
             event = fields[1], int(fields[2], 16), int(fields[3]), int(fields[4], 16)
             assert event[0] in ('read', 'write', 'atomic') and int(fields[6], 16) == (models[hart].data_privilege() != 0), 'Architectural access context'
             certificate = int(fields[7], 16)
-            assert certificate in (0, 1), 'Invalid refill certificate'
+            assert certificate in (0, 3, 6), 'Invalid refill certificate'
             if certificate:
-                assert data_cache and event[0] == 'read' and event[2] in (1, 2, 4) and cacheable(event[1] & ~7), 'Refill certificate has no cacheable narrow demand'
-                assert protected_read(hart, event[1], event[2]) and protected_read(hart, event[1] & ~7, 8), 'Refill certificate escaped PMP authorization'
-            architectural[hart] = dict(event=event, tag=int(fields[5], 16), refillAllowed=bool(certificate))
+                size = 1 << certificate
+                assert data_cache and event[0] == 'read' and event[2] in (1, 2, 4, 8) and cacheable(event[1] & -size, size), 'Refill certificate has no cacheable demand'
+                assert size <= config.get('dCacheRefillBytes', 8), 'Refill certificate exceeds configured span'
+                assert protected_read(hart, event[1], event[2]) and protected_read(hart, event[1] & -size, size), 'Refill certificate escaped PMP authorization'
+            architectural[hart] = dict(event=event, tag=int(fields[5], 16), refillSize=certificate)
             cache_counts[hart]['accepted'] += 1
             cache_counts[hart]['reads'] += int(event[0] == 'read')
         elif kind == 'CACHE_SAMPLE':
@@ -1286,6 +1349,12 @@ def check_multicore(lines, config, program, name, atomic_metadata=False, softwar
             peers = [owner for owner in owners if owner is not None]
             assert not peers or harts > 1 and len(peers) < 2 and ordinary(event) and all(ordinary(owner['event']) for owner in peers), 'Exclusive request overlapped physical service or exceeded read slots'
             tag = int(fields[5], 16)
+            previous = architectural[hart]
+            if previous and 'lineValue' in previous and event[0] != 'fetch':
+                assert previous.get('invalidated') and not previous.get('retry') and event == previous['event'] and tag == previous['tag'], 'Clean line retried without matching write invalidation'
+                del previous['lineValue']
+                previous['physical'], previous['retry'] = False, True
+                cache_counts[hart]['refillRetries'] += 1
             access = data_owner(hart, event, tag, expanded=True) if observed_data and event[0] != 'fetch' else None
             privilege = 1 if access and access.get('walk') else fetch_privileges[hart] if event[0] == 'fetch' else models[hart].data_privilege() if hasattr(models[hart], 'data_privilege') else 3
             active = dict(hart=hart, event=event, tag=tag, bus=False, response=None, expectedPrivileged=privilege != 0)
@@ -1296,6 +1365,9 @@ def check_multicore(lines, config, program, name, atomic_metadata=False, softwar
                 assert context and context[0] == tag, 'Line lacks its architectural protection owner'
                 assert pmp_allowed(context[1], context[2], event[1], 64, 'fetch',
                                    config['physicalAddressBits'], privilege), 'Line escaped whole-range PMP authorization'
+            if event[2] == 64:
+                if event[0] == 'read':
+                    assert config.get('dCacheRefillBytes', 8) == 64 and access and not access.get('walk'), 'Unconfigured data line or page-table expansion'
                 active.update(chunks=deque(), beat=0, chunk=0, lineFault=False)
             if access:
                 expanded = event != access['event']
@@ -1305,11 +1377,13 @@ def check_multicore(lines, config, program, name, atomic_metadata=False, softwar
                     assert not expanded and not access.get('retried'), 'Refill fault did not retry the exact demand once'
                     access['retried'] = True
                 if expanded:
-                    assert cacheable(event[1]) and protected_read(hart, event[1], 8), 'Expanded read lacks complete physical authorization'
+                    assert cacheable(event[1], event[2]) and protected_read(hart, event[1], event[2]), 'Expanded read lacks complete physical authorization'
                 access['physical'] = True
                 active['walk'] = access.get('walk', False)
                 active['expanded'] = expanded
                 cache_counts[hart]['physicalReads'] += int(event[0] == 'read' and not active['walk'])
+                if event[0] == 'read' and not active['walk']:
+                    cache_counts[hart]['lineReads'] += int(event[2] == 64)
             if event[0] == 'atomic':
                 instruction_address = models[hart].translate(models[hart].pc, 'fetch')
                 instruction = sum(memory.get(instruction_address + byte, 0) << (8 * byte) for byte in range(4))
@@ -1344,6 +1418,8 @@ def check_multicore(lines, config, program, name, atomic_metadata=False, softwar
         elif kind == 'BUS':
             axi_transactions += 1
             event = fields[1], int(fields[2], 16), int(fields[3]), int(fields[4], 16)
+            if config.get('dCacheRefillBytes', 8) == 64 and invalidating_write(active):
+                assert active.get('invalidated') == set(range(harts)), 'CPU write escaped cache invalidation broadcast'
             assert device is None or not device.base <= event[1] < device.base + 65536, 'Platform request escaped to AXI'
             if event[0] in ('exclusive_read', 'exclusive_write'):
                 assert active and active['hart'] == hart and active['event'][0] == 'atomic'
@@ -1365,22 +1441,26 @@ def check_multicore(lines, config, program, name, atomic_metadata=False, softwar
             active['bus'] = True
             if event[0] in ('read', 'fetch'):
                 read_started(hart)
+            if event[0] == 'read' and not active.get('walk'):
+                cache_counts[hart]['axiReadAddresses'] += 1
+                cache_counts[hart]['axiReadBytes'] += event[2]
             if event[0] == 'write':
                 service(hart, event)
                 active['response'] = (0, int(event[1] == program.faults.get('write')))
         elif kind == 'LINE_BEAT':
-            assert active and active['hart'] == hart and active['bus'] and active['event'][0::2] == ('fetch', 64), 'Unowned line beat'
+            assert active and active['hart'] == hart and active['bus'] and active['event'][0] in ('read', 'fetch') and active['event'][2] == 64, 'Unowned line beat'
             address, response, data, last = (int(value, 16) for value in fields[1:])
             bus_bytes = config['axiDataBits'] // 8
             expected_address = active['event'][1] + bus_bytes * active['beat']
             expected = sum(memory.get(expected_address + byte, 0) << (8 * byte) for byte in range(bus_bytes))
-            fault = expected_address <= program.faults.get('fetch', -1) < expected_address + bus_bytes
+            fault = expected_address <= program.faults.get(active['event'][0], -1) < expected_address + bus_bytes
             assert (address, response, data, last) == (expected_address, 2 if fault else 0, expected, int(active['beat'] == 64 // bus_bytes - 1)), 'Line beat data, order, error or last differs from independent memory'
             for byte in range(0, bus_bytes, 8):
                 active['chunks'].append(((data >> (8 * byte)) & MASK, int(fault or active['lineFault'])))
             active['lineFault'] |= fault
             active['beat'] += 1
             line_beats += 1
+            cache_counts[hart]['lineBeats'] += int(active['event'][0] == 'read')
             if last:
                 read_completed(hart)
         elif kind == 'READ':
@@ -1441,14 +1521,25 @@ def check_multicore(lines, config, program, name, atomic_metadata=False, softwar
             channel, data, fault, tag = (int(v, 16) for v in fields[1:5])
             last = int(fields[5], 16) if len(fields) > 5 else 1
             if active['event'][2] == 64 and active['bus']:
-                assert channel == 0 and tag == active['tag'] and active['chunks'], 'Line chunk has wrong owner or precedes physical service'
+                assert channel == int(active['event'][0] != 'fetch') and tag == active['tag'] and active['chunks'], 'Line chunk has wrong owner or precedes physical service'
                 expected_data, expected_fault = active['chunks'].popleft()
                 assert (data, fault, last) == (expected_data, expected_fault, int(active['chunk'] == 7)), 'Line chunk value, fault or terminal placement'
+                if channel and active['chunk'] == (architectural[hart]['event'][1] & 63) // 8:
+                    active['demandData'] = expected_data
                 active['chunk'] += 1
                 if not last:
                     continue
                 assert active['beat'] == 64 // (config['axiDataBits'] // 8) and not active['chunks'], 'Incomplete line completion'
                 transactions += 1
+                if channel:
+                    access = architectural[hart]
+                    if active['lineFault']:
+                        assert pending[hart] is None and 'response' not in access and not access.get('retry'), 'Line fault published or retried more than once'
+                        access['physical'], access['retry'] = False, True
+                        cache_counts[hart]['refillRetries'] += 1
+                    else:
+                        access['lineValue'] = (active['demandData'] >> (8 * (access['event'][1] & 7))) & ((1 << (8 * access['event'][2])) - 1)
+                        complete_data(hart)
                 owners[hart] = active = None
                 continue
             assert last, 'Scalar completion must be terminal'
@@ -1637,6 +1728,17 @@ def check_multicore(lines, config, program, name, atomic_metadata=False, softwar
             assert count['witnessHits'] >= job['minHits'] and all(hit_addresses[hart][address] for address in addresses), 'Missing target-address private-cache hits'
             assert count['expandedReads'] >= job.get('minExpandedReads', 0) and count['refillRetries'] >= job.get('minRefillRetries', 0), 'Missing authorized refill or exact-demand retry'
             assert count['expandedReads'] <= job.get('maxExpandedReads', count['expandedReads']), 'Unexpected widened data read'
+            assert count['lineReads'] <= job.get('maxLineReads', count['lineReads']), 'Data line crossed a restricted subrange'
+            if 'work' in job:
+                begin, before = work_samples[hart, 0]
+                end, after = work_samples[hart, 1]
+                assert end > begin, 'Missing forward work interval'
+                count['workCycles'] = end - begin
+                for key in ('axiReadAddresses', 'axiReadBytes', 'hits'):
+                    count['work' + key[0].upper() + key[1:]] = after.get(key, 0) - before.get(key, 0)
+                wanted = job['work']['reads'][config.get('dCacheRefillBytes', 8)]
+                assert count['workAxiReadAddresses'] == wanted, 'Fixed-work data address count differs from expected refill behavior'
+                assert count['workAxiReadBytes'] == wanted * config.get('dCacheRefillBytes', 8), 'Fixed-work overfetch byte count'
         for hart, registers in enumerate(job.get('finalRegisters', [job.get('expectedRegisters', {})] * harts)):
             assert all(models[hart].registers[int(register)] == value for register, value in registers.items()), 'Cache program register result'
         if 'witnesses' in job:
@@ -1771,6 +1873,35 @@ def check_data_oracle():
     report = check_multicore(lines, config, program, 'data_oracle', atomic_metadata=True)
     assert report['dataCache'][0]['hitsDuringPeerService'] == 1
     assert report['readConcurrency'] == dict(maxOutstanding=2, reorderedResponses=1)
+    line_log = []
+    for line in lines:
+        hart = int(line.split()[1]) if line.startswith('HART ') else 0
+        if line.endswith('ARCH_DATA_REQUEST read 100 8 0 1 1 0'):
+            line = line[:-1] + '6'
+        elif line.endswith('REQUEST read 100 8 0 1') or line.endswith('BUS read 100 8 0'):
+            line = line.replace('read 100 8 ', 'read 100 64 ')
+        elif line.endswith('READ 100 0 2a'):
+            for chunk in range(8):
+                address, value, last = 0x100 + 8 * chunk, 42 if chunk == 0 else 0, int(chunk == 7)
+                line_log += [f'HART {hart} LINE_BEAT {address:x} 0 {value:x} {last:x}',
+                             f'HART {hart} RESPONSE 1 {value:x} 0 1 {last:x}']
+            continue
+        elif line.endswith('RESPONSE 1 2a 0 1'):
+            continue
+        line_log.append(line)
+    line_config = dict(config, dCacheRefillBytes=64)
+    assert all(count['lineReads'] == 1 and count['lineBeats'] == 8 for count in
+               check_multicore(line_log, line_config, program, 'data_oracle', atomic_metadata=True)['dataCache'])
+    line_guards = check_burst_guards(line_log, line_config, program, 'data_oracle')
+    completion = line_log.index('HART 0 ARCH_DATA_RESPONSE 2a 0 1')
+    for label, inserted in (('unownedInvalidation', 'INVALIDATE 0 100 0'),
+                            ('unjustifiedRetry', 'HART 0 REQUEST read 100 8 0 1')):
+        try:
+            check_multicore([*line_log[:completion], inserted, *line_log[completion:]], line_config, program, 'data_oracle', atomic_metadata=True)
+        except AssertionError:
+            line_guards.append(label)
+            continue
+        raise AssertionError(f'Line oracle accepted {label}')
     sample = lines.index('HART 0 CACHE_SAMPLE 100 2a 2 8')
     request = lines.index('HART 0 ARCH_DATA_REQUEST read 100 8 0 2 1 0')
     response = sample + 1
@@ -1782,6 +1913,8 @@ def check_data_oracle():
         sampleSize=(sample, ['HART 0 CACHE_SAMPLE 100 2a 2 4']),
         duplicateSample=(sample, [lines[sample], lines[sample]]),
         missingRequest=(request, []),
+        invalidRefillSpan=(request, ['HART 0 ARCH_DATA_REQUEST read 100 8 0 2 1 1']),
+        unconfiguredLineGrant=(request, ['HART 0 ARCH_DATA_REQUEST read 100 8 0 2 1 6']),
         missingSample=(sample, []),
         wrongResponse=(response, ['HART 0 ARCH_DATA_RESPONSE 29 0 2']),
         missingResponse=(response, []),
@@ -1800,7 +1933,7 @@ def check_data_oracle():
     try:
         check_multicore(lines, config, program, 'data_oracle', atomic_metadata=True)
     except AssertionError:
-        return [*mutations, 'missingTargetHit', *interrupt_guards]
+        return [*mutations, 'missingTargetHit', *interrupt_guards, *('dataLine' + label for label in line_guards)]
     raise AssertionError('Data oracle credited unrelated cache hits')
 
 
@@ -2033,6 +2166,7 @@ def verify_software(args):
     assert all(manifest['parameters'][key] == value for key, value in config.items() if key != 'enableTrace'), 'Stale software RTL configuration'
     assert all(hashlib.sha256(Path(name).read_bytes()).hexdigest() == digest for name, digest in manifest['sourceHashes'].items()), 'Stale software RTL sources'
     assert not args.burst_refill or config.get('enableBurstRefill'), 'Software configuration does not enable burst refill'
+    assert args.dcache_refill_bytes == 8 or config.get('dCacheRefillBytes') == args.dcache_refill_bytes, 'Software configuration does not enable data line refill'
     assert not args.branch_prediction or config.get('enableBranchPrediction'), 'Software configuration does not enable branch prediction'
     profile = program.software
     if profile['kind'] != 'runtime':
@@ -2077,38 +2211,42 @@ def verify_software_matrix(args):
     profiles = []
     for harts in args.harts or (1, 2, 16):
         expected = None
-        for width in (1, 2, 3):
-            directory = args.output / f'w{width}-h{harts}'
+        for selection in ((8, 64) if args.software_refill_matrix else (1, 2, 3)):
+            width = args.issue_width if args.software_refill_matrix else selection
+            refill = selection if args.software_refill_matrix else args.dcache_refill_bytes
+            directory = args.output / (f'r{refill}-h{harts}' if args.software_refill_matrix else f'w{width}-h{harts}')
             directory.mkdir(parents=True, exist_ok=True)
             config_path = directory / 'input.json'
             config_path.write_text(json.dumps(dict(template, hartCount=harts, issueWidth=width, enableBranchPrediction=args.branch_prediction,
                 axiDataBits=512 if harts == 16 else 64, iCacheBytes=args.icache_bytes,
-                dCacheBytes=args.dcache_bytes), indent=2) + '\n')
+                dCacheBytes=args.dcache_bytes, dCacheRefillBytes=refill, enableBurstRefill=args.burst_refill), indent=2) + '\n')
             software = directory / 'software'
             run(['python3', 'scripts/build_software.py', '--config', config_path,
                  '--program', 'software/tests/integer.c', '--stack-bytes', '512',
                  '--console-base', '0x10000000', '--output', software], directory / 'software-build.log')
             run_args = SimpleNamespace(**{**vars(args), 'elf': software / 'software.elf',
-                                         'config': config_path, 'output': directory / 'verification'})
+                                         'config': config_path, 'output': directory / 'verification', 'dcache_refill_bytes': refill})
             summary = verify_software(run_args)
             payload = hashlib.sha256((run_args.output / 'software.hex').read_bytes()).hexdigest()
             for report in summary['cases']:
+                if args.software_refill_matrix:
+                    assert all(bool(count.get('lineReads')) == (refill == 64) and count['hits'] > 0 for count in report['dataCache']), 'Software did not consume the selected refill mode and cache hits'
                 observed = payload, report['results'], report['console']
                 if expected is None:
                     expected = observed
-                assert observed == expected, 'Loaded software, per-hart results or console differ across widths or schedules'
+                assert observed == expected, 'Loaded software, per-hart results or console differ across paired configurations or schedules'
             for path, digest in summary['sourceHashes'].items():
                 assert path not in hashes or hashes[path] == digest, 'Mixed matrix source snapshots'
                 hashes[path] = digest
             report_path = run_args.output / 'summary.json'
-            profiles.append(dict(issueWidth=width, hartCount=harts, summary=str(report_path),
+            profiles.append(dict(issueWidth=width, dCacheRefillBytes=refill, hartCount=harts, summary=str(report_path),
                                  summaryHash=hashlib.sha256(report_path.read_bytes()).hexdigest(),
                                  loadedMemoryHash=payload))
     assert all(hashlib.sha256(Path(path).read_bytes()).hexdigest() == digest for path, digest in hashes.items()), 'Matrix sources changed'
-    summary_path.write_text(json.dumps(dict(scope='same software across issue widths for each hart count',
+    dimension = 'Refills' if args.software_refill_matrix else 'Widths'
+    summary_path.write_text(json.dumps(dict(scope=f'same software across {dimension.lower()} for each hart count',
         sourceHashes=hashes, configurations=profiles, busSchedules=len(profiles) * len(args.seeds),
-        loadedBytesEqualAcrossWidths=True, resultsEqualAcrossWidths=True,
-        consoleEqualAcrossWidths=True), indent=2) + '\n')
+        **{key + dimension: True for key in ('loadedBytesEqualAcross', 'resultsEqualAcross', 'consoleEqualAcross')}), indent=2) + '\n')
     print(f'Software matrix passed {len(profiles)} configurations and {len(profiles) * len(args.seeds)} schedules', flush=True)
 
 
@@ -2119,6 +2257,7 @@ def main():
     parser.add_argument('--use-generated', action='store_true')
     parser.add_argument('--elf', type=Path)
     parser.add_argument('--software-matrix', action='store_true')
+    parser.add_argument('--software-refill-matrix', action='store_true')
     parser.add_argument('--config', type=Path)
     parser.add_argument('--poison-bss', action='store_true')
     parser.add_argument('--software-transactions', type=int)
@@ -2139,11 +2278,16 @@ def main():
     parser.add_argument('--pmp-entries', type=int, choices=(0, 16))
     parser.add_argument('--icache-bytes', type=int, choices=(0, 8192, 16384, 32768, 65536), default=0)
     parser.add_argument('--dcache-bytes', type=int, choices=(0, 8192), default=0)
+    parser.add_argument('--dcache-refill-bytes', type=int, choices=(8, 64), default=8)
     parser.add_argument('--case', dest='selected', action='append', default=[])
     parser.add_argument('--traffic-baseline', type=Path)
     args = parser.parse_args()
     if args.burst_refill and not args.icache_bytes and not args.elf:
         parser.error('--burst-refill requires --icache-bytes')
+    if (args.dcache_refill_bytes == 64 or args.software_refill_matrix) and not args.dcache_bytes and not args.elf:
+        parser.error('Data line refill requires --dcache-bytes')
+    if args.software_matrix and args.software_refill_matrix:
+        parser.error('Select one software matrix dimension')
     if args.tlb_entries and not args.sv39:
         parser.error('--tlb-entries requires --sv39')
     if args.sv39:
@@ -2152,13 +2296,13 @@ def main():
         args.user_mode = args.interrupts = True
     if len(set(args.seeds)) != len(args.seeds) or any(not 0 < seed < 1 << 32 for seed in args.seeds):
         parser.error('--seeds requires distinct nonzero 32-bit integers')
-    if not (args.elf or args.software_matrix) and (args.jobs != 1 or tuple(args.seeds) != (1, 17, 2026)):
+    if not (args.elf or args.software_matrix or args.software_refill_matrix) and (args.jobs != 1 or tuple(args.seeds) != (1, 17, 2026)):
         parser.error('--seeds and --jobs require --elf')
-    if args.software_timeout is not None and (not (args.elf or args.software_matrix) or args.software_timeout <= 0):
+    if args.software_timeout is not None and (not (args.elf or args.software_matrix or args.software_refill_matrix) or args.software_timeout <= 0):
         parser.error('--software-timeout requires --elf and a positive integer')
-    if args.software_matrix:
+    if args.software_matrix or args.software_refill_matrix:
         if args.elf or not args.config or args.harts and (len(set(args.harts)) != len(args.harts) or any(hart not in (1, 2, 16) for hart in args.harts)):
-            parser.error('--software-matrix requires --config, no --elf, and distinct hart counts from 1, 2, 16')
+            parser.error('Software matrix requires --config, no --elf, and distinct hart counts from 1, 2, 16')
         verify_software_matrix(args)
         return
     assert bool(args.elf) == bool(args.config), 'ELF execution requires its configuration'
@@ -2197,7 +2341,7 @@ def main():
         directory = args.output / f'{"irq-" if interrupts else ""}{"pmp16-" if entries else ""}axi{width}'
         directory.mkdir(parents=True, exist_ok=True)
         config = configuration(width)
-        config.update(issueWidth=args.issue_width, pmpEntries=entries, enableInterrupts=interrupts, iCacheBytes=args.icache_bytes, dCacheBytes=args.dcache_bytes, tlbEntries=args.tlb_entries, enableBurstRefill=args.burst_refill, enableBranchPrediction=args.branch_prediction)
+        config.update(issueWidth=args.issue_width, pmpEntries=entries, enableInterrupts=interrupts, iCacheBytes=args.icache_bytes, dCacheBytes=args.dcache_bytes, dCacheRefillBytes=args.dcache_refill_bytes, tlbEntries=args.tlb_entries, enableBurstRefill=args.burst_refill, enableBranchPrediction=args.branch_prediction)
         config['memoryRegions'][0]['dataCacheable'] = bool(args.dcache_bytes)
         if args.user_mode:
             config['enableUserMode'] = True
@@ -2226,10 +2370,10 @@ def main():
         report = compare(binary, directory, manifest['parameters'], selected=args.selected)
         report['interfaceContracts'] = interface_contracts
         report['instructionStorage'] = storage
-        report.update(issueWidth=args.issue_width, axiDataBits=width, physicalAddressBits=config['physicalAddressBits'], pmpEntries=entries, enableInterrupts=interrupts, iCacheBytes=args.icache_bytes, dCacheBytes=args.dcache_bytes)
+        report.update(issueWidth=args.issue_width, axiDataBits=width, physicalAddressBits=config['physicalAddressBits'], pmpEntries=entries, enableInterrupts=interrupts, iCacheBytes=args.icache_bytes, dCacheBytes=args.dcache_bytes, dCacheRefillBytes=args.dcache_refill_bytes)
         summary['configurations'].append(report)
         core = directory / 'core'
-        core_config = dict(config, axiDataBits=256, dCacheBytes=0)
+        core_config = dict(config, axiDataBits=256, dCacheBytes=0, dCacheRefillBytes=8)
         core_key = json.dumps(core_config, sort_keys=True)
         if core_key in core_profiles:
             report['coreReuse'] = core_profiles[core_key]
@@ -2258,7 +2402,7 @@ def main():
                 continue
             directory = args.output / f'harts{harts}-axi{width}'
             directory.mkdir(parents=True, exist_ok=True)
-            config = dict(configuration(width), issueWidth=args.issue_width, hartCount=harts, pmpEntries=entries, enableInterrupts=interrupts, iCacheBytes=args.icache_bytes, dCacheBytes=args.dcache_bytes, tlbEntries=args.tlb_entries, enableBurstRefill=args.burst_refill, enableBranchPrediction=args.branch_prediction)
+            config = dict(configuration(width), issueWidth=args.issue_width, hartCount=harts, pmpEntries=entries, enableInterrupts=interrupts, iCacheBytes=args.icache_bytes, dCacheBytes=args.dcache_bytes, dCacheRefillBytes=args.dcache_refill_bytes, tlbEntries=args.tlb_entries, enableBurstRefill=args.burst_refill, enableBranchPrediction=args.branch_prediction)
             config['memoryRegions'][0]['dataCacheable'] = bool(args.dcache_bytes)
             if args.user_mode:
                 config['enableUserMode'] = True
@@ -2287,7 +2431,7 @@ def main():
                                                       *(('DitDahA1DataCache', 'DitDahA1Coherence') if args.dcache_bytes else ()),
                                                       *(('DitDahA1LocalInterrupts',) if args.platform_only else ())))
             report['instructionStorage'] = verify_storage(rtl, directory / 'storage')
-            report.update(issueWidth=args.issue_width, hartCount=harts, axiDataBits=width, pmpEntries=entries, enableInterrupts=interrupts, iCacheBytes=args.icache_bytes, dCacheBytes=args.dcache_bytes)
+            report.update(issueWidth=args.issue_width, hartCount=harts, axiDataBits=width, pmpEntries=entries, enableInterrupts=interrupts, iCacheBytes=args.icache_bytes, dCacheBytes=args.dcache_bytes, dCacheRefillBytes=args.dcache_refill_bytes)
             if not args.icache_bytes and not args.dcache_bytes and not args.platform_only:
                 for count in ((15, 16) if harts == 16 else (harts,)):
                     Path(f'result/harts{count}-input.json').write_text(json.dumps(dict(config, hartCount=count), indent=2) + '\n')

@@ -14,6 +14,7 @@ from contracts import verify_storage
 parser = argparse.ArgumentParser()
 parser.add_argument('--harts', type=int, nargs='+', choices=(2, 3, 15, 16), default=[2])
 parser.add_argument('--data-cache', action='store_true')
+parser.add_argument('--dcache-refill-bytes', type=int, choices=(8, 64), default=8)
 parser.add_argument('--supervisor', action='store_true')
 parser.add_argument('--sv39', action='store_true')
 parser.add_argument('--burst-refill', action='store_true')
@@ -26,7 +27,7 @@ source = Path('software/platform.json')
 original = source.read_bytes()
 baseline = json.loads(original)
 directory = Path('result/software-config-checks') / ('pipeline' if args.pipeline else 'sv39' if args.sv39 else 'supervisor' if args.supervisor else 'data-cache' if args.data_cache else 'base')
-for name, overrides in (('unchanged', {}), ('derived', dict(harts=2)), ('supervisor', dict(harts=2, supervisor_mode=True)), ('sv39', dict(harts=2, sv39=True)), ('cache', dict(tlb_entries=2)), ('burst', dict(burst_refill=True))):
+for name, overrides in (('unchanged', {}), ('derived', dict(harts=2)), ('supervisor', dict(harts=2, supervisor_mode=True)), ('sv39', dict(harts=2, sv39=True)), ('cache', dict(tlb_entries=2)), ('burst', dict(burst_refill=True)), ('data-line', dict(dcache_bytes=8192, dcache_refill_bytes=64))):
     output = directory / name
     output.mkdir(parents=True, exist_ok=True)
     selection = SimpleNamespace(config=source, output=output, harts=None, icache_bytes=None, dcache_bytes=None)
@@ -37,6 +38,7 @@ for name, overrides in (('unchanged', {}), ('derived', dict(harts=2)), ('supervi
     assert selected['virtualAddressBits'] == (39 if overrides.get('sv39') else baseline['virtualAddressBits'])
     assert bool(selected.get('enableBurstRefill')) == bool(overrides.get('burst_refill'))
     assert selected.get('tlbEntries', 0) == overrides.get('tlb_entries', 0)
+    assert selected.get('dCacheRefillBytes', 8) == overrides.get('dcache_refill_bytes', 8)
     if overrides.get('supervisor_mode') or overrides.get('sv39'):
         assert selected['enableUserMode'] and selected['enableInterrupts']
     if selection.config != source:
@@ -58,14 +60,17 @@ if args.burst_refill:
     profiles = (('production-burst', 'DitDahA1'),)
 if args.pipeline:
     profiles = (('production-width2', 'DitDahA1'), ('production-prediction', 'DitDahA1'))
+if args.dcache_refill_bytes == 64:
+    profiles = (('production-data-line', 'DitDahA1'), ('production-data-line-burst', 'DitDahA1'))
 for directory, top in profiles:
+    burst = args.burst_refill or directory == 'production-data-line-burst'
     rtl = Path("result") / directory
     manifest = json.loads((rtl / 'ditdah_a1_config.json').read_text())
     assert manifest['implementation']['issueWidth'] == manifest['parameters']['issueWidth']
-    count = manifest['parameters']['hartCount'] if args.supervisor or args.sv39 or args.burst_refill else int(directory.split('-harts')[1]) if '-harts' in directory else 1
+    count = manifest['parameters']['hartCount'] if args.supervisor or args.sv39 or burst or args.dcache_refill_bytes == 64 else int(directory.split('-harts')[1]) if '-harts' in directory else 1
     component = directory.split('-')[0]
     assert manifest['validationScope'] == {'production': 'system', 'core': 'core', 'frontend': 'frontend', 'fabric': 'fabric', 'backend': 'backend'}[component]
-    interrupts = top != 'DitDahA1MemoryFabric' and (directory.endswith('-irq') or '-harts' in directory or args.data_cache or args.supervisor or args.sv39 or args.burst_refill or args.pipeline)
+    interrupts = top != 'DitDahA1MemoryFabric' and (directory.endswith('-irq') or '-harts' in directory or args.data_cache or args.supervisor or args.sv39 or burst or args.dcache_refill_bytes == 64 or args.pipeline)
     enabled = (directory.endswith('-pmp16') or interrupts) and not args.pipeline
     if args.pipeline:
         prediction = directory == 'production-prediction'
@@ -85,9 +90,11 @@ for directory, top in profiles:
     cache_bytes = manifest['parameters']['iCacheBytes'] if top in ('DitDahA1', 'DitDahA1Core', 'DitDahA1Frontend') else 0
     assert manifest['implementation']['iCacheBytes'] == cache_bytes
     assert ('DitDahA1InstructionCache.sv' in files) == bool(cache_bytes), 'Instruction cache bypass or module mismatch'
-    data_cache = args.data_cache or args.supervisor or args.sv39 or args.burst_refill or (args.pipeline and directory == 'production-width2')
+    data_cache = args.data_cache or args.supervisor or args.sv39 or burst or args.dcache_refill_bytes == 64 or (args.pipeline and directory == 'production-width2')
     assert manifest['implementation']['dCacheBytes'] == (8192 if data_cache and top == 'DitDahA1' else 0)
     assert manifest['implementation']['dataCoherence'] == data_cache
+    assert manifest['parameters']['dCacheRefillBytes'] == args.dcache_refill_bytes
+    assert manifest['implementation']['dCacheRefillBytes'] == (args.dcache_refill_bytes if data_cache and top == 'DitDahA1' else 0)
     assert ('DitDahA1DataCache.sv' in files) == (data_cache and top == 'DitDahA1')
     assert ('DitDahA1Coherence.sv' in files) == data_cache
     if args.supervisor or args.sv39:
@@ -95,11 +102,11 @@ for directory, top in profiles:
         assert manifest['implementation']['privilege'] == 'MSU' and 'sret' in manifest['implementation']['instructions']
     assert ('DitDahA1Translation.sv' in files) == args.sv39
     assert manifest['implementation']['tlbEntries'] == args.tlb_entries
-    assert manifest['parameters']['enableBurstRefill'] == args.burst_refill
-    assert manifest['implementation']['enableBurstRefill'] == args.burst_refill
+    assert manifest['parameters']['enableBurstRefill'] == burst
+    assert manifest['implementation']['enableBurstRefill'] == burst
     if top in ('DitDahA1', 'DitDahA1MemoryFabric'):
         axi = (rtl / 'DitDahA1Axi.sv').read_text()
-        assert bool(re.search(r'\bbeat\b', axi)) == args.burst_refill, 'Burst state presence differs from configuration'
+        assert bool(re.search(r'\bbeat\b', axi)) == (burst or args.dcache_refill_bytes == 64), 'Burst state presence differs from configuration'
     if args.sv39:
         assert ('tlbValid' in (rtl / 'DitDahA1Translation.sv').read_text()) == bool(args.tlb_entries)
     if args.sv39:
@@ -139,7 +146,7 @@ for directory, top in profiles:
                     *[str(rtl / name) for name in files]], check=True)
     print(f"{top} production interface and lint passed")
 
-if args.data_cache or args.supervisor or args.sv39 or args.pipeline:
+if args.data_cache or args.supervisor or args.sv39 or args.pipeline or args.dcache_refill_bytes == 64:
     raise SystemExit(0)
 
 directory = Path('result/component-checks')

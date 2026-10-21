@@ -23,7 +23,7 @@ object DitDahA1Memory extends Generator[DitDahA1Parameter, DitDahA1UnitLayers, D
       allowed | ((address >= region.base.U(64)) & (address <= (region.base + region.size - bytes).U(64)))
     }
   def dataCacheable(parameter: DitDahA1Parameter, address: Referable[UInt], bytes: Int)(using Arena, Context, Block, InstanceContext): Referable[Bool] =
-    parameter.memoryRegions.filter(r => r.dataCacheable && !r.device && r.size >= bytes).foldLeft[Referable[Bool]](false.B) { (selected, region) =>
+    parameter.memoryRegions.filter(r => r.readable && r.dataCacheable && !r.device && r.size >= bytes).foldLeft[Referable[Bool]](false.B) { (selected, region) =>
       selected | ((address >= region.base.U(64)) & (address <= (region.base + region.size - bytes).U(64)))
     }
   def permitted(parameter: DitDahA1Parameter, request: Referable[MemoryRequest])(using Arena, Context, Block, InstanceContext): Referable[Bool] =
@@ -59,6 +59,9 @@ object DitDahA1Memory extends Generator[DitDahA1Parameter, DitDahA1UnitLayers, D
     if parameter.enableBurstRefill then
       when(request.fetch & !request.write & !request.atomic & (request.size === 6.U(3)) &
         (request.address.asBits.bits(5, 0) === 0.B(6))) { allowed := executable(parameter, request.address, 64) }
+    if parameter.enableDataBurstRefill then
+      when(!request.fetch & !request.write & !request.atomic & (request.size === 6.U(3)) &
+        (request.address.asBits.bits(5, 0) === 0.B(6))) { allowed := dataCacheable(parameter, request.address, 64) }
     allowed
   def architecture(parameter: DitDahA1Parameter) =
     val io = summon[Interface[DitDahA1MemoryIO]]

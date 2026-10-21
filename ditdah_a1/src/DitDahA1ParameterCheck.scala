@@ -44,6 +44,17 @@ object DitDahA1ParameterCheck:
     val burst = rtl.copy(iCacheBytes = 8192, enableBurstRefill = true)
     burst.validateRtl()
     assert(DitDahA1Config.parameter(DitDahA1Config.document(burst)) == burst)
+    rejects { rtl.copy(dCacheRefillBytes = 16); () }
+    rejects { rtl.copy(dCacheRefillBytes = 64).validateRtl() }
+    rtl.copy(dCacheRefillBytes = 64).validateFrontend()
+    rtl.copy(dCacheRefillBytes = 64).validateBackend()
+    rtl.copy(dCacheRefillBytes = 64).validateFabric()
+    for bytes <- Seq(8, 64); instruction <- Seq(false, true) do
+      val data = rtl.copy(dCacheBytes = 8192, dCacheRefillBytes = bytes,
+        iCacheBytes = if instruction then 8192 else 0, enableBurstRefill = instruction)
+      data.validateRtl()
+      assert(DitDahA1Config.parameter(DitDahA1Config.document(data)) == data)
+      assert(DitDahA1Config.document(data)("implementation")("dCacheRefillBytes").num == bytes)
     for count <- 1 to 16 do rtl.copy(hartCount = count).validateRtl()
     assert(!rtl.enableInterrupts)
     assert(!rtl.enableUserMode)

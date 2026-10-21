@@ -36,6 +36,7 @@ object DitDahA1Config:
         "tlbEntries" -> (if parameter.enableTranslation then parameter.tlbEntries else 0),
         "fabricReadSlots" -> (if parameter.hartCount > 1 then 2 else 0),
         "enableBranchPrediction" -> parameter.enableBranchPrediction,
+        "dCacheRefillBytes" -> (if parameter.dCacheBytes != 0 then parameter.dCacheRefillBytes else 0),
         "enableBurstRefill" -> parameter.enableBurstRefill, "isaComplete" -> false
       ),
       "target" -> ujson.Obj(

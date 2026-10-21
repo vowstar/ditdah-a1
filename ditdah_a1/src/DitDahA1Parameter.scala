@@ -13,6 +13,7 @@ case class DitDahA1Parameter(
   tlbEntries: Int = 0,
   iCacheBytes: Int = 32768,
   dCacheBytes: Int = 32768,
+  dCacheRefillBytes: Int = 8,
   l2CacheBytes: Int = 262144,
   axiDataBits: Int = 128,
   pmpEntries: Int = 16,
@@ -36,6 +37,7 @@ case class DitDahA1Parameter(
   require((resetVector & 1) == 0, "resetVector must be halfword aligned")
   require(iCacheBytes == 0 || (powerOfTwo(iCacheBytes) && iCacheBytes >= 8192 && iCacheBytes <= 65536), "iCacheBytes must be a power of two between 8192 and 65536")
   require(dCacheBytes == 0 || (powerOfTwo(dCacheBytes) && dCacheBytes >= 8192 && dCacheBytes <= 65536), "dCacheBytes must be a power of two between 8192 and 65536")
+  require(Set(8, 64).contains(dCacheRefillBytes), "dCacheRefillBytes must be eight or sixty-four")
   require(l2CacheBytes == 0 || (powerOfTwo(l2CacheBytes) && l2CacheBytes >= 131072 && l2CacheBytes <= 8388608), "l2CacheBytes must be zero or a power of two between 131072 and 8388608")
   require(Set(64, 128, 256, 512).contains(axiDataBits), "axiDataBits must be 64, 128, 256, or 512")
   require(Set(0, 16, 64).contains(pmpEntries), "pmpEntries must be 0, 16 or 64")
@@ -69,6 +71,7 @@ case class DitDahA1Parameter(
     validateCore()
     validateFabric()
     require(dCacheBytes == 0 || dCacheBytes == 8192, "RTL supports zero or 8192 data cache bytes")
+    require(!enableDataBurstRefill || dCacheBytes != 0, "Data burst refill requires a data cache")
     require(l2CacheBytes == 0, "RTL does not support a shared cache")
     require(memoryRegions.exists(r => r.executable && resetVector >= r.base && resetVector + 4 <= r.base + r.size), "Reset vector must be in executable memory")
 
@@ -80,6 +83,8 @@ case class DitDahA1Parameter(
   }
 
   def enableTranslation: Boolean = virtualAddressBits == 39 && enableSupervisorMode
+  def enableDataBurstRefill: Boolean = dCacheRefillBytes == 64
+  def enableLineRefill: Boolean = enableBurstRefill || enableDataBurstRefill
 
   val xlen: Int = 64
   val axiIdBits: Int = math.max(1, 32 - Integer.numberOfLeadingZeros(hartCount - 1))

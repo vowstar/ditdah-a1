@@ -119,7 +119,7 @@ object DitDahA1Fetch extends Generator[DitDahA1Parameter, DitDahA1UnitLayers, Di
     request.bits.atomic := false.B
     request.bits.atomicOperation := 0.U(5)
     request.bits.scEligible := false.B
-    request.bits.refillAllowed := false.B
+    request.bits.refillSize := 0.U(3)
     response.ready := (state === 2.U(stateBits)) & (if cached then killed | flush | io.output.ready else true.B)
     io.translation.foreach { t =>
       t.request.valid := accepting & io.request.valid & aligned & !flush

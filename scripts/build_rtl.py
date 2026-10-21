@@ -57,6 +57,7 @@ def main():
         manifest["implementation"]["tlbEntries"] = manifest["parameters"]["tlbEntries"] if args.top in ("DitDahA1", "DitDahA1Core", "DitDahA1Translation") else 0
         manifest["implementation"]["enableBurstRefill"] = bool(manifest["parameters"]["enableBurstRefill"] and args.top in ("DitDahA1", "DitDahA1Core", "DitDahA1Frontend", "DitDahA1Fetch", "DitDahA1InstructionCache", "DitDahA1MemoryFabric", "DitDahA1Memory", "DitDahA1Axi"))
         manifest["implementation"]["dCacheBytes"] = manifest["parameters"]["dCacheBytes"] if args.top in ("DitDahA1", "DitDahA1DataCache") else 0
+        manifest["implementation"]["dCacheRefillBytes"] = manifest["parameters"]["dCacheRefillBytes"] if manifest["implementation"]["dCacheBytes"] else 0
         manifest["implementation"]["dataCoherence"] = args.top == "DitDahA1Coherence" or bool(manifest["parameters"]["dCacheBytes"] and args.top in ("DitDahA1", "DitDahA1MemoryFabric"))
         has_gpr = args.top in ("DitDahA1", "DitDahA1Core", "DitDahA1Backend", "DitDahA1Gpr")
         manifest["implementation"]["gprReadPorts"] = 2 * manifest["parameters"]["issueWidth"] if has_gpr else 0

@@ -59,7 +59,7 @@ class MemoryRequest extends Bundle:
   val atomic = Aligned(Bool())
   val atomicOperation = Aligned(UInt(5))
   val scEligible = Aligned(Bool())
-  val refillAllowed = Aligned(Bool())
+  val refillSize = Aligned(UInt(3))
 class MemoryResponse(dataBits: Int = 64, countBits: Int = 0) extends Bundle:
   val data = Aligned(UInt(dataBits))
   val fault = Aligned(Bool())

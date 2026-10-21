@@ -43,8 +43,7 @@ make verify-signoff
 `make config` writes the uncached configuration to `result/ditdah_a1_config.json`; `make check` validates configuration, memory-region, and serialization contracts.
 `configure-ditdah-a1 --config input.json --output result/config.json` validates a supplied configuration.
 `build-ditdah-a1 --config input.json --output result/rtl` generates supported RTL configurations.
-Use `--top DitDahA1Core`, `DitDahA1Frontend`, `DitDahA1Backend`, or `DitDahA1MemoryFabric`
-for independent generation.
+Use `--top DitDahA1Core`, `DitDahA1Frontend`, `DitDahA1Backend`, or `DitDahA1MemoryFabric` for independent generation.
 Component builds validate their own domain; whole-system generation rejects unimplemented features.
 The manifest records the selected top and validation scope; unrelated parameters do not enable hardware features.
 Add `--trace` to retain the separate DV bind files.
@@ -57,7 +56,8 @@ Set `iCacheBytes` to zero for bypass or a power of two from 8 to 64 KiB for a bl
 Instruction refills use individually authorized four-byte requests; non-demand refill faults fall back to the original demand.
 Set `enableBurstRefill` with an instruction cache for protected 64-byte INCR refills; denial or line errors retry the original scalar demand without installing a line.
 Set `dCacheBytes` to 8192 for private read caches on `dataCacheable` non-device regions; zero bypasses them.
-Ordinary loads use eight-byte sectors; narrow refills require full-word permission and retry the original demand on failure. CPU writes invalidate private copies before forwarding.
+Ordinary loads use eight-byte sectors; narrow refills require full-word permission. CPU writes invalidate private copies before forwarding.
+`dCacheRefillBytes` defaults to 8; set it to 64 for protected whole-line refills independent of I-cache. Expanded-read errors drain and retry the original demand without installing a partial line.
 External writers require platform coordination; no DMA coherence is implemented.
 Set `pmpEntries` to 16 to enable protection; successful PMP writes restart younger execution while accepted fetches drain.
 Set `enableUserMode` for Bare M/U execution and effective data privilege via MPRV.

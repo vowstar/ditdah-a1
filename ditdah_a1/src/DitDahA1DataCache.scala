@@ -42,6 +42,10 @@ object DitDahA1DataCache extends Generator[DitDahA1Parameter, DitDahA1Layers, Di
     val invalidated = RegInit(false.B)
     val sameTag = Reg(Bool())
     val expanded = RegInit(false.B)
+    val line = Option.when(parameter.enableDataBurstRefill)(RegInit(false.B))
+    val beat = Option.when(parameter.enableDataBurstRefill)(RegInit(0.U(3)))
+    val lineActive = line.getOrElse(false.B)
+    val lastWord = beat.map(_ === 7.U(3)).getOrElse(false.B)
     val up = io.upstream
     val down = io.downstream
     val index = request.address.asBits.bits(indexBits + 5, 6).asUInt
@@ -57,20 +61,36 @@ object DitDahA1DataCache extends Generator[DitDahA1Parameter, DitDahA1Layers, Di
     refill :<= request
     refill.address := (request.address.asBits.bits(63, 3) ## 0.B(3)).asUInt
     refill.size := 3.U(3)
+    refill.refillSize := 3.U(3)
+    if parameter.enableDataBurstRefill then
+      when(lineActive) {
+        refill.address := (request.address.asBits.bits(63, 6) ## 0.B(6)).asUInt
+        refill.size := 6.U(3)
+        refill.refillSize := 6.U(3)
+      }
     val eligible = !request.write & !request.fetch & !request.atomic & (request.size <= 3.U(3)) &
-      DitDahA1Memory.permitted(parameter, request) & DitDahA1Memory.dataCacheable(parameter, refill.address, 8)
-    val widening = eligible & (request.size < 3.U(3)) & request.refillAllowed & DitDahA1Memory.permitted(parameter, refill)
+      DitDahA1Memory.permitted(parameter, request) &
+        DitDahA1Memory.dataCacheable(parameter, (request.address.asBits.bits(63, 3) ## 0.B(3)).asUInt, 8)
+    val widening = eligible & (request.size < 3.U(3)) &
+      ((request.refillSize === 3.U(3)) | (request.refillSize === 6.U(3))) & DitDahA1Memory.permitted(parameter, refill)
+    val lineCandidate = if parameter.enableDataBurstRefill then eligible & (request.refillSize === 6.U(3)) &
+      DitDahA1Memory.dataCacheable(parameter, (request.address.asBits.bits(63, 6) ## 0.B(6)).asUInt, 64) else false.B
     val responseFault = down.response.bits.fault | (down.response.bits.tag =/= request.tag)
-    val filling = (state === 3.U(3)) & down.response.valid & !responseFault & eligible &
+    val lineFault = responseFault | (down.response.bits.last =/= lastWord)
+    val wordFilling = (state === 3.U(3)) & down.response.valid & !responseFault & !lineActive & !fault & eligible &
       ((request.size === 3.U(3)) | expanded) & !invalidated & !collision
+    val lineFilling = (state === 3.U(3)) & down.response.valid & lineActive & !lineFault & !fault & !invalidated & !collision
+    val publish = lineFilling & lastWord & down.response.bits.last
+    val filling = wordFilling | lineFilling
     val reading = up.request.valid & up.request.ready
     val tag = request.address.asBits.bits(parameter.physicalAddressBits - 1, indexBits + 6).asUInt
+    val writeWord = beat.map(b => lineActive.?((index.asBits ## b.asBits).asUInt, word)).getOrElse(word)
     val wordRead = StorageArray("data", words, 64,
-      up.request.bits.address.asBits.bits(indexBits + 5, 3).asUInt, word,
+      up.request.bits.address.asBits.bits(indexBits + 5, 3).asUInt, writeWord,
       down.response.bits.data, filling, reading, io.clock)
     val tagRead = StorageArray("dataTags", words / 8, tagBits,
       up.request.bits.address.asBits.bits(indexBits + 5, 6).asUInt, index,
-      tag, filling, reading, io.clock)
+      tag, wordFilling | publish, reading, io.clock)
     val hit = (valid.asUInt >> word).asBits.bit(0) & (tagRead === tag) & !collision & !invalidated
     val shift = (request.address.asBits.bits(2, 0) ## 0.B(3)).asUInt
     val readMask = Wire(UInt(64))
@@ -80,6 +100,7 @@ object DitDahA1DataCache extends Generator[DitDahA1Parameter, DitDahA1Layers, Di
     val hitData = ((wordRead >> shift).asBits & readMask.asBits).asUInt
     val refillData = ((down.response.bits.data >> shift).asBits & readMask.asBits).asUInt
     val hitResponse = (state === 1.U(3)) & eligible & hit
+    val startLine = (state === 1.U(3)) & !hitResponse & lineCandidate
     io.invalidate.ready := true.B
     up.request.ready := (state === 0.U(3)) | (up.response.valid & up.response.ready)
     up.response.valid := (state === 4.U(3)) | hitResponse
@@ -89,25 +110,42 @@ object DitDahA1DataCache extends Generator[DitDahA1Parameter, DitDahA1Layers, Di
     up.response.bits.last := true.B
     down.request.valid := state === 2.U(3)
     down.request.bits :<= request
-    when(expanded) { down.request.bits :<= refill }
-    down.response.ready := state === 3.U(3)
+    when(expanded | lineActive) { down.request.bits :<= refill }
+    when(fault) { down.request.bits.refillSize := 0.U(3) }
+    down.response.ready := (state === 3.U(3)) | (if parameter.enableDataBurstRefill then state === 5.U(3) else false.B)
     when(state === 1.U(3)) {
       sameTag := tagRead === tag
       when(eligible & hit) { data := hitData; fault := false.B; state := 4.U(3) }
-        .otherwise { expanded := widening; state := 2.U(3) }
+        .otherwise { expanded := widening & !lineCandidate; line.foreach(_ := lineCandidate); state := 2.U(3) }
     }
     when(down.request.valid & down.request.ready) { state := 3.U(3) }
     when(down.response.valid & down.response.ready) {
-      when(expanded & responseFault) { expanded := false.B; state := 2.U(3) }
-        .otherwise {
-          data := expanded.?(refillData, down.response.bits.data)
-          fault := responseFault
-          state := 4.U(3)
-        }
+      when(lineActive) {
+        if parameter.enableDataBurstRefill then
+          fault := fault | lineFault | invalidated | collision
+          when((state === 3.U(3)) & (beat.get === request.address.asBits.bits(5, 3).asUInt)) { data := refillData }
+          when(down.response.bits.last) {
+            line.get := false.B
+            when((state === 5.U(3)) | lineFault | fault | invalidated | collision) { fault := true.B; state := 2.U(3) }
+              .otherwise { state := 4.U(3) }
+          }.otherwise {
+            when(state === 3.U(3)) {
+              when(lastWord) { state := 5.U(3) }
+                .otherwise { beat.get := (beat.get + 1.U(3)).asBits.bits(2, 0).asUInt }
+            }
+          }
+      }.otherwise {
+        when(expanded & responseFault) { expanded := false.B; fault := true.B; state := 2.U(3) }
+          .otherwise {
+            data := expanded.?(refillData, down.response.bits.data)
+            fault := responseFault
+            state := 4.U(3)
+          }
+      }
     }
     val allocated = sameTag.?(valid, valid & ~lineMask) | mask
-    val nextValid = filling.?(allocated, valid)
-    when(filling | io.invalidate.valid) { valid := io.invalidate.valid.?(nextValid & ~invalidateMask, nextValid) }
+    val nextValid = startLine.?(valid & ~lineMask, publish.?(valid | lineMask, wordFilling.?(allocated, valid)))
+    when(startLine | publish | wordFilling | io.invalidate.valid) { valid := io.invalidate.valid.?(nextValid & ~invalidateMask, nextValid) }
     when(up.response.valid & up.response.ready) { state := 0.U(3) }
     when(io.invalidate.valid) {
       // Invalidation may conservatively evict a different tag at this index.
@@ -118,6 +156,9 @@ object DitDahA1DataCache extends Generator[DitDahA1Parameter, DitDahA1Layers, Di
       invalidated := io.invalidate.valid &
         (invalidateIndex === up.request.bits.address.asBits.bits(indexBits + 5, 6).asUInt)
       expanded := false.B
+      line.foreach(_ := false.B)
+      beat.foreach(_ := 0.U(3))
+      fault := false.B
       state := 1.U(3)
     }
     layer("DV"):

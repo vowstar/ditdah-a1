@@ -15,11 +15,12 @@ def load_configuration(args):
     supervisor_mode = getattr(args, 'supervisor_mode', False) or sv39
     tlb_entries = getattr(args, 'tlb_entries', None)
     burst_refill = getattr(args, 'burst_refill', None)
+    data_refill = getattr(args, 'dcache_refill_bytes', None)
     original = args.config
     content = original.read_bytes()
     document = json.loads(content)
     config = document.get('parameters', document)
-    if args.harts is None and args.icache_bytes is None and args.dcache_bytes is None and not supervisor_mode and tlb_entries is None and burst_refill is None:
+    if args.harts is None and args.icache_bytes is None and args.dcache_bytes is None and not supervisor_mode and tlb_entries is None and burst_refill is None and data_refill is None:
         return config, {}
     if args.harts is not None:
         config['hartCount'] = args.harts
@@ -27,6 +28,8 @@ def load_configuration(args):
         config['iCacheBytes'] = args.icache_bytes
     if args.dcache_bytes is not None:
         config['dCacheBytes'] = args.dcache_bytes
+    if data_refill is not None:
+        config['dCacheRefillBytes'] = data_refill
     if supervisor_mode:
         config.update(enableSupervisorMode=True, enableUserMode=True, enableInterrupts=True)
     if sv39:
@@ -52,6 +55,7 @@ def main():
     parser.add_argument('--harts', type=int, choices=range(1, 17))
     parser.add_argument('--icache-bytes', type=int, choices=(0, 8192, 16384, 32768, 65536))
     parser.add_argument('--dcache-bytes', type=int, choices=(0, 8192))
+    parser.add_argument('--dcache-refill-bytes', type=int, choices=(8, 64))
     parser.add_argument('--supervisor-mode', action='store_true')
     parser.add_argument('--sv39', action='store_true')
     parser.add_argument('--tlb-entries', type=int, choices=(0, 2, 4))
