@@ -143,6 +143,7 @@ module core_tb;
   read_context_t read_context[2];
   integer read_slot = 0, accept_read_slot, read_serial = 0, data_reads = 0;
   integer read_peak = 0, read_reordered = 0, reorder_reads = 0;
+  integer line_peak = 0, line_overlap_cycles = 0;
   wire read_pending = read_context[read_slot].valid;
   wire read_fetch = read_context[read_slot].fetch;
   wire read_exclusive = read_context[read_slot].exclusive;
@@ -242,6 +243,8 @@ module core_tb;
       observe_platform();
 `endif
       cycles <= cycles + 1;
+      if (read_context[0].valid && read_context[1].valid && read_context[0].line && read_context[1].line)
+        line_overlap_cycles <= line_overlap_cycles + 1;
       if (cycles > cycle_limit) $fatal(1, "Timeout");
       if (arvalid && !arready) ar_stall <= ar_stall + 1;
       if (awvalid && !awready) aw_stall <= aw_stall + 1;
@@ -276,6 +279,9 @@ module core_tb;
         end
         if (1 + integer'(read_context[1 - accept_read_slot].valid) > read_peak)
           read_peak = 1 + integer'(read_context[1 - accept_read_slot].valid);
+        if (accepted_request[arid].size == 6 &&
+            1 + integer'(read_context[1 - accept_read_slot].valid && read_context[1 - accept_read_slot].line) > line_peak)
+          line_peak = 1 + integer'(read_context[1 - accept_read_slot].valid && read_context[1 - accept_read_slot].line);
 `ifdef ENABLE_INTERRUPTS
         if (irq_mode == 5 && 64'(araddr) == irq_target) read_context[accept_read_slot].delay <= 48;
 `endif
@@ -434,6 +440,7 @@ module core_tb;
         $display("THROUGHPUT %0d %0d", issue_max, retire_max);
         $display("CYCLES %0d", cycles);
         $display("READ_CONCURRENCY %0d %0d", read_peak, read_reordered);
+        $display("LINE_CONCURRENCY %0d %0d", line_peak, line_overlap_cycles);
         $display("PASS"); $finish;
       end
     end

@@ -3139,22 +3139,34 @@ def arbiter_case(parameters):
 
 def fabric_case(parameters):
     count = 2 * parameters['hartCount']
+    owner_bits = (count - 1).bit_length()
     vector = lambda suffix: '{' + ', '.join(f'{"instruction" if i % 2 == 0 else "data"}_{i//2}_{suffix}' for i in reversed(range(count))) + '}'
     body = f'''
   reg fabric_past = 0, fabric_writer_bypassed;
-  reg [{count-1}:0] fabric_owned, fabric_exclusive;
+  (* anyconst *) reg [5:0] fabric_bit;
+  reg [1:0] fabric_live, fabric_kind;
+  reg [{owner_bits-1}:0] fabric_owner [0:1];
+  reg [7:0] fabric_tags [0:1];
+  wire [{count-1}:0] fabric_owned = (fabric_live[0] ? ({count}'d1 << fabric_owner[0]) : 0) |
+                                   (fabric_live[1] ? ({count}'d1 << fabric_owner[1]) : 0);
+  wire [{count-1}:0] fabric_exclusive = ((fabric_live[0] && fabric_kind[0]) ? ({count}'d1 << fabric_owner[0]) : 0) |
+                                       ((fabric_live[1] && fabric_kind[1]) ? ({count}'d1 << fabric_owner[1]) : 0);
   wire [{count-1}:0] fabric_accepted = {vector('request_valid')} & {vector('request_ready')};
   wire [{count-1}:0] fabric_replied = {vector('response_valid')};
+  wire [{count-1}:0] fabric_completed = fabric_replied & {vector('response_ready')} & {vector('response_bits_last')};
   wire fabric_single = |fabric_exclusive;
   always @(posedge clock) begin
     fabric_past <= 1;
     if (!fabric_past) assume(reset); else assume(!reset);
     if (!reset) begin
       assert($onehot0(fabric_accepted));
+      if (|fabric_accepted) assert(!(&fabric_live));
+      if (&fabric_live) assert((fabric_owner[0] >> 1) != (fabric_owner[1] >> 1));
       assert($countones(fabric_owned) <= 2);
       assert((fabric_owned & ~fabric_exclusive) == formal_queue_live);
       assert(fabric_exclusive == formal_single_live);
       assert(active == fabric_single);
+      assert(!fabric_writer_bypassed || (!preferRead && !active));
       assert(!fabric_single || $onehot(fabric_owned));
       assert(!active || _readers_empty);
       assert(axi_ar_valid == (active ? _axi_axi_ar_valid : _readers_ar_valid));
@@ -3175,29 +3187,40 @@ def fabric_case(parameters):
         device = ' || '.join(f"({req}_bits_address >= 64'h{int(r['base']):x} && {req}_bits_address < 64'h{int(r['base'])+int(r['size']):x})"
                             for r in parameters['memoryRegions'] if r['device']) or "1'b0"
         body += f'''
-  reg [7:0] fabric_tag_{i};
-  wire fabric_special_{i} = {req}_bits_write || {req}_bits_atomic || {req}_bits_size > 3 || ({device});
-  always @(posedge clock) if (reset) begin
-    fabric_owned[{i}] <= 0; fabric_exclusive[{i}] <= 0;
-  end else begin
+  wire [7:0] fabric_tag_{i} = fabric_live[0] && fabric_owner[0] == {i} ? fabric_tags[0] : fabric_tags[1];
+  wire fabric_special_{i} = {req}_bits_write || {req}_bits_atomic ||
+    ({req}_bits_size > 3 && !({req}_bits_size == 6 &&
+      ({req}_bits_fetch ? {int(bool(parameters.get('enableBurstRefill')))} : {int(parameters.get('dCacheRefillBytes') == 64)}))) || ({device});
+  always @(posedge clock) if (!reset) begin
     assert(!(fabric_owned[{i}] && fabric_owned[{i ^ 1}]));
     if ({resp}_valid) begin
-      assert(fabric_owned[{i}] && {resp}_bits_tag == fabric_tag_{i});
-      if ({resp}_ready && {resp}_bits_last) begin fabric_owned[{i}] <= 0; fabric_exclusive[{i}] <= 0; end
+      assert(fabric_owned[{i}]);
+      assert({resp}_bits_tag == fabric_tag_{i});
     end
     if (fabric_accepted[{i}]) begin
       assert(!fabric_owned[{i}] && !fabric_owned[{i ^ 1}] && !fabric_single);
       if (fabric_special_{i}) assert(fabric_owned == 0);
-      fabric_owned[{i}] <= 1;
-      fabric_exclusive[{i}] <= fabric_special_{i};
-      fabric_tag_{i} <= {req}_bits_tag;
     end
     if ($past(!reset && {resp}_valid && !{resp}_ready)) begin
       assert({resp}_valid);
-      assert($stable({resp}_bits_data)); assert($stable({{{resp}_bits_tag, {resp}_bits_fault, {resp}_bits_last}}));
+      assert($stable({resp}_bits_data[fabric_bit])); assert($stable({resp}_bits_tag));
+      assert($stable({{{resp}_bits_fault, {resp}_bits_last}}));
     end
   end
 '''
+    for slot in range(2):
+        free = '!fabric_live[0]' if slot == 0 else 'fabric_live[0] && !fabric_live[1]'
+        body += f'''  always @(posedge clock) if (reset) fabric_live[{slot}] <= 0; else begin
+    if (fabric_live[{slot}] && fabric_completed[fabric_owner[{slot}]]) fabric_live[{slot}] <= 0;
+'''
+        for i in range(count):
+            port = f'{"instruction" if i % 2 == 0 else "data"}_{i//2}'
+            body += f'''    if (fabric_accepted[{i}] && ({free})) begin
+      fabric_live[{slot}] <= 1; fabric_owner[{slot}] <= {i};
+      fabric_kind[{slot}] <= fabric_special_{i}; fabric_tags[{slot}] <= {port}_request_bits_tag;
+    end
+'''
+        body += '  end\n'
     special = '{' + ', '.join(f'fabric_special_{i}' for i in reversed(range(count))) + '}'
     body += f'''
   wire [{count-1}:0] fabric_special = {special};
@@ -3539,6 +3562,11 @@ def axi_case(parameters):
             body += '  always @(posedge clock) if (!reset) cover(line_owned && !line_protection[2] && memory_response_valid && memory_response_ready && memory_response_bits_last && !line_fault);\n'
         for token, value in (('BEATS', 512 // width), ('SLICES', width // 64), ('BUSSIZE', lane_bits)):
             body = body.replace(token, str(value))
+    if parameters.get('enableBurstRefill') or parameters.get('dCacheRefillBytes') == 64:
+        body = re.sub(r'\bline\b', 'axi_request_line', body)
+        body = f'''  wire axi_request_line = !request_write && !request_atomic && request_size == 6 &&
+    (request_fetch ? {int(bool(parameters.get('enableBurstRefill')))} : {int(parameters.get('dCacheRefillBytes') == 64)});
+''' + body
     for channel, fields in (('ar', ('addr', 'id', 'len', 'size', 'burst', 'lock', 'cache', 'prot', 'qos')),
                             ('aw', ('addr', 'id', 'len', 'size', 'burst', 'lock', 'cache', 'prot', 'qos')),
                             ('w', ('data', 'strb', 'last'))):
@@ -3561,181 +3589,213 @@ def axi_case(parameters):
 
 
 def read_queue_case(parameters):
-    harts = parameters['hartCount']
-    lane_bits = (parameters['axiDataBits'] // 8 - 1).bit_length()
-    owner_bits = (2 * harts - 1).bit_length()
-    watched = lambda index: f'({index}) == rq_watch' if harts > 2 else "1'b1"
-    accepted = []
-    body = (f'  (* anyconst *) reg [{owner_bits-2}:0] rq_watch;\n' if harts > 2 else '') + f'''
+    harts, width = parameters['hartCount'], parameters['axiDataBits']
+    lane_bits, owner_bits = (width // 8 - 1).bit_length(), (2 * harts - 1).bit_length()
+    slices, beats = width // 64, 512 // width
+    burst = parameters.get('enableBurstRefill') or parameters.get('dCacheRefillBytes') == 64
+    instruction_line, data_line = int(bool(parameters.get('enableBurstRefill'))), int(parameters.get('dCacheRefillBytes') == 64)
+    body = f'''
   (* anyconst *) reg [5:0] rq_bit;
-  reg rq_past = 0;
-  reg [{harts-1}:0] rq_owned = 0, rq_checked = 0, rq_sent = 0, rq_done = 0;
-  reg [{harts-1}:0] rq_allowed, rq_fault, rq_port, rq_fetch, rq_privileged, rq_write, rq_atomic;
-  reg rq_address [0:{harts-1}], rq_data [0:{harts-1}];
-  reg [{lane_bits-1}:0] rq_offset [0:{harts-1}];
-  reg [2:0] rq_size [0:{harts-1}];
-  reg [7:0] rq_tag [0:{harts-1}];
-  wire [{harts-1}:0] rq_waiting = rq_owned & rq_sent & ~rq_done;
-  wire [{owner_bits-1}:0] rq_reply_owner = responseSlot ? owner_0 : owner;
-  wire [{owner_bits-2}:0] rq_reply_hart = rq_reply_owner >> 1;
-  reg [{owner_bits-2}:0] rq_first_id;
-  reg rq_reordered = 0, rq_bad_beat = 0;
-  wire [63:0] rq_word_0 = READ_QUEUE_DATA_0;
-  wire [63:0] rq_word_1 = READ_QUEUE_DATA_1;
-  wire rq_loaded = responseSlot ? rq_word_1[rq_bit] : rq_word_0[rq_bit];
-  wire [{harts.bit_length()-1}:0] rq_count = {' + '.join(f"{{{harts.bit_length()-1}'b0, rq_owned[{h}]}}" for h in range(harts))};
-  wire [{harts.bit_length()-1}:0] rq_wait_count = {' + '.join(f"{{{harts.bit_length()-1}'b0, rq_waiting[{h}]}}" for h in range(harts))};
+  reg rq_past = 0, rq_poison = 0, rq_reordered = 0, rq_interleaved = 0, rq_previous = 0;
+  reg [1:0] rq_owned = 0, rq_checked = 0, rq_sent = 0, rq_terminal = 0;
+  reg [1:0] rq_allowed, rq_fault, rq_fetch, rq_privileged, rq_write, rq_atomic, rq_line;
+  reg [{owner_bits-1}:0] rq_owner [0:1];
+  reg rq_address [0:1];
+  reg [{lane_bits-1}:0] rq_offset [0:1];
+  reg [2:0] rq_size [0:1];
+  reg [7:0] rq_tag [0:1];
+  reg [{slices-1}:0] rq_data [0:1];
+  reg [3:0] rq_count [0:1], rq_beats [0:1];
+  reg [{owner_bits-2}:0] rq_first_id, rq_previous_id;
+  wire [1:0] rq_waiting = rq_owned & rq_sent & ~rq_terminal;
+  wire [1:0] rq_matches = {{rq_waiting[1] && r_bits_id == (rq_owner[1] >> 1), rq_waiting[0] && r_bits_id == (rq_owner[0] >> 1)}};
+  wire rq_known = |rq_matches;
+  wire [1:0] rq_wait_count = {{1'b0, rq_waiting[0]}} + {{1'b0, rq_waiting[1]}};
 '''
     def permission(suffix):
         field = lambda name: 'request_' + name + suffix
         address, size = field('address'), field('size')
         ranges = []
-        for amount in range(4):
+        for amount in (*range(4), *((6,) if burst else ())):
             terms = []
             for region in parameters['memoryRegions']:
                 if region['device'] or int(region['size']) < 1 << amount:
                     continue
-                access = (f"{field('fetch')} ? 1'b{int(region['executable'])} : "
-                          f"1'b{int(region['readable'])}")
-                terms.append(f"({address} >= 64'h{int(region['base']):x} && "
-                             f"{address} <= 64'h{int(region['base'])+int(region['size'])-(1<<amount):x} && ({access}))")
-            region_match = ' || '.join(terms) or "1'b0"
-            ranges.append(f"({size} == 3'd{amount} && ({address} & 64'd{(1<<amount)-1}) == 0 && ({region_match}))")
+                execute = region['executable'] and (amount != 6 or parameters.get('enableBurstRefill'))
+                read = region['readable'] and (amount != 6 or parameters.get('dCacheRefillBytes') == 64 and region.get('dataCacheable'))
+                terms.append(f"({address} >= 64'h{int(region['base']):x} && {address} <= 64'h{int(region['base'])+int(region['size'])-(1<<amount):x} && ({field('fetch')} ? 1'b{int(bool(execute))} : 1'b{int(bool(read))}))")
+            ranges.append(f"({size} == 3'd{amount} && ({address} & 64'd{(1<<amount)-1}) == 0 && ({' || '.join(terms) or '0'}))")
         return f"!{field('write')} && !{field('atomic')} && (" + ' || '.join(ranges) + ')'
     for slot, suffix in enumerate(('', '_0')):
-        body += f"  wire rq_permission_{slot} = {permission(suffix)};\n"
+        ready = ' || '.join(f'(rq_owner[{slot}] == {port} && ports_{port}_response_ready)' for port in range(2 * harts))
+        body += f'''  wire rq_permission_{slot} = {permission(suffix)};
+  wire [63:0] rq_word_{slot} = READ_QUEUE_DATA_{slot};
+  wire rq_take_{slot} = rq_owned[{slot}] && rq_count[{slot}] != 0 && ({ready});
+'''
     for port in range(2 * harts):
-        accepted.append(f"{{{(2*harts).bit_length()-1}'b0, rq_accept_{port}}}")
-        body += f"  wire rq_accept_{port} = ports_{port}_request_valid && ports_{port}_request_ready;\n"
-    body += f'''
-  wire [{(2*harts).bit_length()-1}:0] rq_accept_count = {' + '.join(accepted)};
+        body += f'  wire rq_accept_{port} = ports_{port}_request_valid && ports_{port}_request_ready;\n'
+    body += f'''  wire [{2*harts-1}:0] rq_accepted = {{{', '.join(f'rq_accept_{port}' for port in reversed(range(2*harts)))}}};
   always @(posedge clock) begin
     rq_past <= 1;
     if (!rq_past) assume(reset); else assume(!reset);
     if (reset) begin
-      rq_owned <= 0; rq_checked <= 0; rq_sent <= 0; rq_done <= 0;
-      rq_reordered <= 0; rq_bad_beat <= 0;
+      rq_owned <= 0; rq_checked <= 0; rq_sent <= 0; rq_terminal <= 0;
+      rq_poison <= 0; rq_reordered <= 0; rq_interleaved <= 0; rq_previous <= 0;
     end else begin
       assume(!r_valid || |rq_waiting);
-      assert(rq_count <= 2 && rq_accept_count <= 1);
-      assert(empty == (rq_count == 0));
-      assert(r_ready == (|rq_waiting));
-      assert(state <= 4 && state_0 <= 4);
-      assert(rq_count == {{31'b0, state != 0}} + {{31'b0, state_0 != 0}});
-      if (state != 0 && state_0 != 0) assert((owner >> 1) != (owner_0 >> 1));
+      assert((rq_accepted & (rq_accepted - {2*harts}'d1)) == 0);
+      assert(empty == (!(|rq_owned) && !rq_poison));
+      assert(poisoned == rq_poison);
+      assert(state <= {6 if burst else 4} && state_0 <= {6 if burst else 4});
+      if (&rq_owned) assert((rq_owner[0] >> 1) != (rq_owner[1] >> 1));
+      if (rq_poison) assert(rq_accepted == 0);
       if (ar_valid) begin
-        assert(ar_bits_id < {harts});
-        assert(rq_owned[ar_bits_id] && rq_checked[ar_bits_id] && rq_allowed[ar_bits_id]);
-        assert(!rq_sent[ar_bits_id] && !rq_done[ar_bits_id]);
-        if ({watched('ar_bits_id')}) begin
-          if (rq_bit < {parameters['physicalAddressBits']}) assert(ar_bits_addr[rq_bit] == rq_address[ar_bits_id]);
-          assert(ar_bits_size == rq_size[ar_bits_id]);
-        end
-        assert(ar_bits_len == 0 && ar_bits_burst == 1);
-        assert(!ar_bits_lock && ar_bits_cache == 0 && ar_bits_qos == 0);
-        assert(ar_bits_prot == {{rq_fetch[ar_bits_id], 1'b0, rq_privileged[ar_bits_id]}});
+        assert((rq_owned[0] && ar_bits_id == (rq_owner[0] >> 1)) || (rq_owned[1] && ar_bits_id == (rq_owner[1] >> 1)));
+        assert(ar_bits_burst == 1 && !ar_bits_lock && ar_bits_cache == 0 && ar_bits_qos == 0);
         if (ar_ready && rq_wait_count == 0) rq_first_id <= ar_bits_id;
       end
       if (r_valid && r_ready) begin
-        assert(rq_reply_hart < {harts} && rq_waiting[rq_reply_hart]);
-        if (r_bits_id < {harts} && rq_waiting[r_bits_id]) assert(rq_reply_hart == r_bits_id);
-        if (!r_bits_last) rq_bad_beat <= 1;
-        if (rq_wait_count == 2 && r_bits_last && r_bits_id != rq_first_id && r_bits_id == rq_reply_hart)
-          rq_reordered <= 1;
+        if (!rq_known) rq_poison <= 1;
+        else begin
+          if (&rq_waiting && r_bits_last && r_bits_id != rq_first_id) rq_reordered <= 1;
+          if (rq_previous && &rq_waiting && r_bits_id != rq_previous_id) rq_interleaved <= 1;
+          rq_previous <= 1; rq_previous_id <= r_bits_id;
+        end
       end
       if ($past(!reset && ar_valid && !ar_ready)) begin
         assert(ar_valid);
         assert($stable({{ar_bits_id, ar_bits_len, ar_bits_size, ar_bits_burst, ar_bits_lock, ar_bits_cache, ar_bits_prot, ar_bits_qos}}));
-        if ({watched('ar_bits_id')} && rq_bit < {parameters['physicalAddressBits']}) assert($stable(ar_bits_addr[rq_bit]));
+        if (rq_bit < {parameters['physicalAddressBits']}) assert($stable(ar_bits_addr[rq_bit]));
       end
+      if ($past(!reset && rq_poison && !ar_valid)) assert(!ar_valid);
       if ($past(!reset && r_valid && !r_ready)) begin
         assume(r_valid); assume($stable({{r_bits_data, r_bits_id, r_bits_resp, r_bits_last}}));
       end
-      cover(rq_wait_count == 2);
-      cover(rq_reordered && rq_count == 0);
-      cover(ar_valid && !ar_ready && rq_count == 2);
+      cover(&rq_waiting);
+      cover(rq_reordered && !(|rq_owned));
+      cover(ar_valid && !ar_ready && &rq_owned);
+      cover(rq_poison && !(|rq_owned));
 '''
-    for hart in range(harts):
-        permission = f'(state != 0 && (owner >> 1) == {hart} ? rq_permission_0 : rq_permission_1)'
+    if burst:
+        body += '''      cover(&(rq_waiting & rq_line));
+      cover(rq_interleaved && !(|rq_owned));
+'''
+        if width > 64:
+            body += '      assert(!(state == 5 && state_0 == 5));\n'
+    for n, suffix in enumerate(('', '_0')):
         body += f'''
-      assert(rq_owned[{hart}] == ((state != 0 && (owner >> 1) == {hart}) || (state_0 != 0 && (owner_0 >> 1) == {hart})));
-      if (rq_owned[{hart}] && !rq_checked[{hart}]) begin
-        rq_checked[{hart}] <= 1; rq_allowed[{hart}] <= {permission};
-        if (!{permission}) begin rq_done[{hart}] <= 1; if ({watched(hart)}) rq_data[{hart}] <= 0; rq_fault[{hart}] <= 1; end
+      if (rq_owned[{n}] && !rq_checked[{n}]) begin
+        rq_checked[{n}] <= 1; rq_allowed[{n}] <= rq_permission_{n};
+        if (!rq_permission_{n}) begin rq_count[{n}] <= 1; rq_terminal[{n}] <= 1; rq_fault[{n}] <= 1; rq_data[{n}] <= 0; end
       end
-      if (ar_valid && ar_ready && ar_bits_id == {hart}) rq_sent[{hart}] <= 1;
-      if (r_valid && r_ready && rq_reply_hart == {hart}) begin
-        if ({watched(hart)}) rq_data[{hart}] <= rq_loaded;
-        rq_fault[{hart}] <= rq_fault[{hart}] || r_bits_resp != 0 || r_bits_id != {hart} || !r_bits_last;
-        if (r_bits_last) rq_done[{hart}] <= 1;
+      if (ar_valid && ar_bits_id == (rq_owner[{n}] >> 1) && rq_owned[{n}]) begin
+        assert(rq_checked[{n}] && rq_allowed[{n}] && !rq_sent[{n}] && !rq_terminal[{n}]);
+        assert(ar_bits_len == (rq_line[{n}] ? {beats-1} : 0));
+        assert(ar_bits_size == (rq_line[{n}] ? {lane_bits} : rq_size[{n}]));
+        assert(ar_bits_prot == {{rq_fetch[{n}], 1'b0, rq_privileged[{n}]}});
+        if (rq_bit < {parameters['physicalAddressBits']}) assert(ar_bits_addr[rq_bit] == rq_address[{n}]);
+        if (ar_ready) rq_sent[{n}] <= 1;
       end
-'''
-        for subport in range(2):
-            port = 2 * hart + subport
-            prefix = f'ports_{port}'
-            request = prefix + '_request_bits_'
-            response = prefix + '_response_bits_'
-            privilege = request + 'privileged' if parameters.get('enableUserMode') else "1'b1"
-            body += f'''
-      if (rq_accept_{port}) begin
-        assert(!rq_owned[{hart}]);
-        rq_owned[{hart}] <= 1; rq_checked[{hart}] <= 0; rq_sent[{hart}] <= 0; rq_done[{hart}] <= 0;
-        rq_fault[{hart}] <= 0; rq_port[{hart}] <= {subport};
-        if ({watched(hart)}) begin
-          rq_address[{hart}] <= {request}address[rq_bit]; rq_offset[{hart}] <= {request}address[{lane_bits-1}:0]; rq_size[{hart}] <= {request}size; rq_tag[{hart}] <= {request}tag;
+      if (r_valid && r_ready && rq_matches[{n}]) begin
+        assert(rq_count[{n}] == 0);
+        rq_terminal[{n}] <= r_bits_last;
+        rq_fault[{n}] <= rq_fault[{n}] || rq_poison || r_bits_resp != 0 ||
+          (rq_line[{n}] ? r_bits_last != (rq_beats[{n}] == {beats-1}) : !r_bits_last);
+        if (rq_line[{n}] && rq_beats[{n}] < {beats}) begin
+          rq_count[{n}] <= {slices}; rq_beats[{n}] <= rq_beats[{n}] + 1;
+          for (integer part = 0; part < {slices}; part++) rq_data[{n}][part] <= r_bits_data[64 * part + rq_bit];
+        end else if (r_bits_last) begin
+          rq_count[{n}] <= 1;
+          rq_data[{n}] <= !rq_line[{n}] && rq_size[{n}] <= 3 && rq_bit < (7'd8 << rq_size[{n}]) && rq_offset[{n}] * 8 + rq_bit < {width} && r_bits_data[rq_offset[{n}] * 8 + rq_bit];
         end
-        rq_fetch[{hart}] <= {request}fetch; rq_privileged[{hart}] <= {privilege};
-        rq_write[{hart}] <= {request}write; rq_atomic[{hart}] <= {request}atomic;
       end
-      assert({prefix}_response_valid == (rq_owned[{hart}] && rq_done[{hart}] && rq_port[{hart}] == {subport}));
-      if ({prefix}_response_valid) begin
-        if ({watched(hart)}) assert({response}data[rq_bit] == rq_data[{hart}] && {response}tag == rq_tag[{hart}]);
-        assert({response}fault == rq_fault[{hart}] && {response}last);
-        if ({prefix}_response_ready) rq_owned[{hart}] <= 0;
-      end
-      if ($past(!reset && {prefix}_response_valid && !{prefix}_response_ready)) begin
-        assert({prefix}_response_valid);
-        assert($stable({{{response}fault, {response}last}}));
-        if ({watched(hart)}) assert($stable({{{response}data[rq_bit], {response}tag}}));
+      if (rq_take_{n}) begin
+        rq_count[{n}] <= rq_count[{n}] - 1; rq_data[{n}] <= rq_data[{n}] >> 1;
+        if (rq_terminal[{n}] && rq_count[{n}] == 1) rq_owned[{n}] <= 0;
       end
 '''
-        body += f'''
-      cover(rq_owned[{hart}] && rq_done[{hart}] && !rq_allowed[{hart}] && !rq_sent[{hart}]);
-      cover(({watched(hart)}) && rq_owned[{hart}] && rq_done[{hart}] && rq_sent[{hart}] && !rq_fault[{hart}] && rq_size[{hart}] < 3);
-      cover(rq_owned[{hart}] && rq_done[{hart}] && rq_fault[{hart}] && rq_bad_beat && rq_sent[{hart}]);
-      cover(rq_owned[{hart}] && rq_done[{hart}] && rq_wait_count == 1);
+        for port in range(2 * harts):
+            req = f'ports_{port}_request_bits_'
+            privilege = req + 'privileged' if parameters.get('enableUserMode') else "1'b1"
+            select = '!rq_owned[0]' if n == 0 else 'rq_owned[0] && !rq_owned[1]'
+            body += f'''      if (rq_accept_{port} && ({select})) begin
+        rq_owned[{n}] <= 1; rq_checked[{n}] <= 0; rq_sent[{n}] <= 0; rq_terminal[{n}] <= 0;
+        rq_owner[{n}] <= {port}; rq_count[{n}] <= 0; rq_beats[{n}] <= 0; rq_fault[{n}] <= 0;
+        rq_size[{n}] <= {req}size; rq_address[{n}] <= {req}address[rq_bit]; rq_offset[{n}] <= {req}address[{lane_bits-1}:0]; rq_tag[{n}] <= {req}tag;
+        rq_fetch[{n}] <= {req}fetch; rq_privileged[{n}] <= {privilege}; rq_write[{n}] <= {req}write; rq_atomic[{n}] <= {req}atomic;
+        rq_line[{n}] <= !{req}write && !{req}atomic && {req}size == 6 && ({req}fetch ? {instruction_line} : {data_line});
+      end
 '''
-    for slot, suffix in enumerate(('', '_0')):
         state, owner = 'state' + suffix, 'owner' + suffix
-        body += f'''
-      if ({state} != 0) begin
-        assert({owner} < {2*harts} && rq_owned[{owner} >> 1] && rq_port[{owner} >> 1] == {owner}[0]);
-        if ({watched(owner + " >> 1")}) begin
-          assert(request_address{suffix}[rq_bit] == rq_address[{owner} >> 1] && request_size{suffix} == rq_size[{owner} >> 1]);
-          assert(request_address{suffix}[{lane_bits-1}:0] == rq_offset[{owner} >> 1]);
-          assert(request_tag{suffix} == rq_tag[{owner} >> 1]);
+        body += f'''      assert(rq_owned[{n}] == ({state} != 0));
+      if (rq_owned[{n}]) begin
+        if ({state} != 1) assert(rq_checked[{n}]);
+        assert(rq_sent[{n}] == ({state} >= 3 && ({state} != 4 || rq_allowed[{n}])));
+        assert(rq_owner[{n}] < {2*harts} && {owner} == rq_owner[{n}]);
+        assert(request_size{suffix} == rq_size[{n}] && request_fetch{suffix} == rq_fetch[{n}] && request_write{suffix} == rq_write[{n}] && request_atomic{suffix} == rq_atomic[{n}]);
+        assert(request_address{suffix}[rq_bit] == rq_address[{n}] && request_address{suffix}[{lane_bits-1}:0] == rq_offset[{n}] && request_tag{suffix} == rq_tag[{n}]);
+        assert(rq_line[{n}] == (!rq_write[{n}] && !rq_atomic[{n}] && rq_size[{n}] == 6 && (rq_fetch[{n}] ? {instruction_line} : {data_line})));
+        if (rq_checked[{n}]) assert(rq_permission_{n} == rq_allowed[{n}]);
+        if ({state} >= 2 && {state} != 4) assert(rq_allowed[{n}] && rq_checked[{n}]);
+        assert(fault{suffix} == rq_fault[{n}]);
+        if ({state} == 1 || {state} == 2 || {state} == 3 || {state} == 6) assert(rq_count[{n}] == 0);
+        if ({state} == 3 || {state} == 6) assert(rq_waiting[{n}]);
+        if ({state} == 1 || {state} == 2) assert(!rq_sent[{n}] && !rq_terminal[{n}]);
+        if ({state} == 4) begin
+          assert(rq_count[{n}] == 1 && rq_terminal[{n}]);
+          assert(data{suffix}[rq_bit] == rq_data[{n}][0]);
         end
-        assert(request_fetch{suffix} == rq_fetch[{owner} >> 1]);
-        assert(request_write{suffix} == rq_write[{owner} >> 1] && request_atomic{suffix} == rq_atomic[{owner} >> 1]);
-        assert(permitted{suffix} == rq_permission_{slot});
-        if (rq_checked[{owner} >> 1]) assert(permitted{suffix} == rq_allowed[{owner} >> 1]);
-        if ({state} == 2 || {state} == 3 || ({state} == 1 && rq_checked[{owner} >> 1])) assert(rq_allowed[{owner} >> 1]);
-        assert(fault{suffix} == rq_fault[{owner} >> 1]);
-        assert(rq_done[{owner} >> 1] == ({state} == 4));
-        assert(rq_sent[{owner} >> 1] == ({state} == 3 || ({state} == 4 && rq_allowed[{owner} >> 1])));
-        if ({state} >= 2) assert(rq_checked[{owner} >> 1]);
-        if ({state} == 4 && ({watched(owner + " >> 1")})) assert(data{suffix}[rq_bit] == rq_data[{owner} >> 1]);
+'''
+        if burst:
+            body += f'''        if ({state} == 5) begin
+          assert(rq_line[{n}] && rq_sent[{n}] && rq_count[{n}] >= 1 && rq_count[{n}] <= {slices});
+          assert(terminal{suffix} == rq_terminal[{n}] && beat{suffix} + 1 == rq_beats[{n}] && beat{suffix} < {beats});
+          if ((beat{suffix} == {beats-1}) != rq_terminal[{n}]) assert(rq_fault[{n}]);
+'''
+            if width > 64:
+                body += f'''          assert(slice == {slices} - rq_count[{n}]);
+          for (integer part = 0; part < {slices}; part++)
+            if (part < rq_count[{n}]) assert(block[(slice + part) * 64 + rq_bit] == rq_data[{n}][part]);
+'''
+            else:
+                body += f'          assert(data{suffix}[rq_bit] == rq_data[{n}][0]);\n'
+            body += f'''        end
+        if ({state} == 1 || {state} == 2) assert(beat{suffix} == 0 && rq_beats[{n}] == 0);
+        if ({state} == 3) assert(beat{suffix} == rq_beats[{n}] && beat{suffix} < {beats});
+        if ({state} == 6) assert(rq_line[{n}] && beat{suffix} == {beats-1} && rq_beats[{n}] == {beats} && rq_fault[{n}]);
+'''
+        body += f'        assert(request_privileged{suffix} == rq_privileged[{n}]);\n' if parameters.get('enableUserMode') else f'        assert(rq_privileged[{n}]);\n'
+        body += '      end\n'
+    for port in range(2 * harts):
+        prefix = f'ports_{port}'
+        body += f'''      if (rq_accept_{port}) begin
+        assert(!(&rq_owned));
+        assert(!rq_owned[0] || (rq_owner[0] >> 1) != {port//2});
+        assert(!rq_owned[1] || (rq_owner[1] >> 1) != {port//2});
+      end
+      assert({prefix}_response_valid == ((rq_owned[0] && rq_owner[0] == {port} && rq_count[0] != 0) || (rq_owned[1] && rq_owner[1] == {port} && rq_count[1] != 0)));
+'''
+        for n in range(2):
+            body += f'''      if ({prefix}_response_valid && rq_owner[{n}] == {port} && rq_owned[{n}]) begin
+        assert({prefix}_response_bits_fault == rq_fault[{n}] && {prefix}_response_bits_last == (rq_terminal[{n}] && rq_count[{n}] == 1));
+        assert({prefix}_response_bits_tag == rq_tag[{n}] && {prefix}_response_bits_data[rq_bit] == rq_data[{n}][0]);
       end
 '''
-        if not parameters.get('enableUserMode'):
-            body += f'      if ({state} != 0) assert(rq_privileged[{owner} >> 1]);\n'
-        if parameters.get('enableUserMode'):
-            body += f'      if ({state} != 0) assert(request_privileged{suffix} == rq_privileged[{owner} >> 1]);\n'
+        body += f'''      if ($past(!reset && {prefix}_response_valid && !{prefix}_response_ready)) begin
+        assert({prefix}_response_valid); assert($stable({{{prefix}_response_bits_fault, {prefix}_response_bits_last}}));
+        assert($stable({{{prefix}_response_bits_data[rq_bit], {prefix}_response_bits_tag}}));
+      end
+'''
     body += '    end\n  end\n'
-    if harts > 2:
-        body = body.replace(f'[0:{harts-1}]', '[0:0]')
-        body = re.sub(r'(rq_(?:address|offset|data|size|tag))\[[^\]]+\]', r'\1[0]', body)
-    return ('ReadQueue', body, 'assign ar_bits_len = 8\'h0;', 'assign ar_bits_len = 8\'h1;')
+    for hart in range(harts):
+        for kind, condition in (
+            ('denied', 'rq_checked[N] && !rq_allowed[N] && rq_count[N] == 1'),
+            ('short', 'rq_sent[N] && rq_count[N] == 1 && !rq_fault[N] && rq_size[N] < 3'),
+            ('fault', 'rq_sent[N] && rq_count[N] == 1 && rq_fault[N] && !rq_poison'),
+            ('terminal', 'rq_terminal[N] && rq_count[N] != 0 && rq_wait_count == 1')):
+            expression = ' || '.join(f'(rq_owned[{n}] && (rq_owner[{n}] >> 1) == {hart} && {condition.replace("N", str(n))})' for n in range(2))
+            body += f'  wire rq_hart_{hart}_{kind} = {expression};\n  always @(posedge clock) if (!reset) begin\n    cover(rq_hart_{hart}_{kind});\n  end\n'
+    return ('ReadQueue', body, 'assign ar_bits_len =', "assign ar_bits_len = 8'h80 |")
 
 
 def verify(rtl, directory, modules=None):
@@ -3927,15 +3987,56 @@ def verify(rtl, directory, modules=None):
             files = dict(sources) if unit in ('Backend', 'Frontend', 'InstructionCache', 'DataCache', 'MemoryFabric') or unit == 'Fetch' and manifest['parameters'].get('iCacheBytes') else {module + '.sv': sources[module + '.sv']}
         if unit == 'MemoryFabric':
             count = 2 * manifest['parameters']['hartCount']
-            for child, signal, expression in (
-                ('ReadQueue', 'formal_queue_live', f"((state != 0) ? ({count}'d1 << owner) : 0) | ((state_0 != 0) ? ({count}'d1 << owner_0) : 0)"),
-                ('MemoryArbiter', 'formal_single_live', f"(state != 0) ? ({count}'d1 << owner) : 0")):
+            observed = [
+                ('ReadQueue', 'formal_queue_live', count, f"((state != 0) ? ({count}'d1 << owner) : 0) | ((state_0 != 0) ? ({count}'d1 << owner_0) : 0)"),
+                ('ReadQueue', 'formal_queue_tags', 8 * count, f"((state != 0) ? ({{{8*count-8}'b0, request_tag}} << (8 * owner)) : 0) | ((state_0 != 0) ? ({{{8*count-8}'b0, request_tag_0}} << (8 * owner_0)) : 0)"),
+                ('MemoryArbiter', 'formal_single_live', count, f"(state != 0) ? ({count}'d1 << owner) : 0"),
+                ('MemoryArbiter', 'formal_single_sent', 1, 'state == 2'),
+                ('MemoryArbiter', 'formal_arbiter_tag', 8, 'request_tag'),
+                ('Axi', 'formal_axi_live', 1, 'state != 0'), ('Memory', 'formal_memory_live', 1, 'pending'),
+                ('Memory', 'formal_memory_fault', 1, 'pending && localFault'),
+                ('Axi', 'formal_axi_tag', 8, 'request_tag'), ('Memory', 'formal_memory_tag', 8, 'tag')]
+            if manifest['parameters'].get('dCacheBytes'):
+                observed.append(('Coherence', 'formal_coherence_live', 1, 'busy'))
+            if manifest['parameters'].get('localInterruptBase') is not None:
+                observed.append(('LocalInterrupts', 'formal_local_live', 1, 'pending'))
+                observed.append(('LocalInterrupts', 'formal_local_tag', 8, 'response_tag'))
+            for child, signal, bits, expression in observed:
                 child_file = 'DitDahA1' + child + '.sv'
-                files[child_file] = files[child_file].replace(');', f', output [{count-1}:0] formal_live);', 1)
-                files[child_file] = files[child_file].replace('endmodule', f'assign formal_live = {expression};\nendmodule', 1)
-                files[module + '.sv'], connected = re.subn(rf'(DitDahA1{child}\s+\w+\s*\()', rf'\1\n.formal_live({signal}),', files[module + '.sv'])
+                files[child_file] = files[child_file].replace(');', f', output [{bits-1}:0] {signal});', 1)
+                files[child_file] = files[child_file].replace('endmodule', f'assign {signal} = {expression};\nendmodule', 1)
+                files[module + '.sv'], connected = re.subn(rf'(DitDahA1{child}\s+\w+\s*\()', rf'\1\n.{signal}({signal}),', files[module + '.sv'])
                 assert connected == 1
-                body += f'\n  wire [{count-1}:0] {signal};\n'
+                body += f'\n  wire [{bits-1}:0] {signal};\n'
+                if bits == 1:
+                    body += f'  always @(posedge clock) if (!reset) assert(!{signal} || active);\n'
+            if manifest['parameters'].get('dCacheBytes'):
+                body += '  always @(posedge clock) if (!reset) assert(!(formal_coherence_live && formal_memory_live));\n'
+            body += '''  always @(posedge clock) if (!reset) begin
+    assert(!formal_memory_live || formal_single_sent);
+    assert(!formal_axi_live || (formal_memory_live && !formal_memory_fault));
+  end
+  wire [7:0] fabric_single_tag = fabric_live[0] && fabric_kind[0] ? fabric_tags[0] : fabric_tags[1];
+  always @(posedge clock) if (!reset) begin
+    if (active) assert(formal_arbiter_tag == fabric_single_tag);
+    if (formal_memory_live) assert(formal_memory_tag == fabric_single_tag);
+    if (formal_axi_live) assert(formal_axi_tag == fabric_single_tag);
+  end
+'''
+            for i in range(count):
+                body += f'  always @(posedge clock) if (!reset && fabric_owned[{i}] && !fabric_exclusive[{i}]) assert(formal_queue_tags[{8*i}+:8] == fabric_tag_{i});\n'
+            if manifest['parameters'].get('localInterruptBase') is not None:
+                body += '''  always @(posedge clock) if (!reset) begin
+    assert(!formal_local_live || (formal_memory_live && !formal_memory_fault));
+    assert(!(formal_local_live && formal_axi_live));
+    if (formal_local_live) assert(formal_local_tag == fabric_single_tag);
+  end
+'''
+            queue_invariants = 'assert(!(state != 0 && state_0 != 0) || (owner >> 1) != (owner_0 >> 1));\n'
+            if manifest['parameters']['axiDataBits'] > 64 and (manifest['parameters'].get('enableBurstRefill') or manifest['parameters'].get('dCacheRefillBytes') == 64):
+                queue_invariants += 'assert(!(state == 5 && state_0 == 5));\n'
+            files['DitDahA1ReadQueue.sv'] = files['DitDahA1ReadQueue.sv'].replace('endmodule',
+                'always @(posedge clock) if (!reset) begin\n' + queue_invariants + 'end\nendmodule')
         if unit == 'Backend':
             body = backend_names(body, sources[module + '.sv'])
             if name == 'InterruptBackend':
@@ -4014,6 +4115,11 @@ def verify(rtl, directory, modules=None):
                 assert update and 'shifted' in update[1]
                 body = body.replace(f'READ_QUEUE_DATA_{slot}', update[1])
                 files[module + '.sv'] = files[module + '.sv'].replace(update[0], f'data{suffix} <= rq_word_{slot};', 1)
+                candidates = [name for name, expression in re.findall(r'wire\s+(\w+)\s*=\s*([^;]+);', sources[module + '.sv'])
+                              if re.match(rf'~request_write{suffix}\s*&\s*~request_atomic{suffix}\s*&', expression)
+                              and f'request_address{suffix} ' in expression]
+                assert len(candidates) == 1, 'Ambiguous read authorization driver'
+                body += f'\n  wire rq_dut_permission_{slot} = {candidates[0]};\n'
         if unit in ('Backend', 'Frontend', 'Gpr', 'Multiply', 'Csr', 'MemoryArbiter', 'ReadQueue', 'MemoryFabric', 'Memory', 'Axi', 'InstructionCache', 'DataCache', 'Coherence', 'Lsu', 'LocalInterrupts', 'Translation') or (enabled and unit not in ('Decode', 'Execute')) or unit == 'Fetch' and manifest['parameters'].get('iCacheBytes'):
             if unit == 'Backend':
                 files['DitDahA1Lsu.sv'] = files['DitDahA1Lsu.sv'].replace(');', ', output formal_owned);', 1).replace('endmodule', 'assign formal_owned = state != 0;\nendmodule', 1)
@@ -4075,10 +4181,9 @@ def verify(rtl, directory, modules=None):
         checks = [('prove', before, after), ('cover', before, after), ('mutation', before, after)]
         if unit == 'MemoryFabric':
             original = sources[module + '.sv']
-            if manifest['parameters']['axiDataBits'] == 512 and (manifest['parameters'].get('enableBurstRefill') or manifest['parameters'].get('dCacheRefillBytes', 8) == 64):
-                checks[:1] = [(mode, before, after) for mode in ('prove-control', *(f'prove-stability-{i}' for i in range(2 * manifest['parameters']['hartCount'])))]
-                payload = re.search(r'assign\s+instruction_0_response_bits_data\s*=[^;]+;', original).group()
-                checks += [('mutation-data', payload, payload.replace('=', '= axi_r_bits_data[63:0] ^ (', 1).replace(';', ');'))]
+            checks[:1] = [(mode, before, after) for mode in ('prove-control', 'prove-tags', *(f'prove-stability-{i}' for i in range(2 * manifest['parameters']['hartCount'])))]
+            payload = re.search(r'assign\s+instruction_0_response_bits_data\s*=[^;]+;', original).group()
+            checks += [('mutation-data', payload, payload.replace('=', '= axi_r_bits_data[63:0] ^ (', 1).replace(';', ');'))]
             drain = re.search(r'wire\s+allowExclusive\s*=[^;]+;', original).group()
             isolate = re.search(r'wire\s+allowRead\s*=[^;]+;', original).group()
             checks += [('mutation-drain', drain, drain.replace('_readers_empty', "1'h1")),
@@ -4283,7 +4388,7 @@ def verify(rtl, directory, modules=None):
         if unit == 'Axi' and (manifest['parameters'].get('enableBurstRefill') or manifest['parameters'].get('dCacheRefillBytes', 8) == 64):
             last = re.search(r'assign memory_response_bits_last\s*=\s*[^;]+;', original).group()
             checks += [('mutation-line-last', last, 'assign memory_response_bits_last = 1;'),
-                       ('mutation-line-data', response_data, response_data.replace('=', '= line ? 0 :', 1))]
+                       ('mutation-line-data', response_data, response_data.replace('=', '= axi_request_line ? 0 :', 1))]
             if manifest['parameters']['axiDataBits'] > 64:
                 step = re.search(r"slice <= slice \+ \d+'h1;", original).group()
                 checks += [('mutation-line-order', step, step.replace("'h1", "'h0"))]
@@ -4392,8 +4497,9 @@ def verify(rtl, directory, modules=None):
                            ('mutation-line-address', write_address, write_address.replace('beat}', "3'h0}")),
                            ('mutation-line-retry', line_update, line_update.replace('<=', '<= fault |', 1))]
         if unit == 'ReadQueue':
-            payload_modes = [f'prove-payload-bits-{bit}' for bit in range(0, 64, 8)] if manifest['parameters']['hartCount'] > 2 else ['prove-payload']
-            checks[:1] = [(mode, before, after) for mode in ('prove-permission', 'prove-read-data', 'prove-control', *payload_modes)]
+            payload_modes = [f'prove-payload-bits-{bit}' for bit in range(0, 64, 8)] if manifest['parameters']['hartCount'] > 2 or manifest['parameters']['axiDataBits'] > 64 else ['prove-payload']
+            storage_modes = [mode.replace('payload', 'storage') for mode in payload_modes]
+            checks[:1] = [(mode, before, after) for mode in ('prove-permission', 'prove-permission-hold', 'prove-read-data', 'prove-control', *storage_modes, *payload_modes)]
             if manifest['parameters']['hartCount'] > 2:
                 cover_index = next(i for i, check in enumerate(checks) if check[0] == 'cover')
                 checks[cover_index:cover_index+1] = [('cover-global', before, after)] + [(f'cover-harts-{hart}', before, after) for hart in range(0, manifest['parameters']['hartCount'], 4)]
@@ -4401,12 +4507,26 @@ def verify(rtl, directory, modules=None):
             shifted = re.search(r'wire\s+\[[^]]+\]\s+shifted\s*=[^;]+;', original).group()
             offset = re.search(r'request_address\[[^]]+\]', shifted).group()
             checks.append(('mutation-lane', shifted, shifted.replace(offset, "6'h0")))
-            for mode, signal, replacement in (('permission', 'permitted', "1'h1"), ('route', 'responseSlot', "1'h0")):
-                update = re.search(r'wire\s+' + signal + r'\s*=[^;]+;', original).group()
-                checks.append(('mutation-' + mode, update, update.split('=', 1)[0] + '= ' + replacement + ';'))
+            permission = re.search(r'wire rq_dut_permission_0 = (\w+);', body)[1]
+            update = re.search(r'wire\s+' + permission + r'\s*=[^;]+;', original).group()
+            checks.append(('mutation-permission', update, update.split('=', 1)[0] + "= 1'h1;"))
+            update = re.search(r'assign ports_2_response_valid\s*=[^;]+;', original).group()
+            checks.append(('mutation-route', update, 'assign ports_2_response_valid = ports_0_response_valid;'))
             for mode, signal in (('tag', 'ports_0_response_bits_tag'), ('data', 'ports_0_response_bits_data'), ('id', 'ar_bits_id')):
                 update = re.search(r'assign ' + signal + r'\s*=[^;]+;', original).group()
                 checks.append(('mutation-' + mode, update, 'assign ' + signal + " = 0;"))
+            if manifest['parameters'].get('enableBurstRefill') or manifest['parameters'].get('dCacheRefillBytes') == 64:
+                update = re.search(r'assign ports_0_response_bits_last\s*=[^;]+;', original).group()
+                checks.append(('mutation-line-last', update, 'assign ports_0_response_bits_last = 1;'))
+                if manifest['parameters']['axiDataBits'] < 512:
+                    update = re.search(r'if \([^\n]*ports_0_response_ready[^\n]*\)\n\s+beat <= beat \+ 3\x27h1;', original).group()
+                    checks.append(('mutation-line-count', update, update.replace("+ 3'h1", "+ 3'h0")))
+                if manifest['parameters']['axiDataBits'] > 64:
+                    update = re.search(r'if \([^\n]*ports_0_response_ready[^\n]*streaming\)\n\s+slice <= slice \+ \d+\x27h1;', original).group()
+                    checks.append(('mutation-line-order', update, update.replace("'h1", "'h0")))
+            checks.append(('mutation-sticky-fault', 'fault | poisoned', 'poisoned'))
+            update = re.search(r'assign empty\s*=[^;]+;', original).group()
+            checks.append(('mutation-fault-release', update, update.replace('~poisoned', "1'h1")))
         if unit == 'Coherence':
             checks += [('mutation-acknowledgement', 'assign invalidate_0_valid =',
                         "assign invalidate_0_valid = 1'h0 &"),
@@ -4429,15 +4549,36 @@ def verify(rtl, directory, modules=None):
             work = directory / f'{name.lower()}-{mode}'
             work.mkdir(exist_ok=True)
             for filename, text in files.items():
+                if unit == 'MemoryFabric' and filename == 'DitDahA1ReadQueue.sv' and (mode == 'prove-tags' or mode.startswith('prove-stability-')):
+                    text = text.replace('assert(', 'assume(')
                 if unit == 'MemoryFabric' and filename == module + '.sv' and mode.startswith('prove-'):
                     def partition_fabric(match):
                         expression = match[0]
-                        port = re.search(r'assert\(\$stable\(((?:instruction|data)_\d+)_response_bits_data\)\)', expression)
-                        if mode == 'prove-control': return 'assert(1);' if port else expression
+                        port = re.search(r'\b((?:instruction|data)_\d+)_response_bits_data\b', expression)
+                        tag = 'tag' in expression
+                        if mode == 'prove-control': return 'assert(1);' if port or tag else expression
+                        if mode == 'prove-tags':
+                            if port: return 'assert(1);'
+                            return expression if tag else expression.replace('assert(', 'assume(', 1)
                         if not port: return expression.replace('assert(', 'assume(', 1)
                         i = int(mode.rsplit('-', 1)[1])
                         return expression if port[1] == f"{'instruction' if i % 2 == 0 else 'data'}_{i//2}" else 'assert(1);'
                     text = re.sub(r'\bassert\([^;]+;', partition_fabric, text)
+                if unit == 'MemoryFabric' and filename == module + '.sv' and mode == 'mutation-data' and manifest['parameters']['hartCount'] > 2:
+                    region = next(r for r in manifest['parameters']['memoryRegions'] if r['executable'] and not r['device'] and int(r['size']) >= 4)
+                    guidance = f'''  reg fabric_witness_pending = 0;
+  always @(posedge clock) if (reset) fabric_witness_pending <= 0;
+    else if (axi_ar_valid && axi_ar_ready) fabric_witness_pending <= 1;
+    else if (axi_r_valid && axi_r_ready) fabric_witness_pending <= 0;
+  always @* begin
+    assume(instruction_0_request_valid && !instruction_0_response_ready && axi_ar_ready && fabric_bit == 0);
+    assume(!instruction_0_request_bits_write && !instruction_0_request_bits_atomic && instruction_0_request_bits_fetch);
+    assume(instruction_0_request_bits_size == 2 && instruction_0_request_bits_address == 64'd{(int(region['base']) + 3) & ~3});
+    assume(axi_r_valid == fabric_witness_pending && axi_r_bits_id == 0 && axi_r_bits_last && axi_r_bits_resp == 0);
+'''
+                    for port in range(1, 2 * manifest['parameters']['hartCount']):
+                        guidance += f'    assume(!{"instruction" if port % 2 == 0 else "data"}_{port//2}_request_valid);\n'
+                    text = text.replace('\nendmodule', '\n' + guidance + '  end\nendmodule')
                 if unit == 'Axi' and filename == module + '.sv' and mode in ('prove-control', 'prove-payload'):
                     def partition_axi(match):
                         expression = match.group()
@@ -4453,28 +4594,46 @@ def verify(rtl, directory, modules=None):
                         read_body += expression + '\n'
                         lane_bits = (manifest['parameters']['axiDataBits'] // 8 - 1).bit_length()
                         offset = f'(request_address{suffix}[{lane_bits-1}:0] * 8 + rq_bit)'
-                        read_body += (f"  always @* assert(rq_word_{slot}[rq_bit] == (request_size{suffix} <= 3 && "
-                                      f"rq_bit < (7'd8 << request_size{suffix}) && {offset} < {manifest['parameters']['axiDataBits']} && r_bits_data[{offset}]));\n")
-                    permission_body = '\n'.join(line for line in body.splitlines() if 'wire rq_permission_' in line)
-                    permission_body += '\n  always @* begin assert(permitted == rq_permission_0); assert(permitted_0 == rq_permission_1); end\n'
+                        expected = f"(request_size{suffix} <= 3 && rq_bit < (7'd8 << request_size{suffix}) && {offset} < {manifest['parameters']['axiDataBits']} && r_bits_data[{offset}])"
+                        if manifest['parameters'].get('enableBurstRefill') or manifest['parameters'].get('dCacheRefillBytes') == 64:
+                            line = f"!request_write{suffix} && !request_atomic{suffix} && request_size{suffix} == 6 && (request_fetch{suffix} ? {int(bool(manifest['parameters'].get('enableBurstRefill')))} : {int(manifest['parameters'].get('dCacheRefillBytes') == 64)})"
+                            expected = f"(state{suffix} == 6 ? 1'b0 : (state{suffix} == 3 && {line}) ? r_bits_data[rq_bit] : {expected})"
+                        read_body += f'  always @* assert(rq_word_{slot}[rq_bit] == {expected});\n'
+                    permission_body = '\n'.join(line for line in body.splitlines() if 'wire rq_permission_' in line or 'wire rq_dut_permission_' in line)
+                    permission_body += '\n  always @* begin assert(rq_dut_permission_0 == rq_permission_0); assert(rq_dut_permission_1 == rq_permission_1); end\n'
                     if mode in ('prove-permission', 'mutation-permission'):
                         text = text.replace(body, permission_body + '\n'.join(re.findall(r'wire \[63:0\] rq_word_\d =[^;]+;', body)))
+                    elif mode == 'prove-permission-hold':
+                        hold = '\n'.join(re.findall(r'wire (?:rq_dut_permission_\d|\[63:0\] rq_word_\d) =[^;]+;', body))
+                        hold += '\n  reg permission_past = 0;\n  always @(posedge clock) begin\n    permission_past <= 1;\n    if (!permission_past) assume(reset); else assume(!reset);\n'
+                        for slot, suffix in enumerate(('', '_0')):
+                            hold += f'    if (permission_past && $past(!reset && state{suffix} != 0)) assert($stable(rq_dut_permission_{slot}));\n'
+                        text = text.replace(body, hold + '  end\n')
                     elif mode in ('prove-read-data', 'mutation-lane'):
                         text = text.replace(body, read_body)
                     else:
                         for slot, suffix in enumerate(('', '_0')):
                             text = re.sub(r'wire rq_permission_' + str(slot) + r' =[^;]+;',
-                                          'wire rq_permission_' + str(slot) + ' = permitted' + suffix + ';', text)
-                            text = text.replace(f'        assert(permitted{suffix} == rq_permission_{slot});', '')
-                        if mode == 'prove-control' or mode.startswith('prove-payload'):
+                                          f'wire rq_permission_{slot} = rq_dut_permission_{slot};', text)
+                        if mode == 'prove-control' or mode.startswith(('prove-storage', 'prove-payload')):
+                            for slot, suffix in enumerate(('', '_0')):
+                                driver = re.search(r'wire rq_dut_permission_' + str(slot) + r' = (\w+);', body)[1]
+                                shape = f'!request_write{suffix} && !request_atomic{suffix} && (request_size{suffix} <= 3 || (request_size{suffix} == 6 && (request_fetch{suffix} ? {int(bool(manifest["parameters"].get("enableBurstRefill")))} : {int(manifest["parameters"].get("dCacheRefillBytes") == 64)})))'
+                                text, changed = re.subn(r'wire\s+' + driver + r'\s*=[^;]+;',
+                                    f'(* anyseq *) reg rq_grant_{slot}; wire {driver} = rq_grant_{slot} && {shape};', text)
+                                assert changed == 1
+                                text = text.replace('\nendmodule', f'\n  always @(posedge clock) if (rq_past && $past(!reset && state{suffix} != 0)) assume($stable(rq_dut_permission_{slot}));\nendmodule')
                             def partition(match):
                                 expression = match.group()
-                                payload = any(token in expression for token in ('rq_address', 'rq_offset', 'rq_size', 'rq_tag', 'rq_data', 'rq_bit'))
+                                payload = any(token in expression for token in ('rq_address', 'rq_offset', 'rq_tag', 'rq_data', 'rq_bit'))
                                 if mode == 'prove-control':
                                     return 'assert(1);' if payload else expression
-                                return expression if payload else expression.replace('assert(', 'assume(', 1)
+                                if not payload: return expression.replace('assert(', 'assume(', 1)
+                                if mode.startswith('prove-storage'):
+                                    return 'assert(1);' if 'ports_' in expression else expression
+                                return expression if 'ports_' in expression else expression.replace('assert(', 'assume(', 1)
                             text = re.sub(r'\bassert\([^;]+;', partition, text)
-                        if mode.startswith('prove-payload-bits-'):
+                        if mode.startswith(('prove-storage-bits-', 'prove-payload-bits-')):
                             declaration = '(* anyconst *) reg [5:0] rq_bit;'
                             assert text.count(declaration) == 1
                             text = text.replace(declaration, "(* anyconst *) reg [2:0] rq_bit_offset; "
@@ -4482,20 +4641,39 @@ def verify(rtl, directory, modules=None):
                 if unit == 'ReadQueue' and filename == module + '.sv' and mode.startswith('cover-'):
                     first_hart = None if mode == 'cover-global' else int(mode.rsplit('-', 1)[1])
                     def select_cover(match):
-                        hart = re.search(r'rq_owned\[(\d+)\]', match[0])
+                        hart = re.search(r'rq_hart_(\d+)_', match[0])
                         selected = first_hart is not None and first_hart <= int(hart[1]) < first_hart + 4 if hart else first_hart is None
                         return match[0] if selected else ''
                     text = re.sub(r'^\s*cover\([^;\n]+;\n', select_cover, text, flags=re.M)
-                if unit == 'ReadQueue' and filename == module + '.sv' and manifest['parameters']['hartCount'] > 2 and mode in ('mutation-route', 'mutation-data'):
+                if unit == 'ReadQueue' and filename == module + '.sv' and (mode.startswith('mutation-line-') or mode in ('mutation-sticky-fault', 'mutation-fault-release')):
+                    line = mode.startswith('mutation-line-')
+                    fetch = line and bool(manifest['parameters'].get('enableBurstRefill'))
+                    region = next(r for r in manifest['parameters']['memoryRegions'] if not r['device'] and
+                                  (r['executable'] if fetch else r['readable'] and (not line or r.get('dataCacheable'))) and int(r['size']) >= 128)
+                    base = (int(region['base']) + 63) & ~63
+                    size, identity = (6 if line else 2), ('(rq_poison ? 0 : 1)' if mode == 'mutation-fault-release' else '0')
+                    last = f'(rq_beats[0] == {512 // manifest["parameters"]["axiDataBits"] - 1})' if line else 'rq_fault[0]' if mode == 'mutation-sticky-fault' else '1'
+                    words = sum((part + 1) << (64 * part) for part in range(manifest['parameters']['axiDataBits'] // 64))
+                    guidance = f'''  always @* begin
+    assume(ports_0_request_valid && ports_0_response_ready && ar_ready);
+    assume(!ports_0_request_bits_write && !ports_0_request_bits_atomic && ports_0_request_bits_fetch == {int(fetch)});
+    assume(ports_0_request_bits_size == {size} && ports_0_request_bits_address == 64'h{base:x});
+    assume(r_valid == (rq_waiting[0] && rq_count[0] == 0));
+    assume(r_bits_id == {identity} && r_bits_last == {last} && r_bits_resp == 0);
+    assume(r_bits_data == {manifest['parameters']['axiDataBits']}'h{words:x});
+'''
+                    for port in range(1, 2 * manifest['parameters']['hartCount']):
+                        guidance += f'    assume(!ports_{port}_request_valid);\n'
+                    text = text.replace('\nendmodule', '\n' + guidance + '  end\nendmodule')
+                if unit == 'ReadQueue' and filename == module + '.sv' and mode in ('mutation-route', 'mutation-data', 'mutation-tag', 'mutation-id'):
                     region = next((r for r in manifest['parameters']['memoryRegions'] if r['readable'] and r['executable'] and not r['device'] and int(r['size']) >= 8 and int(r['base']) % 4 == 0), None)
                     if region is not None:
-                        response = ' && r_bits_resp == 0 && r_bits_last' if mode == 'mutation-data' else ''
-                        constraints = [f'assume(!r_valid || (rq_wait_count == 2 && r_bits_id < 2{response}));']
-                        if mode == 'mutation-data':
-                            constraints.append('assume(ports_0_response_ready);')
-                            constraints.append('assume(rq_watch == 0 && rq_bit == 0);')
+                        constraints = ['assume(r_valid == (&rq_waiting) && r_bits_id == 0 && r_bits_resp == 0 && r_bits_last);',
+                                       'assume(ar_ready && ports_0_response_ready && ports_2_response_ready && rq_bit == 0);',
+                                       f"assume(r_bits_data == {manifest['parameters']['axiDataBits']}'h{(1 << manifest['parameters']['axiDataBits']) - 1:x});"]
                         for port in range(2 * manifest['parameters']['hartCount']):
                             if port in (0, 2):
+                                constraints.append(f'assume(ports_{port}_request_valid && ports_{port}_request_bits_tag == {37+port});')
                                 constraints.append(f"assume(!ports_{port}_request_bits_write && !ports_{port}_request_bits_atomic && ports_{port}_request_bits_fetch && ports_{port}_request_bits_size == 2 && ports_{port}_request_bits_address == {manifest['parameters']['physicalAddressBits']}'d{int(region['base']) + 4});")
                             else:
                                 constraints.append(f'assume(!ports_{port}_request_valid);')
@@ -4804,6 +4982,12 @@ def verify(rtl, directory, modules=None):
             engine = 'abc pdr' if task == 'prove' and unit not in ('Gpr', 'Multiply', 'Pmp', 'PmpDecode', 'PmpInterval', 'PmpSubset', 'Csr', 'Memory', 'Axi', 'InstructionCache', 'DataCache', 'Coherence', 'Decode', 'Execute', 'LocalInterrupts', 'Translation') and name not in ('SynchronizationBackend', 'WfiBackend') else 'smtbmc z3'
             if unit == 'ReadQueue':
                 engine = 'smtbmc z3'
+                if mode == 'prove-control' and manifest['parameters']['hartCount'] > 2:
+                    engine = 'smtbmc --syn --unroll z3'
+            if unit == 'MemoryFabric' and (mode in ('prove-control', 'prove-tags') or mode.startswith('prove-stability-')):
+                engine = 'smtbmc z3'
+            if unit == 'MemoryFabric' and mode in ('prove-control', 'prove-tags') and manifest['parameters']['hartCount'] > 2:
+                engine = 'smtbmc --syn --unroll z3'
             if name in ('WideFetch', 'WfiFrontend', 'Gpr', 'PipelineBackend'):
                 engine = 'smtbmc z3' if name == 'WideFetch' else 'smtbmc --unroll z3'
             if name in ('Gpr', 'PipelineBackend'):
@@ -4827,9 +5011,11 @@ def verify(rtl, directory, modules=None):
                 timeout = 180
             if unit == 'DataCache' and task == 'prove':
                 timeout = 180
-            if unit == 'ReadQueue' and mode.startswith('prove-payload-bits-'):
+            if unit == 'ReadQueue' and mode.startswith(('prove-storage-bits-', 'prove-payload-bits-')):
                 timeout = 180
             if unit == 'Axi' and task == 'prove' and manifest['parameters']['axiDataBits'] == 512:
+                timeout = 120
+            if unit == 'MemoryFabric' and mode in ('prove-control', 'prove-tags') and manifest['parameters']['hartCount'] > 2:
                 timeout = 120
             witness_option = 'aigsmt z3\n' if engine == 'abc pdr' else ''
             preparation = (f'hierarchy -check -top {top}\nproc\nflatten\nopt_expr -keepdc\nopt_clean\nwreduce\nopt_clean\ncheck'
@@ -4839,6 +5025,8 @@ def verify(rtl, directory, modules=None):
                 depth = 40
             if unit == 'ReadQueue' and task == 'prove':
                 depth = 1 if mode in ('prove-permission', 'prove-read-data') else 4
+            if unit == 'MemoryFabric' and (mode in ('prove-control', 'prove-tags') or mode.startswith('prove-stability-')):
+                depth = 4
             if unit == 'Translation' and task == 'prove':
                 depth = 6
             if name in ('WideFetch', 'WfiFrontend', 'PipelineBackend') and task == 'prove':
@@ -4882,24 +5070,32 @@ read -formal -sv {' '.join(files)}
     if 'PipelineBackend' in proved and manifest['parameters']['issueWidth'] > 1:
         assert {f'prove-bits-{bit}' for bit in range(0, 97 if manifest['parameters'].get('enableBranchPrediction') else 96, 4 if manifest['parameters']['issueWidth'] == 3 else 8)} <= {report['mode'] for report in reports}, 'Incomplete identity proof'
     if 'ReadQueue' in proved:
-        expected = {'prove-permission', 'prove-read-data', 'prove-control'} | ({f'prove-payload-bits-{bit}' for bit in range(0, 64, 8)} if manifest['parameters']['hartCount'] > 2 else {'prove-payload'})
+        expected = {'prove-permission', 'prove-permission-hold', 'prove-read-data', 'prove-control'} | ({f'prove-payload-bits-{bit}' for bit in range(0, 64, 8)} if manifest['parameters']['hartCount'] > 2 or manifest['parameters']['axiDataBits'] > 64 else {'prove-payload'})
+        expected |= {mode.replace('payload', 'storage') for mode in expected if 'payload' in mode}
         cover_modes = {'cover-global'} | {f'cover-harts-{hart}' for hart in range(0, manifest['parameters']['hartCount'], 4)} if manifest['parameters']['hartCount'] > 2 else {'cover'}
-        expected |= cover_modes | {'mutation', 'mutation-lane', 'mutation-permission', 'mutation-route', 'mutation-tag', 'mutation-data', 'mutation-id'}
-        assert sum(r['covers'] for r in reports if r['propertyGroup'] == 'ReadQueue' and r['mode'] in cover_modes) == 4 * manifest['parameters']['hartCount'] + 3, 'Incomplete read queue covers'
+        expected |= cover_modes | {'mutation', 'mutation-lane', 'mutation-permission', 'mutation-route', 'mutation-tag', 'mutation-data', 'mutation-id', 'mutation-fault-release', 'mutation-sticky-fault'}
+        line = manifest['parameters'].get('enableBurstRefill') or manifest['parameters'].get('dCacheRefillBytes') == 64
+        if line:
+            expected.add('mutation-line-last')
+            if manifest['parameters']['axiDataBits'] < 512:
+                expected.add('mutation-line-count')
+            if manifest['parameters']['axiDataBits'] > 64:
+                expected.add('mutation-line-order')
+        assert sum(r['covers'] for r in reports if r['propertyGroup'] == 'ReadQueue' and r['mode'] in cover_modes) == 4 * manifest['parameters']['hartCount'] + (6 if line else 4), 'Incomplete read queue covers'
         assert expected <= {r['mode'] for r in reports if r['propertyGroup'] == 'ReadQueue'}, 'Incomplete read queue proof'
     if 'Pmp' in proved:
         assert {'PmpInterval', 'PmpDecode'} <= proved, 'Missing PMP composition prerequisites'
         if manifest['parameters'].get('dCacheRefillBytes', 8) == 64:
             assert 'PmpSubset' in proved, 'Missing PMP containment proof'
     if any(r['propertyGroup'] == 'MemoryFabric' and r['mode'] == 'prove-control' for r in reports):
-        assert {'prove-control', 'cover', 'mutation-data', *(f'prove-stability-{i}' for i in range(2 * manifest['parameters']['hartCount']))} <= {r['mode'] for r in reports if r['propertyGroup'] == 'MemoryFabric'}, 'Incomplete fabric proof'
+        assert {'prove-control', 'prove-tags', 'cover', 'mutation-data', *(f'prove-stability-{i}' for i in range(2 * manifest['parameters']['hartCount']))} <= {r['mode'] for r in reports if r['propertyGroup'] == 'MemoryFabric'}, 'Incomplete fabric proof'
     if 'Axi' in proved and manifest['parameters']['axiDataBits'] == 512:
         assert {'prove-control', 'prove-payload', 'cover'} <= {r['mode'] for r in reports if r['propertyGroup'] == 'Axi'}, 'Incomplete AXI proof'
     summary.write_text(json.dumps(dict(
         scope='module-level safety, cover reachability and mutation detection', propertyGroups=sorted(proved),
         assumptions='initial reset, then no reset except CSR proofs; Fetch responses require accepted requests and stable blocked payloads; enabled control proofs abstract combinational authorization',
-        fabricComposition='512-bit line configurations prove control, ownership, tags, faults and last first; each port then proves its full 64-bit stalled data assuming exactly the proved control assertions, with other ports data assertions removed and all input data unrestricted' if any(r['propertyGroup'] == 'MemoryFabric' and r['mode'] == 'prove-control' for r in reports) else None,
-        readQueueComposition='unrestricted captured-request PMA and actual read-data driver identities; all-hart control proved without payload assumptions; payload consumes exactly proved control assertions, with an arbitrary immutable hart and exhaustive eight-bit data/address domains for larger configurations; no request-value restrictions' if 'ReadQueue' in proved else None,
+        fabricComposition='independent two-entry ownership ledger; control and exclusive-path/buffer invariants, then captured tags across the queue and exclusive path, then arbitrary-bit stalled data per port; each partition assumes only earlier proved assertions; input data and arbitration unrestricted' if any(r['propertyGroup'] == 'MemoryFabric' and r['mode'] == 'prove-control' for r in reports) else None,
+        readQueueComposition='PMA expressions and busy-slot permission stability proved first; arbitrary permission outcomes retain the proved shape and hold conditions; independent two-entry ledger tracks accepted requests, RID, RDATA, beats and faults; control, stored values/address and port payload proofs consume only previously proved assertions; exhaustive eight-bit data/address domains for wide configurations; safety has no request-value restrictions' if 'ReadQueue' in proved else None,
         pmpComposition='Pmp uses independently proved PmpInterval identities and PmpDecode request spans; no table-value restrictions; data-line configurations also prove that one arbitrary priority-fold entry preserves whole-range permission implying contained-demand permission, assuming only the prior-fold implication whose initial M-mode defaults are equal' if 'Pmp' in proved else None,
         registerFile='arbitrary nonzero architectural register and immutable data bit, exact reset and ordered multiport writes, zero-register isolation and every asynchronous read port; unrestricted addresses, data and same-address writes' if 'Gpr' in proved else None,
         backendAbstraction='arbitrary multiply result and completion delay; safety overapproximates nonzero GPR reads, with actual GPR retained for covers/mutations; resource and register contracts are separately proved',

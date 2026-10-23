@@ -32,6 +32,21 @@ object DitDahA1Axi extends Generator[DitDahA1Parameter, DitDahA1UnitLayers, DitD
     channel.prot := (request.fetch.asBits ## 0.B(1) ## privileged.asBits).asUInt
     channel.qos := 0.U(4)
 
+  def lineRead(parameter: DitDahA1Parameter, request: Referable[MemoryRequest])
+    (using Arena, Context, Block, InstanceContext): Referable[Bool] =
+    val client = (if parameter.enableBurstRefill then request.fetch else false.B) |
+      (if parameter.enableDataBurstRefill then !request.fetch else false.B)
+    client & !request.write & !request.atomic & (request.size === 6.U(3))
+
+  def readAddress(parameter: DitDahA1Parameter, channel: Referable[AxiAddress], request: Referable[MemoryRequest],
+    hart: Referable[UInt])(using Arena, Context, Block, InstanceContext): Unit =
+    address(parameter, channel, request, hart)
+    if parameter.enableLineRefill then
+      when(lineRead(parameter, request)) {
+        channel.len := (512 / parameter.axiDataBits - 1).U(8)
+        channel.size := Integer.numberOfTrailingZeros(parameter.axiDataBits / 8).U(3)
+      }
+
   def readData(size: Referable[UInt], data: Referable[UInt], shift: Referable[UInt])
     (using Arena, Context, Block, InstanceContext): Referable[UInt] =
     val shifted = (data >> shift).asBits.bits(63, 0)
@@ -56,9 +71,7 @@ object DitDahA1Axi extends Generator[DitDahA1Parameter, DitDahA1UnitLayers, DitD
     val fault = RegInit(false.B)
     val awDone = RegInit(false.B)
     val wDone = RegInit(false.B)
-    val lineClient = (if parameter.enableBurstRefill then request.fetch else false.B) |
-      (if parameter.enableDataBurstRefill then !request.fetch else false.B)
-    val line = lineClient & !request.write & !request.atomic & (request.size === 6.U(3))
+    val line = lineRead(parameter, request)
     val beat = Option.when(parameter.enableLineRefill)(RegInit(0.U(3)))
     val terminal = Option.when(parameter.enableLineRefill)(Reg(Bool()))
     val slices = parameter.axiDataBits / 64
@@ -80,12 +93,8 @@ object DitDahA1Axi extends Generator[DitDahA1Parameter, DitDahA1UnitLayers, DitD
     io.memory.response.bits.fault := fault
     io.memory.response.bits.tag := request.tag
     io.memory.response.bits.last := terminal.map(last => (state =/= 5.U(3)) | (last & finalSlice)).getOrElse(true.B)
-    for channel <- Seq(aw, ar) do address(parameter, channel.bits, request, hartId)
-    if parameter.enableLineRefill then
-      when(line) {
-        ar.bits.len := (512 / parameter.axiDataBits - 1).U(8)
-        ar.bits.size := Integer.numberOfTrailingZeros(parameter.axiDataBits / 8).U(3)
-      }
+    address(parameter, aw.bits, request, hartId)
+    readAddress(parameter, ar.bits, request, hartId)
     ar.valid := (state === 1.U(3)) & !request.write
     aw.valid := (state === 1.U(3)) & request.write & !awDone
     w.valid := (state === 1.U(3)) & request.write & !wDone

@@ -107,6 +107,11 @@ for directory, top in profiles:
     if top in ('DitDahA1', 'DitDahA1MemoryFabric'):
         axi = (rtl / 'DitDahA1Axi.sv').read_text()
         assert bool(re.search(r'\bbeat\b', axi)) == (burst or args.dcache_refill_bytes == 64), 'Burst state presence differs from configuration'
+        if read_slots:
+            queue = (rtl / 'DitDahA1ReadQueue.sv').read_text()
+            line = burst or args.dcache_refill_bytes == 64
+            assert bool(re.search(r'\bbeat\b', queue)) == line
+            assert bool(re.search(r'\bblock\b', queue)) == (line and manifest['parameters']['axiDataBits'] > 64)
     if args.sv39:
         assert ('tlbValid' in (rtl / 'DitDahA1Translation.sv').read_text()) == bool(args.tlb_entries)
     if args.sv39:

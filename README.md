@@ -23,11 +23,11 @@ Core composes Frontend and Backend; Frontend owns PC sequencing and Backend owns
 Non-fault Backend packets contain four-byte instructions and word-aligned PCs; producers supply fetch faults.
 Core exposes separate instruction/data memory ports; the physical fabric owns shared arbitration and AXI.
 Instruction permissions apply before cache lookup and to the complete refill request; region checks also protect external accesses.
-The multicore fabric permits two ordinary reads from distinct harts; writes, atomics, devices and bursts wait for all accepted reads and execute exclusively.
+The multicore fabric permits two ordinary reads or enabled 64-byte refills from distinct harts; writes, atomics and devices wait for all response fragments and execute exclusively.
+An unexpected read ID blocks new fabric transactions until reset while known in-flight reads drain.
 AXI data width is configurable to 64/128/256/512 bits; scalar requests remain at most eight bytes.
 AMOADD.D, AMOOR.D and AMOSWAP.D use AXI exclusive retry and return the old value.
-LR.D/SC.D use per-hart reservations; ordered data completion covers all aq/rl combinations.
-This does not implement the complete A or Zaamo extension.
+LR.D/SC.D use per-hart reservations; ordered data completion covers all aq/rl combinations. This does not implement the complete A or Zaamo extension.
 FENCE preserves ordered data completion; FENCE.I restarts local instruction fetching and invalidates the optional private instruction cache.
 
 ## Development

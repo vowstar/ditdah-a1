@@ -215,17 +215,28 @@ def compile_tb(rtl, directory, width, pa, top='core_tb', source=None, extra_file
   end''')
         if top == 'core_tb' and parameters.get('dCacheRefillBytes', 8) == 64:
             port = f'dut.fabric.data_{hart}_request'
+            blocked = '!dut.fabric.allowRead' if harts > 1 else "1'b1"
+            full = '(dut.fabric.readers.state != 0 && dut.fabric.readers.state_0 != 0)' if harts > 1 else "1'b0"
             observers.append(f'''  longint unsigned data_line_wait_{hart} = 0;
-  always @(posedge clock) if (!reset && {port}_valid && !{port}_ready && {port}_bits_size == 6)
+  longint unsigned line_serial_wait_{hart} = 0, line_full_wait_{hart} = 0, line_arbiter_wait_{hart} = 0;
+  always @(posedge clock) if (!reset && {port}_valid && !{port}_ready && {port}_bits_size == 6) begin
     data_line_wait_{hart}++;
-  final $display("REFILL_WAIT {hart} %0d", data_line_wait_{hart});''')
+    if ({blocked}) line_serial_wait_{hart}++;
+    else if ({full}) line_full_wait_{hart}++;
+    else line_arbiter_wait_{hart}++;
+  end
+  final begin
+    $display("REFILL_WAIT {hart} %0d", data_line_wait_{hart});
+    $display("REFILL_STALL {hart} %0d %0d %0d", line_serial_wait_{hart}, line_full_wait_{hart}, line_arbiter_wait_{hart});
+  end''')
     (directory / 'fetch_observers.svh').write_text('\n'.join(observers) + '\n')
     (directory / 'retire_bindings.svh').write_text('\n'.join(retirement) + '\n')
     if top == 'core_tb':
         devices = ' || '.join(f"(request.address >= 64'd{int(region['base'])} && request.address < 64'd{int(region['base']) + int(region['size'])})"
                              for region in parameters['memoryRegions'] if region['device']) or "1'b0"
         bindings.append(f'''function automatic bit exclusive_request(input core_request_t request);
-    return request.write || request.atomic || request.size > 3 || {devices};
+    return request.write || request.atomic || (request.size > 3 && !(request.size == 6 &&
+      (request.fetch ? {int(parameters.get('enableBurstRefill', False))} : {int(parameters.get('dCacheRefillBytes') == 64)}))) || {devices};
   endfunction''')
         names = re.findall(r'\bDitDahA1Core\s+(\w+)\s*\(', (rtl / 'DitDahA1.sv').read_text())
         assert names == [f'core_{h}' for h in range(harts)], names
@@ -312,7 +323,7 @@ def log_lines(source):
 def performance_metrics(lines, config):
     harts, width = config.get('hartCount', 1), config.get('issueWidth', 1)
     samples, histograms, retired, traps = {}, {}, Counter(), Counter()
-    elapsed, refill_wait = None, {}
+    elapsed, refill_wait, refill_stall = None, {}, {}
     for line in log_lines(lines):
         fields, hart = line.split(), 0
         if fields[:1] == ['HART']:
@@ -334,8 +345,13 @@ def performance_metrics(lines, config):
             hart, cycles = map(int, fields[1:])
             assert hart not in refill_wait and cycles >= 0, 'Invalid refill wait sample'
             refill_wait[hart] = cycles
+        elif fields[:1] == ['REFILL_STALL']:
+            hart, *counts = map(int, fields[1:])
+            assert hart not in refill_stall and len(counts) == 3 and min(counts) >= 0, 'Invalid refill stall classification'
+            refill_stall[hart] = counts
     assert set(samples) == set(range(harts)), 'Missing per-hart pipeline metrics'
     assert set(refill_wait) == (set(range(harts)) if config.get('dCacheBytes') and config.get('dCacheRefillBytes', 8) == 64 else set()), 'Missing or unexpected data line wait samples'
+    assert set(refill_stall) == set(refill_wait) and all(sum(v) == refill_wait[h] for h, v in refill_stall.items()), 'Refill wait classification does not partition total wait'
     assert set(histograms) == {(hart, lanes) for hart in range(harts) for lanes in range(width + 1)}, 'Missing pipeline histogram'
     cycles = samples[0][0]
     assert elapsed is not None and cycles == elapsed + 1 and cycles > 0, 'Hardware cycles were not sampled exactly once'
@@ -348,6 +364,7 @@ def performance_metrics(lines, config):
         assert all(value >= 0 for value in (*issued, *completed)), 'Negative pipeline histogram'
         reports.append(dict(hart=hart, retiredInstructions=retired[hart], trapEvents=traps[hart],
                             dataLineWaitCycles=refill_wait.get(hart, 0),
+                            dataLineWait=dict(zip(('serialization', 'capacity', 'arbitration'), refill_stall.get(hart, (0, 0, 0)))),
                             issueCycles=issued, retireCycles=completed, dependencyStallCycles=stalls,
                             occupancySum=occupancy, maxOccupancy=peak))
     return dict(sampledCycles=cycles, retiredInstructions=sum(retired.values()),
@@ -1008,6 +1025,7 @@ def check_multicore(lines, config, program, name, atomic_metadata=False, softwar
     memory, active = dict(program.memory), None
     owners = [None] * harts
     read_order, read_peak, read_serial, read_reordered, read_observed = {}, 0, 0, 0, None
+    line_ids, line_peak, line_observed = set(), 0, None
     failures = getattr(program, 'exclusive_failures', 0)
     models = [Model(config, {}, program.faults, hart_id=h) for h in range(harts)]
     local_base = local_interrupt_base(config)
@@ -1050,22 +1068,27 @@ def check_multicore(lines, config, program, name, atomic_metadata=False, softwar
         model.external_access = no_service
 
     def ordinary(event):
-        return event[0] in ('read', 'fetch') and event[2] <= 8 and not any(
+        line = event[2] == 64 and (config.get('enableBurstRefill') if event[0] == 'fetch' else config.get('dCacheRefillBytes') == 64)
+        return event[0] in ('read', 'fetch') and (event[2] <= 8 or line) and not any(
             region['device'] and int(region['base']) <= event[1] < int(region['base']) + int(region['size'])
             for region in config['memoryRegions'])
 
     def read_started(hart):
-        nonlocal read_peak, read_serial
+        nonlocal read_peak, read_serial, line_peak
         assert hart not in read_order, 'Repeated AXI read before terminal response'
         read_order[hart] = read_serial
         read_serial += 1
         read_peak = max(read_peak, len(read_order))
+        if owners[hart]['event'][2] == 64:
+            line_ids.add(hart)
+            line_peak = max(line_peak, len(line_ids))
 
     def read_completed(hart):
         nonlocal read_reordered
         assert hart in read_order, 'Read data lacks an accepted AXI address'
         read_reordered += int(read_order[hart] != min(read_order.values()))
         del read_order[hart]
+        line_ids.discard(hart)
 
     def service(hart, event, atomic_fault=False, local=False, read_value=None):
         nonlocal interrupt_dirty
@@ -1246,6 +1269,11 @@ def check_multicore(lines, config, program, name, atomic_metadata=False, softwar
         if fields[:1] == ['READ_CONCURRENCY']:
             assert read_observed is None, 'Duplicate read-concurrency summary'
             read_observed = tuple(map(int, fields[1:]))
+            continue
+        if fields[:1] == ['LINE_CONCURRENCY']:
+            assert line_observed is None, 'Duplicate line-concurrency summary'
+            line_observed = tuple(map(int, fields[1:]))
+            assert len(line_observed) == 2 and min(line_observed) >= 0
             continue
         if fields[:1] == ['HART']:
             hart, fields = int(fields[1]), fields[2:]
@@ -1746,11 +1774,13 @@ def check_multicore(lines, config, program, name, atomic_metadata=False, softwar
                        for hart in range(harts) for index, value in enumerate(job['values'])), 'Coherence publication witness'
     assert not console_events, 'Console service was not printed'
     assert read_observed is None or read_observed == (read_peak, read_reordered), 'Read-concurrency counters differ from independent bus events'
+    assert line_observed is None or line_observed[0] == line_peak, 'Line concurrency differs from independent accepted addresses'
     if getattr(program, 'parallel_reads', False):
         assert read_peak == 2 and read_reordered > 0, 'Missing simultaneous addresses or reordered read completion'
     return dict(**(dict(results=results) if software_output else {}), **(dict(dataCache=[dict(count) for count in cache_counts]) if data_cache else {}), **(dict(translation=dict(translation_counts)) if translated else {}), events=events, activeHarts=len(finished), sources=sorted(sources),
                 cycles=elapsed_cycles, transactions=transactions, axiTransactions=axi_transactions, lineReadBeats=line_beats,
                 readConcurrency=dict(maxOutstanding=read_peak, reorderedResponses=read_reordered),
+                lineConcurrency=dict(maxOutstanding=line_peak, overlapCycles=line_observed[1] if line_observed else 0),
                 collidingTags=len(collisions), readsBeforePeerRetirement=overtaken, concurrency=dict(concurrent),
                 platformCycles=device.cycle + 1 if device is not None else 0,
                 sleepCycles=sleep_cycles,
@@ -2231,6 +2261,8 @@ def verify_software_matrix(args):
             for report in summary['cases']:
                 if args.software_refill_matrix:
                     assert all(bool(count.get('lineReads')) == (refill == 64) and count['hits'] > 0 for count in report['dataCache']), 'Software did not consume the selected refill mode and cache hits'
+                    if harts == 16 and refill == 64:
+                        assert report['lineConcurrency']['maxOutstanding'] == 2 and report['lineConcurrency']['overlapCycles'] > 0, 'Software did not exercise simultaneous line reads'
                 observed = payload, report['results'], report['console']
                 if expected is None:
                     expected = observed
@@ -2395,6 +2427,9 @@ def main():
     if args.multicore_only or args.platform_only:
         shared_profiles = ((1, 64, 0, True), (2, 64, 0, True), (3, 128, 16, True), (16, 512, 16, True)) if args.platform_only else (
             (2, 64, 0, False), (2, 512, 16, True), (3, 64, 16, True), (16, 512, 16, True))
+        if args.multicore_only and args.harts and args.width and args.pmp_entries is not None:
+            shared_profiles = tuple((h, w, args.pmp_entries, bool(args.interrupts or args.pmp_entries))
+                                    for h in args.harts for w in args.width)
         for harts, width, entries, interrupts in shared_profiles:
             if (args.harts and harts not in args.harts) or (args.width and width not in args.width):
                 continue

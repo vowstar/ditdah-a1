@@ -1507,6 +1507,166 @@ def coherence_contract(parameters):
     return body
 
 
+def line_read_window(parameters, expected_peak=2):
+    data = parameters.get('dCacheRefillBytes') == 64
+    if not data and not parameters.get('enableBurstRefill'):
+        return ''
+    width, harts = parameters['axiDataBits'], parameters['hartCount']
+    base = int(next(r['base'] for r in parameters['memoryRegions'] if not r['device'] and
+                   (r['readable'] and r.get('dataCacheable') if data else r['executable'])))
+    ports = (int(data), 2 * (harts - 1) + int(data))
+    body = f'''    begin
+      integer cycles, peak, selected, id, beat, delay[2], sent[2], received[2];
+      bit [1:0] accepted, issued, live, done;
+      bit holding;
+      cycles = 0; peak = 0; selected = 0; accepted = 0; issued = 0; live = 0; done = 0; holding = 0;
+      for (integer n = 0; n < 2; n++) begin delay[n] = 0; sent[n] = 0; received[n] = 0; end
+      while (done != 3 && cycles < 300) begin
+        @(negedge clock);
+        ar_ready = 1;
+'''
+    for n, port in enumerate(ports):
+        body += f'''        ports_{port}_request_valid = !accepted[{n}];
+        ports_{port}_request_bits_address = 64'h{base + 0x100 + 64 * n:x};
+        ports_{port}_request_bits_size = 6; ports_{port}_request_bits_fetch = {int(not data)};
+        ports_{port}_request_bits_write = 0; ports_{port}_request_bits_atomic = 0;
+        ports_{port}_request_bits_tag = {71 + n}; ports_{port}_response_ready = 1;
+'''
+    body += f'''        if (!holding) begin
+          r_valid = 0;
+          for (integer n = 1; n >= 0; n--) if (live[n] && delay[n] == 0) begin
+            selected = n; r_valid = 1;
+          end
+          if (r_valid) begin
+            r_bits_id = selected == 0 ? 0 : {harts - 1}; r_bits_resp = 0;
+            r_bits_last = sent[selected] == {512 // width - 1};
+            for (integer chunk = 0; chunk < {width // 64}; chunk++)
+              r_bits_data[64 * chunk +: 64] = 64'h1000000000000000 + 256 * selected + sent[selected] * {width // 64} + chunk;
+          end
+        end
+        #1;
+'''
+    for n, port in enumerate(ports):
+        body += f'''        if (ports_{port}_request_valid && ports_{port}_request_ready) accepted[{n}] = 1;
+        if (ports_{port}_response_valid && ports_{port}_response_ready) begin
+          if (done[{n}] || ports_{port}_response_bits_fault || ports_{port}_response_bits_tag != {71 + n} ||
+              ports_{port}_response_bits_data != 64'h1000000000000000 + 256 * {n} + received[{n}] ||
+              ports_{port}_response_bits_last != (received[{n}] == 7)) $fatal(1, "Line window payload or completion");
+          received[{n}]++;
+          if (received[{n}] == 8) done[{n}] = 1;
+        end
+'''
+    body += f'''        if (ar_valid && ar_ready) begin
+          id = ar_bits_id == 0 ? 0 : 1;
+          if (!accepted[id] || issued[id] || ar_bits_id != (id == 0 ? 0 : {harts - 1}) ||
+              ar_bits_addr != 64'h{base + 0x100:x} + 64 * id || ar_bits_len != {512 // width - 1} ||
+              ar_bits_size != {int(width // 8).bit_length() - 1}) $fatal(1, "Line window address identity");
+          issued[id] = 1; live[id] = 1; delay[id] = 24;
+          if (int'(live[0]) + int'(live[1]) > peak) peak = int'(live[0]) + int'(live[1]);
+        end
+        holding = r_valid && !r_ready;
+        if (r_valid && r_ready) begin sent[selected]++; if (r_bits_last) live[selected] = 0; end
+        for (integer n = 0; n < 2; n++) if (delay[n] > 0) delay[n]--;
+        tick(); cycles++;
+      end
+      check(done == 3 && peak == {expected_peak}, "Line window completion and physical overlap");
+      $display("LINE_READ_WINDOW cycles=%0d peak=%0d", cycles, peak);
+      ar_ready = 0; r_valid = 0;
+'''
+    for port in ports:
+        body += f'      ports_{port}_request_valid = 0; ports_{port}_response_ready = 0;\n'
+    return body + '    end\n'
+
+
+def line_read_contract(parameters):
+    width, harts = parameters['axiDataBits'], parameters['hartCount']
+    beats, slices = 512 // width, width // 64
+    kinds = ([True] if parameters.get('enableBurstRefill') else []) + ([False] if parameters.get('dCacheRefillBytes') == 64 else [])
+    if not kinds:
+        return ''
+    base = int(next(r['base'] for r in parameters['memoryRegions'] if not r['device'] and r['executable'] and r['readable'] and
+                   (r.get('dataCacheable') or kinds == [True])))
+    body = ''
+    scenarios = [(a, b, 6, -1, 'normal') for a in kinds for b in kinds]
+    scenarios += [(a, False, 2, -1, 'normal') for a in kinds]
+    scenarios += [(kinds[0], kinds[0], 6, error, 'normal') for error in sorted({0, beats // 2, beats - 1})]
+    scenarios += [(kinds[0], kinds[0], 6, -1, mode) for mode in ('early', 'late') if mode != 'early' or beats > 1]
+    for first, second, second_size, error, mode in scenarios:
+        ports = (int(not first), 2 * (harts - 1) + int(not second))
+        for n, port in enumerate(ports):
+            size, fetch = (6, first) if n == 0 else (second_size, second)
+            body += f'''    ports_{port}_request_bits_address = 64'h{base + 0x100 + 64 * n:x};
+    ports_{port}_request_bits_size = {size}; ports_{port}_request_bits_fetch = {int(fetch)};
+    ports_{port}_request_bits_write = 0; ports_{port}_request_bits_atomic = 0;
+    ports_{port}_request_bits_tag = {91 + n}; ports_{port}_request_valid = 1; #1;
+    while (!ports_{port}_request_ready) tick(); tick(); ports_{port}_request_valid = 0;
+'''
+        for n in range(2):
+            size = 6 if n == 0 else second_size
+            body += f'''    while (!ar_valid) tick();
+    repeat (3) begin
+      check(ar_bits_id == {0 if n == 0 else harts - 1} && ar_bits_addr == 64'h{base + 0x100 + 64 * n:x} && ar_bits_len == {beats - 1 if size == 6 else 0} && ar_bits_size == {int(width // 8).bit_length() - 1 if size == 6 else size}, "Concurrent line AR stable before any R"); tick();
+    end
+    ar_ready = 1; tick(); ar_ready = 0;
+'''
+        for beat in range(beats):
+            for n in (1, 0):
+                size = 6 if n == 0 else second_size
+                if size != 6 and beat != 0 or n == 0 and mode == 'early' and beat > 0:
+                    continue
+                port = ports[n]
+                last = size != 6 or (beat == 0 if n == 0 and mode == 'early' else beat == beats - 1 and not (n == 0 and mode == 'late'))
+                bad = n == 0 and (0 <= error <= beat or mode == 'early' or mode == 'late' and beat == beats - 1)
+                parts = slices if size == 6 else 1
+                words = [(0x2000000000000000 + 256 * n + beat * slices + part) if size == 6 else 0x76543210 for part in range(parts)]
+                value = sum(word << (64 * part) for part, word in enumerate(words))
+                body += f'''    r_bits_id = {0 if n == 0 else harts - 1}; r_bits_data = {width}'h{value:x};
+    r_bits_resp = {2 if n == 0 and error == beat else 0}; r_bits_last = {int(last)}; r_valid = 1; #1;
+    while (!r_ready) tick(); tick(); r_valid = 0;
+'''
+                for part, word in enumerate(words):
+                    body += f'''    while (!ports_{port}_response_valid) tick();
+    repeat (2) begin
+      check(ports_{port}_response_bits_data == 64'h{word:x} && ports_{port}_response_bits_tag == {91 + n} && ports_{port}_response_bits_fault == {int(bad)} && ports_{port}_response_bits_last == {int(last and part == parts - 1)} && !empty, "Interleaved line chunk retains data, fault and owner"); tick();
+    end
+    ports_{port}_response_ready = 1; tick(); ports_{port}_response_ready = 0;
+'''
+        if mode == 'late':
+            port = ports[0]
+            body += f'''    r_bits_id = 0; r_bits_resp = 0; r_bits_last = 0; r_valid = 1; #1;
+    while (!r_ready) tick(); tick(); r_valid = 0;
+    check(!ports_{port}_response_valid && !empty, "Overlong line drains without extra chunks");
+    r_bits_last = 1; r_valid = 1; tick(); r_valid = 0;
+    while (!ports_{port}_response_valid) tick();
+    check(ports_{port}_response_bits_fault && ports_{port}_response_bits_last && ports_{port}_response_bits_tag == 91, "Overlong line terminates with owned error");
+    ports_{port}_response_ready = 1; tick(); ports_{port}_response_ready = 0;
+'''
+        body += '    check(empty, "Both interleaved transactions consumed");\n'
+    if beats > 1:
+        port = int(not kinds[0])
+        body += f'''    ports_{port}_request_bits_address = 64'h{base + 0x100:x};
+    ports_{port}_request_bits_size = 6; ports_{port}_request_bits_fetch = {int(kinds[0])};
+    ports_{port}_request_valid = 1; #1;
+    while (!ports_{port}_request_ready) tick(); tick(); ports_{port}_request_valid = 0;
+    while (!ar_valid) tick(); ar_ready = 1; tick(); ar_ready = 0;
+    r_bits_id = 0; r_bits_resp = 0; r_bits_last = 0; r_bits_data = 0; r_valid = 1;
+    while (!r_ready) tick(); tick(); r_valid = 0;
+'''
+        for beat in range(1, beats):
+            body += f'''    r_bits_data = {beat}; r_bits_last = {int(beat == beats - 1)}; r_valid = 1;
+    repeat (3) begin
+      check(!r_ready && ports_{port}_response_valid && !ports_{port}_response_bits_fault, "Known RID waits for prior fragments without poisoning"); tick();
+    end
+    ports_{port}_response_ready = 1; repeat ({slices}) tick(); ports_{port}_response_ready = 0;
+    while (!r_ready) tick(); tick(); r_valid = 0;
+'''
+        body += f'''    ports_{port}_response_ready = 1;
+    repeat ({slices}) begin check(ports_{port}_response_valid && !ports_{port}_response_bits_fault, "Backpressured line completes"); tick(); end
+    ports_{port}_response_ready = 0; check(empty, "Backpressured line releases owner");
+'''
+    return body + line_read_window(parameters)
+
+
 def read_queue_contract(parameters):
     base = int(parameters['memoryRegions'][0]['base'])
     last = 2*parameters['hartCount']-1
@@ -1550,14 +1710,33 @@ def read_queue_contract(parameters):
         ports_{last}_request_bits_size = 3; ports_{last}_request_bits_address = 64'h{base+0x130:x}; ports_{last}_request_valid = 1;
         tick(); ports_{last}_request_valid = 0;
         while (!ar_valid) tick(); ar_ready = 1; tick(); ar_ready = 0;
-        r_bits_id = 0; r_bits_last = 0; r_valid = 1; tick(); r_valid = 0;
+        r_bits_id = {hart}; r_bits_last = 0; r_valid = 1; tick(); r_valid = 0;
         check(!ports_{last}_response_valid && r_ready, "Malformed response drains");
         r_bits_last = 1; r_valid = 1; tick(); r_valid = 0;
         check(ports_{last}_response_valid && ports_{last}_response_bits_fault, "Malformed response reports fault");
         ports_{last}_response_ready = 1; tick();
         check(empty, "Final ownership release");
     '''
-    return body
+    body += f'''    ports_{last}_response_ready = 0; r_bits_last = 1;
+    ports_{last}_request_valid = 1; tick(); ports_{last}_request_valid = 0;
+    while (!ar_valid) tick(); ar_ready = 1; tick(); ar_ready = 0;
+    ports_1_request_bits_address = 64'h{first_address:x}; ports_1_request_valid = 1;
+    tick(); ports_1_request_valid = 0; while (!ar_valid) tick();
+    r_bits_id = 0; r_valid = 1; tick(); r_valid = 0;
+    ports_1_request_valid = 1;
+    repeat (3) begin check(!ports_1_request_ready && ar_valid && ar_bits_id == 0 && ar_bits_addr == 64'h{first_address:x} && !empty && !ports_{last}_response_valid, "Unknown RID preserves held AR and real owners"); tick(); end
+    ar_ready = 1; tick(); ar_ready = 0;
+    r_bits_id = {hart}; r_valid = 1; tick(); r_valid = 0;
+    check(ports_{last}_response_valid && ports_{last}_response_bits_fault, "Known response drains after protocol fault");
+    ports_{last}_response_ready = 1; tick(); ports_{last}_response_ready = 0;
+    r_bits_id = 0; r_valid = 1; tick(); r_valid = 0;
+    check(ports_1_response_valid && ports_1_response_bits_fault, "Previously held AR drains with owned fault");
+    ports_1_response_ready = 1; tick(); ports_1_response_ready = 0;
+    check(!empty && !ports_1_request_ready && !ar_valid, "Protocol fault blocks exclusive handover and ID reuse");
+    ports_1_request_valid = 0; reset = 1; tick(); reset = 0; tick();
+    check(empty, "Reset clears protocol containment");
+'''
+    return body + line_read_contract(parameters)
 
 
 def fabric_contract(parameters):
@@ -1650,6 +1829,9 @@ def fabric_exclusive_contract(parameters):
     hart = parameters['hartCount'] - 1
     base = int(next(r['base'] for r in parameters['memoryRegions'] if r['writable'] and not r['device']))
     body = f'''
+    data_0_request_bits_write = 0; data_0_request_bits_atomic = 0; data_0_request_bits_fetch = 0;
+    data_{hart}_request_bits_write = 0; data_{hart}_request_bits_atomic = 0; data_{hart}_request_bits_fetch = 0;
+    data_{hart}_request_bits_size = 3;
     data_{hart}_response_ready = 0; axi_r_bits_resp = 0; axi_r_bits_last = 1;
     data_0_request_bits_address = 'h{base+0x100:x}; data_0_request_bits_size = 3;
     data_0_request_valid = 1; tick(); data_0_request_valid = 0;

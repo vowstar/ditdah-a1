@@ -80,16 +80,19 @@ verify-data-line:
 		entries=$${profile%%:*}; rest=$${profile#*:}; bus=$${rest%%:*}; width=$${rest#*:}; \
 		python3 test/verify.py --sv39 --tlb-entries $$entries --width $$bus --pmp-entries 16 --issue-width $$width --icache-bytes 8192 --burst-refill --dcache-bytes 8192 --dcache-refill-bytes 64 --output result/data-line-translation-$$entries --case sv39_reuse --case sv39_protection --case sv39_sum --case sv39_mxr --case sv39_context || exit $$?; \
 	done
-	for profile in 2:512:2 16:512:3; do \
+	for profile in 2:64:1 2:128:2 2:256:3 2:512:2 16:512:3; do \
 		count=$${profile%%:*}; rest=$${profile#*:}; bus=$${rest%%:*}; width=$${rest#*:}; \
-		python3 test/verify.py --multicore-only --harts $$count --width $$bus --pmp-entries 16 --issue-width $$width --icache-bytes 8192 --burst-refill --dcache-bytes 8192 --dcache-refill-bytes 64 --output result/data-line-harts$$count --case data_coherence --case synchronization --case atomic_lrsc_shared --case atomic_lrsc_private --case atomic_interrupt || exit $$?; \
+		python3 test/verify.py --multicore-only --harts $$count --width $$bus --pmp-entries 16 --issue-width $$width --icache-bytes 8192 --burst-refill --dcache-bytes 8192 --dcache-refill-bytes 64 --output result/data-line-harts$$count-axi$$bus --case data_coherence --case synchronization --case atomic_lrsc_shared --case atomic_lrsc_private --case atomic_interrupt || exit $$?; \
 	done
 	python3 test/formal.py --rtl result/data-line-work-64/irq-axi64/rtl --output result/formal/data-line --modules DataCache Memory Axi
 	python3 test/formal.py --rtl result/data-line-protected/irq-pmp16-axi512/rtl --output result/formal/data-line-protected --modules Pmp Lsu DataCache Memory Axi
 	python3 test/formal.py --rtl result/data-line-translation-4/irq-pmp16-axi512/rtl --output result/formal/data-line-translation --modules Translation Lsu Coherence WfiFrontend
-	python3 test/formal.py --rtl result/data-line-harts2/harts2-axi512/rtl --output result/formal/data-line-fabric --modules MemoryFabric
+	for profile in 2:64 2:512 16:512; do \
+		count=$${profile%:*}; bus=$${profile#*:}; \
+		python3 test/formal.py --rtl result/data-line-harts$$count-axi$$bus/harts$$count-axi$$bus/rtl --output result/formal/data-line-fabric-$$count-$$bus --modules ReadQueue MemoryFabric || exit $$?; \
+	done
 	build-ditdah-a1 --no-trace --config result/data-line-protected/irq-pmp16-axi512/input.json --output result/production-data-line
-	build-ditdah-a1 --no-trace --config result/data-line-harts16/harts16-axi512/input.json --output result/production-data-line-burst
+	build-ditdah-a1 --no-trace --config result/data-line-harts16-axi512/harts16-axi512/input.json --output result/production-data-line-burst
 	python3 test/check_production.py --dcache-refill-bytes 64
 	$(MAKE) verify-data-line-software
 

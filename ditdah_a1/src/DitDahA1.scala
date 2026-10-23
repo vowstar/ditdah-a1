@@ -75,7 +75,7 @@ object DitDahA1MemoryFabric extends Generator[DitDahA1Parameter, DitDahA1UnitLay
         val device = parameter.memoryRegions.filter(_.device).foldLeft[Referable[Bool]](false.B) { (selected, region) =>
           selected | ((request.address >= region.base.U(64)) & (request.address < (region.base + region.size).U(64)))
         }
-        !request.write & !request.atomic & (request.size <= 3.U(3)) & !device
+        !request.write & !request.atomic & ((request.size <= 3.U(3)) | DitDahA1Axi.lineRead(parameter, request)) & !device
       }
       val readWaiting = ports.indices.map(i => ports(i).request.valid & ordinary(i)).reduce(_ | _)
       val exclusiveWaiting = ports.indices.map(i => ports(i).request.valid & !ordinary(i)).reduce(_ | _)
