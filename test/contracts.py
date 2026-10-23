@@ -17,6 +17,15 @@ def verify_storage(rtl, directory):
     size = manifest['implementation']['iCacheBytes']
     data_size = manifest['implementation'].get('dCacheBytes', 0)
     files = (rtl / 'filelist.f').read_text().splitlines()
+    slots = manifest['implementation']['fabricReadSlots']
+    assert ('DitDahA1ReadQueue.sv' in files) == bool(slots)
+    if slots:
+        queue = (rtl / 'DitDahA1ReadQueue.sv').read_text()
+        assert len(re.findall(r'\breg\s+\[2:0\]\s+state(?:_\d+)?\s*;', queue)) == slots, 'Read queue geometry'
+        parameter = manifest['parameters']
+        wide_line = parameter['axiDataBits'] > 64 and (parameter['enableBurstRefill'] or parameter['dCacheRefillBytes'] == 64)
+        assert len(re.findall(r'\breg\s+\[\d+:0\]\s+block\s*;', queue)) == int(bool(wide_line)), 'Shared beat storage'
+        assert bool(re.search(r'\bbeat\b', queue)) == bool(parameter['enableBurstRefill'] or parameter['dCacheRefillBytes'] == 64)
     arrays = {file[:-3]: tuple(map(int, re.search(r'_(\d+)x(\d+)\.sv$', file).groups()))
               for file in files if file.startswith(('instructions_', 'tags_', 'data_', 'dataTags_', 'mem_'))}
     assert ('DitDahA1InstructionCache.sv' in files) == bool(size)
@@ -1507,39 +1516,47 @@ def coherence_contract(parameters):
     return body
 
 
-def line_read_window(parameters, expected_peak=2):
+def line_read_window(parameters, expected_peak=None, fault_beat=-1, terminal='normal', stalls=False):
     data = parameters.get('dCacheRefillBytes') == 64
     if not data and not parameters.get('enableBurstRefill'):
         return ''
     width, harts = parameters['axiDataBits'], parameters['hartCount']
     base = int(next(r['base'] for r in parameters['memoryRegions'] if not r['device'] and
                    (r['readable'] and r.get('dataCacheable') if data else r['executable'])))
-    ports = (int(data), 2 * (harts - 1) + int(data))
-    body = f'''    begin
-      integer cycles, peak, selected, id, beat, delay[2], sent[2], received[2];
-      bit [1:0] accepted, issued, live, done;
+    count = min(harts, 4)
+    identities = (*range(count - 1), harts - 1)
+    ports = tuple(2 * hart + int(data) for hart in identities)
+    if expected_peak is None:
+        expected_peak = min(count, parameters.get('fabricReadSlots') or 2)
+    target, beats, slices = expected_peak - 1, 512 // width, width // 64
+    lengths = [slices if n == target and terminal == 'early' else 9 if n == target and terminal == 'late' else 8 for n in range(count)]
+    body = f'''    reset = 1; tick(); reset = 0; tick();
+    begin
+      integer cycles, peak, selected, id, expected, delay[{count}], sent[{count}], received[{count}];
+      bit [{count-1}:0] accepted, issued, live, done;
       bit holding;
       cycles = 0; peak = 0; selected = 0; accepted = 0; issued = 0; live = 0; done = 0; holding = 0;
-      for (integer n = 0; n < 2; n++) begin delay[n] = 0; sent[n] = 0; received[n] = 0; end
-      while (done != 3 && cycles < 300) begin
+      if (!$value$plusargs("EXPECTED_PEAK=%d", expected)) expected = {expected_peak};
+      for (integer n = 0; n < {count}; n++) begin delay[n] = 0; sent[n] = 0; received[n] = 0; end
+      while (done != {count}'d{(1 << count) - 1} && cycles < 500) begin
         @(negedge clock);
-        ar_ready = 1;
+        ar_ready = {'cycles % 3 != 0' if stalls else '1'};
 '''
     for n, port in enumerate(ports):
         body += f'''        ports_{port}_request_valid = !accepted[{n}];
         ports_{port}_request_bits_address = 64'h{base + 0x100 + 64 * n:x};
         ports_{port}_request_bits_size = 6; ports_{port}_request_bits_fetch = {int(not data)};
         ports_{port}_request_bits_write = 0; ports_{port}_request_bits_atomic = 0;
-        ports_{port}_request_bits_tag = {71 + n}; ports_{port}_response_ready = 1;
+        ports_{port}_request_bits_tag = {71 + n}; ports_{port}_response_ready = {'cycles % 5 != 0' if stalls else '1'};
 '''
     body += f'''        if (!holding) begin
           r_valid = 0;
-          for (integer n = 1; n >= 0; n--) if (live[n] && delay[n] == 0) begin
+          for (integer n = {count-1}; n >= 0; n--) if (live[n] && delay[n] == 0) begin
             selected = n; r_valid = 1;
           end
           if (r_valid) begin
-            r_bits_id = selected == 0 ? 0 : {harts - 1}; r_bits_resp = 0;
-            r_bits_last = sent[selected] == {512 // width - 1};
+            r_bits_id = selected == {count-1} ? {harts - 1} : selected; r_bits_resp = selected == {target} && sent[selected] == {fault_beat} ? 2 : 0;
+            r_bits_last = sent[selected] == (selected == {target} ? {0 if terminal == 'early' else beats if terminal == 'late' else beats - 1} : {beats - 1});
             for (integer chunk = 0; chunk < {width // 64}; chunk++)
               r_bits_data[64 * chunk +: 64] = 64'h1000000000000000 + 256 * selected + sent[selected] * {width // 64} + chunk;
           end
@@ -1547,30 +1564,35 @@ def line_read_window(parameters, expected_peak=2):
         #1;
 '''
     for n, port in enumerate(ports):
+        fault_from = fault_beat * slices if fault_beat >= 0 else 9
+        if terminal == 'early' and beats > 1: fault_from = 0
+        if terminal == 'late': fault_from = min(fault_from, 8 - slices)
+        value = f"64'h1000000000000000 + 256 * {n} + received[{n}]"
+        if n == target and terminal == 'late': value = f"(received[{n}] == 8 ? 64'b0 : {value})"
         body += f'''        if (ports_{port}_request_valid && ports_{port}_request_ready) accepted[{n}] = 1;
         if (ports_{port}_response_valid && ports_{port}_response_ready) begin
-          if (done[{n}] || ports_{port}_response_bits_fault || ports_{port}_response_bits_tag != {71 + n} ||
-              ports_{port}_response_bits_data != 64'h1000000000000000 + 256 * {n} + received[{n}] ||
-              ports_{port}_response_bits_last != (received[{n}] == 7)) $fatal(1, "Line window payload or completion");
+          if (done[{n}] || ports_{port}_response_bits_fault != ({int(n == target)} && received[{n}] >= {fault_from}) || ports_{port}_response_bits_tag != {71 + n} ||
+              ports_{port}_response_bits_data != {value} ||
+              ports_{port}_response_bits_last != (received[{n}] == {lengths[n]-1})) $fatal(1, "Line window payload or completion");
           received[{n}]++;
-          if (received[{n}] == 8) done[{n}] = 1;
+          if (received[{n}] == {lengths[n]}) done[{n}] = 1;
         end
 '''
     body += f'''        if (ar_valid && ar_ready) begin
-          id = ar_bits_id == 0 ? 0 : 1;
-          if (!accepted[id] || issued[id] || ar_bits_id != (id == 0 ? 0 : {harts - 1}) ||
+          id = ar_bits_id == {harts - 1} ? {count-1} : integer'(ar_bits_id);
+          if (id >= {count} || !accepted[id] || issued[id] || ar_bits_id != (id == {count-1} ? {harts - 1} : id) ||
               ar_bits_addr != 64'h{base + 0x100:x} + 64 * id || ar_bits_len != {512 // width - 1} ||
               ar_bits_size != {int(width // 8).bit_length() - 1}) $fatal(1, "Line window address identity");
           issued[id] = 1; live[id] = 1; delay[id] = 24;
-          if (int'(live[0]) + int'(live[1]) > peak) peak = int'(live[0]) + int'(live[1]);
+          if ($countones(live) > peak) peak = $countones(live);
         end
         holding = r_valid && !r_ready;
         if (r_valid && r_ready) begin sent[selected]++; if (r_bits_last) live[selected] = 0; end
-        for (integer n = 0; n < 2; n++) if (delay[n] > 0) delay[n]--;
+        for (integer n = 0; n < {count}; n++) if (delay[n] > 0) delay[n]--;
         tick(); cycles++;
       end
-      check(done == 3 && peak == {expected_peak}, "Line window completion and physical overlap");
-      $display("LINE_READ_WINDOW cycles=%0d peak=%0d", cycles, peak);
+      check(done == {count}'d{(1 << count) - 1} && peak == expected, "Line window completion and physical overlap");
+      $display("LINE_READ_WINDOW cycles=%0d peak=%0d fault={fault_beat} terminal={terminal}", cycles, peak);
       ar_ready = 0; r_valid = 0;
 '''
     for port in ports:
@@ -1667,7 +1689,60 @@ def line_read_contract(parameters):
     return body + line_read_window(parameters)
 
 
+def read_queue_serial_contract(parameters):
+    base = int(next(r['base'] for r in parameters['memoryRegions'] if r['readable'] and not r['device']))
+    body = ''
+    for hart in (0, parameters['hartCount'] - 1):
+        port = 2 * hart + 1
+        for mode in ('short', 'late', 'denied', 'write', 'atomic', 'size', 'unknown'):
+            denied = mode in ('denied', 'write', 'atomic', 'size')
+            address = 1 << parameters['physicalAddressBits'] if mode == 'denied' else base + 0x100
+            body += f'''    reset = 1; tick(); reset = 0; tick();
+    r_bits_resp = 0; r_bits_last = 1; r_valid = 0; ar_ready = 0;
+    ports_{port}_request_bits_address = 64'h{address:x}; ports_{port}_request_bits_size = {4 if mode == 'size' else 3};
+    ports_{port}_request_bits_write = {int(mode == 'write')}; ports_{port}_request_bits_atomic = {int(mode == 'atomic')};
+    ports_{port}_request_bits_tag = 59; ports_{port}_request_valid = 1; #1;
+    while (!ports_{port}_request_ready) tick(); tick(); ports_{port}_request_valid = 0;
+'''
+            if denied:
+                body += f'''    while (!ports_{port}_response_valid) begin check(!ar_valid, "Rejected read cannot issue AR"); tick(); end
+'''
+            else:
+                body += f'''    while (!ar_valid) tick();
+    repeat (3) begin check(ar_bits_id == {hart} && ar_bits_addr == 64'h{address:x} && ar_bits_len == 0 && !ports_{port-1}_request_ready, "Serial AR stability and hart exclusion"); tick(); end
+    ar_ready = 1; tick(); ar_ready = 0;
+'''
+                if mode == 'unknown':
+                    body += f'''    r_bits_id = {hart ^ 1}; r_valid = 1; tick(); r_valid = 0;
+    check(!ports_{port}_response_valid && !empty, "Unknown RID cannot complete a real owner");
+'''
+                body += f'''    r_bits_id = {hart}; r_bits_data = 64'h123456789abcdef0; r_valid = 1;
+'''
+                if mode == 'late':
+                    body += f'''    r_bits_last = 0; tick(); r_valid = 0;
+    check(!ports_{port}_response_valid, "Unterminated short read retains ownership");
+    r_bits_last = 1; r_valid = 1;
+'''
+                body += '    tick(); r_valid = 0;\n'
+            body += f'''    repeat (3) begin
+      check(ports_{port}_response_valid && ports_{port}_response_bits_tag == 59 && ports_{port}_response_bits_last &&
+        ports_{port}_response_bits_fault == {int(mode != 'short')} && !ports_{port-1}_request_ready &&
+        (ports_{port}_response_bits_fault || ports_{port}_response_bits_data == 64'h123456789abcdef0), "Serial completion identity, data and retention"); tick();
+    end
+    ports_{port}_response_ready = 1; tick(); ports_{port}_response_ready = 0;
+    check(empty == {int(mode != 'unknown')}, "Serial release or sticky protocol containment");
+    ports_{port}_request_bits_write = 0; ports_{port}_request_bits_atomic = 0;
+'''
+    return body + '    reset = 1; tick(); reset = 0; tick();\n'
+
+
 def read_queue_contract(parameters):
+    stress = ''.join(line_read_window(parameters, fault_beat=beat, stalls=True) for beat in range(512 // parameters['axiDataBits']))
+    stress += line_read_window(parameters, terminal='late', stalls=True)
+    if parameters['axiDataBits'] < 512:
+        stress += line_read_window(parameters, terminal='early', stalls=True)
+    if parameters.get('fabricReadSlots') == 1:
+        return read_queue_serial_contract(parameters) + line_read_window(parameters) + stress
     base = int(parameters['memoryRegions'][0]['base'])
     last = 2*parameters['hartCount']-1
     hart = parameters['hartCount']-1
@@ -1736,7 +1811,7 @@ def read_queue_contract(parameters):
     ports_1_request_valid = 0; reset = 1; tick(); reset = 0; tick();
     check(empty, "Reset clears protocol containment");
 '''
-    return body + line_read_contract(parameters)
+    return body + line_read_contract(parameters) + stress
 
 
 def fabric_contract(parameters):
@@ -1828,27 +1903,31 @@ def fabric_contract(parameters):
 def fabric_exclusive_contract(parameters):
     hart = parameters['hartCount'] - 1
     base = int(next(r['base'] for r in parameters['memoryRegions'] if r['writable'] and not r['device']))
-    body = f'''
-    data_0_request_bits_write = 0; data_0_request_bits_atomic = 0; data_0_request_bits_fetch = 0;
-    data_{hart}_request_bits_write = 0; data_{hart}_request_bits_atomic = 0; data_{hart}_request_bits_fetch = 0;
-    data_{hart}_request_bits_size = 3;
-    data_{hart}_response_ready = 0; axi_r_bits_resp = 0; axi_r_bits_last = 1;
-    data_0_request_bits_address = 'h{base+0x100:x}; data_0_request_bits_size = 3;
-    data_0_request_valid = 1; tick(); data_0_request_valid = 0;
-    data_{hart}_request_bits_address = 'h{base+0x108:x}; data_{hart}_request_valid = 1;
-    tick(); data_{hart}_request_valid = 0;
-    while (!axi_ar_valid) tick(); axi_ar_ready = 1; tick(); axi_ar_ready = 0;
-    while (!axi_ar_valid) tick(); axi_ar_ready = 1; tick(); axi_ar_ready = 0;
-    data_0_request_bits_write = 1; data_0_request_bits_mask = 255;
+    depth = parameters.get('fabricReadSlots') or 2
+    identities = (*range(depth - 1), hart)
+    body = '    axi_r_bits_resp = 0; axi_r_bits_last = 1;\n'
+    for index, reader in enumerate(identities):
+        body += f'''    data_{reader}_request_bits_write = 0; data_{reader}_request_bits_atomic = 0; data_{reader}_request_bits_fetch = 0;
+    data_{reader}_request_bits_address = 'h{base+0x100+8*index:x}; data_{reader}_request_bits_size = 3;
+    data_{reader}_response_ready = 0; data_{reader}_request_valid = 1; #1;
+    while (!data_{reader}_request_ready) tick(); tick(); data_{reader}_request_valid = 0;
+'''
+    body += f'''    repeat ({depth}) begin while (!axi_ar_valid) tick(); axi_ar_ready = 1; tick(); axi_ar_ready = 0; end
+    data_0_request_bits_address = 'h{base+0x200:x}; data_0_request_bits_size = 3;
+    data_0_request_bits_write = 1; data_0_request_bits_atomic = 0; data_0_request_bits_fetch = 0; data_0_request_bits_mask = 255;
     data_0_request_bits_data = 17; data_0_request_bits_tag = 85; data_0_request_valid = 1;
     instruction_{hart}_request_bits_address = 'h{base+0x180:x};
     instruction_{hart}_request_bits_size = 2; instruction_{hart}_request_valid = 1;
     repeat (3) begin
       check(!data_0_request_ready && !instruction_{hart}_request_ready && !axi_aw_valid && !axi_w_valid, "Exclusive request waits for all accepted reads"); tick();
     end
-    axi_r_bits_id = 0; axi_r_valid = 1; tick(); axi_r_valid = 0;
-    data_0_response_ready = 1; tick(); data_0_response_ready = 0;
-    axi_r_bits_id = {hart}; axi_r_valid = 1; tick(); axi_r_valid = 0;
+'''
+    for reader in identities[:-1]:
+        body += f'''    axi_r_bits_id = {reader}; axi_r_valid = 1; tick(); axi_r_valid = 0;
+    data_{reader}_response_ready = 1; tick(); data_{reader}_response_ready = 0;
+    check(!data_0_request_ready && !axi_aw_valid && !axi_w_valid, "Partial drain cannot release exclusive traffic");
+'''
+    body += f'''    axi_r_bits_id = {hart}; axi_r_valid = 1; tick(); axi_r_valid = 0;
     repeat (3) begin
       check(data_{hart}_response_valid && !data_0_request_ready && !axi_aw_valid && !axi_w_valid, "Exclusive request waits for held read response"); tick();
     end

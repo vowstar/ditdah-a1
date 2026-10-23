@@ -8,6 +8,7 @@ import me.jiuyang.zaozi.Parameter
 case class DitDahA1Parameter(
   resetVector: BigInt = BigInt(0),
   hartCount: Int = 1,
+  fabricReadSlots: Option[Int] = None,
   physicalAddressBits: Int = 56,
   virtualAddressBits: Int = 39,
   tlbEntries: Int = 0,
@@ -30,6 +31,7 @@ case class DitDahA1Parameter(
   private def powerOfTwo(value: Int): Boolean = value > 0 && (value & (value - 1)) == 0
 
   require(hartCount >= 1 && hartCount <= 16, "hartCount must be between 1 and 16")
+  require(fabricReadSlots.forall(n => n >= 0 && n <= 4), "fabricReadSlots must be between zero and four")
   require(physicalAddressBits >= 32 && physicalAddressBits <= 56, "physicalAddressBits must be between 32 and 56")
   require(Set(0, 39, 48).contains(virtualAddressBits), "virtualAddressBits must select Bare, Sv39 or Sv48")
   require(Set(0, 2, 4).contains(tlbEntries), "tlbEntries must be zero, two or four")
@@ -75,12 +77,21 @@ case class DitDahA1Parameter(
     require(l2CacheBytes == 0, "RTL does not support a shared cache")
     require(memoryRegions.exists(r => r.executable && resetVector >= r.base && resetVector + 4 <= r.base + r.size), "Reset vector must be in executable memory")
 
-  def validateFabric(): Unit = localInterruptBase.foreach { base =>
-    require(enableInterrupts, "Local interrupt sources require machine interrupts")
-    require(base >= 0 && (base & 65535) == 0 && base + 65536 <= (BigInt(1) << physicalAddressBits), "Local interrupt window must be aligned and fit the physical address space")
-    require(memoryRegions.exists(r => r.device && r.readable && r.writable && !r.executable && !r.atomic &&
-      r.base <= base && base + 65536 <= r.base + r.size), "Local interrupts require a readable writable device region")
-  }
+  def resolvedFabricReadSlots: Int = fabricReadSlots.getOrElse(if hartCount > 1 then 2 else 0)
+
+  def validateReadSlots(): Unit =
+    require(if hartCount == 1 then resolvedFabricReadSlots == 0 else
+      resolvedFabricReadSlots >= 1 && resolvedFabricReadSlots <= hartCount,
+      "Shared read slots require distinct harts; a single hart uses the bridge")
+
+  def validateFabric(): Unit =
+    validateReadSlots()
+    localInterruptBase.foreach { base =>
+      require(enableInterrupts, "Local interrupt sources require machine interrupts")
+      require(base >= 0 && (base & 65535) == 0 && base + 65536 <= (BigInt(1) << physicalAddressBits), "Local interrupt window must be aligned and fit the physical address space")
+      require(memoryRegions.exists(r => r.device && r.readable && r.writable && !r.executable && !r.atomic &&
+        r.base <= base && base + 65536 <= r.base + r.size), "Local interrupts require a readable writable device region")
+    }
 
   def enableTranslation: Boolean = virtualAddressBits == 39 && enableSupervisorMode
   def enableDataBurstRefill: Boolean = dCacheRefillBytes == 64

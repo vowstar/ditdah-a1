@@ -3,7 +3,7 @@
 
 .PHONY: config check rtl software verify-software verify-data-software verify-supervisor-software zephyr verify-zephyr verify-zephyr-long verify-signoff verify-simulation verify-production verify-cache verify-platform verify-user verify-data-cache verify-supervisor verify-formal verify-scalar-formal verify-user-formal verify-data-formal verify-supervisor-formal verify-translation verify-translation-formal verify-translation-software verify-translation-cache verify-translation-cache-formal verify-translation-cache-software clean
 .PHONY: verify-burst verify-burst-formal verify-burst-software verify-widths verify-width-software
-.PHONY: verify-data-line verify-data-line-software
+.PHONY: verify-data-line verify-data-line-software verify-read-capacity verify-read-software
 
 HART_COUNTS ?= 2 3 15 16
 ICACHE_CASES := pipeline_reuse pipeline_integer_stream pipeline_dependency_stream pipeline_dependency_chain cache_replacement fence_ordering fence_i_prefetch synchronization atomic_ordering atomic_denied atomic_retry bus_fetch pipeline_redirect pmp_fetch pmp_update interrupt_fence interrupt_fence_i interrupt_fetch_fault
@@ -69,6 +69,18 @@ verify-zephyr-long:
 verify-signoff: verify-formal
 	$(MAKE) verify-widths
 	$(MAKE) verify-data-line
+	$(MAKE) verify-read-capacity
+
+verify-read-capacity:
+	for profile in 2:1:64:1 2:2:64:1 3:3:128:2 16:4:256:2 16:4:512:3; do \
+		count=$${profile%%:*}; rest=$${profile#*:}; slots=$${rest%%:*}; rest=$${rest#*:}; bus=$${rest%%:*}; width=$${rest#*:}; \
+		python3 test/verify.py --multicore-only --harts $$count --fabric-read-slots $$slots --width $$bus --issue-width $$width --pmp-entries 16 --icache-bytes 8192 --burst-refill --dcache-bytes 8192 --dcache-refill-bytes 64 --output result/read-slots-$$slots-$$bus --case data_coherence --case synchronization --case atomic_lrsc_shared --case atomic_interrupt || exit $$?; \
+		python3 test/formal.py --rtl result/read-slots-$$slots-$$bus/harts$$count-axi$$bus/rtl --output result/formal/read-slots-$$slots-$$bus --modules ReadQueue MemoryFabric || exit $$?; \
+	done
+	$(MAKE) verify-read-software
+
+verify-read-software:
+	python3 test/verify.py --software-read-matrix --config $(SOFTWARE_CONFIG) --harts 16 --icache-bytes 8192 --burst-refill --dcache-bytes 8192 --dcache-refill-bytes 64 --output $(SOFTWARE_OUTPUT)/read-slots --jobs $(SOFTWARE_JOBS)
 
 verify-data-line:
 	for span in 8 64; do \

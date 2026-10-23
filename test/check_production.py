@@ -81,7 +81,7 @@ for directory, top in profiles:
     assert manifest['implementation']['pmpState'] == (enabled and top != 'DitDahA1Frontend')
     assert manifest['implementation']['hartCount'] == (count if top == 'DitDahA1' else int(top == 'DitDahA1Core'))
     assert manifest['implementation']['fabricRequesters'] == (2 * manifest['parameters']['hartCount'] if top in ('DitDahA1', 'DitDahA1MemoryFabric') else 0)
-    read_slots = 2 if top in ('DitDahA1', 'DitDahA1MemoryFabric') and manifest['parameters']['hartCount'] > 1 else 0
+    read_slots = (manifest['parameters'].get('fabricReadSlots') or 2) if top in ('DitDahA1', 'DitDahA1MemoryFabric') and manifest['parameters']['hartCount'] > 1 else 0
     assert manifest['implementation']['fabricReadSlots'] == read_slots
     assert manifest['implementation']['enableBranchPrediction'] == (
         manifest['parameters']['enableBranchPrediction'] and top in ('DitDahA1', 'DitDahA1Core', 'DitDahA1Frontend'))

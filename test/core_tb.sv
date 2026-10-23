@@ -13,6 +13,8 @@ module core_tb;
   localparam integer HARTS = `HARTS;
   localparam integer IDW = HARTS > 1 ? $clog2(HARTS) : 1;
   localparam integer MB = `MEMORY_BYTES;
+  localparam integer READ_SLOTS = `FABRIC_READ_SLOTS > 0 ? `FABRIC_READ_SLOTS : 1;
+  localparam integer READ_CONTEXTS = 4;
 `ifdef SOFTWARE
   localparam integer TRANSACTION_LIMIT = 640 * HARTS;
 `elsif LOCAL_INTERRUPTS
@@ -140,7 +142,8 @@ module core_tb;
     logic [7:0] remaining;
     integer delay, order;
   } read_context_t;
-  read_context_t read_context[2];
+  read_context_t read_context[READ_CONTEXTS];
+  logic [READ_CONTEXTS-1:0] read_live, read_lines, read_older;
   integer read_slot = 0, accept_read_slot, read_serial = 0, data_reads = 0;
   integer read_peak = 0, read_reordered = 0, reorder_reads = 0;
   integer line_peak = 0, line_overlap_cycles = 0;
@@ -153,12 +156,17 @@ module core_tb;
   wire [2:0] read_size = read_context[read_slot].size;
   wire [7:0] read_remaining = read_context[read_slot].remaining;
   integer write_delay = 0, cycles = 0;
-  initial for (integer slot = 0; slot < 2; slot++) read_context[slot] = '0;
+  initial for (integer slot = 0; slot < READ_CONTEXTS; slot++) read_context[slot] = '0;
+  always_comb for (integer slot = 0; slot < READ_CONTEXTS; slot++) begin
+    read_live[slot] = read_context[slot].valid;
+    read_lines[slot] = read_context[slot].valid && read_context[slot].line;
+    read_older[slot] = read_context[slot].valid && read_context[slot].order < read_context[read_slot].order;
+  end
 `ifdef ENABLE_INTERRUPTS
   logic pending_data, pending_instruction_target, pending_exclusive_target, pending_peer;
   always_comb begin
     pending_data = 0; pending_instruction_target = 0; pending_exclusive_target = 0; pending_peer = 0;
-    for (integer slot = 0; slot < 2; slot++) if (read_context[slot].valid) begin
+    for (integer slot = 0; slot < READ_CONTEXTS; slot++) if (read_context[slot].valid) begin
       pending_data |= !read_context[slot].fetch;
       pending_instruction_target |= read_context[slot].fetch && read_context[slot].address == irq_target;
       pending_exclusive_target |= read_context[slot].exclusive && read_context[slot].id == irq_hart;
@@ -209,11 +217,14 @@ module core_tb;
     random_state = random_state ^ (random_state << 13);
     random_state = random_state ^ (random_state >> 17);
     random_state = random_state ^ (random_state << 5);
-    arready = !reset && !(read_context[0].valid && read_context[1].valid) && random_state[0];
+    arready = !reset && !(&read_live) && random_state[0];
     if (!rvalid) begin
-      if (read_context[0].valid && read_context[0].delay == 0) read_slot = 0;
-      if (read_context[1].valid && read_context[1].delay == 0 &&
-          (!read_context[0].valid || read_context[0].delay != 0 || random_state[3])) read_slot = 1;
+      integer candidate;
+      candidate = -1;
+      for (integer slot = 0; slot < READ_CONTEXTS; slot++)
+        if (read_context[slot].valid && read_context[slot].delay == 0 &&
+            (candidate < 0 || random_state[slot + 2])) candidate = slot;
+      if (candidate >= 0) read_slot = candidate;
     end
     awready = !reset && !aw_held && !bvalid && random_state[1];
     wready = !reset && !w_held && !bvalid && random_state[2];
@@ -243,13 +254,13 @@ module core_tb;
       observe_platform();
 `endif
       cycles <= cycles + 1;
-      if (read_context[0].valid && read_context[1].valid && read_context[0].line && read_context[1].line)
+      if ($countones(read_lines) > 1)
         line_overlap_cycles <= line_overlap_cycles + 1;
       if (cycles > cycle_limit) $fatal(1, "Timeout");
       if (arvalid && !arready) ar_stall <= ar_stall + 1;
       if (awvalid && !awready) aw_stall <= aw_stall + 1;
       if (wvalid && !wready) w_stall <= w_stall + 1;
-      for (integer slot = 0; slot < 2; slot++)
+      for (integer slot = 0; slot < READ_CONTEXTS; slot++)
         if (read_context[slot].valid && read_context[slot].delay > 0) read_context[slot].delay <= read_context[slot].delay - 1;
       if (arvalid && arready) begin
         if (!console_address(64'(araddr)) && (64'(araddr) < base_address || 64'(araddr) + (1 << arsize) * (1 + integer'(arlen)) > base_address + MB)) $fatal(1, "Truncated or unexpected read address");
@@ -259,9 +270,12 @@ module core_tb;
             (arlock && arsize != 3) || (araddr & ((1 << arsize) - 1)) != 0) $fatal(1, "Read alignment");
         if (HARTS > 1) $write("HART %0d ", arid);
         $display("BUS %s %016h %0d %016h", arlock ? "exclusive_read" : (arprot[2] ? "fetch" : "read"), 64'(araddr), accepted_request[arid].size == 6 ? 64 : 1 << arsize, 64'b0);
-        accept_read_slot = read_context[0].valid ? 1 : 0;
-        if (read_context[accept_read_slot].valid ||
-            (read_context[1 - accept_read_slot].valid && read_context[1 - accept_read_slot].id == arid)) $fatal(1, "Overlapping AXI read identity");
+        accept_read_slot = -1;
+        for (integer slot = READ_CONTEXTS - 1; slot >= 0; slot--) begin
+          if (!read_context[slot].valid) accept_read_slot = slot;
+          else if (read_context[slot].id == arid) $fatal(1, "Overlapping AXI read identity");
+        end
+        if (accept_read_slot < 0) $fatal(1, "AXI read context capacity");
         read_context[accept_read_slot].valid <= 1;
         read_context[accept_read_slot].remaining <= arlen;
         read_context[accept_read_slot].line <= accepted_request[arid].size == 6;
@@ -277,11 +291,11 @@ module core_tb;
           if (reorder_reads && data_reads % 2 == 0) read_context[accept_read_slot].delay <= 96;
           data_reads = data_reads + 1;
         end
-        if (1 + integer'(read_context[1 - accept_read_slot].valid) > read_peak)
-          read_peak = 1 + integer'(read_context[1 - accept_read_slot].valid);
+        if (1 + $countones(read_live) > read_peak)
+          read_peak = 1 + $countones(read_live);
         if (accepted_request[arid].size == 6 &&
-            1 + integer'(read_context[1 - accept_read_slot].valid && read_context[1 - accept_read_slot].line) > line_peak)
-          line_peak = 1 + integer'(read_context[1 - accept_read_slot].valid && read_context[1 - accept_read_slot].line);
+            1 + $countones(read_lines) > line_peak)
+          line_peak = 1 + $countones(read_lines);
 `ifdef ENABLE_INTERRUPTS
         if (irq_mode == 5 && 64'(araddr) == irq_target) read_context[accept_read_slot].delay <= 48;
 `endif
@@ -314,7 +328,7 @@ module core_tb;
           end
         end
         if (rlast) begin
-          if (read_context[1 - read_slot].valid && read_context[1 - read_slot].order < read_context[read_slot].order)
+          if (|read_older)
             read_reordered = read_reordered + 1;
           read_context[read_slot].valid <= 0;
         end
@@ -456,7 +470,7 @@ module core_tb;
           if (exclusive_request(requests[source]) || exclusive_request(accepted_request[hart]))
             $fatal(1, "Exclusive request overlapped physical service");
         end
-        if (pending_sources >= 2) $fatal(1, "Physical read slots exceeded");
+        if (pending_sources >= READ_SLOTS) $fatal(1, "Physical read slots exceeded");
         active_source[source / 2] = source;
         accepted_request[source / 2] = requests[source];
         if (exclusive_request(requests[source])) bus_owner <= source;

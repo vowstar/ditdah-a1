@@ -97,6 +97,7 @@ def compile_tb(rtl, directory, width, pa, top='core_tb', source=None, extra_file
   task automatic observe_metrics;
     integer retired;
     metric_cycles++;
+    {'observe_read_metrics();' if top == 'core_tb' and harts > 1 else ''}
     for (integer h = 0; h < {harts}; h++) begin
       if (work_metrics && retired_pc(h, work_begin_pc)) $display("WORK_CYCLE %0d 0 %0d", h, metric_cycles);
       if (work_metrics && retired_pc(h, work_end_pc)) $display("WORK_CYCLE %0d 1 %0d", h, metric_cycles);
@@ -118,6 +119,23 @@ def compile_tb(rtl, directory, width, pa, top='core_tb', source=None, extra_file
     bindings, ports, platform = [], [], []
     local_base = local_interrupt_base(parameters) if top == 'core_tb' else None
     observers = [f'  wire [{harts - 1}:0] architectural_fetch_busy;\n  wire [63:0] architectural_fetch_pc[{harts}];']
+    read_slots = parameters.get('fabricReadSlots') or 2
+    read_suffixes = tuple('' if n == 0 else f'_{n-1}' for n in range(read_slots))
+    if top == 'core_tb' and harts > 1:
+        occupancy = ' + '.join(f"integer'(dut.fabric.readers.state{suffix} != 0)" for suffix in read_suffixes)
+        buffered = '(' + ' || '.join(f'dut.fabric.readers.state{suffix} == 5' for suffix in read_suffixes) + ')' if parameters['axiDataBits'] > 64 and (parameters.get('enableBurstRefill') or parameters.get('dCacheRefillBytes') == 64) else "1'b0"
+        observers.append(f'''  longint unsigned read_occupancy[0:{read_slots}];
+  longint unsigned read_drain_wait = 0, read_buffer_wait = 0;
+  initial for (integer n = 0; n <= {read_slots}; n++) read_occupancy[n] = 0;
+  task automatic observe_read_metrics;
+    read_occupancy[{occupancy}]++;
+    if (!dut.fabric.active && !dut.fabric.allowRead && !dut.fabric.readers.empty) read_drain_wait++;
+    if ({buffered} && rvalid && !rready) read_buffer_wait++;
+  endtask
+  final begin
+    for (integer n = 0; n <= {read_slots}; n++) $display("READ_OCCUPANCY %0d %0d", n, read_occupancy[n]);
+    $display("READ_STALL %0d %0d", read_drain_wait, read_buffer_wait);
+  end''')
     for hart in range(harts if top == 'core_tb' else 1):
         fetch = f'dut.core_{hart}.frontend.fetch' if top == 'core_tb' else 'dut.frontend.fetch'
         order = fetch.replace('.frontend.fetch', '.backend.dV.traceOrder')
@@ -216,18 +234,20 @@ def compile_tb(rtl, directory, width, pa, top='core_tb', source=None, extra_file
         if top == 'core_tb' and parameters.get('dCacheRefillBytes', 8) == 64:
             port = f'dut.fabric.data_{hart}_request'
             blocked = '!dut.fabric.allowRead' if harts > 1 else "1'b1"
-            full = '(dut.fabric.readers.state != 0 && dut.fabric.readers.state_0 != 0)' if harts > 1 else "1'b0"
+            full = '(' + ' && '.join(f'dut.fabric.readers.state{suffix} != 0' for suffix in read_suffixes) + ')' if harts > 1 else "1'b0"
+            owner = '(' + ' || '.join(f'(dut.fabric.readers.state{suffix} != 0 && (dut.fabric.readers.owner{suffix} >> 1) == {hart})' for suffix in read_suffixes) + ')' if harts > 1 else "1'b0"
             observers.append(f'''  longint unsigned data_line_wait_{hart} = 0;
-  longint unsigned line_serial_wait_{hart} = 0, line_full_wait_{hart} = 0, line_arbiter_wait_{hart} = 0;
+  longint unsigned line_serial_wait_{hart} = 0, line_owner_wait_{hart} = 0, line_full_wait_{hart} = 0, line_arbiter_wait_{hart} = 0;
   always @(posedge clock) if (!reset && {port}_valid && !{port}_ready && {port}_bits_size == 6) begin
     data_line_wait_{hart}++;
     if ({blocked}) line_serial_wait_{hart}++;
+    else if ({owner}) line_owner_wait_{hart}++;
     else if ({full}) line_full_wait_{hart}++;
     else line_arbiter_wait_{hart}++;
   end
   final begin
     $display("REFILL_WAIT {hart} %0d", data_line_wait_{hart});
-    $display("REFILL_STALL {hart} %0d %0d %0d", line_serial_wait_{hart}, line_full_wait_{hart}, line_arbiter_wait_{hart});
+    $display("REFILL_STALL {hart} %0d %0d %0d %0d", line_serial_wait_{hart}, line_owner_wait_{hart}, line_full_wait_{hart}, line_arbiter_wait_{hart});
   end''')
     (directory / 'fetch_observers.svh').write_text('\n'.join(observers) + '\n')
     (directory / 'retire_bindings.svh').write_text('\n'.join(retirement) + '\n')
@@ -288,7 +308,9 @@ def compile_tb(rtl, directory, width, pa, top='core_tb', source=None, extra_file
         extra_files = [*extra_files, Path('test/core_tb.sv').resolve()]
     command = ['verilator', '--binary', '--timing', '--assert', '-j', '2', '--top-module', top,
          '-Wno-TIMESCALEMOD', '-Wno-WIDTHTRUNC', '-Wno-WIDTHEXPAND',
-         f'-DAXI_BITS={width}', f'-DPA_BITS={pa}', f'-DHARTS={harts}', '-I' + str(directory.resolve()), *(['-DENABLE_INTERRUPTS'] if interrupts else []), '-I' + str(rtl.resolve()),
+         f'-DAXI_BITS={width}', f'-DPA_BITS={pa}', f'-DHARTS={harts}',
+         f'-DFABRIC_READ_SLOTS={parameters.get("fabricReadSlots") or (2 if harts > 1 else 0)}',
+         '-I' + str(directory.resolve()), *(['-DENABLE_INTERRUPTS'] if interrupts else []), '-I' + str(rtl.resolve()),
          *(['-DICACHE'] if parameters['iCacheBytes'] else []),
          *(['-DLOCAL_INTERRUPTS'] if local_base is not None else []),
          *(['-DSOFTWARE'] if software else []),
@@ -324,6 +346,7 @@ def performance_metrics(lines, config):
     harts, width = config.get('hartCount', 1), config.get('issueWidth', 1)
     samples, histograms, retired, traps = {}, {}, Counter(), Counter()
     elapsed, refill_wait, refill_stall = None, {}, {}
+    read_occupancy, read_stalls = {}, None
     for line in log_lines(lines):
         fields, hart = line.split(), 0
         if fields[:1] == ['HART']:
@@ -347,14 +370,26 @@ def performance_metrics(lines, config):
             refill_wait[hart] = cycles
         elif fields[:1] == ['REFILL_STALL']:
             hart, *counts = map(int, fields[1:])
-            assert hart not in refill_stall and len(counts) == 3 and min(counts) >= 0, 'Invalid refill stall classification'
+            assert hart not in refill_stall and len(counts) == 4 and min(counts) >= 0, 'Invalid refill stall classification'
             refill_stall[hart] = counts
+        elif fields[:1] == ['READ_OCCUPANCY']:
+            occupied, count = map(int, fields[1:])
+            assert occupied not in read_occupancy and count >= 0, 'Invalid read occupancy sample'
+            read_occupancy[occupied] = count
+        elif fields[:1] == ['READ_STALL']:
+            assert read_stalls is None and len(fields) == 3, 'Invalid read stall sample'
+            read_stalls = list(map(int, fields[1:]))
     assert set(samples) == set(range(harts)), 'Missing per-hart pipeline metrics'
     assert set(refill_wait) == (set(range(harts)) if config.get('dCacheBytes') and config.get('dCacheRefillBytes', 8) == 64 else set()), 'Missing or unexpected data line wait samples'
     assert set(refill_stall) == set(refill_wait) and all(sum(v) == refill_wait[h] for h, v in refill_stall.items()), 'Refill wait classification does not partition total wait'
     assert set(histograms) == {(hart, lanes) for hart in range(harts) for lanes in range(width + 1)}, 'Missing pipeline histogram'
     cycles = samples[0][0]
     assert elapsed is not None and cycles == elapsed + 1 and cycles > 0, 'Hardware cycles were not sampled exactly once'
+    if harts > 1:
+        assert set(read_occupancy) == set(range((config.get('fabricReadSlots') or 2) + 1)) and sum(read_occupancy.values()) == cycles, 'Read occupancy cycle mismatch'
+        assert read_stalls is not None and all(0 <= n <= cycles for n in read_stalls), 'Invalid read stall cycles'
+    else:
+        assert not read_occupancy and read_stalls is None, 'Single hart has no shared read queue'
     reports = []
     for hart, (sampled, stalls, occupancy, peak) in sorted(samples.items()):
         issued, completed = (list(values) for values in zip(*(histograms[hart, lanes] for lanes in range(width + 1))))
@@ -364,11 +399,12 @@ def performance_metrics(lines, config):
         assert all(value >= 0 for value in (*issued, *completed)), 'Negative pipeline histogram'
         reports.append(dict(hart=hart, retiredInstructions=retired[hart], trapEvents=traps[hart],
                             dataLineWaitCycles=refill_wait.get(hart, 0),
-                            dataLineWait=dict(zip(('serialization', 'capacity', 'arbitration'), refill_stall.get(hart, (0, 0, 0)))),
+                            dataLineWait=dict(zip(('serialization', 'owner', 'capacity', 'arbitration'), refill_stall.get(hart, (0, 0, 0, 0)))),
                             issueCycles=issued, retireCycles=completed, dependencyStallCycles=stalls,
                             occupancySum=occupancy, maxOccupancy=peak))
     return dict(sampledCycles=cycles, retiredInstructions=sum(retired.values()),
-                instructionsPerCycle=sum(retired.values()) / cycles, harts=reports)
+                instructionsPerCycle=sum(retired.values()) / cycles, harts=reports,
+                readOccupancy=read_occupancy, readStallCycles=read_stalls)
 
 
 def control_offset(instruction):
@@ -1375,7 +1411,7 @@ def check_multicore(lines, config, program, name, atomic_metadata=False, softwar
             assert active is None, 'Overlapping source ownership'
             event = fields[1], int(fields[2], 16), int(fields[3]), int(fields[4], 16)
             peers = [owner for owner in owners if owner is not None]
-            assert not peers or harts > 1 and len(peers) < 2 and ordinary(event) and all(ordinary(owner['event']) for owner in peers), 'Exclusive request overlapped physical service or exceeded read slots'
+            assert not peers or harts > 1 and len(peers) < (config.get('fabricReadSlots') or 2) and ordinary(event) and all(ordinary(owner['event']) for owner in peers), 'Exclusive request overlapped physical service or exceeded read slots'
             tag = int(fields[5], 16)
             previous = architectural[hart]
             if previous and 'lineValue' in previous and event[0] != 'fetch':
@@ -2241,15 +2277,16 @@ def verify_software_matrix(args):
     profiles = []
     for harts in args.harts or (1, 2, 16):
         expected = None
-        for selection in ((8, 64) if args.software_refill_matrix else (1, 2, 3)):
-            width = args.issue_width if args.software_refill_matrix else selection
+        for selection in ((2, 4) if args.software_read_matrix else (8, 64) if args.software_refill_matrix else (1, 2, 3)):
+            width = args.issue_width if args.software_refill_matrix or args.software_read_matrix else selection
             refill = selection if args.software_refill_matrix else args.dcache_refill_bytes
-            directory = args.output / (f'r{refill}-h{harts}' if args.software_refill_matrix else f'w{width}-h{harts}')
+            directory = args.output / (f'd{selection}-h{harts}' if args.software_read_matrix else f'r{refill}-h{harts}' if args.software_refill_matrix else f'w{width}-h{harts}')
             directory.mkdir(parents=True, exist_ok=True)
             config_path = directory / 'input.json'
             config_path.write_text(json.dumps(dict(template, hartCount=harts, issueWidth=width, enableBranchPrediction=args.branch_prediction,
                 axiDataBits=512 if harts == 16 else 64, iCacheBytes=args.icache_bytes,
-                dCacheBytes=args.dcache_bytes, dCacheRefillBytes=refill, enableBurstRefill=args.burst_refill), indent=2) + '\n')
+                dCacheBytes=args.dcache_bytes, dCacheRefillBytes=refill, enableBurstRefill=args.burst_refill,
+                **(dict(fabricReadSlots=selection) if args.software_read_matrix else {})), indent=2) + '\n')
             software = directory / 'software'
             run(['python3', 'scripts/build_software.py', '--config', config_path,
                  '--program', 'software/tests/integer.c', '--stack-bytes', '512',
@@ -2259,6 +2296,8 @@ def verify_software_matrix(args):
             summary = verify_software(run_args)
             payload = hashlib.sha256((run_args.output / 'software.hex').read_bytes()).hexdigest()
             for report in summary['cases']:
+                if args.software_read_matrix:
+                    assert report['readConcurrency']['maxOutstanding'] == selection, 'Software did not exercise the configured read capacity'
                 if args.software_refill_matrix:
                     assert all(bool(count.get('lineReads')) == (refill == 64) and count['hits'] > 0 for count in report['dataCache']), 'Software did not consume the selected refill mode and cache hits'
                     if harts == 16 and refill == 64:
@@ -2275,7 +2314,7 @@ def verify_software_matrix(args):
                                  summaryHash=hashlib.sha256(report_path.read_bytes()).hexdigest(),
                                  loadedMemoryHash=payload))
     assert all(hashlib.sha256(Path(path).read_bytes()).hexdigest() == digest for path, digest in hashes.items()), 'Matrix sources changed'
-    dimension = 'Refills' if args.software_refill_matrix else 'Widths'
+    dimension = 'ReadSlots' if args.software_read_matrix else 'Refills' if args.software_refill_matrix else 'Widths'
     summary_path.write_text(json.dumps(dict(scope=f'same software across {dimension.lower()} for each hart count',
         sourceHashes=hashes, configurations=profiles, busSchedules=len(profiles) * len(args.seeds),
         **{key + dimension: True for key in ('loadedBytesEqualAcross', 'resultsEqualAcross', 'consoleEqualAcross')}), indent=2) + '\n')
@@ -2286,10 +2325,12 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--width', type=int, choices=(64, 128, 256, 512), action='append')
     parser.add_argument('--issue-width', type=int, choices=(1, 2, 3), default=1)
+    parser.add_argument('--fabric-read-slots', type=int, choices=(1, 2, 3, 4))
     parser.add_argument('--use-generated', action='store_true')
     parser.add_argument('--elf', type=Path)
     parser.add_argument('--software-matrix', action='store_true')
     parser.add_argument('--software-refill-matrix', action='store_true')
+    parser.add_argument('--software-read-matrix', action='store_true')
     parser.add_argument('--config', type=Path)
     parser.add_argument('--poison-bss', action='store_true')
     parser.add_argument('--software-transactions', type=int)
@@ -2314,12 +2355,17 @@ def main():
     parser.add_argument('--case', dest='selected', action='append', default=[])
     parser.add_argument('--traffic-baseline', type=Path)
     args = parser.parse_args()
+    if args.fabric_read_slots is not None and not args.multicore_only:
+        parser.error('--fabric-read-slots requires --multicore-only; software uses its configuration')
     if args.burst_refill and not args.icache_bytes and not args.elf:
         parser.error('--burst-refill requires --icache-bytes')
     if (args.dcache_refill_bytes == 64 or args.software_refill_matrix) and not args.dcache_bytes and not args.elf:
         parser.error('Data line refill requires --dcache-bytes')
-    if args.software_matrix and args.software_refill_matrix:
+    matrix = args.software_matrix or args.software_refill_matrix or args.software_read_matrix
+    if sum((args.software_matrix, args.software_refill_matrix, args.software_read_matrix)) > 1:
         parser.error('Select one software matrix dimension')
+    if args.software_read_matrix and args.harts != [16]:
+        parser.error('Read capacity software requires --harts 16')
     if args.tlb_entries and not args.sv39:
         parser.error('--tlb-entries requires --sv39')
     if args.sv39:
@@ -2328,11 +2374,11 @@ def main():
         args.user_mode = args.interrupts = True
     if len(set(args.seeds)) != len(args.seeds) or any(not 0 < seed < 1 << 32 for seed in args.seeds):
         parser.error('--seeds requires distinct nonzero 32-bit integers')
-    if not (args.elf or args.software_matrix or args.software_refill_matrix) and (args.jobs != 1 or tuple(args.seeds) != (1, 17, 2026)):
+    if not (args.elf or matrix) and (args.jobs != 1 or tuple(args.seeds) != (1, 17, 2026)):
         parser.error('--seeds and --jobs require --elf')
-    if args.software_timeout is not None and (not (args.elf or args.software_matrix or args.software_refill_matrix) or args.software_timeout <= 0):
+    if args.software_timeout is not None and (not (args.elf or matrix) or args.software_timeout <= 0):
         parser.error('--software-timeout requires --elf and a positive integer')
-    if args.software_matrix or args.software_refill_matrix:
+    if matrix:
         if args.elf or not args.config or args.harts and (len(set(args.harts)) != len(args.harts) or any(hart not in (1, 2, 16) for hart in args.harts)):
             parser.error('Software matrix requires --config, no --elf, and distinct hart counts from 1, 2, 16')
         verify_software_matrix(args)
@@ -2438,6 +2484,8 @@ def main():
             directory = args.output / f'harts{harts}-axi{width}'
             directory.mkdir(parents=True, exist_ok=True)
             config = dict(configuration(width), issueWidth=args.issue_width, hartCount=harts, pmpEntries=entries, enableInterrupts=interrupts, iCacheBytes=args.icache_bytes, dCacheBytes=args.dcache_bytes, dCacheRefillBytes=args.dcache_refill_bytes, tlbEntries=args.tlb_entries, enableBurstRefill=args.burst_refill, enableBranchPrediction=args.branch_prediction)
+            if args.fabric_read_slots is not None:
+                config['fabricReadSlots'] = args.fabric_read_slots
             config['memoryRegions'][0]['dataCacheable'] = bool(args.dcache_bytes)
             if args.user_mode:
                 config['enableUserMode'] = True

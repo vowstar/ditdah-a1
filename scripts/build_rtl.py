@@ -47,7 +47,8 @@ def main():
         manifest["validationScope"] = scope
         manifest["implementation"]["hartCount"] = manifest["parameters"]["hartCount"] if args.top == "DitDahA1" else int(args.top == "DitDahA1Core")
         manifest["implementation"]["fabricRequesters"] = 2 * manifest["parameters"]["hartCount"] if args.top in ("DitDahA1", "DitDahA1MemoryFabric", "DitDahA1ReadQueue") else 0
-        manifest["implementation"]["fabricReadSlots"] = 2 if args.top in ("DitDahA1", "DitDahA1MemoryFabric", "DitDahA1ReadQueue") and manifest["parameters"]["hartCount"] > 1 else 0
+        if args.top not in ("DitDahA1", "DitDahA1MemoryFabric", "DitDahA1ReadQueue"):
+            manifest["implementation"]["fabricReadSlots"] = 0
         manifest["implementation"]["enableBranchPrediction"] = bool(manifest["parameters"]["enableBranchPrediction"] and args.top in ("DitDahA1", "DitDahA1Core", "DitDahA1Frontend"))
         manifest["implementation"]["pmpEntries"] = 0 if scope in ("fabric", "localInterrupts", "gpr") else manifest["parameters"]["pmpEntries"]
         manifest["implementation"]["pmpState"] = bool(manifest["implementation"]["pmpEntries"] and args.top in ("DitDahA1", "DitDahA1Core", "DitDahA1Backend"))
