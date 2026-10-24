@@ -36,7 +36,7 @@ object DitDahA1Module extends Generator[DitDahA1Parameter, DitDahA1Layers, DitDa
         cache.io.reset := io.reset
         cache.io.upstream :<>= core.io.data
         fabric.io.data(hart) :<>= cache.io.downstream
-        cache.io.invalidate :<>= fabric.io.invalidate.get(hart)
+        cache.io.probe :<>= fabric.io.probe.get(hart)
     fabric.io.clock := io.clock
     fabric.io.reset := io.reset
     if parameter.localInterruptBase.nonEmpty then fabric.io.timeTick.get := io.timeTick.get
@@ -75,7 +75,9 @@ object DitDahA1MemoryFabric extends Generator[DitDahA1Parameter, DitDahA1UnitLay
         val device = parameter.memoryRegions.filter(_.device).foldLeft[Referable[Bool]](false.B) { (selected, region) =>
           selected | ((request.address >= region.base.U(64)) & (request.address < (region.base + region.size).U(64)))
         }
-        !request.write & !request.atomic & ((request.size <= 3.U(3)) | DitDahA1Axi.lineRead(parameter, request)) & !device
+        val coherent = if parameter.dCacheWriteback then DitDahA1Memory.dataCacheable(parameter, request.address, 1) else false.B
+        (request.cacheOperation === 0.U(2)) & !request.write & !request.atomic &
+          ((request.size <= 3.U(3)) | DitDahA1Axi.lineRead(parameter, request)) & !device & !coherent
       }
       val readWaiting = ports.indices.map(i => ports(i).request.valid & ordinary(i)).reduce(_ | _)
       val exclusiveWaiting = ports.indices.map(i => ports(i).request.valid & !ordinary(i)).reduce(_ | _)
@@ -107,15 +109,23 @@ object DitDahA1MemoryFabric extends Generator[DitDahA1Parameter, DitDahA1UnitLay
       for hart <- 0 until parameter.hartCount do
         arbiter.io.ports(2 * hart) :<>= io.instruction(hart)
         arbiter.io.ports(2 * hart + 1) :<>= io.data(hart)
-    memory.io.upstream :<>= arbiter.io.downstream
-    val physical = if parameter.dCacheBytes == 0 then memory.io.downstream else
+    val physical = if parameter.dCacheBytes == 0 then
+      memory.io.upstream :<>= arbiter.io.downstream
+      memory.io.downstream
+    else
       val coherence = DitDahA1Coherence.instantiate(parameter)
       coherence.io.clock := io.clock
       coherence.io.reset := io.reset
       coherence.io.hartId := arbiter.io.hartId
-      coherence.io.upstream :<>= memory.io.downstream
-      io.invalidate.get :<>= coherence.io.invalidate
-      coherence.io.downstream
+      io.probe.get :<>= coherence.io.probe
+      if parameter.dCacheWriteback then
+        coherence.io.upstream :<>= arbiter.io.downstream
+        memory.io.upstream :<>= coherence.io.downstream
+        memory.io.downstream
+      else
+        memory.io.upstream :<>= arbiter.io.downstream
+        coherence.io.upstream :<>= memory.io.downstream
+        coherence.io.downstream
     if parameter.localInterruptBase.isEmpty then axi.io.memory :<>= physical
     else
       given ClockScope = ClockScope.posedge(io.clock)

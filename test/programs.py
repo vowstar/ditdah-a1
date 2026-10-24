@@ -174,7 +174,7 @@ def memory_group_cases(base, protection, interrupts, sv39):
         yield 'memory_group_interrupt', p
 
 
-def cases(base, protection=False, interrupts=False, user=False, local_interrupt_base=None, supervisor=False, sv39=False):
+def cases(base, protection=False, interrupts=False, user=False, local_interrupt_base=None, supervisor=False, sv39=False, writeback=False):
     yield from memory_group_cases(base, protection, interrupts, sv39)
     for fault in (False, True):
         p = Program(base)
@@ -342,12 +342,12 @@ def cases(base, protection=False, interrupts=False, user=False, local_interrupt_
            mul(7, 2, 3) | (1 << 12), mul(7, 2, 3) | (4 << 12), mul(7, 2, 3) | 8)
     yield 'multiply', p.finish()
     yield from integer_cases(base)
-    yield from synchronization_cases(base)
+    yield from synchronization_cases(base, writeback)
     yield 'data_cache', data_cache_program(base)
     yield from data_cache_access_cases(base, protection)
     yield from atomic_cases(base, protection)
     if protection:
-        yield from pmp_cases(base)
+        yield from pmp_cases(base, writeback)
     if interrupts:
         yield from interrupt_cases(base, protection)
     if user:
@@ -355,10 +355,10 @@ def cases(base, protection=False, interrupts=False, user=False, local_interrupt_
     if supervisor:
         yield from supervisor_cases(base, protection)
     if sv39:
-        yield from sv39_cases(base, protection)
+        yield from sv39_cases(base, protection, writeback)
 
 
-def sv39_cases(base, protection):
+def sv39_cases(base, protection, writeback=False):
     p = Program(base)
     root, middle, leaf, virtual = base + 0x1000, base + 0x2000, base + 0x3000, 0x40000000
     values = [(root + 8, ((middle >> 12) << 10) | 1), (middle, ((leaf >> 12) << 10) | 1),
@@ -418,6 +418,8 @@ def sv39_cases(base, protection):
         yield 'sv39_' + name, p.finish()
     p = Program(base)
     root, other, middle, alternate, leaf, changed = (base + offset for offset in (0x1000, 0, 0x2000, 0x3000, 0x4000, 0x7000))
+    if writeback:
+        changed = root
     def word(physical, value):
         for byte in range(8):
             p.memory[physical + byte] = (value >> (8 * byte)) & 255
@@ -432,11 +434,14 @@ def sv39_cases(base, protection):
     if protection:
         p.emit(addi(2, 0, -1), csr(0, 0x3b0, 2), addi(2, 0, 0x1f), csr(0, 0x3a0, 2))
     p.address(10, 0x600)
-    p.address(13, 0x7000)
+    p.address(13, changed - base)
     p.emit(ld(2, 10), ld(3, 10, 8), ld(11, 10, 16), ld(12, 10, 24), ld(14, 10, 32),
            csr(0, 0x180, 2), 0x12000073, csr(0, 0x300, 12), ld(4, 11), csr(0, 0x300, 0),
-           csr(0, 0x180, 3), 0x12358073, csr(0, 0x300, 12), ld(5, 11), csr(0, 0x300, 0),
-           sd(14, 13), 0x12000073, csr(0, 0x300, 12), ld(6, 11), csr(0, 0x300, 0), csr(0, 0x180, 0))
+           csr(0, 0x180, 3), 0x12358073, csr(0, 0x300, 12), ld(5, 11), csr(0, 0x300, 0))
+    if writeback:
+        p.emit(ld(15, 13))
+        p.dirty_pte = changed, ((alternate >> 12) << 10) | 0xcf
+    p.emit(sd(14, 13), 0x12000073, csr(0, 0x300, 12), ld(6, 11), csr(0, 0x300, 0), csr(0, 0x180, 0))
     p.translation = {4: 0x11, 5: 0x22, 6: 0x33}
     yield 'sv39_context', p.finish()
 
@@ -708,7 +713,7 @@ def atomic_cases(base, protection=False):
         yield 'lrsc_pmp', p.finish()
 
 
-def synchronization_cases(base):
+def synchronization_cases(base, writeback=False):
     p = Program(base)
     p.address(10, 0x1000)
     p.emit(addi(2, 0, 11), sd(2, 10), fence(), ld(3, 10), fence(),
@@ -742,10 +747,10 @@ def synchronization_cases(base):
         for byte in range(8):
             p.memory[base + offset + byte] = (word >> (8 * byte)) & 255
     yield 'cache_replacement', p.finish()
-    yield 'synchronization', synchronization_program(base, 1)
+    yield 'synchronization', synchronization_program(base, 1, writeback=writeback)
 
 
-def pmp_cases(base):
+def pmp_cases(base, writeback=False):
     for name in ('permissions', 'tor_lock', 'partial', 'word', 'fetch', 'update', 'atomic_readonly', 'atomic_none'):
         p = Program(base)
         constant_offset = 0x3000
@@ -770,6 +775,10 @@ def pmp_cases(base):
             p.address(1, 0x1fc)
             p.emit(jalr(0, 1))
             p.offset = 0x1fc
+        if writeback and name == 'permissions':
+            p.emit(ld(16, 10), sd(2, 10))
+            p.dirty_permission = base + 0x1000
+            p.permission_update_pc = base + p.offset
         p.emit(csr(4, 0x3a0, 3))
         if name == 'word':
             p.emit(lw(5, 10, 4), lw(6, 10, 4, True), ld(7, 10), sw(2, 10, 4))
@@ -782,6 +791,9 @@ def pmp_cases(base):
             p.emit(csr(7, 0x3b0, 0), csr(8, 0x3b1, 0), csr(9, 0x3a0, 0))
             p.emit(csr(11, 0x3b0, 0, True), csr(12, 0x3b1, 0, True), csr(13, 0x3a0, 0, True))
             p.emit(csr(14, 0x3a1, 0, True), csr(15, 0x3a4, 0, True), csr(16, 0x3ef, 0, True))
+        if hasattr(p, 'dirty_permission'):
+            p.address(17, 0x3000)
+            p.emit(ld(17, 17), ld(18, 10))
         yield 'pmp_' + name, p.finish(fixed_return=name in ('fetch', 'update'))
 
 
@@ -827,7 +839,7 @@ def interrupt_cases(base, protection):
         yield 'interrupt_' + name, p
 
 
-def multicore_cases(base, harts, protection=False, interrupts=False, user=False):
+def multicore_cases(base, harts, protection=False, interrupts=False, user=False, writeback=False):
     p = Program(base)
     p.emit(csr(2, 0xf14, 0, True), alu(3, 2, 3, 1, immediate=True))
     p.address(10, 0x1800)
@@ -854,8 +866,31 @@ def multicore_cases(base, harts, protection=False, interrupts=False, user=False)
         p.offset = 0x200
         p.emit(csr(7, 0x340, 0, True), addi(4, 2, 1), sd(4, 10), ld(5, 10), 0x73, addi(6, 5, 1))
         yield 'user_isolation', p.finish()
-    yield 'synchronization', synchronization_program(base, harts)
+    yield 'synchronization', synchronization_program(base, harts, writeback)
     yield 'data_coherence', data_coherence_program(base, harts)
+    if writeback:
+        p = Program(base)
+        p.emit(csr(2, 0xf14, 0, True), addi(14, 0, 1), addi(7, 0, 0x22), addi(15, 0, 0x33))
+        for register, address in ((10, 0x1800), (11, 0x1880), (12, 0x18c0), (13, 0x2000)):
+            p.address(register, address)
+        p.emit(ld(4, 11))
+        dispatch = p.offset
+        p.emit(beq(2, 0, 0x100 - dispatch), beq(2, 14, 0x180 - dispatch - 4), jal(0, 0x280 - dispatch - 8))
+        p.offset = 0x100
+        p.emit(amo(2, 6, 10), sd(14, 11))
+        loop = p.offset
+        p.emit(ld(5, 12), beq(5, 0, loop - p.offset - 4))
+        p.emit(amo(3, 8, 10, 15), ld(9, 10), sd(6, 13), sd(8, 13, 8), sd(9, 13, 16))
+        p.emit(jal(0, 0x280 - p.offset))
+        p.offset = 0x180
+        loop = p.offset
+        p.emit(ld(5, 11), beq(5, 0, loop - p.offset - 4), ld(6, 10), store(7, 10, 0, 0), sd(14, 12))
+        p.emit(jal(0, 0x280 - p.offset))
+        p.offset = 0x280
+        p.memory[base + 0x1800] = 0x11
+        p.data_cache = dict(minHits=0, minReservedStores=1,
+            finalRegisters=[{'6': 0x11, '8': 1, '9': 0x22}, {'6': 0x11, '7': 0x22}, *({} for _ in range(harts - 2))])
+        yield 'cache_reservation', p.finish()
     yield from atomic_multicore_cases(base, harts, interrupts)
     for name in ('exchange', *(('protection',) if protection else ()), *(('interrupt',) if interrupts else ())):
         p = Program(base)
@@ -1095,7 +1130,7 @@ def platform_program(base, harts, local_base, wait=False):
     return p
 
 
-def synchronization_program(base, harts):
+def synchronization_program(base, harts, writeback=False):
     p = Program(base)
     p.emit(csr(2, 0xf14, 0, True), addi(3, 0, 64), mul(3, 2, 3), addi(5, 0, 1))
     p.address(10, 0x1800)
@@ -1108,7 +1143,10 @@ def synchronization_program(base, harts):
     skip = p.offset
     p.emit(0)
     p.address(26, 0x3000)
-    p.emit(ld(26, 26), sd(26, 27), fence(), sd(5, 10, 8))
+    p.emit(ld(26, 26))
+    if writeback:
+        p.emit(ld(24, 27))
+    p.emit(sd(26, 27), fence(), sd(5, 10, 8))
     resume = p.offset
     for byte in range(4):
         p.memory[base + skip + byte] = (jal(0, resume - skip) >> (8 * byte)) & 255
@@ -1135,7 +1173,7 @@ def synchronization_program(base, harts):
         word = addi(28, 0, value) | (jalr(0, 29) << 32)
         for byte in range(8):
             p.memory[base + offset + byte] = (word >> (8 * byte)) & 255
-    p.synchronization = dict(rounds=3, code=base + 0x1000)
+    p.synchronization = dict(rounds=3, code=base + 0x1000, dirtyCode=writeback)
     return p.finish()
 
 

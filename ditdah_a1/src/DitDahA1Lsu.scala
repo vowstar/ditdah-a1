@@ -95,6 +95,7 @@ object DitDahA1Lsu extends Generator[DitDahA1Parameter, DitDahA1UnitLayers, DitD
     request.bits.privileged := privilege.map(_ =/= 0.U(2)).getOrElse(privileged.getOrElse(true.B))
     request.bits.atomic := packet.atomic
     request.bits.atomicOperation := packet.atomic.?(operation, 0.U(5))
+    request.bits.cacheOperation := 0.U(2)
     request.bits.scEligible := scEligible
     request.bits.refillSize := refillSize.getOrElse(0.U(3))
     response.ready := state === 2.U(stateBits)

@@ -118,6 +118,7 @@ def compile_tb(rtl, directory, width, pa, top='core_tb', source=None, extra_file
   end''')
     bindings, ports, platform = [], [], []
     local_base = local_interrupt_base(parameters) if top == 'core_tb' else None
+    writeback = bool(parameters.get('dCacheWriteback'))
     observers = [f'  wire [{harts - 1}:0] architectural_fetch_busy;\n  wire [63:0] architectural_fetch_pc[{harts}];']
     read_slots = parameters.get('fabricReadSlots') or 2
     read_suffixes = tuple('' if n == 0 else f'_{n-1}' for n in range(read_slots))
@@ -210,7 +211,11 @@ def compile_tb(rtl, directory, width, pa, top='core_tb', source=None, extra_file
   end''')
         if top == 'core_tb' and parameters['dCacheBytes'] or translated:
             core = f'dut.core_{hart}.backend.lsu.memory' if translated and top == 'core_tb' else 'dut.backend.lsu.memory' if translated else f'dut.core_{hart}.data'
-            sample = f'dut.data_cache_{hart}.dV'
+            cache = f'dut.data_cache_{hart}'
+            sample = cache + '.dV'
+            invalidate = (f'{cache}.probe_response_valid && {cache}.probe_response_ready && {cache}.probe_response_bits_last && {cache}.probeMatch && {cache}.probeRequest_invalidate' if writeback else
+                          f'{cache}.probe_request_valid && {cache}.probe_request_ready && {cache}.probe_request_bits_invalidate')
+            invalid_address = cache + ('.probeRequest_address' if writeback else '.probe_request_bits_address')
             observers.append(f'''  always @(posedge clock) if (!reset) begin
     if ({core}_request_valid && {core}_request_ready) begin
       {prefix}$display("ARCH_DATA_REQUEST %s %016h %0d %016h %02h %01h %01h",
@@ -219,13 +224,16 @@ def compile_tb(rtl, directory, width, pa, top='core_tb', source=None, extra_file
         {core}_request_bits_write ? {core}_request_bits_data & access_mask({core}_request_bits_size) : 64'b0,
         {core}_request_bits_tag, {core}_request_bits_privileged, {core}_request_bits_refillSize);
     end
-''' + (f'''    if (dut.data_cache_{hart}.invalidate_valid && dut.data_cache_{hart}.invalidate_ready)
-      $display("INVALIDATE {hart} %016h %0d", dut.data_cache_{hart}.invalidate_bits, cycles);
+''' + (f'''    if ({invalidate}) $display("INVALIDATE {hart} %016h %0d", {invalid_address}, cycles);
 ''' if top == 'core_tb' and parameters.get('dCacheRefillBytes', 8) == 64 else '') + (f'''    if ({sample}.sampleValid) begin
       {prefix}$display("CACHE_SAMPLE %016h %016h %02h %0d", {sample}.sampleAddress,
-        {sample}.sampleData, {sample}.sampleTag, 1 << {sample}.sampleSize);
+        {sample}.sampleData & access_mask({sample}.sampleSize), {sample}.sampleTag, 1 << {sample}.sampleSize);
     end
-''' if top == 'core_tb' and parameters['dCacheBytes'] else '') + f'''
+''' if top == 'core_tb' and parameters['dCacheBytes'] else '') + (f'''    if ({cache}.storeUpdating && {cache}.acquiring) begin
+      {prefix}$display("CACHE_STORE %016h %016h %02h %0d", {cache}.request_address,
+        {cache}.request_data & access_mask({cache}.request_size), {cache}.request_tag, 1 << {cache}.request_size);
+    end
+''' if top == 'core_tb' and writeback else '') + f'''
     if ({core}_response_valid && {core}_response_ready) begin
       {prefix}$display("ARCH_DATA_RESPONSE %016h %01h %02h", {core}_response_bits_data,
         {core}_response_bits_fault, {core}_response_bits_tag);
@@ -249,13 +257,39 @@ def compile_tb(rtl, directory, width, pa, top='core_tb', source=None, extra_file
     $display("REFILL_WAIT {hart} %0d", data_line_wait_{hart});
     $display("REFILL_STALL {hart} %0d %0d %0d %0d", line_serial_wait_{hart}, line_owner_wait_{hart}, line_full_wait_{hart}, line_arbiter_wait_{hart});
   end''')
+    if top == 'core_tb' and writeback:
+        unit = 'dut.fabric.coherence'
+        identity = '$write("HART %0d ", dut.fabric._arbiter_hartId);' if harts > 1 else ''
+        observers.append(f'''  always @(posedge clock) if (reset) writeback_pending <= 0; else begin
+    if ({unit}.state == 2 && {unit}.downstream_request_valid && {unit}.downstream_request_ready) begin
+      if (writeback_pending) $fatal(1, "Overlapping physical writeback");
+      writeback_pending <= 1;
+      writeback_request.address <= {unit}.downstream_request_bits_address;
+      writeback_request.data <= {unit}.downstream_request_bits_data;
+      writeback_request.mask <= {unit}.downstream_request_bits_mask;
+      {identity}
+      $display("WRITEBACK_REQUEST %016h %016h %02h %02h %01h", {unit}.downstream_request_bits_address,
+        {unit}.downstream_request_bits_data, {unit}.downstream_request_bits_mask,
+        {unit}.downstream_request_bits_tag, {unit}.downstream_request_bits_privileged);
+    end
+    if ({unit}.state == 3 && {unit}.downstream_response_valid && {unit}.downstream_response_ready) begin
+      if (!writeback_pending) $fatal(1, "Unowned physical writeback reply");
+      {identity}
+      $display("WRITEBACK_RESPONSE %01h %02h %01h", {unit}.downstream_response_bits_fault,
+        {unit}.downstream_response_bits_tag, {unit}.downstream_response_bits_last);
+      if ({unit}.downstream_response_bits_last) writeback_pending <= 0;
+    end
+  end''')
     (directory / 'fetch_observers.svh').write_text('\n'.join(observers) + '\n')
     (directory / 'retire_bindings.svh').write_text('\n'.join(retirement) + '\n')
     if top == 'core_tb':
         devices = ' || '.join(f"(request.address >= 64'd{int(region['base'])} && request.address < 64'd{int(region['base']) + int(region['size'])})"
                              for region in parameters['memoryRegions'] if region['device']) or "1'b0"
+        coherent = ' || '.join('(' + (f"request.address >= 64'd{int(r['base'])} && " if int(r['base']) else '') +
+                              f"request.address < 64'd{int(r['base']) + int(r['size'])})"
+                               for r in parameters['memoryRegions'] if r.get('dataCacheable') and r['readable'] and not r['device']) if writeback else "1'b0"
         bindings.append(f'''function automatic bit exclusive_request(input core_request_t request);
-    return request.write || request.atomic || (request.size > 3 && !(request.size == 6 &&
+    return request.cacheOperation != 0 || ({coherent or "1'b0"}) || request.write || request.atomic || (request.size > 3 && !(request.size == 6 &&
       (request.fetch ? {int(parameters.get('enableBurstRefill', False))} : {int(parameters.get('dCacheRefillBytes') == 64)}))) || {devices};
   endfunction''')
         names = re.findall(r'\bDitDahA1Core\s+(\w+)\s*\(', (rtl / 'DitDahA1.sv').read_text())
@@ -269,7 +303,7 @@ def compile_tb(rtl, directory, width, pa, top='core_tb', source=None, extra_file
                 for channel in ('request', 'response'):
                     for field in ('valid', 'ready'):
                         bindings.append(f'assign {channel}_{field}[{index}] = {physical}_{channel}_{field};')
-                    for field in (('address', 'data', 'size', 'mask', 'tag', 'write', 'fetch', 'atomic', 'atomicOperation', 'scEligible', 'privileged', 'refillSize') if channel == 'request' else ('data', 'fault', 'tag', 'last')):
+                    for field in (('cacheOperation', 'address', 'data', 'size', 'mask', 'tag', 'write', 'fetch', 'atomic', 'atomicOperation', 'scEligible', 'privileged', 'refillSize') if channel == 'request' else ('data', 'fault', 'tag', 'last')):
                         bindings.append(f'assign {channel}s[{index}].{field} = {physical}_{channel}_bits_{field};')
             if interrupts:
                 ports += [f'.interrupts_{hart}_{name}(irq_by_hart[{hart}][{index}]),'
@@ -301,6 +335,28 @@ def compile_tb(rtl, directory, width, pa, top='core_tb', source=None, extra_file
         {device}.memory_response_bits_fault, {device}.memory_response_bits_tag);
     end
   endtask''')
+    result_sources = []
+    if top == 'core_tb' and software and writeback:
+        for hart in range(harts):
+            cache = f'dut.data_cache_{hart}'
+            result_sources.append(f'''
+    if ({cache}.dirtyLines[index] && 64'({cache}.dataTags_ext.Memory[index]) == (address >> 13)) begin
+      if (dirty_owner) $fatal(1, "Duplicate dirty result line owner");
+      dirty_owner = 1;
+      if ({cache}.valid[sector])
+        for (integer byte_index = 0; byte_index < 8; byte_index++)
+          if ({cache}.dataDirty_ext.Memory[sector][byte_index])
+            coherent_result[byte_index*8 +: 8] = {cache}.data_ext.Memory[sector][byte_index*8 +: 8];
+    end''')
+    bindings.append(f'''  localparam bit WRITEBACK_RESULTS = {int(bool(result_sources))};
+  function automatic logic [63:0] coherent_result(input logic [63:0] address, physical_data);
+    logic [9:0] sector;
+    logic [6:0] index;
+    bit dirty_owner;
+    sector = address[12:3]; index = address[12:6]; dirty_owner = 0;
+    coherent_result = physical_data;
+{''.join(result_sources)}
+  endfunction''')
     (directory / 'core_bindings.svh').write_text('\n'.join(bindings) + '\n')
     (directory / 'core_ports.svh').write_text('\n'.join(ports) + '\n')
     (directory / 'platform_observers.svh').write_text('\n'.join(platform) + '\n')
@@ -709,6 +765,13 @@ def check_burst_guards(lines, config, program, name):
         mutations += [('invalidationAddress', invalidation, 2, 64),
                       ('invalidationRecipient', invalidation, 1, config['hartCount']),
                       ('missingInvalidation', invalidation, None, 0), ('duplicateInvalidation', invalidation, None, 2)]
+    return check_event_guards(lines, config, program, name, mutations)
+
+
+def check_event_guards(lines, config, program, name, mutations):
+    software = hasattr(program, 'software')
+    check_multicore(lines, config, program, name, atomic_metadata=True, software_output=software)
+    guards = []
     for label, index, field, mask in mutations:
         changed = list(lines)
         if field is None:
@@ -719,12 +782,34 @@ def check_burst_guards(lines, config, program, name):
             fields[offset + field] = f'{int(fields[offset + field], 16) ^ mask:x}'
             changed[index] = ' '.join(fields)
         try:
-            check_multicore(changed, config, program, name, atomic_metadata=True)
+            check_multicore(changed, config, program, name, atomic_metadata=True, software_output=software)
         except AssertionError:
             guards.append(label)
             continue
-        raise AssertionError(f'Line oracle accepted {label}')
+        raise AssertionError(f'Event oracle accepted {label}')
     return guards
+
+
+def check_writeback_guards(lines, config, program, name):
+    events = [' '.join(line.split()[2:] if line.startswith('HART ') else line.split()) for line in lines]
+    mutations = []
+    for event, label, field, mask in (
+            ('CACHE_STORE', 'cachedStoreData', 2, 1), ('CACHE_STORE', 'cachedStoreTag', 3, 1),
+            ('CACHE_STORE', 'missingCachedStore', None, 0),
+            ('WRITEBACK_REQUEST', 'writebackData', 2, None),
+            ('WRITEBACK_REQUEST', 'writebackPrivilege', 5, 1),
+            ('WRITEBACK_RESPONSE', 'writebackTag', 2, 1),
+            ('WRITEBACK_RESPONSE', 'missingWritebackReply', None, 0),
+            ('RESULT', 'coherentResult', 2, 1), ('PHYSICAL_RESULT', 'physicalResult', 2, 1),
+            ('BUS writeback', 'writebackStrobes', 5, 1)):
+        index = next((i for i, line in enumerate(events) if line.startswith(event + ' ')), None)
+        if index is None:
+            continue
+        if mask is None:
+            dirty = int(events[index].split()[3], 16)
+            mask = 1 << (8 * ((dirty & -dirty).bit_length() - 1))
+        mutations.append((label, index, field, mask))
+    return check_event_guards(lines, config, program, name, mutations)
 
 
 def check_access_privileges(lines, modes, requests, privileges, required):
@@ -891,7 +976,7 @@ def compare(binary, directory, config, transport='axi', selected=()):
     count = 0
     reports, burst_guards = [], []
     pipeline_max, dependency_stalls = 0, 0
-    for name, program in cases(base, config['pmpEntries'] != 0, config['enableInterrupts'], config.get('enableUserMode', False), local_interrupt_base(config), config.get('enableSupervisorMode', False), config.get('virtualAddressBits') == 39):
+    for name, program in cases(base, config['pmpEntries'] != 0, config['enableInterrupts'], config.get('enableUserMode', False), local_interrupt_base(config), config.get('enableSupervisorMode', False), config.get('virtualAddressBits') == 39, config.get('dCacheWriteback', False)):
         if selected and name not in selected:
             continue
         image = directory / (name + '.hex')
@@ -1057,8 +1142,11 @@ def compare(binary, directory, config, transport='axi', selected=()):
 
 def check_multicore(lines, config, program, name, atomic_metadata=False, software_output=False):
     harts, base = config['hartCount'], int(config['resetVector'])
-    covers, results, passed = [], [], False
+    covers, results, physical_results, passed = [], [], [], False
     memory, active = dict(program.memory), None
+    writeback = bool(config.get('dCacheWriteback'))
+    physical_memory = dict(memory) if writeback else memory
+    maintenance, cached_writes = None, set()
     owners = [None] * harts
     read_order, read_peak, read_serial, read_reordered, read_observed = {}, 0, 0, 0, None
     line_ids, line_peak, line_observed = set(), 0, None
@@ -1097,6 +1185,11 @@ def check_multicore(lines, config, program, name, atomic_metadata=False, softwar
     observed_reservations = None
     elapsed_cycles, transactions, axi_transactions, line_beats = None, 0, 0, 0
 
+    def physical_write(address, size, value, mask=None):
+        for byte in range(size):
+            if mask is None or mask >> byte & 1:
+                physical_memory[address + byte] = value >> (8 * byte) & 255
+
     def no_service(*args):
         raise AssertionError('Architectural data access without bus service')
 
@@ -1105,7 +1198,7 @@ def check_multicore(lines, config, program, name, atomic_metadata=False, softwar
 
     def ordinary(event):
         line = event[2] == 64 and (config.get('enableBurstRefill') if event[0] == 'fetch' else config.get('dCacheRefillBytes') == 64)
-        return event[0] in ('read', 'fetch') and (event[2] <= 8 or line) and not any(
+        return not (writeback and cacheable(event[1], 1)) and event[0] in ('read', 'fetch') and (event[2] <= 8 or line) and not any(
             region['device'] and int(region['base']) <= event[1] < int(region['base']) + int(region['size'])
             for region in config['memoryRegions'])
 
@@ -1204,6 +1297,9 @@ def check_multicore(lines, config, program, name, atomic_metadata=False, softwar
         data, fault, tag = access['response']
         expected, expected_fault = access['expected']
         assert tag == access['tag'] and fault == expected_fault and (fault or data == expected), 'PTE response differs from physical service'
+        if hasattr(program, 'dirty_pte') and access['event'][1] == program.dirty_pte[0] and cache_counts[hart]['dirtyPteStores']:
+            assert translation_counts['dirtyPteBarriers'] == 1 and not fault and data == program.dirty_pte[1], 'Dirty PTE was not consumed after its synchronization'
+            translation_counts['dirtyPteReads'] += 1
         walk = walks[hart][access['port']]
         assert walk, 'PTE completion lost its translation owner'
         walk['reads'].append((access['event'][1], data, bool(fault)))
@@ -1246,10 +1342,10 @@ def check_multicore(lines, config, program, name, atomic_metadata=False, softwar
             continue
         if fields[:1] == ['INVALIDATE']:
             recipient, address, cycle = int(fields[1]), int(fields[2], 16), int(fields[3])
-            assert data_cache and config.get('dCacheRefillBytes', 8) == 64 and 0 <= recipient < harts and cycle >= 0, 'Invalid cache invalidation recipient'
-            writers = [owner for owner in owners if invalidating_write(owner) and owner['event'][1] == address]
+            assert data_cache and config.get('dCacheRefillBytes', 8) == 64 and 0 <= recipient < harts and cycle >= 0 and address % 64 == 0, 'Invalid cache invalidation recipient'
+            writers = [owner for owner in owners if owner and owner['event'][1] // 64 == address // 64 and (writeback or invalidating_write(owner))]
             assert len(writers) == 1, 'Invalidation lacks a unique accepted CPU write'
-            assert writers[0]['event'][0] == 'atomic' or recipient != writers[0]['hart'], 'Ordinary writer invalidated its retained copy'
+            assert writeback or writers[0]['event'][0] == 'atomic' or recipient != writers[0]['hart'], 'Ordinary writer invalidated its retained copy'
             recipients = writers[0].setdefault('invalidated', set())
             assert recipient not in recipients and not writers[0]['bus'], 'Duplicate or late write invalidation'
             recipients.add(recipient)
@@ -1260,6 +1356,10 @@ def check_multicore(lines, config, program, name, atomic_metadata=False, softwar
             continue
         if fields[:1] == ['RESULT']:
             results.append((int(fields[1]), int(fields[2], 16)))
+            continue
+        if fields[:1] == ['PHYSICAL_RESULT']:
+            assert writeback and software, 'Unexpected physical result snapshot'
+            physical_results.append((int(fields[1]), int(fields[2], 16)))
             continue
         if fields == ['PASS']:
             passed = True
@@ -1314,7 +1414,7 @@ def check_multicore(lines, config, program, name, atomic_metadata=False, softwar
             continue
         if fields[:1] == ['HART']:
             hart, fields = int(fields[1]), fields[2:]
-        elif harts == 1 and fields and fields[0] in ('REQUEST', 'ACCESS_PRIVILEGE', 'ATOMIC', 'BUS', 'READ', 'LINE_BEAT', 'WRITE', 'INTERFERE', 'RESPONSE', 'FETCH', 'IRQ', 'TRACE', 'FETCH_RETIRE', 'ARCH_REQUEST', 'ARCH_FETCH', 'ARCH_CANCEL', 'LOCAL_REQUEST', 'LOCAL_RESPONSE', 'ARCH_DATA_REQUEST', 'ARCH_DATA_RESPONSE', 'CACHE_SAMPLE', 'TRANSLATE_REQUEST', 'TRANSLATE_RESPONSE', 'WALK_REQUEST', 'WALK_RESPONSE'):
+        elif harts == 1 and fields and fields[0] in ('REQUEST', 'ACCESS_PRIVILEGE', 'ATOMIC', 'BUS', 'READ', 'LINE_BEAT', 'WRITE', 'INTERFERE', 'RESPONSE', 'FETCH', 'IRQ', 'TRACE', 'FETCH_RETIRE', 'ARCH_REQUEST', 'ARCH_FETCH', 'ARCH_CANCEL', 'LOCAL_REQUEST', 'LOCAL_RESPONSE', 'ARCH_DATA_REQUEST', 'ARCH_DATA_RESPONSE', 'CACHE_SAMPLE', 'CACHE_STORE', 'WRITEBACK_REQUEST', 'WRITEBACK_RESPONSE', 'TRANSLATE_REQUEST', 'TRANSLATE_RESPONSE', 'WALK_REQUEST', 'WALK_RESPONSE'):
             hart = 0
         else:
             continue
@@ -1337,7 +1437,7 @@ def check_multicore(lines, config, program, name, atomic_metadata=False, softwar
             if kind == 'ARCH_CANCEL' and walks[hart][0]:
                 walks[hart][0]['cancelled'] = True
             continue
-        assert kind in ('REQUEST', 'ACCESS_PRIVILEGE', 'ATOMIC', 'BUS', 'READ', 'LINE_BEAT', 'WRITE', 'INTERFERE', 'RESPONSE', 'FETCH', 'IRQ', 'TRACE', 'LOCAL_REQUEST', 'LOCAL_RESPONSE', 'ARCH_DATA_REQUEST', 'ARCH_DATA_RESPONSE', 'CACHE_SAMPLE', 'TRANSLATE_REQUEST', 'TRANSLATE_RESPONSE', 'WALK_REQUEST', 'WALK_RESPONSE'), 'Unknown hart event'
+        assert kind in ('REQUEST', 'ACCESS_PRIVILEGE', 'ATOMIC', 'BUS', 'READ', 'LINE_BEAT', 'WRITE', 'INTERFERE', 'RESPONSE', 'FETCH', 'IRQ', 'TRACE', 'LOCAL_REQUEST', 'LOCAL_RESPONSE', 'ARCH_DATA_REQUEST', 'ARCH_DATA_RESPONSE', 'CACHE_SAMPLE', 'CACHE_STORE', 'WRITEBACK_REQUEST', 'WRITEBACK_RESPONSE', 'TRANSLATE_REQUEST', 'TRANSLATE_RESPONSE', 'WALK_REQUEST', 'WALK_RESPONSE'), 'Unknown hart event'
         if kind == 'TRANSLATE_REQUEST':
             port, address, privilege, fetch, write, satp, sum_enabled, mxr = (int(value, 16) for value in fields[1:])
             assert translated and port in (0, 1) and walks[hart][port] is None, 'Overlapping translation port ownership'
@@ -1382,20 +1482,56 @@ def check_multicore(lines, config, program, name, atomic_metadata=False, softwar
             architectural[hart] = dict(event=event, tag=int(fields[5], 16), refillSize=certificate)
             cache_counts[hart]['accepted'] += 1
             cache_counts[hart]['reads'] += int(event[0] == 'read')
-        elif kind == 'CACHE_SAMPLE':
+        elif kind in ('CACHE_SAMPLE', 'CACHE_STORE'):
             address, value, tag = (int(field, 16) for field in fields[1:4])
             size = int(fields[4])
-            access = data_owner(hart, ('read', address, size, 0), tag)
+            store = kind == 'CACHE_STORE'
+            assert not store or writeback, 'Unexpected cache-local store'
+            access = data_owner(hart, ('write' if store else 'read', address, size, value if store else 0), tag)
             assert data_cache and access and not access.get('physical') and 'expected' not in access, 'Unowned, duplicate or physically serviced cache sample'
             assert size in (1, 2, 4, 8) and address % size == 0 and cacheable(address & ~7), 'Cache sample outside permitted cacheable RAM'
-            assert access.get('walk') or protected_read(hart, address, size), 'Cache sample bypassed demand protection'
+            assert store or access.get('walk') or protected_read(hart, address, size), 'Cache sample bypassed demand protection'
+            reserved = sum(address < base + length and base < address + size for base, length in monitor.reservations.values()) if store else 0
             expected = (sum(memory.get(address + byte, 0) << (8 * byte) for byte in range(size)), 0) if access.get('walk') else service(hart, access['event'])
-            assert expected == (value, 0), 'Cache sample differs from independent shared memory'
+            if store:
+                assert pending[hart] and not pending[hart][7], 'Cache-local store bypassed architectural authorization'
+                expected = (0, 0)
+            assert expected == (0 if store else value, 0), 'Cache sample differs from independent shared memory'
+            if store:
+                cached_writes.update(range(address, address + size))
+                cache_counts[hart]['cachedStores'] += 1
+                cache_counts[hart]['reservedStores'] += reserved
+                if address == getattr(program, 'synchronization', {}).get('code'):
+                    cache_counts[hart]['dirtyInstructionStores'] += 1
+                if hasattr(program, 'dirty_pte') and address == program.dirty_pte[0]:
+                    cache_counts[hart]['dirtyPteStores'] += 1
+                if address == getattr(program, 'dirty_permission', None):
+                    cache_counts[hart]['dirtyPermissionStores'] += 1
             access['expected'] = expected
-            cache_counts[hart]['hits'] += int(not access.get('walk'))
-            hit_addresses[hart][address] += int(not access.get('walk'))
-            cache_counts[hart]['hitsDuringPeerService'] += int(not access.get('walk') and any(owner is not None for peer, owner in enumerate(owners) if peer != hart))
+            cache_counts[hart]['hits'] += int(not store and not access.get('walk'))
+            hit_addresses[hart][address] += int(not store and not access.get('walk'))
+            cache_counts[hart]['hitsDuringPeerService'] += int(not store and not access.get('walk') and any(owner is not None for peer, owner in enumerate(owners) if peer != hart))
             (complete_walk if access.get('walk') else complete_data)(hart)
+        elif kind == 'WRITEBACK_REQUEST':
+            address, data, mask, tag, privileged = (int(v, 16) for v in fields[1:])
+            assert writeback and maintenance is None and active and tag == active['tag'], 'Unowned or overlapping writeback'
+            if address == getattr(program, 'dirty_permission', None):
+                assert cache_counts[hart]['permissionChanges'] == 1 and cache_counts[hart]['permissionRejected'] == 1, 'Dirty recall preceded permission revocation or denied demand'
+                cache_counts[hart]['permissionWritebacks'] += 1
+            assert address % 8 == 0 and 0 < mask < 256 and cacheable(address, 8), 'Writeback outside cacheable words'
+            assert any(r['writable'] and int(r['base']) <= address and address + 8 <= int(r['base']) + int(r['size']) for r in config['memoryRegions']), 'Writeback escaped physical write permission'
+            assert privileged == 1, 'Writeback escaped trusted maintenance context'
+            for byte in range(8):
+                if mask >> byte & 1:
+                    assert address + byte in cached_writes and data >> (8 * byte) & 255 == memory.get(address + byte, 0), 'Writeback lacks a cached store or carries stale bytes'
+            if active['event'][0] == 'fetch' and address == getattr(program, 'synchronization', {}).get('code'):
+                cache_counts[hart]['instructionWritebacks'] += 1
+            maintenance = dict(hart=hart, address=address, data=data, mask=mask, tag=tag, bus=False)
+        elif kind == 'WRITEBACK_RESPONSE':
+            fault, tag, last = (int(v, 16) for v in fields[1:])
+            assert maintenance and maintenance['hart'] == hart and maintenance['bus'] and tag == maintenance['tag'] and last, 'Writeback completion identity'
+            assert fault == int(maintenance['address'] == program.faults.get('write')), 'Writeback physical fault attribution'
+            maintenance = None
         elif kind == 'ARCH_DATA_RESPONSE':
             access = architectural[hart]
             assert observed_data and access and 'response' not in access, 'Unowned or duplicate architectural response'
@@ -1412,7 +1548,9 @@ def check_multicore(lines, config, program, name, atomic_metadata=False, softwar
             assert active is None, 'Overlapping source ownership'
             event = fields[1], int(fields[2], 16), int(fields[3]), int(fields[4], 16)
             peers = [owner for owner in owners if owner is not None]
-            assert not peers or harts > 1 and len(peers) < (config.get('fabricReadSlots') or 2) and ordinary(event) and all(ordinary(owner['event']) for owner in peers), 'Exclusive request overlapped physical service or exceeded read slots'
+            cache_operation = int(fields[6], 16) if len(fields) > 6 else 0
+            assert cache_operation in (0, 1, 2) and (writeback or cache_operation == 0), 'Unexpected internal cache operation'
+            assert not peers or harts > 1 and not cache_operation and len(peers) < (config.get('fabricReadSlots') or 2) and ordinary(event) and all(not owner.get('cacheOperation') and ordinary(owner['event']) for owner in peers), 'Exclusive request overlapped physical service or exceeded read slots'
             tag = int(fields[5], 16)
             previous = architectural[hart]
             if previous and 'lineValue' in previous and event[0] != 'fetch':
@@ -1420,9 +1558,9 @@ def check_multicore(lines, config, program, name, atomic_metadata=False, softwar
                 del previous['lineValue']
                 previous['physical'], previous['retry'] = False, True
                 cache_counts[hart]['refillRetries'] += 1
-            access = data_owner(hart, event, tag, expanded=True) if observed_data and event[0] != 'fetch' else None
+            access = data_owner(hart, event, tag, expanded=True) if observed_data and event[0] != 'fetch' and cache_operation != 2 else None
             privilege = 1 if access and access.get('walk') else fetch_privileges[hart] if event[0] == 'fetch' else models[hart].data_privilege() if hasattr(models[hart], 'data_privilege') else 3
-            active = dict(hart=hart, event=event, tag=tag, bus=False, response=None, expectedPrivileged=privilege != 0)
+            active = dict(hart=hart, event=event, tag=tag, cacheOperation=cache_operation, bus=False, response=None, expectedPrivileged=privilege != 0)
             owners[hart] = active
             if event[0] == 'fetch' and event[2] == 64:
                 assert config.get('enableBurstRefill') and event[1] % 64 == 0, 'Unconfigured or unaligned line read'
@@ -1434,7 +1572,7 @@ def check_multicore(lines, config, program, name, atomic_metadata=False, softwar
                 if event[0] == 'read':
                     assert config.get('dCacheRefillBytes', 8) == 64 and access and not access.get('walk'), 'Unconfigured data line or page-table expansion'
                 active.update(chunks=deque(), beat=0, chunk=0, lineFault=False)
-            if access:
+            if access and not cache_operation:
                 expanded = event != access['event']
                 assert 'expected' not in access and not access.get('physical'), 'Physical request lacks unique architectural ownership'
                 assert not expanded or not access.get('retried'), 'Expanded refill repeated after retry'
@@ -1483,7 +1621,15 @@ def check_multicore(lines, config, program, name, atomic_metadata=False, softwar
         elif kind == 'BUS':
             axi_transactions += 1
             event = fields[1], int(fields[2], 16), int(fields[3]), int(fields[4], 16)
-            if config.get('dCacheRefillBytes', 8) == 64 and invalidating_write(active):
+            if event[0] == 'writeback':
+                assert writeback and maintenance and maintenance['hart'] == hart and not maintenance['bus'], 'Unowned physical writeback'
+                assert event[1:] == (maintenance['address'], 8, maintenance['data']) and int(fields[5], 16) == maintenance['mask'], 'Physical writeback payload or strobes changed'
+                maintenance['bus'] = True
+                if event[1] != program.faults.get('write'):
+                    physical_write(event[1], 8, event[3], maintenance['mask'])
+                    monitor.write(event[1], 8)
+                continue
+            if not writeback and config.get('dCacheRefillBytes', 8) == 64 and invalidating_write(active):
                 targets = set(range(harts)) - ({hart} if active['event'][0] == 'write' else set())
                 assert active.get('invalidated', set()) == targets, 'CPU write escaped required cache invalidations'
             assert device is None or not device.base <= event[1] < device.base + 65536, 'Platform request escaped to AXI'
@@ -1512,13 +1658,15 @@ def check_multicore(lines, config, program, name, atomic_metadata=False, softwar
                 cache_counts[hart]['axiReadBytes'] += event[2]
             if event[0] == 'write':
                 service(hart, event)
+                if writeback and event[1] != program.faults.get('write'):
+                    physical_write(event[1], event[2], event[3])
                 active['response'] = (0, int(event[1] == program.faults.get('write')))
         elif kind == 'LINE_BEAT':
             assert active and active['hart'] == hart and active['bus'] and active['event'][0] in ('read', 'fetch') and active['event'][2] == 64, 'Unowned line beat'
             address, response, data, last = (int(value, 16) for value in fields[1:])
             bus_bytes = config['axiDataBits'] // 8
             expected_address = active['event'][1] + bus_bytes * active['beat']
-            expected = sum(memory.get(expected_address + byte, 0) << (8 * byte) for byte in range(bus_bytes))
+            expected = sum(physical_memory.get(expected_address + byte, 0) << (8 * byte) for byte in range(bus_bytes))
             fault = expected_address <= program.faults.get(active['event'][0], -1) < expected_address + bus_bytes
             assert (address, response, data, last) == (expected_address, 2 if fault else 0, expected, int(active['beat'] == 64 // bus_bytes - 1)), 'Line beat data, order, error or last differs from independent memory'
             for byte in range(0, bus_bytes, 8):
@@ -1533,7 +1681,9 @@ def check_multicore(lines, config, program, name, atomic_metadata=False, softwar
             assert active and active['hart'] == hart and active['bus'] and active['response'] is None
             access, address, size, _ = active['event']
             read_completed(hart)
-            expected = sum(memory.get(address + byte, 0) << (byte * 8) for byte in range(size))
+            expected = sum(physical_memory.get(address + byte, 0) << (byte * 8) for byte in range(size))
+            if writeback and cacheable(address, size):
+                assert expected == sum(memory.get(address + byte, 0) << (byte * 8) for byte in range(size)), 'Physical read preceded required dirty recall'
             if access == 'atomic':
                 assert active['phase'] == 'read'
                 response = 2 if address <= program.faults.get('read', -1) < address + size else 0 if address == program.faults.get('exclusive') else 1
@@ -1562,6 +1712,8 @@ def check_multicore(lines, config, program, name, atomic_metadata=False, softwar
             assert address == active['event'][1] and value == (active['old'] + program.interference) & MASK
             for byte in range(8):
                 memory[address + byte] = (value >> (8 * byte)) & 255
+            if writeback:
+                physical_write(address, 8, value)
             failures -= 1
             monitor.write(address, 8)
             active['phase'] = 'interference'
@@ -1572,6 +1724,9 @@ def check_multicore(lines, config, program, name, atomic_metadata=False, softwar
             fault = address == program.faults.get('write')
             success = not fault and monitor.conditional(hart, address, active['event'][2])
             assert response == (2 if fault else 1 if success else 0), 'Exclusive response differs from independent endpoint monitor'
+            if writeback and success:
+                value = active['event'][3] if active['operation'] == 3 else atomic_value(active['operation'], active['old'], active['event'][3], active['event'][2])
+                physical_write(address, active['event'][2], value)
             active['phase'] = 'retry' if response == 0 and active['operation'] != 3 else 'complete'
             if active['operation'] == 3:
                 active['scSuccess'] = success
@@ -1586,6 +1741,11 @@ def check_multicore(lines, config, program, name, atomic_metadata=False, softwar
             assert not config.get('enableUserMode') or active.get('privilegeMetadata'), 'Missing accepted access privilege'
             channel, data, fault, tag = (int(v, 16) for v in fields[1:5])
             last = int(fields[5], 16) if len(fields) > 5 else 1
+            if active.get('cacheOperation'):
+                assert channel == 1 and tag == active['tag'] and last and not fault and data == 0 and maintenance is None, 'Internal cache operation completion'
+                transactions += 1
+                owners[hart] = active = None
+                continue
             if active['event'][2] == 64 and active['bus']:
                 assert channel == int(active['event'][0] != 'fetch') and tag == active['tag'] and active['chunks'], 'Line chunk has wrong owner or precedes physical service'
                 expected_data, expected_fault = active['chunks'].popleft()
@@ -1686,6 +1846,13 @@ def check_multicore(lines, config, program, name, atomic_metadata=False, softwar
                 models[hart].request_privileges.clear()
             retired_privileges[hart] = getattr(models[hart], 'privilege', 3)
             assert observed == wanted, f'{name} hart {hart}:\nactual {observed}\nexpected {wanted}'
+            if wanted[1] == getattr(program, 'permission_update_pc', None):
+                assert cache_counts[hart]['dirtyPermissionStores'] == 1 and not wanted[7], 'Permission update lacks a prior authorized cached store'
+                cache_counts[hart]['permissionChanges'] += 1
+            if wanted[7] and wanted[8] == 7 and wanted[9] == getattr(program, 'dirty_permission', None):
+                cache_counts[hart]['permissionRejected'] += 1
+            if hasattr(program, 'dirty_pte') and wanted[2] == 0x12000073 and cache_counts[hart]['dirtyPteStores']:
+                translation_counts['dirtyPteBarriers'] += 1
             wake[hart] = bool(models[hart].csrs[0x304] & models[hart].csrs[0x344])
             wake_mask = (wake_mask & ~(1 << hart)) | (int(wake[hart]) << hart)
             if wanted[7]:
@@ -1705,6 +1872,8 @@ def check_multicore(lines, config, program, name, atomic_metadata=False, softwar
     if software_output:
         assert passed, 'Software simulation did not finish'
         assert results == [(hart, 1) for hart in range(harts)], 'Test memory did not contain per-hart success'
+        if writeback:
+            assert physical_results == [(hart, sum(physical_memory.get(software['results'] + 8 * hart + byte, 0) << (8 * byte) for byte in range(8))) for hart in range(harts)], 'Physical result snapshot differs from bus memory'
     if device is not None:
         for hart in range(harts):
             if waiting[hart]:
@@ -1713,6 +1882,10 @@ def check_multicore(lines, config, program, name, atomic_metadata=False, softwar
     assert all(owner is None or owner['event'][0] == 'fetch' for owner in owners), 'Unretired data access at completion'
     assert all(access is None for access in architectural), 'Uncompleted architectural data access'
     assert failures == 0, 'Exclusive failure stimulus was not consumed'
+    if hasattr(program, 'dirty_pte'):
+        assert sum(c['dirtyPteStores'] for c in cache_counts) == 1 and translation_counts['dirtyPteReads'] == 1, 'Missing dirty PTE store or synchronized page walk'
+    if hasattr(program, 'dirty_permission'):
+        assert sum(c['permissionWritebacks'] for c in cache_counts) == 1, 'Missing dirty recall after permission revocation'
     assert not atomic_metadata or observed_reservations == reservation_max, 'Exclusive monitor coverage differs from independent reservations'
     if harts > 1:
         assert sources == set(range(2 * harts)) and collisions, 'Missing source or cross-hart tag collision'
@@ -1765,6 +1938,8 @@ def check_multicore(lines, config, program, name, atomic_metadata=False, softwar
         elif hasattr(program, 'synchronization'):
             word = lambda address: sum(memory.get(address + byte, 0) << (8 * byte) for byte in range(8))
             tasks = program.synchronization['rounds'] * harts
+            if program.synchronization.get('dirtyCode'):
+                assert sum(c['dirtyInstructionStores'] for c in cache_counts) == 1 and sum(c['instructionWritebacks'] for c in cache_counts) == 1, 'Missing dirty instruction write and fetch-triggered recall'
             assert word(base + 0x1810) == tasks, 'Work allocation count'
             assert [word(base + 0x2000 + 8 * ticket) for ticket in range(tasks)] == list(range(1, tasks + 1)), 'Lost or duplicate work'
             assert all(sum(effects[h, base + 0x2000 + 8 * ticket] for h in range(harts)) == 1 for ticket in range(tasks)), 'Repeated task execution'
@@ -1788,6 +1963,7 @@ def check_multicore(lines, config, program, name, atomic_metadata=False, softwar
         assert all(count['accepted'] == count['completed'] and count['reads'] == count['hits'] + count['physicalReads'] - count['refillRetries'] + count['rejectedReads'] for count in cache_counts), 'Cached read accounting differs from architectural requests'
     if data_cache and hasattr(program, 'data_cache'):
         job = program.data_cache
+        assert sum(count['reservedStores'] for count in cache_counts) >= job.get('minReservedStores', 0), 'Missing cache-local store overlapping a live reservation'
         for hart, count in enumerate(cache_counts):
             addresses = job.get('addresses', ())
             count['witnessHits'] = sum(hit_addresses[hart][address] for address in addresses) if addresses else count['hits']
@@ -1810,6 +1986,7 @@ def check_multicore(lines, config, program, name, atomic_metadata=False, softwar
         if 'witnesses' in job:
             assert all(sum(memory.get(job['witnesses'] + hart * job['stride'] + 8 * index + byte, 0) << (8 * byte) for byte in range(8)) == value
                        for hart in range(harts) for index, value in enumerate(job['values'])), 'Coherence publication witness'
+    assert maintenance is None, 'Unfinished physical writeback'
     assert not console_events, 'Console service was not printed'
     assert read_observed is None or read_observed == (read_peak, read_reordered), 'Read-concurrency counters differ from independent bus events'
     assert line_observed is None or line_observed[0] == line_peak, 'Line concurrency differs from independent accepted addresses'
@@ -1834,7 +2011,7 @@ def compare_multicore(binary, directory, config, selected=(), platform=False):
     reports = []
     programs = ((name, platform_program(base, harts, local_interrupt_base(config), wait=name == 'platform_wait'))
                 for name in ('platform', 'platform_wait')) if platform else multicore_cases(
-        base, harts, bool(config['pmpEntries']), config['enableInterrupts'], config.get('enableUserMode', False))
+        base, harts, bool(config['pmpEntries']), config['enableInterrupts'], config.get('enableUserMode', False), config.get('dCacheWriteback', False))
     if platform and config.get('enableUserMode'):
         programs = chain(programs,
             ((name, program) for name, program in multicore_cases(base, harts, bool(config['pmpEntries']), config['enableInterrupts'], True) if name == 'user_isolation'),
@@ -2254,6 +2431,7 @@ def verify_software(args):
         reports = list(executor.map(software_schedule, tasks))
     guards = (check_translation_guards((args.output / f'software-{args.seeds[0]}.log').read_text().splitlines(), manifest['parameters'], program)
               if config.get('virtualAddressBits') == 39 and config['hartCount'] == 1 and not config['dCacheBytes'] else [])
+    writeback_guards = check_writeback_guards((args.output / f'software-{args.seeds[0]}.log').read_text().splitlines(), manifest['parameters'], program, 'software') if config.get('dCacheWriteback') else []
     hashes = {**manifest['sourceHashes'], **test_hashes, **software['sourceHashes']}
     assert all(hashlib.sha256(Path(name).read_bytes()).hexdigest() == digest for name, digest in hashes.items()), 'Sources changed during software verification'
     assert hashlib.sha256(args.elf.read_bytes()).hexdigest() == software['imageHash'], 'Image changed during software verification'
@@ -2263,7 +2441,7 @@ def verify_software(args):
         software=software, poisonBss=args.poison_bss, zeroLoadedBssBytes=program.software['bss'][1] - program.software['bss'][0],
         issueWidth=config.get('issueWidth', 1), hartCount=harts, axiDataBits=config['axiDataBits'], clockHz=100000000, timebaseHz=profile['timebaseHz'],
         cyclesPerTimeTick=profile['timeTickCycles'], transactionLimit=transaction_limit, cycleLimit=cycle_limit,
-        idleCycles=profile['idleCycles'], wallSecondsPerSchedule=software_timeout, translationOracleGuards=guards, cases=reports)
+        idleCycles=profile['idleCycles'], wallSecondsPerSchedule=software_timeout, translationOracleGuards=guards, writebackOracleGuards=writeback_guards, cases=reports)
     summary_path.write_text(json.dumps(summary, indent=2) + '\n')
     print(f'{harts}-hart ELF software and console passed {len(reports)} bus schedules', flush=True)
     return summary
@@ -2287,7 +2465,7 @@ def verify_software_matrix(args):
             config_path = directory / 'input.json'
             config_path.write_text(json.dumps(dict(template, hartCount=harts, issueWidth=width, enableBranchPrediction=args.branch_prediction,
                 axiDataBits=512 if harts == 16 else 64, iCacheBytes=args.icache_bytes,
-                dCacheBytes=args.dcache_bytes, dCacheRefillBytes=refill, enableBurstRefill=args.burst_refill,
+                dCacheBytes=args.dcache_bytes, dCacheRefillBytes=refill, dCacheWriteback=args.dcache_writeback, enableBurstRefill=args.burst_refill,
                 **(dict(fabricReadSlots=selection) if args.software_read_matrix else {})), indent=2) + '\n')
             software = directory / 'software'
             run(['python3', 'scripts/build_software.py', '--config', config_path,
@@ -2302,8 +2480,10 @@ def verify_software_matrix(args):
                     assert report['readConcurrency']['maxOutstanding'] == selection, 'Software did not exercise the configured read capacity'
                 if args.software_refill_matrix:
                     assert all(bool(count.get('lineReads')) == (refill == 64) and count['hits'] > 0 for count in report['dataCache']), 'Software did not consume the selected refill mode and cache hits'
-                    if harts == 16 and refill == 64:
+                    if harts == 16 and refill == 64 and not args.dcache_writeback:
                         assert report['lineConcurrency']['maxOutstanding'] == 2 and report['lineConcurrency']['overlapCycles'] > 0, 'Software did not exercise simultaneous line reads'
+                if args.dcache_writeback:
+                    assert sum(count.get('cachedStores', 0) for count in report['dataCache']) > 0, 'Software did not exercise cached stores'
                 observed = payload, report['results'], report['console']
                 if expected is None:
                     expected = observed
@@ -2353,6 +2533,7 @@ def main():
     parser.add_argument('--pmp-entries', type=int, choices=(0, 16))
     parser.add_argument('--icache-bytes', type=int, choices=(0, 8192, 16384, 32768, 65536), default=0)
     parser.add_argument('--dcache-bytes', type=int, choices=(0, 8192), default=0)
+    parser.add_argument('--dcache-writeback', action='store_true')
     parser.add_argument('--dcache-refill-bytes', type=int, choices=(8, 64), default=8)
     parser.add_argument('--case', dest='selected', action='append', default=[])
     parser.add_argument('--traffic-baseline', type=Path)
@@ -2363,6 +2544,8 @@ def main():
         parser.error('--burst-refill requires --icache-bytes')
     if (args.dcache_refill_bytes == 64 or args.software_refill_matrix) and not args.dcache_bytes and not args.elf:
         parser.error('Data line refill requires --dcache-bytes')
+    if args.dcache_writeback and not args.dcache_bytes and not args.elf:
+        parser.error('Writeback requires --dcache-bytes')
     matrix = args.software_matrix or args.software_refill_matrix or args.software_read_matrix
     if sum((args.software_matrix, args.software_refill_matrix, args.software_read_matrix)) > 1:
         parser.error('Select one software matrix dimension')
@@ -2421,7 +2604,7 @@ def main():
         directory = args.output / f'{"irq-" if interrupts else ""}{"pmp16-" if entries else ""}axi{width}'
         directory.mkdir(parents=True, exist_ok=True)
         config = configuration(width)
-        config.update(issueWidth=args.issue_width, pmpEntries=entries, enableInterrupts=interrupts, iCacheBytes=args.icache_bytes, dCacheBytes=args.dcache_bytes, dCacheRefillBytes=args.dcache_refill_bytes, tlbEntries=args.tlb_entries, enableBurstRefill=args.burst_refill, enableBranchPrediction=args.branch_prediction)
+        config.update(issueWidth=args.issue_width, pmpEntries=entries, enableInterrupts=interrupts, iCacheBytes=args.icache_bytes, dCacheBytes=args.dcache_bytes, dCacheRefillBytes=args.dcache_refill_bytes, dCacheWriteback=args.dcache_writeback, tlbEntries=args.tlb_entries, enableBurstRefill=args.burst_refill, enableBranchPrediction=args.branch_prediction)
         config['memoryRegions'][0]['dataCacheable'] = bool(args.dcache_bytes)
         if args.user_mode:
             config['enableUserMode'] = True
@@ -2450,10 +2633,10 @@ def main():
         report = compare(binary, directory, manifest['parameters'], selected=args.selected)
         report['interfaceContracts'] = interface_contracts
         report['instructionStorage'] = storage
-        report.update(issueWidth=args.issue_width, axiDataBits=width, physicalAddressBits=config['physicalAddressBits'], pmpEntries=entries, enableInterrupts=interrupts, iCacheBytes=args.icache_bytes, dCacheBytes=args.dcache_bytes, dCacheRefillBytes=args.dcache_refill_bytes)
+        report.update(issueWidth=args.issue_width, axiDataBits=width, physicalAddressBits=config['physicalAddressBits'], pmpEntries=entries, enableInterrupts=interrupts, iCacheBytes=args.icache_bytes, dCacheBytes=args.dcache_bytes, dCacheRefillBytes=args.dcache_refill_bytes, dCacheWriteback=args.dcache_writeback)
         summary['configurations'].append(report)
         core = directory / 'core'
-        core_config = dict(config, axiDataBits=256, dCacheBytes=0, dCacheRefillBytes=8)
+        core_config = dict(config, axiDataBits=256, dCacheBytes=0, dCacheRefillBytes=8, dCacheWriteback=False)
         core_key = json.dumps(core_config, sort_keys=True)
         if core_key in core_profiles:
             report['coreReuse'] = core_profiles[core_key]
@@ -2485,7 +2668,7 @@ def main():
                 continue
             directory = args.output / f'harts{harts}-axi{width}'
             directory.mkdir(parents=True, exist_ok=True)
-            config = dict(configuration(width), issueWidth=args.issue_width, hartCount=harts, pmpEntries=entries, enableInterrupts=interrupts, iCacheBytes=args.icache_bytes, dCacheBytes=args.dcache_bytes, dCacheRefillBytes=args.dcache_refill_bytes, tlbEntries=args.tlb_entries, enableBurstRefill=args.burst_refill, enableBranchPrediction=args.branch_prediction)
+            config = dict(configuration(width), issueWidth=args.issue_width, hartCount=harts, pmpEntries=entries, enableInterrupts=interrupts, iCacheBytes=args.icache_bytes, dCacheBytes=args.dcache_bytes, dCacheRefillBytes=args.dcache_refill_bytes, dCacheWriteback=args.dcache_writeback, tlbEntries=args.tlb_entries, enableBurstRefill=args.burst_refill, enableBranchPrediction=args.branch_prediction)
             if args.fabric_read_slots is not None:
                 config['fabricReadSlots'] = args.fabric_read_slots
             config['memoryRegions'][0]['dataCacheable'] = bool(args.dcache_bytes)
@@ -2516,7 +2699,7 @@ def main():
                                                       *(('DitDahA1DataCache', 'DitDahA1Coherence') if args.dcache_bytes else ()),
                                                       *(('DitDahA1LocalInterrupts',) if args.platform_only else ())))
             report['instructionStorage'] = verify_storage(rtl, directory / 'storage')
-            report.update(issueWidth=args.issue_width, hartCount=harts, axiDataBits=width, pmpEntries=entries, enableInterrupts=interrupts, iCacheBytes=args.icache_bytes, dCacheBytes=args.dcache_bytes, dCacheRefillBytes=args.dcache_refill_bytes)
+            report.update(issueWidth=args.issue_width, hartCount=harts, axiDataBits=width, pmpEntries=entries, enableInterrupts=interrupts, iCacheBytes=args.icache_bytes, dCacheBytes=args.dcache_bytes, dCacheRefillBytes=args.dcache_refill_bytes, dCacheWriteback=args.dcache_writeback)
             if not args.icache_bytes and not args.dcache_bytes and not args.platform_only:
                 for count in ((15, 16) if harts == 16 else (harts,)):
                     Path(f'result/harts{count}-input.json').write_text(json.dumps(dict(config, hartCount=count), indent=2) + '\n')

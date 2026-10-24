@@ -3,6 +3,7 @@
 """Exercise cancellation, authorization and backpressure on unit interfaces."""
 
 from pathlib import Path
+import hashlib
 import json
 import re
 import random
@@ -27,7 +28,7 @@ def verify_storage(rtl, directory):
         assert len(re.findall(r'\breg\s+\[\d+:0\]\s+block\s*;', queue)) == int(bool(wide_line)), 'Shared beat storage'
         assert bool(re.search(r'\bbeat\b', queue)) == bool(parameter['enableBurstRefill'] or parameter['dCacheRefillBytes'] == 64)
     arrays = {file[:-3]: tuple(map(int, re.search(r'_(\d+)x(\d+)\.sv$', file).groups()))
-              for file in files if file.startswith(('instructions_', 'tags_', 'data_', 'dataTags_', 'mem_'))}
+              for file in files if file.startswith(('instructions_', 'tags_', 'data_', 'dataTags_', 'dataDirty_', 'mem_'))}
     assert ('DitDahA1InstructionCache.sv' in files) == bool(size)
     assert ('DitDahA1DataCache.sv' in files) == bool(data_size)
     banks = 1 << (manifest['parameters']['issueWidth'] - 1).bit_length() if size else 1
@@ -36,6 +37,8 @@ def verify_storage(rtl, directory):
     if data_size:
         expected.update(data=(data_size // 8, 64),
                         dataTags=(data_size // 64, manifest['parameters']['physicalAddressBits'] - (data_size // 64).bit_length() - 5))
+    if data_size and manifest['parameters'].get('dCacheWriteback'):
+        expected['dataDirty'] = (data_size // 8, 8)
     assert set(arrays.values()) == set(expected.values())
     if size:
         cache = (rtl / 'DitDahA1InstructionCache.sv').read_text()
@@ -1293,7 +1296,7 @@ def data_cache_contract(parameters):
     region = next(r for r in parameters['memoryRegions'] if r.get('dataCacheable'))
     base, size = int(region['base']), parameters['dCacheBytes']
     assert int(region['size']) >= 2 * size
-    fields = dict(address=64, data=64, size=3, mask=8, tag=8, write=1, fetch=1,
+    fields = dict(cacheOperation=2, address=64, data=64, size=3, mask=8, tag=8, write=1, fetch=1,
                   privileged=1, atomic=1, atomicOperation=5, scEligible=1, refillSize=3)
     current = {}
 
@@ -1306,20 +1309,25 @@ def data_cache_contract(parameters):
             f"    upstream_request_bits_{key} = {fields[key]}'h{value:x};\n" for key, value in current.items()) + '''    upstream_request_valid = 1;
 '''
         if invalidate_accept:
-            body += f"    invalidate_bits = 64'h{address:x}; invalidate_valid = 1;\n"
-        return body + '    #1; while (!upstream_request_ready) tick(); tick(); upstream_request_valid = 0; invalidate_valid = 0;\n'
+            body += f"    probe_request_bits_address = 64'h{address:x}; probe_request_valid = 1;\n"
+        return body + '    #1; while (!upstream_request_ready) tick(); tick(); upstream_request_valid = 0; probe_request_valid = 0;\n'
 
     def invalidate(address):
-        return f'''    invalidate_bits = 64'h{address:x}; invalidate_valid = 1;
-    check(invalidate_ready, "Invalidation must not wait for local or physical service");
-    tick(); invalidate_valid = 0;
+        return f'''    probe_request_bits_address = 64'h{address:x}; probe_request_valid = 1;
+    check(probe_request_ready, "Invalidation must not wait for local or physical service");
+    tick(); probe_request_valid = 0;
 '''
 
-    def bus(value, fault=0, wrong_tag=False, invalidation=None, expanded=False, fallback=False):
+    def bus(value, fault=0, wrong_tag=False, invalidation=None, expanded=False, fallback=False,
+            operation=0, physical_address=None, before_response=''):
         body = '''    while (!downstream_request_valid) begin check(!upstream_response_valid, "Miss completed before physical service"); tick(); end
     repeat (3) begin
 '''
         physical = dict(current, address=current['address'] & ~7, size=3) if expanded else dict(current)
+        physical['cacheOperation'] = operation
+        if operation == 2:
+            physical.update(address=physical_address, size=3, data=0, mask=0, write=0, fetch=0,
+                            atomic=0, atomicOperation=0, scEligible=0, refillSize=0)
         if fallback:
             physical['refillSize'] = 0
         body += '      check(' + ' && '.join(f"downstream_request_bits_{key} == {fields[key]}'h{value:x}" for key, value in physical.items())
@@ -1329,6 +1337,7 @@ def data_cache_contract(parameters):
         body += '    downstream_request_ready = 1; tick(); downstream_request_ready = 0;\n'
         if invalidation == 'waiting':
             body += invalidate(current['address'])
+        body += before_response
         body += f'''    downstream_response_bits_data = 64'h{value:x}; downstream_response_bits_tag = {current['tag'] ^ int(wrong_tag)};
     downstream_response_bits_fault = {fault}; downstream_response_bits_last = 1; downstream_response_valid = 1;
     check(downstream_response_ready, "Physical response ownership");
@@ -1353,7 +1362,113 @@ def data_cache_contract(parameters):
 '''
         return body + '    upstream_response_ready = 1; tick(); upstream_response_ready = 0;\n'
 
-    body = request(base) + bus(0x123456789abcdef0) + reply(0x123456789abcdef0)
+    values = tuple(0xfedcba9876543210 ^ (0x0101010101010101 * word) for word in range(8))
+
+    def line(fault=-1, wrong_tag=-1, chunks=8, invalidation=None):
+        physical = dict(current, address=current['address'] & ~63, size=6)
+        body = '''    while (!downstream_request_valid) begin check(!upstream_response_valid, "Line miss completed before service"); tick(); end
+repeat (3) begin
+  check(''' + ' && '.join(f"downstream_request_bits_{key} == {fields[key]}'h{value:x}" for key, value in physical.items())
+        body += ', "Line request identity and retention"); tick();\n    end\n'
+        if invalidation == 'held':
+            body += invalidate(current['address'])
+        body += '    downstream_request_ready = 1; tick(); downstream_request_ready = 0;\n'
+        if invalidation == 'waiting':
+            body += invalidate(current['address'])
+        for chunk in range(chunks):
+            body += f'''    repeat (2) begin check(!upstream_response_valid && !downstream_request_valid && !upstream_request_ready, "Partial line cannot complete or release ownership"); tick(); end
+downstream_response_bits_data = 64'h{values[chunk % 8]:x}; downstream_response_bits_tag = {current['tag'] ^ int(chunk == wrong_tag)};
+downstream_response_bits_fault = {int(chunk == fault)}; downstream_response_bits_last = {int(chunk == chunks - 1)};
+downstream_response_valid = 1; check(downstream_response_ready, "Line response ownership");
+'''
+            body += invalidate(current['address']) if invalidation == chunk else '    tick();\n'
+            body += '    downstream_response_valid = 0; downstream_response_bits_fault = 0;\n'
+        return body
+
+
+    if parameters.get('dCacheWriteback'):
+        def probe_line(address, invalidate_line, dirty=None):
+            dirty = dirty or {}
+            body = f'''    probe_request_bits_address = 64'h{address:x}; probe_request_bits_invalidate = {int(invalidate_line)};
+    probe_request_valid = 1; probe_response_ready = 0;
+    #1; while (!probe_request_ready) tick(); tick(); probe_request_valid = 0;
+'''
+            for word in range(8) if dirty else (0,):
+                value, mask = dirty.get(word, (0, 0))
+                data = f" && probe_response_bits_data == 64'h{value:x}" if mask else ''
+                body += f'''    while (!probe_response_valid) tick();
+    repeat (4) begin
+      check(probe_response_valid && probe_response_bits_mask == {mask} && probe_response_bits_word == {word} && probe_response_bits_last == {int(not dirty or word == 7)}{data} && !upstream_request_ready, "Probe frame data, dirty bytes and ownership retained under backpressure"); tick();
+    end
+    probe_response_ready = 1; tick(); probe_response_ready = 0;
+'''
+            return body + '    check(!probe_response_valid, "Probe completes once");\n'
+
+        initial = 0x123456789abcdef0
+        value = initial
+        body = request(base) + bus(value) + reply(value)
+        for width in range(4):
+            for offset in range(0, 8, 1 << width):
+                mask = (1 << (1 << width)) - 1
+                for selected in sorted({mask, mask & 0x55 or 1}):
+                    byte_mask = sum(255 << (8 * byte) for byte in range(8) if selected >> byte & 1) << (8 * offset)
+                    value = (value & ~byte_mask) | ((0xfedcba9876543210 << (8 * offset)) & byte_mask)
+                    body += request(base + offset, size=width, mask=selected, write=1, data=0xfedcba9876543210)
+                    body += bus(0, operation=1) + reply(0)
+                    body += request(base) + reply(value)
+                    body += probe_line(base, False, {0: (value, selected << offset)})
+                    body += request(base) + reply(value)
+        value = (value & ~0xff000000000000ff) | 0xa500000000000091
+        body += request(base, write=1, size=0, mask=1, data=0x91) + bus(0, operation=1) + reply(0)
+        body += request(base + 7, write=1, size=0, mask=1, data=0xa5) + bus(0, operation=1) + reply(0)
+        body += request(base) + reply(value) + probe_line(base, False, {0: (value, 0x81)})
+        body += request(base, write=1, mask=255, data=initial) + bus(0, operation=1) + reply(0)
+        for options in ({'fault': 1}, {'wrong_tag': True}):
+            body += request(base, write=1, mask=255, data=29) + bus(0, operation=1, **options) + reply(0, fault=1)
+            body += request(base) + reply(initial)
+        body += probe_line(base + size, True)
+        body += probe_line(base + (1 << parameters['physicalAddressBits']), True)
+        body += request(base) + reply(initial)
+        body += request(base + 8) + bus(17) + reply(17)
+        body += request(base + 9, write=1, size=0, mask=1, data=0x88) + bus(0, operation=1) + reply(0)
+        body += probe_line(base, False, {0: (initial, 255), 1: (0x8811, 2)})
+        body += request(base) + reply(initial)
+        body += request(base + 8) + reply(0x8811)
+        body += probe_line(base, False)
+        body += request(base, write=1, mask=255, data=31) + bus(0, operation=1) + reply(0)
+        body += request(base + size)
+        body += bus(0, operation=2, physical_address=base, before_response=probe_line(base, True, {0: (31, 255)}))
+        body += bus(23) + reply(23)
+        body += request(base) + bus(31) + reply(31)
+        body += probe_line(base, True)
+        body += request(base, write=1, mask=255, data=41) + bus(0) + reply(0)
+        body += request(base) + bus(41) + reply(41)
+        if parameters.get('dCacheRefillBytes') == 64:
+            body += probe_line(base, True) + request(base + 56, refillSize=6) + line() + reply(values[7])
+            for word in range(8):
+                body += request(base + 8 * word) + reply(values[word])
+            low, high = (values[0] & ~255) | 0x91, (values[7] & ((1 << 56) - 1)) | (0xa5 << 56)
+            body += request(base, write=1, size=0, mask=1, data=0x91) + bus(0, operation=1) + reply(0)
+            body += request(base + 63, write=1, size=0, mask=1, data=0xa5) + bus(0, operation=1) + reply(0)
+            body += request(base + size + 8, refillSize=6)
+            body += bus(0, operation=2, physical_address=base, before_response=probe_line(base, True, {0: (low, 1), 7: (high, 128)}))
+            body += line() + reply(values[1])
+            body += request(base + size) + reply(values[0])
+            body += request(base + size + 56) + reply(values[7])
+            body += probe_line(base + size, True) + request(base + size) + bus(values[0]) + reply(values[0])
+            low = (values[0] & ~0xff00) | 0xab00
+            body += request(base + size + 1, write=1, size=0, mask=1, data=0xab) + bus(0, operation=1) + reply(0)
+            body += request(base + size + 8, refillSize=6)
+            body += bus(0, operation=2, physical_address=base + size, before_response=probe_line(base + size, True, {0: (low, 2)}))
+            values = (low, *values[1:])
+            body += line() + reply(values[1]) + request(base + size) + reply(low)
+            body += probe_line(base + size, True) + request(base + size, refillSize=6) + line(wrong_tag=3)
+            body += bus(low, fallback=True) + reply(low)
+            body += request(base + size + 8) + bus(values[1]) + reply(values[1])
+        return body
+
+    body = '    probe_request_bits_invalidate = 1; probe_response_ready = 1;\n'
+    body += request(base) + bus(0x123456789abcdef0) + reply(0x123456789abcdef0)
     body += request(base, tag=38, privileged=0) + reply(0x123456789abcdef0)
     body += request(base + 8) + bus(0x9988776655443322) + reply(0x9988776655443322)
     body += request(base) + reply(0x123456789abcdef0, invalidate_hit=True)
@@ -1412,29 +1527,6 @@ def data_cache_contract(parameters):
     for grant in (1, 2, 4, 5, 7):
         body += invalidate(base) + request(base + 1, size=0, refillSize=grant) + bus(29) + reply(29)
     if parameters.get('dCacheRefillBytes') == 64:
-        values = tuple(0xfedcba9876543210 ^ (0x0101010101010101 * word) for word in range(8))
-
-        def line(fault=-1, wrong_tag=-1, chunks=8, invalidation=None):
-            physical = dict(current, address=current['address'] & ~63, size=6)
-            body = '''    while (!downstream_request_valid) begin check(!upstream_response_valid, "Line miss completed before service"); tick(); end
-    repeat (3) begin
-      check(''' + ' && '.join(f"downstream_request_bits_{key} == {fields[key]}'h{value:x}" for key, value in physical.items())
-            body += ', "Line request identity and retention"); tick();\n    end\n'
-            if invalidation == 'held':
-                body += invalidate(current['address'])
-            body += '    downstream_request_ready = 1; tick(); downstream_request_ready = 0;\n'
-            if invalidation == 'waiting':
-                body += invalidate(current['address'])
-            for chunk in range(chunks):
-                body += f'''    repeat (2) begin check(!upstream_response_valid && !downstream_request_valid && !upstream_request_ready, "Partial line cannot complete or release ownership"); tick(); end
-    downstream_response_bits_data = 64'h{values[chunk % 8]:x}; downstream_response_bits_tag = {current['tag'] ^ int(chunk == wrong_tag)};
-    downstream_response_bits_fault = {int(chunk == fault)}; downstream_response_bits_last = {int(chunk == chunks - 1)};
-    downstream_response_valid = 1; check(downstream_response_ready, "Line response ownership");
-'''
-                body += invalidate(current['address']) if invalidation == chunk else '    tick();\n'
-                body += '    downstream_response_valid = 0; downstream_response_bits_fault = 0;\n'
-            return body
-
         for word in range(8):
             for width in range(4):
                 offset = 8 * word + 8 - (1 << width)
@@ -1503,41 +1595,101 @@ def data_cache_contract(parameters):
 def coherence_contract(parameters):
     count = parameters['hartCount']
     base = int(next(r for r in parameters['memoryRegions'] if r.get('dataCacheable'))['base'])
+    writeback = parameters.get('dCacheWriteback', False)
     body = ''
-    for case, (write, atomic, operation, cacheable) in enumerate(((1, 0, 0, True), (1, 0, 0, True), (1, 1, 0, True),
-                                               (1, 1, 3, True), (0, 1, 2, True), (0, 0, 0, True),
-                                               (1, 0, 0, False))):
-        writer = 0 if case == 0 else count - 1
-        address = base if cacheable else 1 << parameters['physicalAddressBits']
-        body += f'''    @(negedge clock);
-    hartId = {writer}; upstream_request_bits_address = 64'h{address:x}; upstream_request_bits_tag = 37;
+    cases = ((0, 0, 0, 1), (0, 1, 0, 1), (0, 1, 1, 1)) + (((1, 1, 0, 1), (2, 0, 0, 1), (0, 0, 0, 0)) if writeback else ())
+    for operation, write, atomic, privileged in cases:
+        writer = count - 1
+        targets = ([writer] if operation == 2 else [h for h in range(count) if operation != 1 or h != writer]) if writeback else (
+            [h for h in range(count) if atomic or h != writer] if write else [])
+        for dirty in (False, True) if targets and writeback else (False,):
+            body += f'''    @(negedge clock);
+    hartId = {writer}; upstream_request_bits_address = 64'h{base & ~63 if operation == 2 else base:x}; upstream_request_bits_tag = 37;
     upstream_request_bits_size = 3; upstream_request_bits_mask = {255 if write else 0};
-    upstream_request_bits_write = {write}; upstream_request_bits_atomic = {atomic};
-    upstream_request_bits_atomicOperation = {operation}; upstream_request_bits_data = 19;
-    upstream_request_valid = 1; downstream_request_ready = 0;
+    upstream_request_bits_cacheOperation = {operation}; upstream_request_bits_write = {write};
+    upstream_request_bits_atomic = {atomic}; upstream_request_bits_atomicOperation = 0;
+    upstream_request_bits_data = 19; upstream_request_bits_privileged = {privileged};
+    upstream_request_valid = 1; downstream_request_ready = 0; tick();
 '''
-        if write and cacheable:
-            body += '    tick();\n'
-            targets = [hart for hart in range(count) if atomic or hart != writer]
             for hart in targets:
                 for peer in range(count):
-                    body += f'''    check(invalidate_{peer}_valid == {int(peer in targets and peer >= hart)} && (!invalidate_{peer}_valid || invalidate_{peer}_bits == 64'h{address:x}), "Invalidation identity and one completion per target");
+                    body += f'''    check(probe_{peer}_request_valid == {int(peer in targets and peer >= hart)}, "Exactly the required probes remain offered");
 '''
-                body += f'''    check(!downstream_request_valid && !upstream_request_ready, "Write forwarded before every invalidation completed");
-    invalidate_{hart}_ready = 1; tick(); invalidate_{hart}_ready = 0;
+                body += f'''    check(probe_{hart}_request_bits_address == 64'h{base & ~63:x} && probe_{hart}_request_bits_invalidate == {int(bool(write or operation == 2 or atomic))}, "Probe address and operation");
+    probe_{hart}_request_ready = 1; tick(); probe_{hart}_request_ready = 0;
 '''
-        else:
-            body += '    #1;\n' + ''.join(f'    check(!invalidate_{hart}_valid, "Bypass generated invalidation");\n' for hart in range(count))
-        body += ''.join(f'    check(!invalidate_{hart}_valid, "Completed write has no pending invalidation");\n' for hart in range(count))
-        body += f'''    repeat (3) begin
-      check(downstream_request_valid && downstream_request_bits_address == 64'h{address:x} && downstream_request_bits_tag == 37 && downstream_request_bits_write == {write} && downstream_request_bits_atomic == {atomic} && downstream_request_bits_atomicOperation == {operation} && !upstream_request_ready, "Forwarded request retention"); tick();
+            if targets:
+                body += '''    repeat (3) begin
+      check(!upstream_request_ready && !upstream_response_valid && !downstream_request_valid, "Probe acceptance is not completion"); tick();
+    end
+'''
+            for hart in targets:
+                if dirty and hart == targets[0]:
+                    value, mask, word = 0x1122334455667788, 0x55, 3
+                    body += f'''    probe_{hart}_response_valid = 1; probe_{hart}_response_bits_mask = {mask};
+    probe_{hart}_response_bits_word = {word}; probe_{hart}_response_bits_last = 0;
+    probe_{hart}_response_bits_data = 64'h{value:x};
+'''
+                    for failure in ('fault', 'tag', 'terminal', None):
+                        body += f'''    while (!downstream_request_valid) begin
+      check(!upstream_request_ready && !upstream_response_valid && !probe_{hart}_response_ready, "Dirty ownership retained before writeback"); tick();
+    end
+    repeat (3) begin
+      check(downstream_request_valid && downstream_request_bits_address == 64'h{(base & ~63) + 8 * word:x} && downstream_request_bits_data == 64'h{value:x} && downstream_request_bits_mask == {mask} && downstream_request_bits_tag == 37 && downstream_request_bits_size == 3 && downstream_request_bits_write && downstream_request_bits_privileged && !downstream_request_bits_atomic && !downstream_request_bits_fetch && downstream_request_bits_cacheOperation == 0 && !probe_{hart}_response_ready, "Held masked writeback payload and trusted maintenance context"); tick();
+    end
+    downstream_request_ready = 1; tick(); downstream_request_ready = 0;
+    repeat (3) begin check(!probe_{hart}_response_ready && !upstream_request_ready && !upstream_response_valid, "Writeback request acceptance is not completion"); tick(); end
+'''
+                        if failure == 'terminal':
+                            body += f'''    downstream_response_bits_fault = 0; downstream_response_bits_tag = 37;
+    downstream_response_bits_last = 0; downstream_response_valid = 1;
+    check(downstream_response_ready && !probe_{hart}_response_ready, "Malformed writeback cannot release dirty data");
+    tick(); downstream_response_valid = 0;
+    repeat (3) begin check(!downstream_request_valid && downstream_response_ready && !probe_{hart}_response_ready, "Malformed stream retains physical ownership until last"); tick(); end
+'''
+                        body += f'''
+    downstream_response_bits_data = 0; downstream_response_bits_tag = {36 if failure == 'tag' else 37};
+    downstream_response_bits_fault = {int(failure == 'fault')}; downstream_response_bits_last = 1;
+    downstream_response_valid = 1;
+    check(downstream_response_ready && probe_{hart}_response_ready == {int(failure is None)} && !upstream_request_ready && !upstream_response_valid, "Only successful writeback releases dirty data");
+    tick(); downstream_response_valid = 0; downstream_response_bits_fault = 0;
+'''
+                    body += f'    probe_{hart}_response_valid = 0; tick();\n'
+                body += f'''    probe_{hart}_response_bits_mask = 0; probe_{hart}_response_bits_word = 7;
+    probe_{hart}_response_bits_last = 1; probe_{hart}_response_valid = 1;
+    #1; while (!probe_{hart}_response_ready) tick(); tick(); probe_{hart}_response_valid = 0;
+'''
+            body += '''    while (!upstream_request_ready && !downstream_request_valid) tick();
+'''
+            if operation:
+                body += '''    check(upstream_request_ready && !downstream_request_valid && !upstream_response_valid, "Ownership grant needs request acceptance");
+    tick(); upstream_request_valid = 0; upstream_request_bits_tag = 99;
+    repeat (3) begin
+      check(upstream_response_valid && upstream_response_bits_tag == 37 && !upstream_response_bits_fault && upstream_response_bits_data == 0 && upstream_response_bits_last && !downstream_request_valid, "Retained ownership grant"); tick();
+    end
+'''
+            else:
+                body += f'''    repeat (3) begin
+      check(downstream_request_valid && downstream_request_bits_address == 64'h{base:x} && downstream_request_bits_tag == 37 && downstream_request_bits_write == {write} && downstream_request_bits_atomic == {atomic} && downstream_request_bits_privileged == {privileged} && !upstream_request_ready, "Original request follows probe completion"); tick();
     end
     downstream_request_ready = 1; tick(); downstream_request_ready = 0; upstream_request_valid = 0;
-    downstream_response_bits_tag = 37; downstream_response_bits_data = 23; downstream_response_valid = 1;
+    downstream_response_bits_tag = 37; downstream_response_bits_data = 23; downstream_response_bits_fault = 0;
+    downstream_response_bits_last = 1; downstream_response_valid = 1;
     repeat (3) begin
       check(upstream_response_valid && upstream_response_bits_tag == 37 && upstream_response_bits_data == 23 && !downstream_response_ready, "Shared response retention"); tick();
     end
-    upstream_response_ready = 1; tick(); upstream_response_ready = 0; downstream_response_valid = 0;
+'''
+            body += '    upstream_response_ready = 1; tick(); upstream_response_ready = 0; downstream_response_valid = 0;\n'
+    address = int(next(r['base'] for r in parameters['memoryRegions'] if r['readable'] and not r.get('dataCacheable')))
+    for operation in (1, 2, 3):
+        body += f'''    upstream_request_bits_address = 64'h{address:x}; upstream_request_bits_size = 3;
+    upstream_request_bits_cacheOperation = {operation}; upstream_request_bits_write = {int(operation == 1)};
+    upstream_request_bits_mask = 255; upstream_request_bits_atomic = 0; upstream_request_bits_fetch = 0;
+    upstream_request_bits_tag = 37; upstream_request_valid = 1;
+    check(upstream_request_ready && !downstream_request_valid, "Invalid ownership request rejected before physical effects");
+    tick(); upstream_request_valid = 0;
+    check(upstream_response_valid && upstream_response_bits_fault && upstream_response_bits_tag == 37 && upstream_response_bits_last, "Invalid ownership request attribution");
+    upstream_response_ready = 1; tick(); upstream_response_ready = 0;
 '''
     return body
 
@@ -1840,7 +1992,68 @@ def read_queue_contract(parameters):
     return body + line_read_contract(parameters) + stress
 
 
+def coherent_fabric_contract(parameters):
+    count = parameters['hartCount']
+    base = int(next(r['base'] for r in parameters['memoryRegions'] if r.get('dataCacheable') and r['writable']))
+    uncached = int(next(r['base'] for r in parameters['memoryRegions'] if r['readable'] and not r.get('dataCacheable') and not r['device']))
+    body = ''
+    for operation, address, write, physical in ((1, base, 1, False), (2, base & ~63, 0, False),
+                                                 (3, base, 0, False), (0, base, 0, True), (0, uncached, 0, True)):
+        targets = (1 if operation == 2 else ((1 << count) - 2) if operation == 1 else
+                   (1 << count) - 1 if address == base and operation == 0 else 0)
+        body += f'''    begin
+      reg [{count-1}:0] seen, pending;
+      seen = 0; pending = 0;
+      reset = 1; tick(); reset = 0; tick();
+      data_0_request_bits_cacheOperation = {operation}; data_0_request_bits_address = 64'h{address:x};
+      data_0_request_bits_size = 3; data_0_request_bits_write = {write};
+      data_0_request_bits_mask = {255 if write else 0}; data_0_request_bits_tag = 77;
+      data_0_request_valid = 1;
+      #1; while (!data_0_request_ready) tick(); tick(); data_0_request_valid = 0;
+'''
+        while_condition = '!axi_ar_valid && !data_0_response_valid' if physical else '!data_0_response_valid'
+        body += f'      while ({while_condition}) begin\n'
+        if not physical:
+            body += '        check(!axi_ar_valid && !axi_aw_valid && !axi_w_valid, "Internal cache operation escaped to AXI");\n'
+        if operation:
+            body += f'        check({"dut.readers.empty" if count > 1 else "1"}, "Internal cache operation entered ordinary read slots");\n'
+        for hart in range(count):
+            body += f'''        probe_{hart}_request_ready = 1; probe_{hart}_response_valid = pending[{hart}];
+        probe_{hart}_response_bits_data = 0; probe_{hart}_response_bits_mask = 0;
+        probe_{hart}_response_bits_word = 0; probe_{hart}_response_bits_last = 1;
+'''
+        body += '        #1;\n'
+        for hart in range(count):
+            body += f'''        if (probe_{hart}_response_valid && probe_{hart}_response_ready) pending[{hart}] = 0;
+        if (probe_{hart}_request_valid && probe_{hart}_request_ready) begin
+          if (seen[{hart}] || probe_{hart}_request_bits_address != 64'h{address & ~63:x} || probe_{hart}_request_bits_invalidate != {int(bool(operation in (1,2)))}) $fatal(1, "Actual fabric probe owner and identity");
+          seen[{hart}] = 1; pending[{hart}] = 1;
+        end
+'''
+        body += '        tick();\n      end\n'
+        body += f'      check(seen == {count}\'h{targets:x} && pending == 0, "Complete actual-fabric probe set");\n'
+        if physical:
+            value = 42 << ((address % (parameters['axiDataBits'] // 8)) * 8)
+            body += f'''      check(axi_ar_valid && axi_ar_bits_addr == 64'h{address:x} && axi_ar_bits_id == 0 && !data_0_response_valid, "Read follows required coherence service");
+      axi_ar_ready = 1; tick(); axi_ar_ready = 0;
+      axi_r_bits_data = {parameters['axiDataBits']}'h{value:x}; axi_r_bits_id = 0;
+      axi_r_bits_resp = 0; axi_r_bits_last = 1; axi_r_valid = 1;
+      while (!axi_r_ready) tick(); tick(); axi_r_valid = 0;
+      while (!data_0_response_valid) tick();
+'''
+        body += f'''      repeat (3) begin
+        check(data_0_response_valid && data_0_response_bits_tag == 77 && data_0_response_bits_last && data_0_response_bits_fault == {int(operation == 3)} && data_0_response_bits_data == {42 if physical else 0}, "Coherent fabric completion attribution"); tick();
+      end
+      data_0_response_ready = 1; tick(); data_0_response_ready = 0;
+'''
+        body += ''.join(f'      probe_{h}_response_valid = 0; probe_{h}_request_ready = 0;\n' for h in range(count))
+        body += '    end\n'
+    return body
+
+
 def fabric_contract(parameters):
+    if parameters.get('dCacheWriteback'):
+        return coherent_fabric_contract(parameters)
     base = int(next(r['base'] for r in parameters['memoryRegions'] if r['writable'] and r['executable'] and not r['device']))
     width = parameters['axiDataBits']
     data_address, instruction_address = base + 0x238, base + 0x104
@@ -1929,6 +2142,20 @@ def fabric_contract(parameters):
 def fabric_exclusive_contract(parameters):
     hart = parameters['hartCount'] - 1
     base = int(next(r['base'] for r in parameters['memoryRegions'] if r['writable'] and not r['device']))
+    def probes(writer, address):
+        if not parameters.get('dCacheBytes'):
+            return ''
+        body = f'    check(!probe_{writer}_request_valid, "Ordinary writer retains its copy");\n'
+        for peer in range(parameters['hartCount']):
+            if peer == writer:
+                continue
+            body += f'''    while (!probe_{peer}_request_valid) begin check(!axi_aw_valid && !axi_w_valid, "Write waits for peer probes"); tick(); end
+    check(probe_{peer}_request_bits_address == 64'h{address & ~63:x} && probe_{peer}_request_bits_invalidate, "Peer probe line and action");
+    probe_{peer}_request_ready = 1; tick(); probe_{peer}_request_ready = 0;
+    probe_{peer}_response_bits_data = 0; probe_{peer}_response_bits_mask = 0; probe_{peer}_response_bits_word = 0; probe_{peer}_response_bits_last = 1;
+    probe_{peer}_response_valid = 1; while (!probe_{peer}_response_ready) tick(); tick(); probe_{peer}_response_valid = 0;
+'''
+        return body
     depth = parameters.get('fabricReadSlots') or 2
     identities = (*range(depth - 1), hart)
     body = '    axi_r_bits_resp = 0; axi_r_bits_last = 1;\n'
@@ -1961,8 +2188,7 @@ def fabric_exclusive_contract(parameters):
     check(data_0_request_ready && !instruction_{hart}_request_ready, "Waiting writer precedes another read");
     tick(); data_0_request_valid = 0;
 '''
-    if parameters.get('dCacheBytes'):
-        body += ''.join(f'    invalidate_{i}_ready = 1;\n' for i in range(parameters['hartCount']))
+    body += probes(0, base + 0x200)
     body += f'''
     while (!axi_aw_valid || !axi_w_valid) begin check(!axi_ar_valid, "Read bypassed exclusive writer"); tick(); end
     axi_aw_ready = 1; tick(); axi_aw_ready = 0;
@@ -2008,7 +2234,7 @@ def fabric_exclusive_contract(parameters):
     data_0_response_ready = 1; tick(); data_0_response_ready = 0;
 '''
         body += f'''    while (!data_{hart}_request_ready) tick(); tick(); data_{hart}_request_valid = 0;
-    while (!axi_aw_valid || !axi_w_valid) tick();
+''' + probes(hart, base + 0x180) + f'''    while (!axi_aw_valid || !axi_w_valid) tick();
     axi_aw_ready = 1; axi_w_ready = 1; tick(); axi_aw_ready = 0; axi_w_ready = 0;
     axi_b_bits_id = {hart}; axi_b_bits_resp = 0; axi_b_valid = 1;
     while (!axi_b_ready) tick(); tick(); axi_b_valid = 0;
@@ -2420,9 +2646,9 @@ def backend_fence_contract():
     return body
 
 
-def bench(module, body):
+def module_ports(module):
     header = module.read_text().split(');', 1)[0].split('(', 1)[1]
-    declarations, connections, names = [], [], []
+    ports = []
     direction, width = None, ''
     for item in header.split(','):
         match = re.fullmatch(r'\s*(?:(input|output)\s+)?(\[\d+:\d+\])?\s*(\w+)\s*', item)
@@ -2430,6 +2656,212 @@ def bench(module, body):
         new_direction, new_width, name = match.groups()
         if new_direction:
             direction, width = new_direction, new_width or ''
+        ports.append((direction, width, name))
+    return ports
+
+
+def verify_cache_coherence(cache_rtl, fabric_rtl, directory, mutations=False):
+    directory.mkdir(parents=True, exist_ok=True)
+    manifest = json.loads((cache_rtl / 'ditdah_a1_config.json').read_text())
+    parameters = manifest['parameters']
+    assert parameters['hartCount'] == 2 and parameters['dCacheWriteback'] and parameters['dCacheRefillBytes'] == 8
+    assert manifest['sourceHashes'] == json.loads((fabric_rtl / 'ditdah_a1_config.json').read_text())['sourceHashes']
+    modules = dict(DitDahA1DataCache=cache_rtl / 'DitDahA1DataCache.sv', **{
+        name: fabric_rtl / (name + '.sv') for name in ('DitDahA1MemoryArbiter', 'DitDahA1Coherence', 'DitDahA1Memory')})
+    ports = [('input', '', 'clock'), ('input', '', 'reset')]
+    for hart in range(2):
+        ports += [(d, w, n.replace('upstream_', f'upstream_{hart}_', 1))
+                  for d, w, n in module_ports(modules['DitDahA1DataCache']) if n.startswith('upstream_')]
+    ports += [(d, w, n.replace('downstream_', 'physical_', 1))
+              for d, w, n in module_ports(modules['DitDahA1Memory']) if n.startswith('downstream_')]
+    wires, instances = {}, []
+
+    def instantiate(module, instance, select):
+        pins = []
+        for direction, width, pin in module_ports(modules[module]):
+            signal = pin if pin in ('clock', 'reset') else select(pin, direction)
+            if signal and signal not in ('clock', 'reset') and not signal.startswith(('upstream_', 'physical_', "'")):
+                assert signal not in wires or wires[signal] == width
+                wires[signal] = width
+            pins.append(f'.{pin}({signal or ""})')
+        instances.append(f'  {module} {instance}(' + ', '.join(pins) + ');')
+
+    for hart in range(2):
+        instantiate('DitDahA1DataCache', f'cache_{hart}', lambda pin, direction, h=hart:
+                    pin.replace('upstream_', f'upstream_{h}_', 1) if pin.startswith('upstream_') else f'cache_{h}_' + pin)
+
+    def arbiter_pin(pin, direction):
+        if pin.startswith('ports_'):
+            _, port, channel = pin.split('_', 2)
+            if int(port) % 2 == 0:
+                return "'0" if direction == 'input' else None
+            return f'cache_{int(port)//2}_downstream_' + channel
+        return 'arbiter_' + pin
+
+    instantiate('DitDahA1MemoryArbiter', 'arbiter', arbiter_pin)
+    instantiate('DitDahA1Coherence', 'coherence', lambda pin, direction:
+                'arbiter_hartId' if pin == 'hartId' else pin.replace('upstream_', 'arbiter_downstream_', 1)
+                if pin.startswith('upstream_') else 'cache_' + pin[6:].split('_', 1)[0] + '_probe_' + pin[6:].split('_', 1)[1]
+                if pin.startswith('probe_') else 'coherence_' + pin)
+    instantiate('DitDahA1Memory', 'memory', lambda pin, direction:
+                pin.replace('upstream_', 'coherence_downstream_', 1) if pin.startswith('upstream_') else
+                pin.replace('downstream_', 'physical_', 1))
+    license = '\n'.join(line.replace('#', '//', 1) for line in Path(__file__).read_text().splitlines()[:2]) + '\n'
+    wrapper = directory / 'CacheCoherence.sv'
+    wrapper.write_text(license + 'module CacheCoherence(\n' + ',\n'.join(f'  {d} {w} {n}' for d, w, n in ports) + '\n);\n' +
+                       '\n'.join(f'  wire {w} {n};' for n, w in wires.items()) + '\n' + '\n'.join(instances) + '\nendmodule\n')
+    region = next(r for r in parameters['memoryRegions'] if r.get('dataCacheable'))
+    base, limit = int(region['base']), int(region['base']) + int(region['size'])
+    assert base % 8 == 0 and int(region['size']) >= 2 * parameters['dCacheBytes']
+    initial = {base: 0x1122334455667788, base + 8: 0x9988776655443322, base + parameters['dCacheBytes']: 29}
+    oracle = {address + b: value >> (8 * b) & 255 for address, value in initial.items() for b in range(8)}
+    body = f'''    begin
+      reg [7:0] memory [0:{limit-1}];
+      integer cycles, reads, writes, failures, failure_budget, delay;
+      reg owned, response_fault;
+      reg [7:0] response_tag;
+      reg [63:0] response_data;
+      cycles = 0; reads = 0; writes = 0; failures = 0; failure_budget = 2; delay = 0; owned = 0;
+      for (integer b = 0; b < {limit}; b++) memory[b] = 0;
+'''
+    body += ''.join(f"      memory[{address}] = 8'h{value:x};\n" for address, value in oracle.items())
+    body += f'''      fork
+        begin
+          forever begin
+            @(negedge clock);
+            physical_request_ready = !owned && cycles % 3 != 0;
+            physical_response_valid = owned && delay == 0;
+            physical_response_bits_data = response_data; physical_response_bits_fault = response_fault;
+            physical_response_bits_tag = response_tag; physical_response_bits_last = 1;
+            @(posedge clock); cycles = cycles + 1;
+            if (physical_request_valid && physical_request_ready) begin
+              if (physical_request_bits_cacheOperation != 0 || physical_request_bits_size > 3 || physical_request_bits_address < {base} ||
+                  physical_request_bits_address + (1 << physical_request_bits_size) > {limit}) $fatal(1, "Invalid physical transaction");
+              owned = 1; delay = 3; response_data = 0; response_fault = 0; response_tag = physical_request_bits_tag;
+              if (physical_request_bits_write) begin
+                writes = writes + 1;
+                if (failure_budget > 0) begin
+                  response_fault = failures % 2 == 0; response_tag = physical_request_bits_tag ^ (failures % 2 == 1);
+                  failures = failures + 1; failure_budget = failure_budget - 1;
+                end
+                for (integer b = 0; b < (1 << physical_request_bits_size); b++)
+                  if (physical_request_bits_mask[b] && (!response_fault || b % 2 == 0))
+                    memory[physical_request_bits_address + b] = physical_request_bits_data[8*b +: 8];
+              end else begin
+                reads = reads + 1;
+                for (integer b = 0; b < (1 << physical_request_bits_size); b++)
+                  response_data[8*b +: 8] = memory[physical_request_bits_address + b];
+              end
+            end else if (owned && delay > 0) delay = delay - 1;
+            if (physical_response_valid && physical_response_ready) owned = 0;
+          end
+        end
+      join_none
+'''
+
+    def transfer(hart, address, value=None, size=3):
+        write = value is not None
+        mask = (1 << (1 << size)) - 1 if write else 0
+        expected = 0 if write else sum(oracle.get(address + b, 0) << (8 * b) for b in range(1 << size))
+        if write:
+            oracle.update((address + b, value >> (8 * b) & 255) for b in range(1 << size))
+        return f'''      @(negedge clock);
+      upstream_{hart}_request_bits_address = 64'h{address:x}; upstream_{hart}_request_bits_size = {size};
+      upstream_{hart}_request_bits_write = {int(write)}; upstream_{hart}_request_bits_data = 64'h{(value or 0):x};
+      upstream_{hart}_request_bits_mask = {mask}; upstream_{hart}_request_bits_tag = 37;
+      upstream_{hart}_request_valid = 1;
+      #1; while (!upstream_{hart}_request_ready) tick(); tick(); upstream_{hart}_request_valid = 0;
+      while (!upstream_{hart}_response_valid) tick();
+      repeat (3) begin
+        check(upstream_{hart}_response_valid && !upstream_{hart}_response_bits_fault && upstream_{hart}_response_bits_tag == 37 && upstream_{hart}_response_bits_last && upstream_{hart}_response_bits_data == 64'h{expected:x}, "Architectural value from actual coherent arrays"); tick();
+      end
+      upstream_{hart}_response_ready = 1; tick(); upstream_{hart}_response_ready = 0;
+'''
+
+    body += transfer(0, base) + transfer(0, base) + transfer(1, base)
+    body += transfer(0, base + 2, 0x5678, 1) + transfer(0, base + 7, 0xa5, 0) + transfer(0, base)
+    body += '      check(reads == 2 && writes == 0, "Dirty store stays in its owning cache");\n'
+    body += transfer(1, base)
+    body += '      check(reads == 3 && writes == 3 && failures == 2, "Fault and bad identity retain and retry dirty bytes");\n'
+    body += transfer(0, base) + transfer(1, base + 3, 0x12, 0) + transfer(0, base)
+    body += transfer(0, base, 0xfedcba9876543210) + transfer(0, base + parameters['dCacheBytes'])
+    body += transfer(1, base) + transfer(0, base + parameters['dCacheBytes'])
+    body += transfer(1, base + 8) + transfer(1, base, 3, 0) + transfer(1, base + 9, 0x77, 0)
+    body += transfer(0, base) + transfer(0, base + 8)
+    body += '      check(failures == 2 && writes == 7, "Masked recalls and dirty replacement reach physical memory");\n'
+    body += transfer(0, base, 0x1020304050607080)
+    body += transfer(1, base + parameters['dCacheBytes']) + transfer(1, base + parameters['dCacheBytes'], 0x8877665544332211)
+    body += f'''      begin
+        integer accepted, completed;
+        accepted = 0; completed = 0; failure_budget = 2;
+        @(negedge clock);
+        upstream_0_request_bits_address = 64'h{base+parameters['dCacheBytes']:x}; upstream_0_request_bits_tag = 51;
+        upstream_1_request_bits_address = 64'h{base:x}; upstream_1_request_bits_tag = 52;
+        upstream_0_request_bits_write = 0; upstream_1_request_bits_write = 0;
+        upstream_0_request_bits_size = 3; upstream_1_request_bits_size = 3;
+        upstream_0_request_valid = 1; upstream_1_request_valid = 1;
+        upstream_0_response_ready = 1; upstream_1_response_ready = 1;
+        while (completed != 3) begin
+          #1;
+          if (upstream_0_request_valid && upstream_0_request_ready) accepted = accepted | 1;
+          if (upstream_1_request_valid && upstream_1_request_ready) accepted = accepted | 2;
+          if (upstream_0_response_valid) begin
+            check(!upstream_0_response_bits_fault && upstream_0_response_bits_tag == 51 && upstream_0_response_bits_data == 64'h8877665544332211, "First simultaneous dirty replacement reads latest peer data");
+            completed = completed | 1;
+          end
+          if (upstream_1_response_valid) begin
+            check(!upstream_1_response_bits_fault && upstream_1_response_bits_tag == 52 && upstream_1_response_bits_data == 64'h1020304050607080, "Second simultaneous dirty replacement reads latest peer data");
+            completed = completed | 2;
+          end
+          tick(); upstream_0_request_valid = !(accepted & 1); upstream_1_request_valid = !(accepted & 2);
+          @(negedge clock);
+        end
+        upstream_0_response_ready = 0; upstream_1_response_ready = 0;
+      end
+      check(failures == 4 && writes == 11, "Concurrent release retains dirty data across injected errors");
+      $display("COHERENCE reads=%0d writes=%0d failures=%0d", reads, writes, failures);
+    end
+'''
+    test = directory / 'CacheCoherence_tb.sv'
+    test.write_text(bench(wrapper, body))
+    files = [*modules.values(), *(cache_rtl / f for f in (cache_rtl / 'filelist.f').read_text().splitlines()
+                                  if f.startswith(('data_', 'dataTags_', 'dataDirty_', 'mem_'))), wrapper, test]
+    binary = directory / 'CacheCoherence'
+    subprocess.run(['iverilog', '-g2012', '-s', 'contract_tb', '-o', str(binary), *map(str, files)], check=True)
+    result = subprocess.run(['vvp', str(binary)], capture_output=True, text=True, timeout=30)
+    (directory / 'CacheCoherence.log').write_text(result.stdout + result.stderr)
+    assert result.returncode == 0 and 'PASS' in result.stdout, result.stdout + result.stderr
+    negative = []
+    if mutations:
+        original = modules['DitDahA1DataCache'].read_text()
+        mask = re.search(r'assign probe_response_bits_mask\s*=[^;]+;', original).group()
+        word = re.search(r'assign probe_response_bits_word\s*=[^;]+;', original).group()
+        for name, before, after in (
+                ('mask-accumulation', 'storedDirty | accessMask[7:0]', 'accessMask[7:0]'),
+                ('probe-mask', mask, 'assign probe_response_bits_mask = 0;'),
+                ('probe-word', word, 'assign probe_response_bits_word = 0;')):
+            assert original.count(before) == 1
+            work = directory / ('mutation-' + name)
+            work.mkdir(exist_ok=True)
+            changed = work / 'DitDahA1DataCache.sv'
+            changed.write_text(original.replace(before, after, 1))
+            binary = work / 'CacheCoherence'
+            subprocess.run(['iverilog', '-g2012', '-s', 'contract_tb', '-o', str(binary),
+                            *map(str, [changed, *files[1:]])], check=True)
+            result = subprocess.run(['vvp', str(binary)], capture_output=True, text=True, timeout=30)
+            (work / 'simulation.log').write_text(result.stdout + result.stderr)
+            assert result.returncode != 0 and 'Architectural value from actual coherent arrays' in result.stdout, result.stdout + result.stderr
+            negative.append(dict(name=name, status='FAIL_FUNCTIONAL_VALUE', log=str(work / 'simulation.log')))
+    (directory / 'summary.json').write_text(json.dumps(dict(scope='two real caches, shared arbiter, coherence and physical protection',
+        checkerHash=hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
+        inputHashes={str(p): hashlib.sha256(p.read_bytes()).hexdigest() for p in files},
+        physicalFailures=4, physicalWrites=11, negativeControls=negative), indent=2) + '\n')
+    print('  Two-cache dirty ownership, masked recall, failed writeback and replacement passed', flush=True)
+
+
+def bench(module, body):
+    declarations, connections, names = [], [], []
+    for direction, width, name in module_ports(module):
         initial = (" = 3" if name == 'privilege' else " = 1" if name == 'wfiLegal' or name.endswith(('_privileged', '_response_bits_last')) else " = '0") if direction == 'input' else ''
         declarations.append(f'  logic {width} {name}{initial};')
         connections.append(f'.{name}({name})')
@@ -3251,7 +3683,7 @@ def verify(rtl, directory, modules=None):
                 dependencies.append(rtl / 'DitDahA1ReadQueue.sv')
         if name == 'DitDahA1DataCache':
             dependencies = [rtl / file for file in (rtl / 'filelist.f').read_text().splitlines()
-                            if file.startswith(('data_', 'dataTags_', 'mem_'))]
+                            if file.startswith(('data_', 'dataTags_', 'dataDirty_', 'mem_'))]
         if name == 'DitDahA1Backend':
             dependencies = [rtl / ('DitDahA1' + child + '.sv') for child in ('Decode', 'Issue', 'Execute', 'Multiply', 'Commit', 'Gpr', 'Csr', 'Lsu')]
         if enabled and name in ('DitDahA1Fetch', 'DitDahA1Lsu', 'DitDahA1Frontend', 'DitDahA1Backend'):
@@ -3265,4 +3697,9 @@ def verify(rtl, directory, modules=None):
         assert result.returncode == 0 and 'PASS' in result.stdout, result.stdout + result.stderr
         print(f'  {name} interface contracts passed', flush=True)
         verified.append(name)
+    if (parameters.get('dCacheWriteback') and parameters['hartCount'] == 2 and
+            parameters['dCacheRefillBytes'] == 8 and
+            (not modules or {'DitDahA1DataCache', 'DitDahA1Coherence'} <= set(modules))):
+        verify_cache_coherence(rtl, rtl, directory / 'cache-coherence', mutations=True)
+        verified.append('CacheCoherence')
     return verified

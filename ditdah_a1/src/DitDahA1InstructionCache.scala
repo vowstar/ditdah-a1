@@ -68,6 +68,7 @@ object DitDahA1InstructionCache extends Generator[DitDahA1Parameter, DitDahA1Uni
     down.request.bits.privileged := privileged.getOrElse(true.B)
     down.request.bits.atomic := false.B
     down.request.bits.atomicOperation := 0.U(5)
+    down.request.bits.cacheOperation := 0.U(2)
     down.request.bits.scEligible := false.B
     down.request.bits.refillSize := 0.U(3)
     down.response.ready := state === 4.U(3)

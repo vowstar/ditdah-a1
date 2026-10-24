@@ -162,6 +162,7 @@ object DitDahA1Translation extends Generator[DitDahA1Parameter, DitDahA1UnitLaye
     read.bits.privileged := true.B
     read.bits.atomic := false.B
     read.bits.atomicOperation := 0.U(5)
+    read.bits.cacheOperation := 0.U(2)
     read.bits.scEligible := false.B
     read.bits.refillSize := 0.U(3)
     response.ready := state === 3.U(3)

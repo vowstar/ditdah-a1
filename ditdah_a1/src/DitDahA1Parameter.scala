@@ -15,6 +15,7 @@ case class DitDahA1Parameter(
   iCacheBytes: Int = 32768,
   dCacheBytes: Int = 32768,
   dCacheRefillBytes: Int = 8,
+  dCacheWriteback: Boolean = false,
   l2CacheBytes: Int = 262144,
   axiDataBits: Int = 128,
   pmpEntries: Int = 16,
@@ -86,6 +87,7 @@ case class DitDahA1Parameter(
 
   def validateFabric(): Unit =
     validateReadSlots()
+    require(!dCacheWriteback || dCacheBytes == 8192, "Writeback requires an 8192-byte data cache")
     localInterruptBase.foreach { base =>
       require(enableInterrupts, "Local interrupt sources require machine interrupts")
       require(base >= 0 && (base & 65535) == 0 && base + 65536 <= (BigInt(1) << physicalAddressBits), "Local interrupt window must be aligned and fit the physical address space")

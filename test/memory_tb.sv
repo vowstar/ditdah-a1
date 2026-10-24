@@ -9,6 +9,7 @@ typedef struct packed {
   logic [4:0] atomicOperation;
   logic scEligible;
   logic [2:0] refillSize;
+  logic [1:0] cacheOperation;
 } request_t;
 typedef struct packed { logic [63:0] data; logic fault; logic [7:0] tag; logic last; } response_t;
 interface memory_port;
@@ -24,6 +25,7 @@ endinterface
   .P``_request_bits_fetch(B.request.fetch), .P``_request_bits_atomic(B.request.atomic), \
   .P``_request_bits_privileged(B.request.privileged), \
   .P``_request_bits_atomicOperation(B.request.atomicOperation), .P``_request_bits_scEligible(B.request.scEligible), \
+  .P``_request_bits_cacheOperation(B.request.cacheOperation), \
   .P``_request_bits_refillSize(B.request.refillSize), .P``_response_ready(B.response_ready), \
   .P``_response_valid(B.response_valid), .P``_response_bits_data(B.response.data), \
   .P``_response_bits_fault(B.response.fault), .P``_response_bits_tag(B.response.tag), .P``_response_bits_last(B.response.last)
@@ -116,7 +118,7 @@ module memory_tb;
       if (core_port[p].request_valid && !core_port[p].request_ready) stalls <= stalls + 1;
       if (core_port[p].request_valid && core_port[p].request_ready) begin
         if (core_pending[p]) $fatal(1, "Overlapping requests on one port");
-        if (core_port[p].request.fetch != (p == 0) ||
+        if (core_port[p].request.cacheOperation != 0 || core_port[p].request.fetch != (p == 0) ||
             (p == 0 ? (core_port[p].request.size != 2 && core_port[p].request.size != 6) : core_port[p].request.size > 3) ||
             core_port[p].request.mask != (core_port[p].request.write ? ((1 << (1 << core_port[p].request.size)) - 1) : 0) ||
             (p == 0 && (core_port[p].request.write || core_port[p].request.atomic)) ||

@@ -18,7 +18,7 @@ The executable RTL supports one to sixteen RV64 harts, M or optional M/U and M/S
 PMP is configurable to zero or sixteen entries per hart; the default uncached configuration omits it.
 MUL uses an iterative resource; accepted operations retain their instruction owner through completion or cancellation draining.
 Branches recover in EX while retaining older work; `enableBranchPrediction` enables static backward-branch and direct-jump prediction.
-The manifest lists implemented instructions; Sv48, writeback caches and shared L2 remain design targets.
+The manifest lists implemented instructions; Sv48 and shared L2 remain design targets.
 Core composes Frontend and Backend; Frontend owns PC sequencing and Backend owns execution and retirement.
 Non-fault Backend packets contain four-byte instructions and word-aligned PCs; producers supply fetch faults.
 Core exposes separate instruction/data memory ports; the physical fabric owns shared arbitration and AXI.
@@ -50,15 +50,15 @@ Add `--trace` to retain the separate DV bind files.
 The default physical map is 64 KiB of RAM at zero; configure regions for the intended system.
 Set a region's `atomic` flag only for readable, writable, non-device memory with end-to-end exclusive monitoring of every competing writer.
 The flag defaults to false; unsupported exclusive reads and bus errors fault without rollback guarantees.
-Failed AMO writes retry; SC returns a status without retry.
-AMO completion requires eventual bus responses and successful exclusive access; contention can delay all harts on the shared fabric.
+Failed AMO writes retry; SC returns a status without retry. AMO completion requires eventual bus responses and successful exclusive access; contention can delay all harts on the shared fabric.
 Set `iCacheBytes` to zero for bypass or a power of two from 8 to 64 KiB for a blocking, direct-mapped instruction cache with 64-byte lines.
 Instruction refills use individually authorized four-byte requests; non-demand refill faults fall back to the original demand.
 Set `enableBurstRefill` with an instruction cache for protected 64-byte INCR refills; denial or line errors retry the original scalar demand without installing a line.
-Set `dCacheBytes` to 8192 for private write-through caches on `dataCacheable` non-device regions; zero bypasses them.
-Ordinary loads use eight-byte sectors; narrow refills require full-word permission. Successful ordinary writes update existing local bytes and invalidate peer copies; misses do not allocate, and atomic writes invalidate all copies.
+Set `dCacheBytes` to 8192 for private caches on `dataCacheable` non-device regions; zero bypasses them.
+Ordinary loads use eight-byte sectors; narrow refills require full-word permission. Write-through stores update existing bytes after successful completion; store misses do not allocate.
 `dCacheRefillBytes` defaults to 8; set it to 64 for protected whole-line refills independent of I-cache. Expanded-read errors drain and retry the original demand without installing a partial line.
-External writers require platform coordination; no DMA coherence is implemented.
+Set `dCacheWriteback` for dirty-byte tracking, ownership probes and masked writeback; errors retain dirty data and retry. Ordinary writes invalidate peer copies, and atomic operations invalidate all copies.
+Writeback cacheable service is serialized and uses privileged maintenance writes for previously authorized dirty bytes; new demands retain their protection checks. External writers require platform coordination; no DMA coherence is implemented.
 Set `pmpEntries` to 16 to enable protection; successful PMP writes restart younger execution while accepted fetches drain.
 Set `enableUserMode` for Bare M/U execution and effective data privilege via MPRV.
 Set `enableSupervisorMode` with user mode and interrupts for M/S/U, standard trap delegation and SRET.
@@ -69,8 +69,7 @@ System interrupt inputs are indexed by hart; each hart has independent CSR and P
 An optional `localInterruptBase` maps protected software-interrupt and 64-bit timer registers; `timeTick` supplies the synchronous timebase.
 All harts share the reset vector and read their index from `mhartid`; standalone Core and Backend integrations must hold `hartId` constant.
 
-`make verify-signoff` checks standalone Core and AXI integration against the same instruction model,
-tests interface and component-configuration contracts, lints the five production tops, and proves execution/transaction safety.
+`make verify-signoff` checks standalone Core and AXI integration against the same instruction model, tests interface and component-configuration contracts, lints the five production tops, and proves execution/transaction safety.
 Formal checks cover Fetch cancellation, multiply ownership and zero/unit operands, and Backend ownership with an abstract resource.
 Enabled configurations additionally check PMP decisions, CSR locks, and cancellation/ownership with abstract authorization.
 Interrupt checks cover CSR eligibility, saved PC, transaction ownership, and independently modeled architectural events.

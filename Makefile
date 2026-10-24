@@ -4,6 +4,7 @@
 .PHONY: config check rtl software verify-software verify-data-software verify-supervisor-software zephyr verify-zephyr verify-zephyr-long verify-signoff verify-simulation verify-production verify-cache verify-platform verify-user verify-data-cache verify-supervisor verify-formal verify-scalar-formal verify-user-formal verify-data-formal verify-supervisor-formal verify-translation verify-translation-formal verify-translation-software verify-translation-cache verify-translation-cache-formal verify-translation-cache-software clean
 .PHONY: verify-burst verify-burst-formal verify-burst-software verify-widths verify-width-software
 .PHONY: verify-data-line verify-data-line-software verify-read-capacity verify-read-software
+.PHONY: verify-writeback verify-writeback-software
 
 HART_COUNTS ?= 2 3 15 16
 ICACHE_CASES := pipeline_reuse pipeline_integer_stream pipeline_dependency_stream pipeline_dependency_chain cache_replacement fence_ordering fence_i_prefetch synchronization atomic_ordering atomic_denied atomic_retry bus_fetch pipeline_redirect pmp_fetch pmp_update interrupt_fence interrupt_fence_i interrupt_fetch_fault
@@ -66,10 +67,24 @@ verify-zephyr: zephyr
 verify-zephyr-long:
 	for count in 1 2 16; do $(MAKE) verify-zephyr SOFTWARE_HARTS=$$count || exit $$?; done
 
-verify-signoff: verify-formal
+verify-signoff: verify-writeback verify-formal
 	$(MAKE) verify-widths
 	$(MAKE) verify-data-line
 	$(MAKE) verify-read-capacity
+
+verify-writeback:
+	for profile in 2:64:1:8 2:128:2:64 16:512:3:64; do \
+		count=$${profile%%:*}; rest=$${profile#*:}; bus=$${rest%%:*}; rest=$${rest#*:}; width=$${rest%%:*}; span=$${rest#*:}; \
+		python3 test/verify.py --multicore-only --harts $$count --width $$bus --issue-width $$width --pmp-entries 16 --icache-bytes 8192 --burst-refill --dcache-bytes 8192 --dcache-refill-bytes $$span --dcache-writeback --output result/writeback-harts$$count-axi$$bus --case data_coherence --case synchronization --case cache_reservation --case atomic_lrsc_shared --case atomic_interrupt || exit $$?; \
+		python3 test/formal.py --rtl result/writeback-harts$$count-axi$$bus/harts$$count-axi$$bus/rtl --output result/formal/writeback-harts$$count-axi$$bus --modules DataCacheWriteback Coherence MemoryArbiter MemoryFabric || exit $$?; \
+	done
+	python3 test/verify.py --sv39 --tlb-entries 4 --width 256 --issue-width 2 --pmp-entries 16 --icache-bytes 8192 --burst-refill --dcache-bytes 8192 --dcache-refill-bytes 64 --dcache-writeback --output result/writeback-translation --case sv39_context --case sv39_reuse --case sv39_protection --case sv39_sum --case sv39_mxr
+	python3 test/verify.py --user-mode --interrupts --width 512 --pmp-entries 16 --dcache-bytes 8192 --dcache-writeback --output result/writeback-protection --case user_mprv --case pmp_update --case pmp_permissions --case interrupt_read_pending --case synchronization
+	$(MAKE) verify-writeback-software
+
+verify-writeback-software:
+	python3 test/verify.py --software-refill-matrix --config $(SOFTWARE_CONFIG) --icache-bytes 8192 --burst-refill --dcache-bytes 8192 --dcache-writeback --issue-width 3 --output $(SOFTWARE_OUTPUT)/writeback --jobs $(SOFTWARE_JOBS)
+	$(MAKE) verify-translation-software SOFTWARE_CONFIG=$(SOFTWARE_OUTPUT)/writeback/r64-h16/input.json SOFTWARE_TLB_ENTRIES=4 SOFTWARE_CACHE_SIZES=8192 SOFTWARE_BURST_REFILL=--burst-refill TRANSLATION_SOFTWARE_DIR=writeback-sv39
 
 verify-read-capacity:
 	for profile in 2:1:64:1 2:2:64:1 3:3:128:2 16:4:256:2 16:4:512:3; do \

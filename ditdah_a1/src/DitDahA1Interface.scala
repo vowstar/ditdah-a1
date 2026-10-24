@@ -48,6 +48,7 @@ class AxiBundle(parameter: DitDahA1Parameter) extends Bundle:
   val r = Flipped(new Decoupled(new AxiRead(parameter)))
 
 class MemoryRequest extends Bundle:
+  val cacheOperation = Aligned(UInt(2))
   val address = Aligned(UInt(64))
   val data = Aligned(UInt(64))
   val size = Aligned(UInt(3))
@@ -69,6 +70,17 @@ class MemoryResponse(dataBits: Int = 64, countBits: Int = 0) extends Bundle:
 class MemoryPort extends Bundle:
   val request = Aligned(new Decoupled(new MemoryRequest))
   val response = Flipped(new Decoupled(new MemoryResponse))
+class CacheProbeRequest extends Bundle:
+  val address = Aligned(UInt(64))
+  val invalidate = Aligned(Bool())
+class CacheProbeResponse extends Bundle:
+  val data = Aligned(UInt(64))
+  val mask = Aligned(UInt(8))
+  val word = Aligned(UInt(3))
+  val last = Aligned(Bool())
+class CacheProbePort extends Bundle:
+  val request = Aligned(new Decoupled(new CacheProbeRequest))
+  val response = Flipped(new Decoupled(new CacheProbeResponse))
 class InstructionCachePort(parameter: DitDahA1Parameter) extends Bundle:
   val request = Aligned(new Decoupled(new MemoryRequest))
   val response = Flipped(new Decoupled(new MemoryResponse(math.max(64, 32 * parameter.fetchWords),
@@ -206,7 +218,7 @@ class DitDahA1FrontendIO(parameter: DitDahA1Parameter) extends HWBundle(paramete
   val memory = Aligned(new MemoryPort)
 
 class DitDahA1MemoryFabricIO(parameter: DitDahA1Parameter) extends HWBundle(parameter):
-  val invalidate = Option.when(parameter.dCacheBytes != 0)(Aligned(Vec(parameter.hartCount, new Decoupled(UInt(64)))))
+  val probe = Option.when(parameter.dCacheBytes != 0)(Aligned(Vec(parameter.hartCount, new CacheProbePort)))
   val timeTick = Option.when(parameter.localInterruptBase.nonEmpty)(Flipped(Bool()))
   val localInterrupts = Option.when(parameter.localInterruptBase.nonEmpty)(Aligned(Vec(parameter.hartCount, new InterruptBundle)))
   val clock = Flipped(Clock())

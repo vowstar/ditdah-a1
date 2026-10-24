@@ -34,6 +34,7 @@ module core_tb;
     logic [4:0] atomicOperation;
     logic scEligible;
     logic [2:0] refillSize;
+    logic [1:0] cacheOperation;
   } core_request_t;
   typedef struct packed { logic [63:0] data; logic fault; logic [7:0] tag; logic last; } core_response_t;
   core_request_t requests[2*HARTS];
@@ -42,7 +43,8 @@ module core_tb;
   wire [HARTS-1:0] multiply_busy;
   logic [HARTS-1:0] finished = 0;
   integer bus_owner = 0, active_source[HARTS], completed_transactions = 0;
-  core_request_t accepted_request[HARTS];
+  core_request_t accepted_request[HARTS], writeback_request;
+  logic writeback_pending = 0;
   initial for (integer h = 0; h < HARTS; h++) active_source[h] = -1;
   `include "core_bindings.svh"
   logic clock = 0;
@@ -342,7 +344,7 @@ module core_tb;
       if (awvalid && awready) begin
         if (!console_address(64'(awaddr)) && (64'(awaddr) < base_address || 64'(awaddr) + (1 << awsize) > base_address + MB)) $fatal(1, "Truncated or unexpected write address");
         if (awid >= HARTS || active_source[awid] < 0 || awid != IDW'(bus_owner / 2) || awlen != 0 || awsize > 3 || (awlock && awsize != 3) ||
-            awburst != 1 || awcache != 0 || awprot != {2'b0, accepted_request[awid].privileged} || awqos != 0 ||
+            awburst != 1 || awcache != 0 || awprot != (writeback_pending ? 3'b001 : {2'b0, accepted_request[awid].privileged}) || awqos != 0 ||
             (awaddr & ((1 << awsize) - 1)) != 0) $fatal(1, "Write attributes");
         aw_held <= 1;
         write_address <= 64'(awaddr);
@@ -360,10 +362,11 @@ module core_tb;
       end
       if (awvalid && awready && wvalid && wready) together <= together + 1;
       if (aw_held && w_held && !write_pending && !bvalid) begin
-        if (write_mask != ((DW/8)'((1 << (1 << write_size)) - 1) << (write_address % (DW/8)))) $fatal(1, "Write strobes");
+        if (write_mask != ((DW/8)'(writeback_pending ? writeback_request.mask : (1 << (1 << write_size)) - 1) << (write_address % (DW/8)))) $fatal(1, "Write strobes");
         if (HARTS > 1) $write("HART %0d ", bus_owner / 2);
-        $display("BUS %s %016h %0d %016h", write_exclusive ? "exclusive_write" : "write", write_address,
-          1 << write_size, 64'(write_data >> (8 * (write_address % (DW/8)))) & access_mask(write_size));
+        $display("BUS %s %016h %0d %016h %02h", writeback_pending ? "writeback" : write_exclusive ? "exclusive_write" : "write", write_address,
+          1 << write_size, 64'(write_data >> (8 * (write_address % (DW/8)))) & access_mask(write_size),
+          8'(write_mask >> (write_address % (DW/8))));
         if (console_address(write_address) && write_address != fault_write) begin
           if (write_size != 2 || write_exclusive || write_address != console_base + 4 * (bus_owner / 2)) $fatal(1, "Console access ownership");
           if ((write_data >> (8 * (write_address % (DW/8)))) & 32'hffffff80) $fatal(1, "Console requires ASCII");
@@ -444,7 +447,8 @@ module core_tb;
             if (console_lines[h] != "") $fatal(1, "Incomplete console line");
             result_value = 0;
             for (integer i = 0; i < 8; i++) result_value[i*8 +: 8] = memory[integer'(results_address - base_address) + 8 * h + i];
-            $display("RESULT %0d %016h", h, result_value);
+            if (WRITEBACK_RESULTS) $display("PHYSICAL_RESULT %0d %016h", h, result_value);
+            $display("RESULT %0d %016h", h, coherent_result(results_address + 8 * 64'(h), result_value));
           end
           $fclose(console_file);
         end
@@ -475,11 +479,11 @@ module core_tb;
         accepted_request[source / 2] = requests[source];
         if (exclusive_request(requests[source])) bus_owner <= source;
         if (HARTS > 1) $write("HART %0d ", source / 2);
-        $display("REQUEST %s %016h %0d %016h %02h",
+        $display("REQUEST %s %016h %0d %016h %02h %01h",
           requests[source].atomic ? "atomic" : (source % 2 == 0 ? "fetch" : (requests[source].write ? "write" : "read")),
           requests[source].address, 1 << requests[source].size,
           requests[source].write ? requests[source].data & access_mask(requests[source].size) : 64'b0,
-          requests[source].tag);
+          requests[source].tag, requests[source].cacheOperation);
         if (HARTS > 1) $write("HART %0d ", source / 2);
         $display("ACCESS_PRIVILEGE %01h", requests[source].privileged);
         if (requests[source].atomic) begin
