@@ -1249,6 +1249,7 @@ def check_multicore(lines, config, program, name, atomic_metadata=False, softwar
             assert data_cache and config.get('dCacheRefillBytes', 8) == 64 and 0 <= recipient < harts and cycle >= 0, 'Invalid cache invalidation recipient'
             writers = [owner for owner in owners if invalidating_write(owner) and owner['event'][1] == address]
             assert len(writers) == 1, 'Invalidation lacks a unique accepted CPU write'
+            assert writers[0]['event'][0] == 'atomic' or recipient != writers[0]['hart'], 'Ordinary writer invalidated its retained copy'
             recipients = writers[0].setdefault('invalidated', set())
             assert recipient not in recipients and not writers[0]['bus'], 'Duplicate or late write invalidation'
             recipients.add(recipient)
@@ -1483,7 +1484,8 @@ def check_multicore(lines, config, program, name, atomic_metadata=False, softwar
             axi_transactions += 1
             event = fields[1], int(fields[2], 16), int(fields[3]), int(fields[4], 16)
             if config.get('dCacheRefillBytes', 8) == 64 and invalidating_write(active):
-                assert active.get('invalidated') == set(range(harts)), 'CPU write escaped cache invalidation broadcast'
+                targets = set(range(harts)) - ({hart} if active['event'][0] == 'write' else set())
+                assert active.get('invalidated', set()) == targets, 'CPU write escaped required cache invalidations'
             assert device is None or not device.base <= event[1] < device.base + 65536, 'Platform request escaped to AXI'
             if event[0] in ('exclusive_read', 'exclusive_write'):
                 assert active and active['hart'] == hart and active['event'][0] == 'atomic'

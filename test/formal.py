@@ -2741,6 +2741,8 @@ def data_cache_case(parameters):
          "(cache_retried ? 0 : cache_line ? 6 : cache_expanded ? 3 : request_refillSize)" if field == 'refillSize' else f"request_{field}") + ");"
         for field in fields)
     current_ranges = ranges.replace('upstream_request_bits_address', 'request_address')
+    writable = ' || '.join(f"(upstream_request_bits_address >= 64'h{int(r['base']):x} && upstream_request_bits_address <= 64'h{int(r['base'])+int(r['size']):x} - (64'd1 << upstream_request_bits_size))"
+                          for r in parameters['memoryRegions'] if r['writable'])
     body = f'''
   reg cache_past = 0, cache_owned, cache_bus, cache_sent, cache_finished, cache_killed, cache_eligible;
   reg [159:0] cache_request;
@@ -2748,6 +2750,8 @@ def data_cache_case(parameters):
   reg [7:0] cache_tag;
   reg cache_fault, cache_same_tag, cache_expanded, cache_retried;
   reg cache_line, cache_stream_fault;
+  reg cache_store, cache_store_hit;
+  reg [63:0] cache_store_word;
   reg [3:0] cache_beats;
   reg [63:0] cache_line_result;
   reg [2:0] cache_size;
@@ -2765,17 +2769,31 @@ def data_cache_case(parameters):
   wire cache_line_write = cache_reply && cache_line && cache_beats < 8 && !cache_stream_fault &&
     !cache_killed && !cache_collision && !cache_line_error;
   wire cache_publish = cache_line_write && cache_beats == 7 && downstream_response_bits_last;
+  wire cache_store_write = cache_reply && cache_store_hit && !cache_error && !cache_killed && !cache_collision;
+  wire cache_store_failed = cache_reply && request_write && cache_error;
+  wire [63:0] cache_store_mask;
+  for (genvar byte_index = 0; byte_index < 8; byte_index = byte_index + 1) begin
+    assign cache_store_mask[8 * byte_index +: 8] = byte_index >= cache_address[2:0] &&
+      request_mask[byte_index - cache_address[2:0]] ? 8'hff : 8'h00;
+  end
+  wire [63:0] cache_store_data = (cache_store_word & ~cache_store_mask) |
+    ((request_data << (8 * cache_address[2:0])) & cache_store_mask);
   wire cache_start_line = state == 1 && !cache_sample && cache_line;
   wire [63:0] cache_mask = cache_size == 0 ? 64'hff : cache_size == 1 ? 64'hffff : cache_size == 2 ? 64'hffffffff : 64'hffffffffffffffff;
   wire [63:0] cache_hit_data = (CACHE_READ >> (8 * cache_address[2:0])) & cache_mask;
   wire [63:0] cache_fill_data = (downstream_response_bits_data >> (8 * cache_address[2:0])) & cache_mask;
-  wire cache_clear_watched = cache_invalidate && invalidate_bits[{index+5}:6] == cache_watched[{sector-1}:3];
+  wire cache_clear_watched = (cache_invalidate && invalidate_bits[{index+5}:6] == cache_watched[{sector-1}:3]) ||
+    (cache_store_failed && cache_address[{index+5}:6] == cache_watched[{sector-1}:3]);
   wire cache_expected_valid = !cache_clear_watched &&
     ((cache_publish && cache_address[{index+5}:6] == cache_watched[{sector-1}:3]) ||
      (cache_word_write && cache_address[{index+5}:3] == cache_watched) ||
       (valid[cache_watched] && !((cache_start_line || (cache_word_write && !cache_same_tag)) && cache_address[{index+5}:6] == cache_watched[{sector-1}:3])));
   wire cache_input_eligible = !upstream_request_bits_write && !upstream_request_bits_fetch && !upstream_request_bits_atomic &&
     upstream_request_bits_size <= 3 && (upstream_request_bits_address & ((64'd1 << upstream_request_bits_size)-1)) == 0 && ({ranges or '0'});
+  wire cache_input_store = upstream_request_bits_write && !upstream_request_bits_fetch && !upstream_request_bits_atomic &&
+    upstream_request_bits_size <= 3 && (upstream_request_bits_address & ((64'd1 << upstream_request_bits_size)-1)) == 0 &&
+    upstream_request_bits_mask != 0 && (upstream_request_bits_mask >> (1 << upstream_request_bits_size)) == 0 &&
+    ({ranges or '0'}) && ({writable or '0'});
   wire cache_input_line = {int(data_line)} && cache_input_eligible && upstream_request_bits_refillSize == 6 && ({line_ranges or '0'});
   wire cache_request_line = {int(data_line)} && cache_eligible && request_refillSize == 6 && ({line_ranges.replace('upstream_request_bits_address', 'request_address') or '0'});
   always @(posedge clock) begin
@@ -2797,6 +2815,9 @@ def data_cache_case(parameters):
       if (cache_owned) begin
         assert({payload('request')} == cache_request);
         assert(request_address == cache_address && request_tag == cache_tag && request_size == cache_size);
+        assert(cache_store == (request_write && !request_fetch && !request_atomic && request_size <= 3 &&
+          (request_address & ((64'd1 << request_size)-1)) == 0 && request_mask != 0 && (request_mask >> (1 << request_size)) == 0 &&
+          ({current_ranges or '0'}) && ({writable.replace('upstream_request_bits_', 'request_') or '0'})));
         assert(cache_eligible == (!request_write && !request_fetch && !request_atomic && request_size <= 3 &&
           (request_address & ((64'd1 << request_size)-1)) == 0 && ({current_ranges or '0'})));
         if (cache_expanded) assert(cache_eligible && (request_refillSize == 3 || request_refillSize == 6) && cache_size < 3 && !cache_retried);
@@ -2806,11 +2827,17 @@ def data_cache_case(parameters):
       end
       if (state == 1) cache_same_tag <= _dataTags_ext_R0_data == cache_address[{parameters['physicalAddressBits']-1}:{index+6}];
       if (state == 1) begin
+        cache_store_hit <= cache_store && valid[cache_address[{index+5}:3]] &&
+          _dataTags_ext_R0_data == cache_address[{parameters['physicalAddressBits']-1}:{index+6}] && !cache_killed && !cache_collision;
+        cache_store_word <= CACHE_READ;
         assert(!fault && !expanded && !cache_retried && cache_line == cache_request_line);
         assert(cache_expanded == (cache_eligible && !cache_line && cache_size < 3 && (request_refillSize == 3 || request_refillSize == 6)));
       end
       if (state >= 2) begin
         assert(sameTag == cache_same_tag && expanded == cache_expanded);
+        assert(storeHit == cache_store_hit);
+        if (cache_store_hit) assert(cache_store && request_write && !cache_eligible && !cache_line && !cache_expanded);
+        if (cache_store_hit && state != 4) assert(data == cache_store_word);
       end
       if (!cache_line && (state == 2 || state == 3)) assert(fault == cache_retried);
       if (downstream_request_valid) begin
@@ -2850,11 +2877,11 @@ def data_cache_case(parameters):
         assert(valid[cache_address[{index+5}:3]] && _dataTags_ext_R0_data == cache_address[{parameters['physicalAddressBits']-1}:{index+6}]);
         cache_finished <= 1; cache_result <= cache_hit_data; cache_fault <= 0; cache_expanded <= 0; cache_line <= 0;
       end
-      assert(filling_0 == (cache_word_write || cache_line_write));
+      assert(filling_0 == (cache_word_write || cache_line_write || cache_store_write));
       assert(CACHE_TAG_WRITE == (cache_word_write || cache_publish));
       if (filling_0) begin
         assert(CACHE_WRITE_ADDRESS == (cache_line ? {{cache_address[{index+5}:6], cache_beats[2:0]}} : cache_address[{index+5}:3]));
-        assert(CACHE_WRITE_DATA == downstream_response_bits_data);
+        assert(CACHE_WRITE_DATA == (cache_store_write ? cache_store_data : downstream_response_bits_data));
       end
       if (upstream_response_valid) begin
         assert(cache_owned && (cache_finished || cache_sample) && !cache_bus && !downstream_request_valid);
@@ -2868,6 +2895,7 @@ def data_cache_case(parameters):
         cache_owned <= 1; cache_request <= {payload('upstream_request_bits')};
         cache_address <= upstream_request_bits_address; cache_tag <= upstream_request_bits_tag;
         cache_size <= upstream_request_bits_size; cache_eligible <= cache_input_eligible;
+        cache_store <= cache_input_store;
         cache_expanded <= cache_input_eligible && !cache_input_line && upstream_request_bits_size < 3 && (upstream_request_bits_refillSize == 3 || upstream_request_bits_refillSize == 6);
         cache_line <= cache_input_line; cache_beats <= 0; cache_stream_fault <= 0;
         cache_bus <= 0; cache_sent <= 0; cache_finished <= 0; cache_retried <= 0;
@@ -2899,6 +2927,9 @@ def data_cache_case(parameters):
       cover(upstream_response_valid && !upstream_response_ready && cache_invalidate);
       cover(upstream_response_valid && cache_fault);
       cover(cache_reply && !cache_eligible && request_atomic);
+      cover(cache_store_write && cache_size < 3);
+      cover(cache_reply && cache_store_hit && cache_killed && !cache_error);
+      cover(cache_store_failed && cache_store_hit);
     end
   end
 '''
@@ -2943,13 +2974,14 @@ def coherence_case(parameters):
   wire [{count-1}:0] coherent_valid = {vector('valid')};
   wire [{count-1}:0] coherent_ready = {vector('ready')};
   wire coherent_write = upstream_request_bits_write && ({ranges or '0'});
+  wire [{count-1}:0] coherent_skip = upstream_request_bits_atomic ? 0 : ({count}'d1 << hartId);
   always @(posedge clock) begin
     coherent_past <= 1;
     if (!coherent_past) assume(reset); else assume(!reset);
     if (reset) begin coherent_started <= 0; coherent_completed <= 0; coherent_bus <= 0; end
     else begin
       if ($past(!reset && upstream_request_valid && !upstream_request_ready)) begin
-        assume(upstream_request_valid); assume($stable({payload('upstream_request')}));
+        assume(upstream_request_valid); assume($stable({{{payload('upstream_request')}, hartId}}));
       end
       assume(!downstream_response_valid || coherent_bus);
       assume(!upstream_request_valid || !coherent_bus);
@@ -2958,10 +2990,10 @@ def coherence_case(parameters):
       if (coherent_started) assert(upstream_request_valid && coherent_write && !coherent_bus);
       if (coherent_started) assert(coherent_valid == ~coherent_completed);
       else assert(coherent_valid == 0);
-      if (upstream_request_valid && coherent_write && !coherent_started && !coherent_bus) begin
-        coherent_started <= 1; coherent_completed <= 0;
-      end
       coherent_completed <= coherent_completed | (coherent_valid & coherent_ready);
+      if (upstream_request_valid && coherent_write && !coherent_started && !coherent_bus) begin
+        coherent_started <= 1; coherent_completed <= coherent_skip;
+      end
       assert((upstream_request_valid && upstream_request_ready) == (downstream_request_valid && downstream_request_ready));
       if (downstream_request_valid) begin
         assert(upstream_request_valid && !coherent_bus);
@@ -2981,6 +3013,7 @@ def coherence_case(parameters):
       cover(downstream_request_valid && coherent_write && !downstream_request_ready);
       cover(downstream_request_valid && !coherent_write);
       cover(downstream_response_valid && !upstream_response_ready);
+      cover(downstream_request_valid && coherent_write && !upstream_request_bits_atomic && hartId == {count-1});
 '''
     for hart in range(count):
         body += f'''      if (invalidate_{hart}_valid) assert(invalidate_{hart}_bits == upstream_request_bits_address);
@@ -4534,11 +4567,19 @@ def verify(rtl, directory, modules=None):
             checks += [('mutation-bank-read', read, read.replace('(', "(1'h0 & (", 1) + ')'),
                        ('mutation-count', count, 'assign upstream_response_bits_count = 1;')]
         if unit == 'DataCache':
+            original = sources[module + '.sv']
+            store_update = re.search(r'wire\s+storeUpdating\s*=[^;]+;', original).group()
+            store_data = re.search(r'\bdata & ~\(storeMask\[63:0\]\)[^\n]+', original).group()
+            store_failure = 'storeComplete & responseFault'
+            checks += [('mutation-store-update', store_update, store_update.replace('storeHit', "1'h0")),
+                       ('mutation-store-mask', store_data, store_data.replace('storeMask[63:0]', "64'hffffffffffffffff")),
+                       ('mutation-store-invalidate', store_update, store_update.replace('~invalidated', "1'h1")),
+                       ('mutation-store-error', store_failure, store_failure.replace('responseFault', "1'h0"))]
             retry = re.search(r'wire\s+\w+\s*=\s*expanded & responseFault;', sources[module + '.sv']).group()
             expanded_update, = [update for update in re.findall(r'expanded <=[^;]+;', sources[module + '.sv']) if 'request_refillSize' in update]
             checks += [('mutation-refill-permission', expanded_update, re.sub(r'\(request_refillSize == 3\x27h3 \| (?:\w+|request_refillSize == 3\x27h6)\)', "1'h1", expanded_update)),
                        ('mutation-refill-retry', retry, retry.replace('expanded & responseFault', "1'h0")),
-                       ('mutation-read-offset', "request_address[2:0], 3'h0", "3'h0, 3'h0")]
+                       ('mutation-read-offset', "{58'h0, request_address[2:0], 3'h0}", "64'h0")]
             write_enable = re.search(r'\.W0_en\s*\([^\n]+\)', data_ports[0][0]).group()
             checks += [('mutation-hold', 'assign downstream_request_valid =',
                         'assign downstream_request_valid = ~invalidate_valid &'),
@@ -4603,6 +4644,10 @@ def verify(rtl, directory, modules=None):
             if read_slots > 2:
                 checks.append(('mutation-capacity', 'assign empty =', f'assign empty = (state{read_suffixes[-1]} != 0) |'))
         if unit == 'Coherence':
+            target = re.search(r'wire\s+(?:\[[^]]+\]\s+)?targets\s*=[^;]+;', sources[module + '.sv'])
+            target = target.group() if target else re.findall(r'pending <=[^;]+;', sources[module + '.sv'])[-1]
+            assert 'upstream_request_bits_atomic' in target
+            checks.append(('mutation-writer', target, target.replace('upstream_request_bits_atomic', "1'h1")))
             checks += [('mutation-acknowledgement', 'assign invalidate_0_valid =',
                         "assign invalidate_0_valid = 1'h0 &"),
                        ('mutation-read-acceptance', 'assign upstream_request_ready =',
@@ -5043,6 +5088,29 @@ def verify(rtl, directory, modules=None):
                     if mode == 'mutation-count':
                         guidance += f'  always @* assume(cache_scenario == 0 && upstream_request_bits_size == {banks.bit_length()+1} && upstream_request_bits_tag == 0);\n'
                     text = text.replace('endmodule', guidance + '\nendmodule', 1)
+                if unit == 'DataCache' and mode.startswith('mutation-store-') and filename == module + '.sv':
+                    base = min(int(r['base']) for r in manifest['parameters']['memoryRegions'] if r.get('dataCacheable') and r['writable'])
+                    base = (base + 63) & ~63
+                    tag_shift = (manifest['parameters']['dCacheBytes'] // 64 - 1).bit_length() + 6
+                    guidance = f'''
+  reg cache_witness_store = 0;
+  always @(posedge clock) if (reset) cache_witness_store <= 0;
+  else if (upstream_response_valid && upstream_response_ready) cache_witness_store <= 1;
+  always @* begin
+    assume(upstream_request_valid && upstream_response_ready && downstream_request_ready);
+    assume(upstream_request_bits_address == (cache_witness_store ? 64'h{base+3:x} : 64'h{base:x}));
+    assume(upstream_request_bits_size == (cache_witness_store ? 0 : 3) && upstream_request_bits_tag == 0);
+    assume(upstream_request_bits_write == cache_witness_store && !upstream_request_bits_fetch && !upstream_request_bits_atomic);
+    assume(upstream_request_bits_refillSize == 0 && upstream_request_bits_mask == 1 && upstream_request_bits_data == 91);
+    assume(downstream_response_valid == (cache_bus && (!cache_witness_store || {int(mode != 'mutation-store-invalidate')} || cache_killed)));
+    assume(downstream_response_bits_fault == (cache_witness_store && {int(mode == 'mutation-store-error')}) && downstream_response_bits_tag == 0);
+    assume(downstream_response_bits_last && downstream_response_bits_data == 0);
+    assume(invalidate_valid == ({int(mode == 'mutation-store-invalidate')} && cache_witness_store && cache_bus && !cache_killed));
+    assume(invalidate_bits == 64'h{base:x} && _dataTags_ext_R0_data == {base >> tag_shift});
+    assume(cache_watched == {(base >> 3) % (manifest['parameters']['dCacheBytes'] // 8)});
+  end
+'''
+                    text = text.replace('endmodule', guidance + '\nendmodule', 1)
                 if unit == 'DataCache' and mode == 'mutation-tag-lifetime' and filename == module + '.sv':
                     base = min(int(r['base']) for r in manifest['parameters']['memoryRegions'] if r.get('dataCacheable'))
                     base = (base + 63) & ~63
@@ -5268,10 +5336,10 @@ read -formal -sv {' '.join(files)}
         synchronization='raw barrier encodings, independent accepted-data ownership until retirement, sequential instruction synchronization redirect and younger flush; no data response timing assumptions' if 'SynchronizationBackend' in proved else None,
         synchronizationWitnessGuidance='cover/mutations only: port-driven zero-address SD, FENCE/FENCE.I, one request and response stall, faulted FENCE.I and quiescent interrupts; unrestricted safety proof' if 'SynchronizationBackend' in proved else None,
         instructionCache='control proof at configured geometry; arbitrary native SRAM read outputs; independent ownership, authorization, response fault/tag/last history, native write data, complete publication, invalidation and precise fallback; functional array contents require separate simulation' if 'InstructionCache' in proved else None,
-        dataCache='control safety with arbitrary native SRAM reads; independently captured requests, physical ownership, valid-sector/tag-qualified sampling, fault/tag attribution, index invalidation, segment addressing and complete publication; line mode adds saturating segment history, terminal-only ownership release and one exact fallback; functional SRAM contents require separate simulation' if 'DataCache' in proved else None,
+        dataCache='control safety with arbitrary native SRAM reads; independently captured requests, physical ownership, valid-sector/tag-qualified sampling, fault/tag attribution, index invalidation, byte-masked write-through hit updates and failed-write eviction; line mode adds saturating segment history, terminal-only ownership release and one exact fallback; functional SRAM contents require separate simulation' if 'DataCache' in proved else None,
         dataRefillProtection='largest PMA-qualified read range first, recorded grant and effective privilege, at most two narrower queries, original VA faults and no extra successful-line query; arbitrary PMP outcomes compose with concrete PMP span/priority and containment proofs' if 'Lsu' in proved and manifest['parameters'].get('dCacheRefillBytes', 8) == 64 else None,
-        dataCacheWitnessGuidance='tag-lifetime mutation uses two permitted sectors and unrelated later SRAM output; line covers use permitted first/last-sector demands, immediate service, terminal invalidation or overlong response; safety unrestricted' if 'DataCache' in proved else None,
-        coherence='broadcast completion before cacheable writes; held upstream request and one physical transaction supplied by the shared arbiter; no endpoint progress assumption or DMA coherence claim' if 'Coherence' in proved else None,
+        dataCacheWitnessGuidance='store mutations use a permitted refill followed by a byte store with success, invalidation or error; tag-lifetime mutation uses two sectors and unrelated later SRAM output; line covers use first/last-sector demands, immediate service, terminal invalidation or overlong response; safety unrestricted' if 'DataCache' in proved else None,
+        coherence='peer invalidation before ordinary cacheable writes and all-hart invalidation before atomic writes; held upstream request and writer identity with one physical transaction supplied by the shared arbiter; no endpoint progress assumption or DMA coherence claim' if 'Coherence' in proved else None,
         cacheWitnessGuidance='cover/mutations only: zero-address demand, successful service, canceled stalls, last-beat/post-fill invalidation, permission denial and demand/speculative fault scenarios; unrestricted safety proof' if 'InstructionCache' in proved else None,
         arbitration='one retained request and owner, hart identity from independent accepted requester/2 through response; at most 2N-1 other completions while continuously requesting; no bound on external service delay' if 'MemoryArbiter' in proved else None,
         interruptProgress='with eligibility held, successful matching data response reaches interrupt entry or priority synchronous trap within three cycles; memory service itself is external' if any(r['propertyGroup'] == 'InterruptBackend' for r in reports) else None,

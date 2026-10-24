@@ -55,8 +55,8 @@ AMO completion requires eventual bus responses and successful exclusive access; 
 Set `iCacheBytes` to zero for bypass or a power of two from 8 to 64 KiB for a blocking, direct-mapped instruction cache with 64-byte lines.
 Instruction refills use individually authorized four-byte requests; non-demand refill faults fall back to the original demand.
 Set `enableBurstRefill` with an instruction cache for protected 64-byte INCR refills; denial or line errors retry the original scalar demand without installing a line.
-Set `dCacheBytes` to 8192 for private read caches on `dataCacheable` non-device regions; zero bypasses them.
-Ordinary loads use eight-byte sectors; narrow refills require full-word permission. CPU writes invalidate private copies before forwarding.
+Set `dCacheBytes` to 8192 for private write-through caches on `dataCacheable` non-device regions; zero bypasses them.
+Ordinary loads use eight-byte sectors; narrow refills require full-word permission. Successful ordinary writes update existing local bytes and invalidate peer copies; misses do not allocate, and atomic writes invalidate all copies.
 `dCacheRefillBytes` defaults to 8; set it to 64 for protected whole-line refills independent of I-cache. Expanded-read errors drain and retry the original demand without installing a partial line.
 External writers require platform coordination; no DMA coherence is implemented.
 Set `pmpEntries` to 16 to enable protection; successful PMP writes restart younger execution while accepted fetches drain.

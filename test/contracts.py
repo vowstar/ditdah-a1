@@ -1468,6 +1468,29 @@ def data_cache_contract(parameters):
         body += request(base, refillSize=6) + line() + reply(values[0])
         for options in (dict(fetch=1), dict(write=1, mask=255, data=17), dict(atomic=1, atomicOperation=2)):
             body += request(base, refillSize=6, **options) + bus(17) + reply(17)
+    value = 0x123456789abcdef0
+    for width in range(4):
+        for offset in range(0, 8, 1 << width):
+            mask = (1 << (1 << width)) - 1
+            for selected in sorted({mask, mask & 0x55 or 1}):
+                byte_mask = sum(255 << (8 * byte) for byte in range(8) if selected >> byte & 1) << (8 * offset)
+                expected = (value & ~byte_mask) | ((0xfedcba9876543210 << (8 * offset)) & byte_mask)
+                body += invalidate(base) + request(base) + bus(value) + reply(value)
+                body += request(base + 8) + bus(19) + reply(19)
+                body += request(base + offset, size=width, mask=selected, write=1, data=0xfedcba9876543210)
+                body += bus(0) + reply(0)
+                body += request(base) + reply(expected)
+                body += request(base + 8) + reply(19)
+    body += invalidate(base) + request(base, write=1, mask=255, data=23) + bus(0) + reply(0)
+    body += request(base) + bus(23) + reply(23)
+    for options in ({'fault': 1}, {'wrong_tag': True}):
+        body += request(base, write=1, mask=255, data=29) + bus(0, **options) + reply(0, fault=1)
+        body += request(base) + bus(23) + reply(23)
+    for phase in ('held', 'waiting', 'response'):
+        body += request(base, write=1, mask=255, data=29) + bus(0, invalidation=phase) + reply(0)
+        body += request(base) + bus(29) + reply(29)
+    body += request(base, write=1, mask=255, data=31, invalidate_accept=True) + bus(0) + reply(0)
+    body += request(base) + bus(31) + reply(31)
     for region in parameters['memoryRegions']:
         if region['device']:
             options = {} if region['readable'] else dict(write=1, mask=255, data=14)
@@ -1481,12 +1504,13 @@ def coherence_contract(parameters):
     count = parameters['hartCount']
     base = int(next(r for r in parameters['memoryRegions'] if r.get('dataCacheable'))['base'])
     body = ''
-    for write, atomic, operation, cacheable in ((1, 0, 0, True), (1, 1, 0, True),
+    for case, (write, atomic, operation, cacheable) in enumerate(((1, 0, 0, True), (1, 0, 0, True), (1, 1, 0, True),
                                                (1, 1, 3, True), (0, 1, 2, True), (0, 0, 0, True),
-                                               (1, 0, 0, False)):
+                                               (1, 0, 0, False))):
+        writer = 0 if case == 0 else count - 1
         address = base if cacheable else 1 << parameters['physicalAddressBits']
         body += f'''    @(negedge clock);
-    upstream_request_bits_address = 64'h{address:x}; upstream_request_bits_tag = 37;
+    hartId = {writer}; upstream_request_bits_address = 64'h{address:x}; upstream_request_bits_tag = 37;
     upstream_request_bits_size = 3; upstream_request_bits_mask = {255 if write else 0};
     upstream_request_bits_write = {write}; upstream_request_bits_atomic = {atomic};
     upstream_request_bits_atomicOperation = {operation}; upstream_request_bits_data = 19;
@@ -1494,15 +1518,17 @@ def coherence_contract(parameters):
 '''
         if write and cacheable:
             body += '    tick();\n'
-            for hart in range(count):
+            targets = [hart for hart in range(count) if atomic or hart != writer]
+            for hart in targets:
                 for peer in range(count):
-                    body += f'''    check(invalidate_{peer}_valid == {int(peer >= hart)} && (!invalidate_{peer}_valid || invalidate_{peer}_bits == 64'h{address:x}), "Invalidation identity and one completion per hart");
+                    body += f'''    check(invalidate_{peer}_valid == {int(peer in targets and peer >= hart)} && (!invalidate_{peer}_valid || invalidate_{peer}_bits == 64'h{address:x}), "Invalidation identity and one completion per target");
 '''
                 body += f'''    check(!downstream_request_valid && !upstream_request_ready, "Write forwarded before every invalidation completed");
     invalidate_{hart}_ready = 1; tick(); invalidate_{hart}_ready = 0;
 '''
         else:
             body += '    #1;\n' + ''.join(f'    check(!invalidate_{hart}_valid, "Bypass generated invalidation");\n' for hart in range(count))
+        body += ''.join(f'    check(!invalidate_{hart}_valid, "Completed write has no pending invalidation");\n' for hart in range(count))
         body += f'''    repeat (3) begin
       check(downstream_request_valid && downstream_request_bits_address == 64'h{address:x} && downstream_request_bits_tag == 37 && downstream_request_bits_write == {write} && downstream_request_bits_atomic == {atomic} && downstream_request_bits_atomicOperation == {operation} && !upstream_request_ready, "Forwarded request retention"); tick();
     end

@@ -10,6 +10,7 @@ import me.jiuyang.zaozi.valuetpe.*
 class DitDahA1CoherenceIO(parameter: DitDahA1Parameter) extends HWBundle(parameter):
   val clock = Flipped(Clock())
   val reset = Flipped(Reset())
+  val hartId = Flipped(UInt(4))
   val upstream = Flipped(new MemoryPort)
   val downstream = Aligned(new MemoryPort)
   val invalidate = Aligned(Vec(parameter.hartCount, new Decoupled(UInt(64))))
@@ -26,6 +27,8 @@ object DitDahA1Coherence extends Generator[DitDahA1Parameter, DitDahA1UnitLayers
     val up = io.upstream
     val down = io.downstream
     val needsInvalidate = up.request.bits.write & DitDahA1Memory.dataCacheable(parameter, up.request.bits.address, 1)
+    val targets = (0 until parameter.hartCount).reverse.map(hart =>
+      (up.request.bits.atomic | (io.hartId =/= hart.U(4))).asBits).reduce(_ ## _)
     val permitted = !needsInvalidate | (busy & (pending === 0.B(parameter.hartCount)))
     up.request.ready := down.request.ready & permitted
     down.request.valid := up.request.valid & permitted
@@ -39,6 +42,6 @@ object DitDahA1Coherence extends Generator[DitDahA1Parameter, DitDahA1UnitLayers
     when(busy) { pending := pending & ~acknowledged }
     when(!busy & up.request.valid & needsInvalidate) {
       busy := true.B
-      pending := ((BigInt(1) << parameter.hartCount) - 1).B(parameter.hartCount)
+      pending := targets
     }
     when(up.request.valid & up.request.ready) { busy := false.B }

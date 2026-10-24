@@ -112,6 +112,7 @@ object DitDahA1MemoryFabric extends Generator[DitDahA1Parameter, DitDahA1UnitLay
       val coherence = DitDahA1Coherence.instantiate(parameter)
       coherence.io.clock := io.clock
       coherence.io.reset := io.reset
+      coherence.io.hartId := arbiter.io.hartId
       coherence.io.upstream :<>= memory.io.downstream
       io.invalidate.get :<>= coherence.io.invalidate
       coherence.io.downstream
