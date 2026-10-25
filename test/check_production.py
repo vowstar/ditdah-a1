@@ -81,7 +81,7 @@ for directory, top in profiles:
     assert manifest['implementation']['pmpState'] == (enabled and top != 'DitDahA1Frontend')
     assert manifest['implementation']['hartCount'] == (count if top == 'DitDahA1' else int(top == 'DitDahA1Core'))
     assert manifest['implementation']['fabricRequesters'] == (2 * manifest['parameters']['hartCount'] if top in ('DitDahA1', 'DitDahA1MemoryFabric') else 0)
-    read_slots = (manifest['parameters'].get('fabricReadSlots') or 2) if top in ('DitDahA1', 'DitDahA1MemoryFabric') and manifest['parameters']['hartCount'] > 1 else 0
+    read_slots = (manifest['parameters'].get('fabricReadSlots') or (2 if manifest['parameters']['hartCount'] > 1 else 0)) if top in ('DitDahA1', 'DitDahA1MemoryFabric') else 0
     assert manifest['implementation']['fabricReadSlots'] == read_slots
     assert manifest['implementation']['enableBranchPrediction'] == (
         manifest['parameters']['enableBranchPrediction'] and top in ('DitDahA1', 'DitDahA1Core', 'DitDahA1Frontend'))
@@ -133,17 +133,17 @@ for directory, top in profiles:
     if top in ("DitDahA1Core", "DitDahA1Frontend", "DitDahA1Backend"):
         assert "axi_" not in header
     else:
-        width = max(1, (manifest['parameters']['hartCount'] - 1).bit_length())
+        width = max(1, (max(manifest['parameters']['hartCount'], read_slots) - 1).bit_length())
         for channel in ('aw', 'ar', 'b', 'r'):
             port = next((m for m in re.finditer(r'\b(?:input|output)\s*(?:\[(\d+):0\])?([\s\S]*?)(?=\binput\b|\boutput\b|$)', header)
                          if re.search(r'\baxi_' + channel + r'_bits_id\b', m[2])), None)
-            assert port and (int(port[1]) + 1 if port[1] else 1) == width, 'AXI hart identity width mismatch'
+            assert port and (int(port[1]) + 1 if port[1] else 1) == width, 'AXI transaction identity width mismatch'
     if top == 'DitDahA1Backend':
         assert set(files) == {'DitDahA1' + name + '.sv' for name in ('Backend', 'Decode', 'Issue', 'Execute', 'Multiply', 'Commit', 'Gpr', 'Csr', 'Lsu', *(('Pmp',) if enabled else ()))}
         assert (rtl / (top + '.sv')).read_bytes() == Path('result/verify/' + ('irq-' if interrupts else '') + ('pmp16-' if enabled else '') + 'axi512/rtl', top + '.sv').read_bytes()
     if top == 'DitDahA1MemoryFabric':
         assert set(files) == {name + '.sv' for name in (top, 'DitDahA1MemoryArbiter', 'DitDahA1Memory', 'DitDahA1Axi',
-            *(('DitDahA1ReadQueue',) if manifest['parameters']['hartCount'] > 1 else ()),
+            *(('DitDahA1ReadQueue',) if read_slots else ()),
             *(('DitDahA1Coherence',) if args.data_cache else ()))}
         integrated = Path('result/production-dcache-harts16' if args.data_cache else 'result/production-harts16')
         assert all((rtl / name).read_bytes() == (integrated / name).read_bytes() for name in ('DitDahA1Memory.sv', 'DitDahA1Axi.sv'))

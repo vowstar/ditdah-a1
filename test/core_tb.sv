@@ -7,14 +7,18 @@
 `ifndef TIME_TICK_CYCLES
 `define TIME_TICK_CYCLES 1
 `endif
+`ifndef LOAD_QUEUE_ENTRIES
+`define LOAD_QUEUE_ENTRIES 1
+`endif
 module core_tb;
   localparam integer DW = `AXI_BITS;
   localparam integer PA = `PA_BITS;
   localparam integer HARTS = `HARTS;
-  localparam integer IDW = HARTS > 1 ? $clog2(HARTS) : 1;
+  localparam integer IDW = $clog2(HARTS > `FABRIC_READ_SLOTS ? HARTS : `FABRIC_READ_SLOTS) > 0 ? $clog2(HARTS > `FABRIC_READ_SLOTS ? HARTS : `FABRIC_READ_SLOTS) : 1;
   localparam integer MB = `MEMORY_BYTES;
   localparam integer READ_SLOTS = `FABRIC_READ_SLOTS > 0 ? `FABRIC_READ_SLOTS : 1;
   localparam integer READ_CONTEXTS = 4;
+  localparam integer CLIENT_CONTEXTS = 2 * HARTS * `LOAD_QUEUE_ENTRIES;
 `ifdef SOFTWARE
   localparam integer TRANSACTION_LIMIT = 640 * HARTS;
 `elsif LOCAL_INTERRUPTS
@@ -42,10 +46,14 @@ module core_tb;
   wire [2*HARTS-1:0] request_valid, request_ready, response_valid, response_ready;
   wire [HARTS-1:0] multiply_busy;
   logic [HARTS-1:0] finished = 0;
-  integer bus_owner = 0, active_source[HARTS], completed_transactions = 0;
-  core_request_t accepted_request[HARTS], writeback_request;
+  integer bus_owner = 0, active_source[CLIENT_CONTEXTS], transport_id[CLIENT_CONTEXTS], completed_transactions = 0;
+  core_request_t accepted_request[CLIENT_CONTEXTS], writeback_request;
   logic writeback_pending = 0;
-  initial for (integer h = 0; h < HARTS; h++) active_source[h] = -1;
+  initial for (integer source = 0; source < CLIENT_CONTEXTS; source++) active_source[source] = -1;
+  task automatic emit_source(input integer context_index);
+    $write("SOURCE %0d ", context_index % (2*HARTS));
+    if (`LOAD_QUEUE_ENTRIES == 2) $write("TAG %02h ", accepted_request[context_index].tag);
+  endtask
   `include "core_bindings.svh"
   logic clock = 0;
   logic reset = 1;
@@ -142,12 +150,14 @@ module core_tb;
     logic [IDW-1:0] id;
     logic [2:0] size;
     logic [7:0] remaining;
-    integer delay, order;
+    integer delay, order, source;
   } read_context_t;
   read_context_t read_context[READ_CONTEXTS];
   logic [READ_CONTEXTS-1:0] read_live, read_lines, read_older;
-  integer read_slot = 0, accept_read_slot, read_serial = 0, data_reads = 0;
+  integer read_slot = 0, accept_read_slot, read_serial = 0, data_reads[HARTS];
   integer read_peak = 0, read_reordered = 0, reorder_reads = 0;
+  integer fixed_read_delay = -1;
+  bit fixed_address_held = 0;
   integer line_peak = 0, line_overlap_cycles = 0;
   wire read_pending = read_context[read_slot].valid;
   wire read_fetch = read_context[read_slot].fetch;
@@ -159,6 +169,7 @@ module core_tb;
   wire [7:0] read_remaining = read_context[read_slot].remaining;
   integer write_delay = 0, cycles = 0;
   initial for (integer slot = 0; slot < READ_CONTEXTS; slot++) read_context[slot] = '0;
+  initial for (integer hart = 0; hart < HARTS; hart++) data_reads[hart] = 0;
   always_comb for (integer slot = 0; slot < READ_CONTEXTS; slot++) begin
     read_live[slot] = read_context[slot].valid;
     read_lines[slot] = read_context[slot].valid && read_context[slot].line;
@@ -172,7 +183,7 @@ module core_tb;
       pending_data |= !read_context[slot].fetch;
       pending_instruction_target |= read_context[slot].fetch && read_context[slot].address == irq_target;
       pending_exclusive_target |= read_context[slot].exclusive && read_context[slot].id == irq_hart;
-      pending_peer |= !read_context[slot].fetch && read_context[slot].id != irq_hart;
+      pending_peer |= !read_context[slot].fetch && (read_context[slot].source % (2*HARTS)) / 2 != irq_hart;
     end
   end
 `endif
@@ -192,6 +203,7 @@ module core_tb;
     if (!$value$plusargs("STOP=%h", stop_pc)) $fatal(1, "Missing stop");
     if (!$value$plusargs("SEED=%d", random_state)) random_state = 1;
     if (!$value$plusargs("REORDER_READS=%d", reorder_reads)) reorder_reads = 0;
+    if (!$value$plusargs("FIXED_READ_DELAY=%d", fixed_read_delay)) fixed_read_delay = -1;
     if (!$value$plusargs("FAULT_FETCH=%h", fault_fetch)) fault_fetch = '1;
     if (!$value$plusargs("FAULT_READ=%h", fault_read)) fault_read = '1;
     if (!$value$plusargs("FAULT_WRITE=%h", fault_write)) fault_write = '1;
@@ -219,7 +231,8 @@ module core_tb;
     random_state = random_state ^ (random_state << 13);
     random_state = random_state ^ (random_state >> 17);
     random_state = random_state ^ (random_state << 5);
-    arready = !reset && !(&read_live) && random_state[0];
+    arready = !reset && !(&read_live) && (fixed_read_delay >= 0 ? fixed_address_held : random_state[0]);
+    fixed_address_held = !reset && arvalid && !arready;
     if (!rvalid) begin
       integer candidate;
       candidate = -1;
@@ -265,13 +278,23 @@ module core_tb;
       for (integer slot = 0; slot < READ_CONTEXTS; slot++)
         if (read_context[slot].valid && read_context[slot].delay > 0) read_context[slot].delay <= read_context[slot].delay - 1;
       if (arvalid && arready) begin
+        integer read_source, delay_index;
+        read_source = -1;
+        for (integer source = 0; source < CLIENT_CONTEXTS; source++)
+          if (active_source[source] >= 0 && transport_id[source] == integer'(arid)) begin
+            if (read_source >= 0) $fatal(1, "Ambiguous live AXI ID");
+            read_source = source;
+          end
+        if (read_source < 0) $fatal(1, "AXI ID lacks accepted ownership");
+        delay_index = `LOAD_QUEUE_ENTRIES == 2 ? (read_source % (2*HARTS)) / 2 : 0;
         if (!console_address(64'(araddr)) && (64'(araddr) < base_address || 64'(araddr) + (1 << arsize) * (1 + integer'(arlen)) > base_address + MB)) $fatal(1, "Truncated or unexpected read address");
-        if (arid >= HARTS || active_source[arid] < 0 || arlen != (accepted_request[arid].size == 6 ? 64 / (DW/8) - 1 : 0) || arburst != 1 || (arlock && arprot[2]) || arcache != 0 || arqos != 0) $fatal(1, "Read attributes");
-        if (arprot != {accepted_request[arid].fetch, 1'b0, accepted_request[arid].privileged}) $fatal(1, "Read privilege");
-        if ((accepted_request[arid].size == 6 ? arsize != $clog2(DW/8) : arprot[2] ? arsize != 2 : arsize > 3) ||
+        if (arlen != (accepted_request[read_source].size == 6 ? 64 / (DW/8) - 1 : 0) || arburst != 1 || (arlock && arprot[2]) || arcache != 0 || arqos != 0) $fatal(1, "Read attributes");
+        if (arprot != {accepted_request[read_source].fetch, 1'b0, accepted_request[read_source].privileged}) $fatal(1, "Read privilege");
+        if ((accepted_request[read_source].size == 6 ? arsize != $clog2(DW/8) : arprot[2] ? arsize != 2 : arsize > 3) ||
             (arlock && arsize != 3) || (araddr & ((1 << arsize) - 1)) != 0) $fatal(1, "Read alignment");
-        if (HARTS > 1) $write("HART %0d ", arid);
-        $display("BUS %s %016h %0d %016h", arlock ? "exclusive_read" : (arprot[2] ? "fetch" : "read"), 64'(araddr), accepted_request[arid].size == 6 ? 64 : 1 << arsize, 64'b0);
+        if (HARTS > 1) $write("HART %0d ", (read_source % (2*HARTS)) / 2);
+        emit_source(read_source);
+        $display("BUS %s %016h %0d %016h", arlock ? "exclusive_read" : (arprot[2] ? "fetch" : "read"), 64'(araddr), accepted_request[read_source].size == 6 ? 64 : 1 << arsize, 64'b0);
         accept_read_slot = -1;
         for (integer slot = READ_CONTEXTS - 1; slot >= 0; slot--) begin
           if (!read_context[slot].valid) accept_read_slot = slot;
@@ -280,22 +303,25 @@ module core_tb;
         if (accept_read_slot < 0) $fatal(1, "AXI read context capacity");
         read_context[accept_read_slot].valid <= 1;
         read_context[accept_read_slot].remaining <= arlen;
-        read_context[accept_read_slot].line <= accepted_request[arid].size == 6;
+        read_context[accept_read_slot].line <= accepted_request[read_source].size == 6;
         read_context[accept_read_slot].address <= 64'(araddr);
         read_context[accept_read_slot].id <= arid;
+        read_context[accept_read_slot].source <= read_source;
         read_context[accept_read_slot].size <= arsize;
         read_context[accept_read_slot].fetch <= arprot[2];
         read_context[accept_read_slot].exclusive <= arlock;
         read_context[accept_read_slot].order <= read_serial;
         read_serial = read_serial + 1;
         read_context[accept_read_slot].delay <= arprot[2] ? integer'(random_state[5:4]) : 32 + integer'(random_state[7:4]);
+        if (fixed_read_delay >= 0) read_context[accept_read_slot].delay <= arprot[2] ? 1 : fixed_read_delay;
         if (!arprot[2] && !arlock) begin
-          if (reorder_reads && data_reads % 2 == 0) read_context[accept_read_slot].delay <= 96;
-          data_reads = data_reads + 1;
+          if (reorder_reads && data_reads[delay_index] % 2 == 0)
+            read_context[accept_read_slot].delay <= fixed_read_delay >= 0 ? fixed_read_delay + 64 : 96;
+          data_reads[delay_index]++;
         end
         if (1 + $countones(read_live) > read_peak)
           read_peak = 1 + $countones(read_live);
-        if (accepted_request[arid].size == 6 &&
+        if (accepted_request[read_source].size == 6 &&
             1 + $countones(read_lines) > line_peak)
           line_peak = 1 + $countones(read_lines);
 `ifdef ENABLE_INTERRUPTS
@@ -318,13 +344,15 @@ module core_tb;
           rvalid <= 1;
       end
       if (rvalid && rready) begin
-        if (HARTS > 1) $write("HART %0d ", read_id);
+        if (HARTS > 1) $write("HART %0d ", (read_context[read_slot].source % (2*HARTS)) / 2);
+        emit_source(read_context[read_slot].source);
         if (read_line) $display("LINE_BEAT %016h %01h %h %01h", read_address, rresp, rdata, rlast);
         else $display("READ %016h %01h %016h", read_address, rresp,
           64'(rdata >> (8 * (read_address % (DW/8)))) & access_mask(read_size));
         if (read_fetch) begin
           for (integer word_index = 0; word_index < (read_line ? DW/32 : 1); word_index++) begin
-            if (HARTS > 1) $write("HART %0d ", read_id);
+            if (HARTS > 1) $write("HART %0d ", (read_context[read_slot].source % (2*HARTS)) / 2);
+            emit_source(read_context[read_slot].source);
             $display("FETCH %016h %01h %08h", read_address + 4 * word_index, rresp,
               32'(rdata >> (8 * (read_address % (DW/8)) + 32 * word_index)));
           end
@@ -343,8 +371,8 @@ module core_tb;
       end
       if (awvalid && awready) begin
         if (!console_address(64'(awaddr)) && (64'(awaddr) < base_address || 64'(awaddr) + (1 << awsize) > base_address + MB)) $fatal(1, "Truncated or unexpected write address");
-        if (awid >= HARTS || active_source[awid] < 0 || awid != IDW'(bus_owner / 2) || awlen != 0 || awsize > 3 || (awlock && awsize != 3) ||
-            awburst != 1 || awcache != 0 || awprot != (writeback_pending ? 3'b001 : {2'b0, accepted_request[awid].privileged}) || awqos != 0 ||
+        if (awid >= HARTS || active_source[bus_owner] < 0 || awid != IDW'(bus_owner / 2) || awlen != 0 || awsize > 3 || (awlock && awsize != 3) ||
+            awburst != 1 || awcache != 0 || awprot != (writeback_pending ? 3'b001 : {2'b0, accepted_request[bus_owner].privileged}) || awqos != 0 ||
             (awaddr & ((1 << awsize) - 1)) != 0) $fatal(1, "Write attributes");
         aw_held <= 1;
         write_address <= 64'(awaddr);
@@ -364,6 +392,7 @@ module core_tb;
       if (aw_held && w_held && !write_pending && !bvalid) begin
         if (write_mask != ((DW/8)'(writeback_pending ? writeback_request.mask : (1 << (1 << write_size)) - 1) << (write_address % (DW/8)))) $fatal(1, "Write strobes");
         if (HARTS > 1) $write("HART %0d ", bus_owner / 2);
+        emit_source(bus_owner);
         $display("BUS %s %016h %0d %016h %02h", writeback_pending ? "writeback" : write_exclusive ? "exclusive_write" : "write", write_address,
           1 << write_size, 64'(write_data >> (8 * (write_address % (DW/8)))) & access_mask(write_size),
           8'(write_mask >> (write_address % (DW/8))));
@@ -464,42 +493,77 @@ module core_tb;
     end
   end
   always @(posedge clock) if (!reset) begin
-    integer pending_sources;
+    integer pending_sources, context_index;
     for (integer source = 0; source < 2*HARTS; source++) begin
       if (request_valid[source] && request_ready[source]) begin
-        if (active_source[source / 2] != -1) $fatal(1, "Overlapping accepted hart sources");
+        context_index = -1;
+        for (integer bank = `LOAD_QUEUE_ENTRIES - 1; bank >= 0; bank--) begin
+          integer candidate;
+          candidate = source + bank * 2*HARTS;
+          if (active_source[candidate] < 0 && (bank == 0 || source % 2 == 1)) context_index = candidate;
+          if (active_source[candidate] >= 0 && accepted_request[candidate].tag == requests[source].tag)
+            $fatal(1, "Live client tag reused");
+        end
+        if (context_index < 0) $fatal(1, "Client context capacity exceeded");
         pending_sources = 0;
-        for (integer hart = 0; hart < HARTS; hart++) if (active_source[hart] >= 0) begin
+        for (integer owner = 0; owner < CLIENT_CONTEXTS; owner++) if (active_source[owner] >= 0) begin
           pending_sources = pending_sources + 1;
-          if (exclusive_request(requests[source]) || exclusive_request(accepted_request[hart]))
+          if (exclusive_request(requests[source]) || exclusive_request(accepted_request[owner]))
             $fatal(1, "Exclusive request overlapped physical service");
         end
         if (pending_sources >= READ_SLOTS) $fatal(1, "Physical read slots exceeded");
-        active_source[source / 2] = source;
-        accepted_request[source / 2] = requests[source];
+        transport_id[context_index] = source / 2;
+        if (`FABRIC_READ_SLOTS > 0 && !exclusive_request(requests[source])) begin
+          integer candidate, occupied;
+          candidate = -1;
+          for (integer slot = READ_SLOTS - 1; slot >= 0; slot--) begin
+            occupied = 0;
+            for (integer owner = 0; owner < CLIENT_CONTEXTS; owner++)
+              if (active_source[owner] >= 0 && transport_id[owner] == slot) occupied = 1;
+            if (!occupied) candidate = slot;
+          end
+          if (candidate < 0) $fatal(1, "Read ID allocation exhausted");
+          transport_id[context_index] = candidate;
+        end
+        active_source[context_index] = source;
+        accepted_request[context_index] = requests[source];
         if (exclusive_request(requests[source])) bus_owner <= source;
         if (HARTS > 1) $write("HART %0d ", source / 2);
+        emit_source(context_index);
         $display("REQUEST %s %016h %0d %016h %02h %01h",
           requests[source].atomic ? "atomic" : (source % 2 == 0 ? "fetch" : (requests[source].write ? "write" : "read")),
           requests[source].address, 1 << requests[source].size,
           requests[source].write ? requests[source].data & access_mask(requests[source].size) : 64'b0,
           requests[source].tag, requests[source].cacheOperation);
         if (HARTS > 1) $write("HART %0d ", source / 2);
+        if (`LOAD_QUEUE_ENTRIES == 2) emit_source(context_index);
         $display("ACCESS_PRIVILEGE %01h", requests[source].privileged);
         if (requests[source].atomic) begin
           if (HARTS > 1) $write("HART %0d ", source / 2);
+          if (`LOAD_QUEUE_ENTRIES == 2) emit_source(context_index);
           $display("ATOMIC %02h %01h", requests[source].atomicOperation, requests[source].scEligible);
         end
       end
+    end
+    for (integer source = 0; source < 2*HARTS; source++) begin
       if (response_valid[source] && response_ready[source]) begin
-        if (active_source[source / 2] != source || responses[source].tag != accepted_request[source / 2].tag)
-          $fatal(1, "Response source or tag");
+        context_index = -1;
+        for (integer bank = 0; bank < `LOAD_QUEUE_ENTRIES; bank++) begin
+          integer candidate;
+          candidate = source + bank * 2*HARTS;
+          if (active_source[candidate] == source && responses[source].tag == accepted_request[candidate].tag) begin
+            if (context_index >= 0) $fatal(1, "Ambiguous response context");
+            context_index = candidate;
+          end
+        end
+        if (context_index < 0) $fatal(1, "Response source or tag");
         if (responses[source].last) begin
-          active_source[source / 2] = -1;
+          active_source[context_index] = -1;
           completed_transactions = completed_transactions + 1;
         end
         if (completed_transactions > transaction_limit) $fatal(1, "Transaction budget");
         if (HARTS > 1) $write("HART %0d ", source / 2);
+        emit_source(context_index);
         $display("RESPONSE %0d %016h %01h %02h %01h", source % 2,
           responses[source].data, responses[source].fault, responses[source].tag, responses[source].last);
       end

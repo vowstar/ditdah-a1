@@ -35,6 +35,7 @@ object DitDahA1Config:
         "translation" -> (if parameter.enableTranslation then "Sv39/Svade" else "Bare"),
         "tlbEntries" -> (if parameter.enableTranslation then parameter.tlbEntries else 0),
         "fabricReadSlots" -> parameter.resolvedFabricReadSlots,
+        "loadQueueEntries" -> parameter.loadQueueEntries,
         "enableBranchPrediction" -> parameter.enableBranchPrediction,
         "dCacheRefillBytes" -> (if parameter.dCacheBytes != 0 then parameter.dCacheRefillBytes else 0),
         "enableBurstRefill" -> parameter.enableBurstRefill, "isaComplete" -> false

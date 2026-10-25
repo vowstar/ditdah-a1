@@ -20,9 +20,9 @@ class DitDahA1AxiIO(parameter: DitDahA1Parameter) extends HWBundle(parameter):
 object DitDahA1Axi extends Generator[DitDahA1Parameter, DitDahA1UnitLayers, DitDahA1AxiIO, DitDahA1UnitProbe]:
   override def moduleName(parameter: DitDahA1Parameter): String = "DitDahA1Axi"
   def address(parameter: DitDahA1Parameter, channel: Referable[AxiAddress], request: Referable[MemoryRequest],
-    hart: Referable[UInt])(using Arena, Context, Block, InstanceContext): Unit =
+    id: Referable[UInt])(using Arena, Context, Block, InstanceContext): Unit =
     channel.addr := request.address.asBits.bits(parameter.physicalAddressBits - 1, 0).asUInt
-    channel.id := hart
+    channel.id := id
     channel.len := 0.U(8)
     channel.size := request.size
     channel.burst := 1.U(2)
@@ -39,8 +39,8 @@ object DitDahA1Axi extends Generator[DitDahA1Parameter, DitDahA1UnitLayers, DitD
     client & !request.write & !request.atomic & (request.size === 6.U(3))
 
   def readAddress(parameter: DitDahA1Parameter, channel: Referable[AxiAddress], request: Referable[MemoryRequest],
-    hart: Referable[UInt])(using Arena, Context, Block, InstanceContext): Unit =
-    address(parameter, channel, request, hart)
+    id: Referable[UInt])(using Arena, Context, Block, InstanceContext): Unit =
+    address(parameter, channel, request, id)
     if parameter.enableLineRefill then
       when(lineRead(parameter, request)) {
         channel.len := (512 / parameter.axiDataBits - 1).U(8)

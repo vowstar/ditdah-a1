@@ -71,6 +71,22 @@ verify-signoff: verify-writeback verify-formal
 	$(MAKE) verify-widths
 	$(MAKE) verify-data-line
 	$(MAKE) verify-read-capacity
+	$(MAKE) verify-memory-concurrency
+
+.PHONY: verify-memory-concurrency
+verify-memory-concurrency:
+	python3 test/verify.py --multicore-only --harts 1 --width 64 --pmp-entries 0 --load-queue-entries 2 --fabric-read-slots 1 --dcache-bytes 8192 --output result/dual-load-serial --case load_window --case load_cancel
+	for profile in 1:2 2:4; do \
+		count=$${profile%:*}; slots=$${profile#*:}; \
+		python3 test/verify.py --multicore-only --harts $$count --width 128 --pmp-entries 0 --load-queue-entries 2 --fabric-read-slots $$slots --dcache-bytes 8192 --output result/dual-load --case load_window --case load_cancel || exit $$?; \
+	done
+	python3 test/formal.py --rtl result/dual-load/harts1-axi128/rtl --output result/formal/dual-load --modules LsuReads ReadQueue PipelineBackend
+	python3 test/verify.py --multicore-only --harts 1 --width 256 --issue-width 2 --pmp-entries 0 --load-queue-entries 2 --fabric-read-slots 2 --dcache-bytes 8192 --dcache-refill-bytes 64 --output result/dual-load-line --case load_window --case load_cancel
+	python3 test/verify.py --multicore-only --interrupts --harts 2 --width 64 --issue-width 2 --load-queue-entries 2 --pmp-entries 0 --dcache-bytes 8192 --dcache-writeback --output result/dual-load-writeback --case data_coherence --case synchronization --case atomic_interrupt --case cache_reservation --case interrupt
+	python3 test/verify.py --user-mode --interrupts --width 512 --issue-width 3 --load-queue-entries 2 --fabric-read-slots 3 --pmp-entries 16 --icache-bytes 8192 --burst-refill --dcache-bytes 8192 --dcache-refill-bytes 64 --dcache-writeback --output result/dual-load-protection --case user_mprv --case pmp_update --case pmp_permissions --case interrupt_read_pending --case synchronization --case fence_i_prefetch --case fence_ordering
+	python3 test/verify.py --sv39 --tlb-entries 2 --width 512 --issue-width 3 --load-queue-entries 2 --fabric-read-slots 3 --pmp-entries 16 --icache-bytes 8192 --burst-refill --dcache-bytes 8192 --dcache-refill-bytes 64 --output result/dual-load-translation --case sv39_context --case sv39_reuse --case sv39_accessed
+	python3 test/verify.py --software-matrix --load-queue-entries 2 --config $(SOFTWARE_CONFIG) --icache-bytes 8192 --burst-refill --dcache-bytes 8192 --output $(SOFTWARE_OUTPUT)/dual-load --jobs $(SOFTWARE_JOBS)
+	$(MAKE) verify-translation-software SOFTWARE_CONFIG=$(SOFTWARE_OUTPUT)/dual-load/w3-h16/input.json SOFTWARE_TLB_ENTRIES=4 SOFTWARE_CACHE_SIZES=8192 SOFTWARE_BURST_REFILL=--burst-refill TRANSLATION_SOFTWARE_DIR=dual-load-translation
 
 verify-writeback:
 	for profile in 2:64:1:8 2:128:2:64 16:512:3:64; do \
@@ -87,10 +103,12 @@ verify-writeback-software:
 	$(MAKE) verify-translation-software SOFTWARE_CONFIG=$(SOFTWARE_OUTPUT)/writeback/r64-h16/input.json SOFTWARE_TLB_ENTRIES=4 SOFTWARE_CACHE_SIZES=8192 SOFTWARE_BURST_REFILL=--burst-refill TRANSLATION_SOFTWARE_DIR=writeback-sv39
 
 verify-read-capacity:
-	for profile in 2:1:64:1 2:2:64:1 3:3:128:2 16:4:256:2 16:4:512:3; do \
+	for profile in 1:1:64:1 1:2:512:2 2:1:64:1 2:2:64:1 2:4:64:2 3:3:128:2 16:4:256:2 16:4:512:3; do \
 		count=$${profile%%:*}; rest=$${profile#*:}; slots=$${rest%%:*}; rest=$${rest#*:}; bus=$${rest%%:*}; width=$${rest#*:}; \
-		python3 test/verify.py --multicore-only --harts $$count --fabric-read-slots $$slots --width $$bus --issue-width $$width --pmp-entries 16 --icache-bytes 8192 --burst-refill --dcache-bytes 8192 --dcache-refill-bytes 64 --output result/read-slots-$$slots-$$bus --case data_coherence --case synchronization --case atomic_lrsc_shared --case atomic_interrupt || exit $$?; \
-		python3 test/formal.py --rtl result/read-slots-$$slots-$$bus/harts$$count-axi$$bus/rtl --output result/formal/read-slots-$$slots-$$bus --modules ReadQueue MemoryFabric || exit $$?; \
+		cases="--case data_coherence --case synchronization"; \
+		if test $$count -gt 1; then cases="$$cases --case atomic_lrsc_shared --case atomic_interrupt"; fi; \
+		python3 test/verify.py --multicore-only --harts $$count --fabric-read-slots $$slots --width $$bus --issue-width $$width --pmp-entries 16 --icache-bytes 8192 --burst-refill --dcache-bytes 8192 --dcache-refill-bytes 64 --output result/read-slots-harts$$count-$$slots-$$bus $$cases || exit $$?; \
+		python3 test/formal.py --rtl result/read-slots-harts$$count-$$slots-$$bus/harts$$count-axi$$bus/rtl --output result/formal/read-slots-harts$$count-$$slots-$$bus --modules ReadQueue MemoryFabric || exit $$?; \
 	done
 	$(MAKE) verify-read-software
 

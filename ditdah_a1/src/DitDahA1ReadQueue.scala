@@ -19,7 +19,7 @@ class DitDahA1ReadQueueIO(parameter: DitDahA1Parameter) extends HWBundle(paramet
 object DitDahA1ReadQueue extends Generator[DitDahA1Parameter, DitDahA1UnitLayers, DitDahA1ReadQueueIO, DitDahA1UnitProbe]:
   override def moduleName(parameter: DitDahA1Parameter): String = "DitDahA1ReadQueue"
   def architecture(parameter: DitDahA1Parameter) =
-    require(parameter.hartCount > 1, "Concurrent reads require multiple harts")
+    require(parameter.resolvedFabricReadSlots > 0, "Read queue requires a positive slot count")
     parameter.validateReadSlots()
     val io = summon[Interface[DitDahA1ReadQueueIO]]
     given ClockScope = ClockScope.posedge(io.clock)
@@ -48,9 +48,12 @@ object DitDahA1ReadQueue extends Generator[DitDahA1Parameter, DitDahA1UnitLayers
     val waiting = state.map(s => (s === 3.U(3)) | (if parameter.enableLineRefill then s === 6.U(3) else false.B))
     val inflight = (0 until depth).map(n => waiting(n) |
       terminal.map(t => (state(n) === 5.U(3)) & !t(n)).getOrElse(false.B))
-    val hart = owner.map(_.asBits.bits(ownerBits - 1, 1).asUInt)
     val available = (0 until count).map { i =>
-      !(0 until depth).map(n => !free(n) & (hart(n) === (i / 2).U(parameter.axiIdBits))).reduce(_ | _)
+      val owned = (0 until depth).map(n => !free(n) & (owner(n) === i.U(ownerBits)))
+      if parameter.loadQueueEntries == 1 || i % 2 == 0 then !owned.reduce(_ | _)
+      else !(0 until depth).flatMap(n => (n + 1 until depth).map(m => owned(n) & owned(m)))
+        .foldLeft[Referable[Bool]](false.B)(_ | _) &
+        !(0 until depth).map(n => owned(n) & (request(n).tag === io.ports(i).request.bits.tag)).reduce(_ | _)
     }
     val valid = (0 until count).map(i => io.ports(i).request.valid & available(i))
     val selected = DitDahA1MemoryArbiter.select(valid, next)
@@ -69,9 +72,23 @@ object DitDahA1ReadQueue extends Generator[DitDahA1Parameter, DitDahA1UnitLayers
       port.response.bits.fault := false.B
       port.response.bits.tag := 0.U(8)
       port.response.bits.last := true.B
+      val responses = (0 until depth).map(n => ((state(n) === 4.U(3)) |
+        (if parameter.enableLineRefill then state(n) === 5.U(3) else false.B)) & (owner(n) === i.U(ownerBits)))
+      val responseSlot = if parameter.loadQueueEntries == 1 || i % 2 == 0 || depth == 1 then None else
+        val held = RegInit(false.B)
+        val saved = Reg(UInt(slotBits))
+        val next = RegInit(0.U(slotBits))
+        val selected = held.?(saved, DitDahA1MemoryArbiter.select(responses, next))
+        when(port.response.valid & !port.response.ready) { held := true.B; saved := selected }
+        when(port.response.valid & port.response.ready) {
+          held := false.B
+          next := (selected === (depth - 1).U(slotBits)).?(0.U(slotBits),
+            (selected + 1.U(slotBits)).asBits.bits(slotBits - 1, 0).asUInt)
+        }
+        Some(selected)
       for n <- 0 until depth do
         val streaming = if parameter.enableLineRefill then state(n) === 5.U(3) else false.B
-        when(((state(n) === 4.U(3)) | streaming) & (owner(n) === i.U(ownerBits))) {
+        when(responses(n) & responseSlot.map(_ === n.U(slotBits)).getOrElse(true.B)) {
           port.response.valid := true.B
           port.response.bits.data := data(n)
           block.foreach { value =>
@@ -101,18 +118,16 @@ object DitDahA1ReadQueue extends Generator[DitDahA1Parameter, DitDahA1UnitLayers
       case (selected, (value, index)) => (value === 2.U(3)).?(index.U(slotBits), selected)
     }
     val addressRequest = Wire(new MemoryRequest)
-    val addressHart = Wire(UInt(parameter.axiIdBits))
     addressRequest :<= request(0)
-    addressHart := hart(0)
     for n <- 1 until depth do
-      when(state(n) === 2.U(3)) { addressRequest :<= request(n); addressHart := hart(n) }
-    DitDahA1Axi.readAddress(parameter, io.ar.bits, addressRequest, addressHart)
+      when(state(n) === 2.U(3)) { addressRequest :<= request(n) }
+    DitDahA1Axi.readAddress(parameter, io.ar.bits, addressRequest, addressSlot)
     io.ar.valid := addressActive
     when(io.ar.valid & io.ar.ready) {
       addressNext.foreach(_ := (addressSlot === (depth - 1).U(slotBits)).?(0.U(slotBits),
         (addressSlot + 1.U(slotBits)).asBits.bits(slotBits - 1, 0).asUInt))
     }
-    val matches = (0 until depth).map(n => inflight(n) & (io.r.bits.id === hart(n)))
+    val matches = (0 until depth).map(n => inflight(n) & (io.r.bits.id === n.U(parameter.axiIdBits)))
     val known = matches.reduce(_ | _)
     io.r.ready := (!known & inflight.reduce(_ | _)) | (0 until depth).map(n =>
       matches(n) & waiting(n) & (!line(n) | !blockBusy | (state(n) === 6.U(3)))).reduce(_ | _)

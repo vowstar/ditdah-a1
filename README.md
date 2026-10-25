@@ -23,8 +23,9 @@ Core composes Frontend and Backend; Frontend owns PC sequencing and Backend owns
 Non-fault Backend packets contain four-byte instructions and word-aligned PCs; producers supply fetch faults.
 Core exposes separate instruction/data memory ports; the physical fabric owns shared arbitration and AXI.
 Instruction permissions apply before cache lookup and to the complete refill request; region checks also protect external accesses.
-The multicore fabric permits 1–4 distinct-hart reads or enabled 64-byte refills through `fabricReadSlots` (default two, at most `hartCount`; zero for the single-hart bridge); writes, atomics and devices wait for all response fragments and execute exclusively.
-An unexpected read ID blocks new fabric transactions until reset while known in-flight reads drain.
+`loadQueueEntries` selects one or two ordinary data-read contexts per hart; replies retain their instruction owner and complete in order.
+The fabric permits one instruction read and the configured data-read count per hart through 1–4 `fabricReadSlots` (at most `hartCount * (1 + loadQueueEntries)`; default two for multiple harts, zero for the single-hart bridge); writes, atomics and devices wait for all response fragments and execute exclusively.
+Queued AXI read IDs identify transaction slots; serialized accesses retain hart IDs. An unexpected read ID blocks new fabric transactions until reset while known in-flight reads drain.
 AXI data width is configurable to 64/128/256/512 bits; scalar requests remain at most eight bytes.
 AMOADD.D, AMOOR.D and AMOSWAP.D use AXI exclusive retry and return the old value.
 LR.D/SC.D use per-hart reservations; ordered data completion covers all aq/rl combinations. This does not implement the complete A or Zaamo extension.
@@ -84,7 +85,7 @@ ELF checks build freestanding software with `RISCV_PREFIX` (default `riscv64-unk
 `make verify-width-software` checks identical loaded software across 1/2/3 issue for each of 1/2/16 harts; `make verify-zephyr-long SOFTWARE_JOBS=3` uses the pinned `ZEPHYR_BASE` checkout.
 Reachability and mutation checks exercise the properties; general multiply results are checked by simulation.
 This checks the implemented instruction subset, not full ISA compliance or physical signoff.
-Use `make verify-signoff VERIFY_ARGS=--use-generated` to reuse RTL whose recorded sources and configuration still match.
+`make verify-memory-concurrency` checks dual reads, fallback resources, fault/interrupt ordering and multicore console software.
 
 ## Credits
 

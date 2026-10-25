@@ -68,7 +68,7 @@ def compile_tb(rtl, directory, width, pa, top='core_tb', source=None, extra_file
     logic traceValid;
     logic [63:0] traceOrder;
 ''' + '\n'.join(f'    logic [{bits - 1}:0] trace{name[0].upper() + name[1:]};' for name, bits in fields.items()) + f'''
-    logic [{(6 * issue_width).bit_length() - 1}:0] pipelineOccupancy;
+    logic [{((5 + parameters.get('loadQueueEntries', 1)) * issue_width).bit_length() - 1}:0] pipelineOccupancy;
     logic pipelineStall;
   }} trace_t;
   trace_t traces[{harts}][ISSUE_WIDTH];
@@ -97,7 +97,7 @@ def compile_tb(rtl, directory, width, pa, top='core_tb', source=None, extra_file
   task automatic observe_metrics;
     integer retired;
     metric_cycles++;
-    {'observe_read_metrics();' if top == 'core_tb' and harts > 1 else ''}
+    {'observe_read_metrics();' if top == 'core_tb' and (parameters.get('fabricReadSlots') or harts > 1) else ''}
     for (integer h = 0; h < {harts}; h++) begin
       if (work_metrics && retired_pc(h, work_begin_pc)) $display("WORK_CYCLE %0d 0 %0d", h, metric_cycles);
       if (work_metrics && retired_pc(h, work_end_pc)) $display("WORK_CYCLE %0d 1 %0d", h, metric_cycles);
@@ -122,7 +122,7 @@ def compile_tb(rtl, directory, width, pa, top='core_tb', source=None, extra_file
     observers = [f'  wire [{harts - 1}:0] architectural_fetch_busy;\n  wire [63:0] architectural_fetch_pc[{harts}];']
     read_slots = parameters.get('fabricReadSlots') or 2
     read_suffixes = tuple('' if n == 0 else f'_{n-1}' for n in range(read_slots))
-    if top == 'core_tb' and harts > 1:
+    if top == 'core_tb' and (parameters.get('fabricReadSlots') or harts > 1):
         occupancy = ' + '.join(f"integer'(dut.fabric.readers.state{suffix} != 0)" for suffix in read_suffixes)
         buffered = '(' + ' || '.join(f'dut.fabric.readers.state{suffix} == 5' for suffix in read_suffixes) + ')' if parameters['axiDataBits'] > 64 and (parameters.get('enableBurstRefill') or parameters.get('dCacheRefillBytes') == 64) else "1'b0"
         observers.append(f'''  longint unsigned read_occupancy[0:{read_slots}];
@@ -185,6 +185,22 @@ def compile_tb(rtl, directory, width, pa, top='core_tb', source=None, extra_file
       {early}, {issued}_pc, {issued}_tag, {backend}.redirectPc); end
   end''')
         translated = parameters.get('virtualAddressBits') == 39
+        dual = parameters.get('loadQueueEntries', 1) == 2
+        if dual:
+            lsu = backend + '.lsu'
+            observers.append(f'''  bit lsu_head_{hart} = 0, lsu_tail_{hart} = 0;
+  always @(posedge clock) if (reset) begin lsu_head_{hart} <= 0; lsu_tail_{hart} <= 0; end else begin
+    if ({lsu}.input_valid && {lsu}.input_ready) begin
+      {prefix}$display("LSU_REQUEST %01h %016h %02h %08h", lsu_tail_{hart}, {lsu}.input_bits_instruction_pc,
+        {lsu}.input_bits_instruction_tag, {lsu}.input_bits_instruction_instruction);
+      lsu_tail_{hart} <= !lsu_tail_{hart};
+    end
+    if ({lsu}.output_valid && {lsu}.output_ready) begin
+      {prefix}$display("LSU_RESPONSE %01h %016h %02h %01h %016h %016h", lsu_head_{hart}, {lsu}.output_bits_instruction_pc,
+        {lsu}.output_bits_instruction_tag, {lsu}.output_bits_instruction_fault, {lsu}.output_bits_instruction_cause, {lsu}.output_bits_instruction_tval);
+      lsu_head_{hart} <= !lsu_head_{hart};
+    end
+  end''')
         if translated:
             unit = f'dut.core_{hart}' if top == 'core_tb' else 'dut'
             translation = unit + '.translation'
@@ -202,15 +218,15 @@ def compile_tb(rtl, directory, width, pa, top='core_tb', source=None, extra_file
   end''')
             observers.append(f'''  always @(posedge clock) if (!reset) begin
     if ({translation}.memory_request_valid && {translation}.memory_request_ready) begin
-      {prefix}$display("WALK_REQUEST %016h %02h %01h", {translation}.memory_request_bits_address, {translation}.memory_request_bits_tag, {translation}.owner);
+      {prefix}$display("WALK_REQUEST %016h %02h %01h", {translation}.memory_request_bits_address, {"8'd2" if dual else translation + '.memory_request_bits_tag'}, {translation}.owner);
     end
     if ({translation}.memory_response_valid && {translation}.memory_response_ready) begin
       {prefix}$display("WALK_RESPONSE %016h %01h %02h", {translation}.memory_response_bits_data,
-        {translation}.memory_response_bits_fault, {translation}.memory_response_bits_tag);
+        {translation}.memory_response_bits_fault, {"8'd2" if dual else translation + '.memory_response_bits_tag'});
     end
   end''')
-        if top == 'core_tb' and parameters['dCacheBytes'] or translated:
-            core = f'dut.core_{hart}.backend.lsu.memory' if translated and top == 'core_tb' else 'dut.backend.lsu.memory' if translated else f'dut.core_{hart}.data'
+        if top == 'core_tb' and parameters['dCacheBytes'] or translated or dual:
+            core = backend + '.lsu.memory' if translated or dual else f'dut.core_{hart}.data'
             cache = f'dut.data_cache_{hart}'
             sample = cache + '.dV'
             invalidate = (f'{cache}.probe_response_valid && {cache}.probe_response_ready && {cache}.probe_response_bits_last && {cache}.probeMatch && {cache}.probeRequest_invalidate' if writeback else
@@ -241,9 +257,14 @@ def compile_tb(rtl, directory, width, pa, top='core_tb', source=None, extra_file
   end''')
         if top == 'core_tb' and parameters.get('dCacheRefillBytes', 8) == 64:
             port = f'dut.fabric.data_{hart}_request'
-            blocked = '!dut.fabric.allowRead' if harts > 1 else "1'b1"
-            full = '(' + ' && '.join(f'dut.fabric.readers.state{suffix} != 0' for suffix in read_suffixes) + ')' if harts > 1 else "1'b0"
-            owner = '(' + ' || '.join(f'(dut.fabric.readers.state{suffix} != 0 && (dut.fabric.readers.owner{suffix} >> 1) == {hart})' for suffix in read_suffixes) + ')' if harts > 1 else "1'b0"
+            queued = parameters.get('fabricReadSlots') or harts > 1
+            blocked = '!dut.fabric.allowRead' if queued else "1'b1"
+            full = '(' + ' && '.join(f'dut.fabric.readers.state{suffix} != 0' for suffix in read_suffixes) + ')' if queued else "1'b0"
+            owner = '(' + ' || '.join(f'(dut.fabric.readers.state{suffix} != 0 && dut.fabric.readers.owner{suffix} == {2*hart+1})' for suffix in read_suffixes) + ')' if queued else "1'b0"
+            if queued and parameters.get('loadQueueEntries', 1) == 2:
+                terms = [f'(dut.fabric.readers.state{suffix} != 0 && dut.fabric.readers.owner{suffix} == {2*hart+1})' for suffix in read_suffixes]
+                owner = '(' + ' + '.join(f"integer'({term})" for term in terms) + ' >= 2 || ' + ' || '.join(
+                    f'({term} && dut.fabric.readers.request_tag{suffix} == {port}_bits_tag)' for term, suffix in zip(terms, read_suffixes)) + ')'
             observers.append(f'''  longint unsigned data_line_wait_{hart} = 0;
   longint unsigned line_serial_wait_{hart} = 0, line_owner_wait_{hart} = 0, line_full_wait_{hart} = 0, line_arbiter_wait_{hart} = 0;
   always @(posedge clock) if (!reset && {port}_valid && !{port}_ready && {port}_bits_size == 6) begin
@@ -260,6 +281,7 @@ def compile_tb(rtl, directory, width, pa, top='core_tb', source=None, extra_file
     if top == 'core_tb' and writeback:
         unit = 'dut.fabric.coherence'
         identity = '$write("HART %0d ", dut.fabric._arbiter_hartId);' if harts > 1 else ''
+        identity += 'emit_source(bus_owner);'
         observers.append(f'''  always @(posedge clock) if (reset) writeback_pending <= 0; else begin
     if ({unit}.state == 2 && {unit}.downstream_request_valid && {unit}.downstream_request_ready) begin
       if (writeback_pending) $fatal(1, "Overlapping physical writeback");
@@ -366,6 +388,7 @@ def compile_tb(rtl, directory, width, pa, top='core_tb', source=None, extra_file
          '-Wno-TIMESCALEMOD', '-Wno-WIDTHTRUNC', '-Wno-WIDTHEXPAND',
          f'-DAXI_BITS={width}', f'-DPA_BITS={pa}', f'-DHARTS={harts}',
          f'-DFABRIC_READ_SLOTS={parameters.get("fabricReadSlots") or (2 if harts > 1 else 0)}',
+         f'-DLOAD_QUEUE_ENTRIES={parameters.get("loadQueueEntries", 1)}',
          '-I' + str(directory.resolve()), *(['-DENABLE_INTERRUPTS'] if interrupts else []), '-I' + str(rtl.resolve()),
          *(['-DICACHE'] if parameters['iCacheBytes'] else []),
          *(['-DLOCAL_INTERRUPTS'] if local_base is not None else []),
@@ -396,6 +419,14 @@ def log_lines(source):
             yield from (line.rstrip('\n') for line in stream)
     else:
         yield from source
+
+
+def event_fields(line):
+    fields = line.split()
+    for prefix in ('HART', 'SOURCE', 'TAG'):
+        if fields[:1] == [prefix]:
+            fields = fields[2:]
+    return fields
 
 
 def performance_metrics(lines, config):
@@ -441,17 +472,17 @@ def performance_metrics(lines, config):
     assert set(histograms) == {(hart, lanes) for hart in range(harts) for lanes in range(width + 1)}, 'Missing pipeline histogram'
     cycles = samples[0][0]
     assert elapsed is not None and cycles == elapsed + 1 and cycles > 0, 'Hardware cycles were not sampled exactly once'
-    if harts > 1:
+    if config.get('fabricReadSlots') or harts > 1:
         assert set(read_occupancy) == set(range((config.get('fabricReadSlots') or 2) + 1)) and sum(read_occupancy.values()) == cycles, 'Read occupancy cycle mismatch'
         assert read_stalls is not None and all(0 <= n <= cycles for n in read_stalls), 'Invalid read stall cycles'
     else:
-        assert not read_occupancy and read_stalls is None, 'Single hart has no shared read queue'
+        assert not read_occupancy and read_stalls is None, 'Serial bridge has no shared read queue'
     reports = []
     for hart, (sampled, stalls, occupancy, peak) in sorted(samples.items()):
         issued, completed = (list(values) for values in zip(*(histograms[hart, lanes] for lanes in range(width + 1))))
         assert sampled == cycles and sum(issued) == sum(completed) == cycles, 'Pipeline histogram cycle mismatch'
         assert sum(lanes * count for lanes, count in enumerate(completed)) == retired[hart], 'Retirement metrics include traps or omit instructions'
-        assert 0 <= stalls <= cycles and 0 <= occupancy <= cycles * peak and 0 <= peak <= 6 * width, 'Invalid occupancy or stall metrics'
+        assert 0 <= stalls <= cycles and 0 <= occupancy <= cycles * peak and 0 <= peak <= (5 + config.get('loadQueueEntries', 1)) * width, 'Invalid occupancy or stall metrics'
         assert all(value >= 0 for value in (*issued, *completed)), 'Negative pipeline histogram'
         reports.append(dict(hart=hart, retiredInstructions=retired[hart], trapEvents=traps[hart],
                             dataLineWaitCycles=refill_wait.get(hart, 0),
@@ -480,15 +511,19 @@ def retirement_group(fields, width):
     return order - lane, order - lane + count, lane
 
 
-def defer_interrupt(record, group, previous, owned):
+def defer_interrupt(record, group, previous, owned, maximum=1):
     assert group and group[0] <= record[0] < group[1], 'Missing pending-memory retirement group'
     if previous is None:
         assert owned and group[2] == 0, 'Interrupt deferred without its memory owner'
-    else:
-        instruction = record[2]
-        assert not owned and group[1] == previous and record[0] < previous, 'Interrupt deferred beyond its memory group'
-        assert instruction & 127 in (0x13, 0x17, 0x1b, 0x33, 0x37, 0x3b) and not (instruction & 127 in (0x33, 0x3b) and instruction >> 25 == 1), 'Non-ALU follower deferred an interrupt'
-    return group[1]
+        return group[1], 1, record[2] & 127 == 3
+    end, owners, ordinary = previous
+    if group[1] != end:
+        assert owned and group[2] == 0 and group[0] == end and owners < maximum and ordinary and record[2] & 127 == 3, 'Interrupt deferred beyond accepted read groups'
+        return group[1], owners + 1, True
+    instruction = record[2]
+    assert not owned and record[0] < end, 'Interrupt deferred beyond its memory group'
+    assert instruction & 127 in (0x13, 0x17, 0x1b, 0x33, 0x37, 0x3b) and not (instruction & 127 in (0x33, 0x3b) and instruction >> 25 == 1), 'Non-ALU follower deferred an interrupt'
+    return previous
 
 
 def fetch_checker(config, faults, local_faults, architectural=None, buffered=()):
@@ -753,18 +788,20 @@ def check_fetch_oracle():
 
 def check_burst_guards(lines, config, program, name):
     guards = []
-    beat = next(index for index, line in enumerate(lines) if 'LINE_BEAT ' in line)
-    response = next(index for index in range(beat + 1, len(lines)) if 'RESPONSE ' in lines[index] and 'ARCH_DATA_RESPONSE ' not in lines[index])
+    beat = next(index for index, line in enumerate(lines) if event_fields(line)[:1] == ['LINE_BEAT'])
+    response = next(index for index in range(beat + 1, len(lines)) if event_fields(lines[index])[:1] == ['RESPONSE'])
     mutations = [('beatData', beat, 3, 1), ('beatOrder', beat, 1, 8),
                  ('beatLast', beat, 4, 1), ('chunkLast', response, 5, 1), ('chunkTag', response, 4, 1)]
-    certificate = next((index for index, line in enumerate(lines[:beat]) if 'ARCH_DATA_REQUEST read ' in line and line.split()[-1] == '6'), None)
+    certificate = next((index for index, line in enumerate(lines[:beat]) if event_fields(line)[:2] == ['ARCH_DATA_REQUEST', 'read'] and line.split()[-1] == '6'), None)
     if certificate is not None:
         mutations.append(('refillSpan', certificate, 7, 5))
     invalidation = next((index for index, line in enumerate(lines) if line.startswith('INVALIDATE ')), None)
     if invalidation is not None:
         mutations += [('invalidationAddress', invalidation, 2, 64),
                       ('invalidationRecipient', invalidation, 1, config['hartCount']),
-                      ('missingInvalidation', invalidation, None, 0), ('duplicateInvalidation', invalidation, None, 2)]
+                      ('duplicateInvalidation', invalidation, None, 2)]
+        if not config.get('dCacheWriteback'):
+            mutations.append(('missingInvalidation', invalidation, None, 0))
     return check_event_guards(lines, config, program, name, mutations)
 
 
@@ -778,8 +815,10 @@ def check_event_guards(lines, config, program, name, mutations):
             changed[index:index + 1] = [changed[index]] * mask
         else:
             fields = changed[index].split()
-            offset = 2 if fields[0] == 'HART' else 0
-            fields[offset + field] = f'{int(fields[offset + field], 16) ^ mask:x}'
+            offset = len(fields) - len(event_fields(changed[index]))
+            decimal = label == 'invalidationRecipient'
+            value = int(fields[offset + field], 10 if decimal else 16) ^ mask
+            fields[offset + field] = str(value) if decimal else f'{value:x}'
             changed[index] = ' '.join(fields)
         try:
             check_multicore(changed, config, program, name, atomic_metadata=True, software_output=software)
@@ -791,7 +830,7 @@ def check_event_guards(lines, config, program, name, mutations):
 
 
 def check_writeback_guards(lines, config, program, name):
-    events = [' '.join(line.split()[2:] if line.startswith('HART ') else line.split()) for line in lines]
+    events = [' '.join(event_fields(line)) for line in lines]
     mutations = []
     for event, label, field, mask in (
             ('CACHE_STORE', 'cachedStoreData', 2, 1), ('CACHE_STORE', 'cachedStoreTag', 3, 1),
@@ -1009,13 +1048,18 @@ def compare(binary, directory, config, transport='axi', selected=()):
             command += [f'+{key.upper()}={getattr(program, key, 0)}' for key in ('exclusive_failures', 'interference')]
             if hasattr(program, 'data_cache') and 'work' in program.data_cache:
                 command += [f'+WORK_{key.upper()}={program.data_cache["work"][key]:x}' for key in ('begin', 'end')]
+            if getattr(program, 'load_window', False):
+                command.append('+REORDER_READS=1')
+            if name == 'load_cancel':
+                command.append('+FIXED_READ_DELAY=128')
             if hasattr(program, 'pipeline_groups') or hasattr(program, 'pipeline_recovery'):
                 command.append('+PIPELINE_EVENTS')
             if hasattr(program, 'interrupts'):
                 command.extend(f'+IRQ_{key.upper()}={value:x}' if key == 'target' else f'+IRQ_{key.upper()}={value}'
                                for key, value in program.interrupts.items())
             run(command, log)
-            lines = log.read_text().splitlines()
+            raw_lines = log.read_text().splitlines()
+            lines = [re.sub(r'^SOURCE \d+ (?:TAG [0-9a-f]+ )?', '', line) for line in raw_lines]
             assert 'PASS' in lines, f'{name}: simulation did not complete'
             if hasattr(program, 'interrupts'):
                 model = Model(config, program.memory, program.faults)
@@ -1042,7 +1086,7 @@ def compare(binary, directory, config, transport='axi', selected=()):
                         if observed[8] >> 63:
                             expected_modes.append(getattr(model, 'privilege', 3))
                         if pending and not record[8] >> 63 and not record[7]:
-                            deferred = defer_interrupt(record, group, deferred, owned)
+                            deferred = defer_interrupt(record, group, deferred, owned, config.get('loadQueueEntries', 1))
                         else:
                             deferred = None
                         if record[8] >> 63:
@@ -1071,9 +1115,9 @@ def compare(binary, directory, config, transport='axi', selected=()):
             if config.get('virtualAddressBits') == 39 and transport == 'memory':
                 check_core_translations(lines, config, program, model.requests)
             elif transport == 'axi' and (config.get('virtualAddressBits') == 39 or config.get('dCacheBytes') or any(event[0] == 'atomic' for event in model.requests) or config.get('enableBurstRefill') or name in ('fence_ordering', 'synchronization')):
-                checked = check_multicore(lines, config, program, name, atomic_metadata=True)
+                checked = check_multicore(raw_lines, config, program, name, atomic_metadata=True)
                 if not burst_guards and any('LINE_BEAT ' in line for line in lines):
-                    burst_guards = check_burst_guards(lines, config, program, name)
+                    burst_guards = check_burst_guards(raw_lines, config, program, name)
                 if config.get('enableBurstRefill') and name == 'pmp_fetch':
                     fault_trace = next(tuple(int(value, 16) for value in line.split()[1:]) for line in lines
                                        if line.startswith('TRACE ') and int(line.split()[9], 16) == 1)
@@ -1125,7 +1169,8 @@ def compare(binary, directory, config, transport='axi', selected=()):
             full_width |= name == 'sv39_integer_stream' and bool(config.get('tlbEntries'))
             if full_width and config['iCacheBytes']:
                 assert min(issue_streak, retire_streak) >= 64, f'{name}: native cached pipeline did not sustain the configured issue and retirement width'
-            reports.append(dict(test=name, seed=seed, events=len(actual), cycles=elapsed, performance=performance_metrics(lines, config),
+            metric_config = config if transport == 'axi' else dict(config, fabricReadSlots=0)
+            reports.append(dict(test=name, seed=seed, events=len(actual), cycles=elapsed, performance=performance_metrics(lines, metric_config),
                                 busTransactions=len(bus), axiReadBeats=sum(line.startswith(('READ ', 'LINE_BEAT ')) for line in lines), fetches=fetches,
                                 issueStreak=issue_streak, retireStreak=retire_streak,
                                 **(dict(pipeline=pipeline_events) if pipeline_events is not None else {}),
@@ -1142,13 +1187,18 @@ def compare(binary, directory, config, transport='axi', selected=()):
 
 def check_multicore(lines, config, program, name, atomic_metadata=False, software_output=False):
     harts, base = config['hartCount'], int(config['resetVector'])
+    read_slots = config.get('fabricReadSlots') or (2 if harts > 1 else 0)
     covers, results, physical_results, passed = [], [], [], False
     memory, active = dict(program.memory), None
     writeback = bool(config.get('dCacheWriteback'))
     physical_memory = dict(memory) if writeback else memory
     maintenance, cached_writes = None, set()
-    owners = [None] * harts
+    owners = {}
+    dual = config.get('loadQueueEntries', 1) == 2
+    lsu_slots, lsu_order = [{} for _ in range(harts)], [deque() for _ in range(harts)]
+    recent_source = [2 * hart + 1 for hart in range(harts)]
     read_order, read_peak, read_serial, read_reordered, read_observed = {}, 0, 0, 0, None
+    data_read_peak, data_read_reordered = [0] * harts, [0] * harts
     line_ids, line_peak, line_observed = set(), 0, None
     failures = getattr(program, 'exclusive_failures', 0)
     models = [Model(config, {}, program.faults, hart_id=h) for h in range(harts)]
@@ -1164,7 +1214,7 @@ def check_multicore(lines, config, program, name, atomic_metadata=False, softwar
     hit_addresses = [Counter() for _ in range(harts)]
     data_cache = bool(config.get('dCacheBytes'))
     translated = config.get('virtualAddressBits') == 39
-    observed_data = data_cache or translated
+    observed_data = data_cache or translated or dual
     implicit, walkers = [None] * harts, [None] * harts
     walks = [[None, None] for _ in range(harts)]
     translation_history = [[] for _ in range(harts)]
@@ -1202,25 +1252,43 @@ def check_multicore(lines, config, program, name, atomic_metadata=False, softwar
             region['device'] and int(region['base']) <= event[1] < int(region['base']) + int(region['size'])
             for region in config['memoryRegions'])
 
-    def read_started(hart):
+    def read_started(source):
         nonlocal read_peak, read_serial, line_peak
-        assert hart not in read_order, 'Repeated AXI read before terminal response'
-        read_order[hart] = read_serial
+        assert source not in read_order, 'Repeated AXI read before terminal response'
+        read_order[source] = read_serial
         read_serial += 1
         read_peak = max(read_peak, len(read_order))
-        if owners[hart]['event'][2] == 64:
-            line_ids.add(hart)
+        owner = owners[source]
+        if owner['event'][0] == 'read' and not owner.get('walk'):
+            data_read_peak[owner['hart']] = max(data_read_peak[owner['hart']], sum(
+                owners[key]['hart'] == owner['hart'] and owners[key]['event'][0] == 'read' and not owners[key].get('walk') for key in read_order))
+        if owners[source]['event'][2] == 64:
+            line_ids.add(source)
             line_peak = max(line_peak, len(line_ids))
 
-    def read_completed(hart):
+    def read_completed(source):
         nonlocal read_reordered
-        assert hart in read_order, 'Read data lacks an accepted AXI address'
-        read_reordered += int(read_order[hart] != min(read_order.values()))
-        del read_order[hart]
-        line_ids.discard(hart)
+        assert source in read_order, 'Read data lacks an accepted AXI address'
+        owner = owners[source]
+        if owner['event'][0] == 'read' and not owner.get('walk'):
+            data_read_reordered[owner['hart']] += int(any(
+                owners[key]['hart'] == owner['hart'] and owners[key]['event'][0] == 'read' and not owners[key].get('walk') and order < read_order[source]
+                for key, order in read_order.items()))
+        read_reordered += int(read_order[source] != min(read_order.values()))
+        del read_order[source]
+        line_ids.discard(source)
 
-    def service(hart, event, atomic_fault=False, local=False, read_value=None):
+    def service(hart, event, atomic_fault=False, local=False, read_value=None, replay=False):
         nonlocal interrupt_dirty
+        if dual and event[0] == 'read' and not replay:
+            _, address, size, _ = event
+            if local:
+                try:
+                    return device.access(address, size, 'read', 0), 0
+                except Fault:
+                    return 0, 1
+            value = sum(memory.get(address + byte, 0) << (8 * byte) for byte in range(size)) if read_value is None else read_value
+            return value, int(address <= program.faults.get('read', -1) < address + size)
         assert pending[hart] is None, 'Second memory operation before retirement'
         accesses, response = [], None
 
@@ -1287,6 +1355,9 @@ def check_multicore(lines, config, program, name, atomic_metadata=False, softwar
         data, fault, tag = access['response']
         expected, expected_fault = access['expected']
         assert tag == access['tag'] and fault == expected_fault and (fault or data == expected), 'Architectural data response differs from independent service'
+        if dual:
+            assert not access.get('complete'), 'Duplicate data completion'
+            access['complete'] = True
         architectural[hart] = None
         cache_counts[hart]['completed'] += 1
 
@@ -1322,8 +1393,9 @@ def check_multicore(lines, config, program, name, atomic_metadata=False, softwar
             owner['event'][0] == 'atomic' and owner['operation'] != 2)
 
     def data_owner(hart, event, tag, expanded=False):
-        candidates = [access for access in (implicit[hart], architectural[hart])
+        candidates = [access for access in ([implicit[hart], *lsu_slots[hart].values()] if dual else (implicit[hart], architectural[hart]))
                       if access and access['tag'] == tag and 'expected' not in access and
+                      'event' in access and
                       (access['event'] == event or expanded and event[2] in (8, 64) and
                        event[2] <= 1 << access.get('refillSize', 0) and
                        event == ('read', access['event'][1] & -event[2], event[2], 0))]
@@ -1343,16 +1415,16 @@ def check_multicore(lines, config, program, name, atomic_metadata=False, softwar
         if fields[:1] == ['INVALIDATE']:
             recipient, address, cycle = int(fields[1]), int(fields[2], 16), int(fields[3])
             assert data_cache and config.get('dCacheRefillBytes', 8) == 64 and 0 <= recipient < harts and cycle >= 0 and address % 64 == 0, 'Invalid cache invalidation recipient'
-            writers = [owner for owner in owners if owner and owner['event'][1] // 64 == address // 64 and (writeback or invalidating_write(owner))]
+            writers = [owner for owner in owners.values() if owner and owner['event'][1] // 64 == address // 64 and (writeback or invalidating_write(owner))]
             assert len(writers) == 1, 'Invalidation lacks a unique accepted CPU write'
             assert writeback or writers[0]['event'][0] == 'atomic' or recipient != writers[0]['hart'], 'Ordinary writer invalidated its retained copy'
             recipients = writers[0].setdefault('invalidated', set())
             assert recipient not in recipients and not writers[0]['bus'], 'Duplicate or late write invalidation'
             recipients.add(recipient)
-            access = architectural[recipient]
-            if access and access['event'][0] == 'read' and 'lineValue' not in access and (
-                    address // 64) % (config['dCacheBytes'] // 64) == (access['event'][1] // 64) % (config['dCacheBytes'] // 64):
-                access['invalidated'] = True
+            for access in (lsu_slots[recipient].values() if dual else (architectural[recipient],)):
+                if access and 'event' in access and access['event'][0] == 'read' and 'lineValue' not in access and (
+                        address // 64) % (config['dCacheBytes'] // 64) == (access['event'][1] // 64) % (config['dCacheBytes'] // 64):
+                    access['invalidated'] = True
             continue
         if fields[:1] == ['RESULT']:
             results.append((int(fields[1]), int(fields[2], 16)))
@@ -1414,13 +1486,42 @@ def check_multicore(lines, config, program, name, atomic_metadata=False, softwar
             continue
         if fields[:1] == ['HART']:
             hart, fields = int(fields[1]), fields[2:]
-        elif harts == 1 and fields and fields[0] in ('REQUEST', 'ACCESS_PRIVILEGE', 'ATOMIC', 'BUS', 'READ', 'LINE_BEAT', 'WRITE', 'INTERFERE', 'RESPONSE', 'FETCH', 'IRQ', 'TRACE', 'FETCH_RETIRE', 'ARCH_REQUEST', 'ARCH_FETCH', 'ARCH_CANCEL', 'LOCAL_REQUEST', 'LOCAL_RESPONSE', 'ARCH_DATA_REQUEST', 'ARCH_DATA_RESPONSE', 'CACHE_SAMPLE', 'CACHE_STORE', 'WRITEBACK_REQUEST', 'WRITEBACK_RESPONSE', 'TRANSLATE_REQUEST', 'TRANSLATE_RESPONSE', 'WALK_REQUEST', 'WALK_RESPONSE'):
+        elif harts == 1 and fields and fields[0] in ('LSU_REQUEST', 'LSU_RESPONSE', 'SOURCE', 'REQUEST', 'ACCESS_PRIVILEGE', 'ATOMIC', 'BUS', 'READ', 'LINE_BEAT', 'WRITE', 'INTERFERE', 'RESPONSE', 'FETCH', 'IRQ', 'TRACE', 'FETCH_RETIRE', 'ARCH_REQUEST', 'ARCH_FETCH', 'ARCH_CANCEL', 'LOCAL_REQUEST', 'LOCAL_RESPONSE', 'ARCH_DATA_REQUEST', 'ARCH_DATA_RESPONSE', 'CACHE_SAMPLE', 'CACHE_STORE', 'WRITEBACK_REQUEST', 'WRITEBACK_RESPONSE', 'TRANSLATE_REQUEST', 'TRANSLATE_RESPONSE', 'WALK_REQUEST', 'WALK_RESPONSE'):
             hart = 0
         else:
             continue
         assert 0 <= hart < harts
-        active = owners[hart]
+        explicit_source = int(fields[1]) if fields[:1] == ['SOURCE'] else None
+        if explicit_source is not None:
+            fields = fields[2:]
+        transport_tag = int(fields[1], 16) if fields[:1] == ['TAG'] else None
+        if transport_tag is not None:
+            fields = fields[2:]
         kind = fields[0]
+        client = int(fields[1]) if kind == 'RESPONSE' else int(fields[1] != 'fetch') if kind in ('REQUEST', 'BUS') else 0 if kind in ('FETCH', 'ARCH_REQUEST', 'ARCH_FETCH', 'ARCH_CANCEL') else 1
+        source = explicit_source if explicit_source is not None else recent_source[hart] if kind == 'ACCESS_PRIVILEGE' else 2 * hart + client
+        assert 0 <= source < 2 * harts and source // 2 == hart, 'Source disagrees with hart'
+        if explicit_source is not None and kind in ('REQUEST', 'BUS', 'RESPONSE', 'FETCH') and not (kind == 'BUS' and fields[1] == 'writeback'):
+            assert source % 2 == client, 'Source disagrees with client'
+        physical_source = source
+        if dual:
+            candidates = [key for key in owners if key[0] == source]
+            source = (source, transport_tag) if transport_tag is not None else candidates[0] if len(candidates) == 1 else (source, None)
+        if explicit_source is None and (kind in ('WRITEBACK_REQUEST', 'WRITEBACK_RESPONSE') or kind == 'BUS' and fields[1] == 'writeback'):
+            candidates = [index for index, owner in owners.items() if owner and owner['hart'] == hart]
+            assert len(candidates) == 1, 'Legacy writeback event lacks unique ownership'
+            source = candidates[0]
+        if explicit_source is None and kind in ('READ', 'LINE_BEAT'):
+            candidates = [index for index, owner in owners.items() if owner and owner['hart'] == hart and owner['bus']]
+            assert len(candidates) == 1, 'Legacy read event lacks unique ownership'
+            source = candidates[0]
+        active = owners.get(source)
+        if kind == 'REQUEST':
+            recent_source[hart] = physical_source
+        if dual:
+            tag = (int(fields[5], 16) if kind in ('ARCH_DATA_REQUEST', 'REQUEST') else int(fields[3], 16) if kind in ('ARCH_DATA_RESPONSE', 'CACHE_SAMPLE', 'CACHE_STORE') else
+                   active['tag'] if active and source[0] % 2 else None)
+            architectural[hart] = lsu_slots[hart].get(tag)
         if kind != 'TRACE':
             fetch_checks[hart].send((line, fields))
         if kind == 'FETCH_RETIRE':
@@ -1436,9 +1537,25 @@ def check_multicore(lines, config, program, name, atomic_metadata=False, softwar
             assert kind != 'ARCH_REQUEST' or not waiting[hart], 'New architectural fetch while waiting'
             if kind == 'ARCH_CANCEL' and walks[hart][0]:
                 walks[hart][0]['cancelled'] = True
+            if kind == 'ARCH_CANCEL':
+                local = [owner for owner in owners.values() if owner['hart'] == hart]
+                concurrent['instructionCancelDuringDataService'] += int(any(owner['event'][0] == 'fetch' for owner in local) and
+                    any(owner['event'][0] != 'fetch' for owner in local))
             continue
-        assert kind in ('REQUEST', 'ACCESS_PRIVILEGE', 'ATOMIC', 'BUS', 'READ', 'LINE_BEAT', 'WRITE', 'INTERFERE', 'RESPONSE', 'FETCH', 'IRQ', 'TRACE', 'LOCAL_REQUEST', 'LOCAL_RESPONSE', 'ARCH_DATA_REQUEST', 'ARCH_DATA_RESPONSE', 'CACHE_SAMPLE', 'CACHE_STORE', 'WRITEBACK_REQUEST', 'WRITEBACK_RESPONSE', 'TRANSLATE_REQUEST', 'TRANSLATE_RESPONSE', 'WALK_REQUEST', 'WALK_RESPONSE'), 'Unknown hart event'
-        if kind == 'TRANSLATE_REQUEST':
+        assert kind in ('LSU_REQUEST', 'LSU_RESPONSE', 'REQUEST', 'ACCESS_PRIVILEGE', 'ATOMIC', 'BUS', 'READ', 'LINE_BEAT', 'WRITE', 'INTERFERE', 'RESPONSE', 'FETCH', 'IRQ', 'TRACE', 'LOCAL_REQUEST', 'LOCAL_RESPONSE', 'ARCH_DATA_REQUEST', 'ARCH_DATA_RESPONSE', 'CACHE_SAMPLE', 'CACHE_STORE', 'WRITEBACK_REQUEST', 'WRITEBACK_RESPONSE', 'TRANSLATE_REQUEST', 'TRANSLATE_RESPONSE', 'WALK_REQUEST', 'WALK_RESPONSE'), 'Unknown hart event'
+        if kind == 'LSU_REQUEST':
+            tag, pc, fetch_tag, instruction = (int(value, 16) for value in fields[1:])
+            assert dual and tag in (0, 1) and tag not in lsu_slots[hart] and len(lsu_order[hart]) < 2, 'LSU context reused before retirement'
+            access = dict(tag=tag, pc=pc, fetchTag=fetch_tag, instruction=instruction)
+            lsu_slots[hart][tag] = access
+            lsu_order[hart].append(access)
+        elif kind == 'LSU_RESPONSE':
+            tag, pc, fetch_tag, fault, cause, tval = (int(value, 16) for value in fields[1:])
+            access = lsu_slots[hart].get(tag)
+            assert access and not access.get('done') and (pc, fetch_tag) == (access['pc'], access['fetchTag']), 'LSU completion identity'
+            assert all(value.get('done') for value in list(lsu_order[hart])[:list(lsu_order[hart]).index(access)]), 'LSU completed out of accepted order'
+            access.update(done=True, completion=(fault, cause, tval))
+        elif kind == 'TRANSLATE_REQUEST':
             port, address, privilege, fetch, write, satp, sum_enabled, mxr = (int(value, 16) for value in fields[1:])
             assert translated and port in (0, 1) and walks[hart][port] is None, 'Overlapping translation port ownership'
             assert privilege == (fetch_privileges[hart] if port == 0 else models[hart].data_privilege()), 'Translation effective privilege'
@@ -1469,7 +1586,8 @@ def check_multicore(lines, config, program, name, atomic_metadata=False, softwar
             implicit[hart]['response'] = tuple(int(value, 16) for value in fields[1:])
             complete_walk(hart)
         elif kind == 'ARCH_DATA_REQUEST':
-            assert observed_data and architectural[hart] is None and pending[hart] is None, 'Overlapping architectural data requests'
+            access = architectural[hart]
+            assert observed_data and (access is not None and 'event' not in access if dual else access is None and pending[hart] is None), 'Overlapping architectural data requests'
             event = fields[1], int(fields[2], 16), int(fields[3]), int(fields[4], 16)
             assert event[0] in ('read', 'write', 'atomic') and int(fields[6], 16) == (models[hart].data_privilege() != 0), 'Architectural access context'
             certificate = int(fields[7], 16)
@@ -1479,7 +1597,12 @@ def check_multicore(lines, config, program, name, atomic_metadata=False, softwar
                 assert data_cache and event[0] == 'read' and event[2] in (1, 2, 4, 8) and cacheable(event[1] & -size, size), 'Refill certificate has no cacheable demand'
                 assert size <= config.get('dCacheRefillBytes', 8), 'Refill certificate exceeds configured span'
                 assert protected_read(hart, event[1], event[2]) and protected_read(hart, event[1] & -size, size), 'Refill certificate escaped PMP authorization'
-            architectural[hart] = dict(event=event, tag=int(fields[5], 16), refillSize=certificate)
+            if dual:
+                access.update(event=event, refillSize=certificate)
+                if any(region['device'] and int(region['base']) <= event[1] < int(region['base']) + int(region['size']) for region in config['memoryRegions']):
+                    assert lsu_order[hart][0] is access and models[hart].pc == access['pc'], 'Device access preceded architectural authorization'
+            else:
+                architectural[hart] = dict(event=event, tag=int(fields[5], 16), refillSize=certificate)
             cache_counts[hart]['accepted'] += 1
             cache_counts[hart]['reads'] += int(event[0] == 'read')
         elif kind in ('CACHE_SAMPLE', 'CACHE_STORE'):
@@ -1510,7 +1633,7 @@ def check_multicore(lines, config, program, name, atomic_metadata=False, softwar
             access['expected'] = expected
             cache_counts[hart]['hits'] += int(not store and not access.get('walk'))
             hit_addresses[hart][address] += int(not store and not access.get('walk'))
-            cache_counts[hart]['hitsDuringPeerService'] += int(not store and not access.get('walk') and any(owner is not None for peer, owner in enumerate(owners) if peer != hart))
+            cache_counts[hart]['hitsDuringPeerService'] += int(not store and not access.get('walk') and any(owner is not None for owner in owners.values() if owner and owner['hart'] != hart))
             (complete_walk if access.get('walk') else complete_data)(hart)
         elif kind == 'WRITEBACK_REQUEST':
             address, data, mask, tag, privileged = (int(v, 16) for v in fields[1:])
@@ -1538,20 +1661,24 @@ def check_multicore(lines, config, program, name, atomic_metadata=False, softwar
             access['response'] = tuple(int(field, 16) for field in fields[1:])
             if not access.get('physical') and 'expected' not in access:
                 assert access['response'][1] and pending[hart] is None, 'Architectural response without a cache sample or physical service'
-                first = len(models[hart].requests)
-                pending[hart] = models[hart].step()
-                assert pending[hart][7] and [event for event in models[hart].requests[first:] if event[0] != 'fetch'] == [access['event']], 'Unexpected cache-local rejection'
+                if not dual:
+                    first = len(models[hart].requests)
+                    pending[hart] = models[hart].step()
+                    assert pending[hart][7] and [event for event in models[hart].requests[first:] if event[0] != 'fetch'] == [access['event']], 'Unexpected cache-local rejection'
                 access['expected'] = (0, 1)
                 cache_counts[hart]['rejectedReads'] += int(access['event'][0] == 'read')
             complete_data(hart)
         elif kind == 'REQUEST':
             assert active is None, 'Overlapping source ownership'
             event = fields[1], int(fields[2], 16), int(fields[3]), int(fields[4], 16)
-            peers = [owner for owner in owners if owner is not None]
+            peers = [owner for owner in owners.values() if owner is not None]
             cache_operation = int(fields[6], 16) if len(fields) > 6 else 0
             assert cache_operation in (0, 1, 2) and (writeback or cache_operation == 0), 'Unexpected internal cache operation'
-            assert not peers or harts > 1 and not cache_operation and len(peers) < (config.get('fabricReadSlots') or 2) and ordinary(event) and all(not owner.get('cacheOperation') and ordinary(owner['event']) for owner in peers), 'Exclusive request overlapped physical service or exceeded read slots'
+            assert not peers or read_slots > 0 and not cache_operation and len(peers) < read_slots and ordinary(event) and all(not owner.get('cacheOperation') and ordinary(owner['event']) for owner in peers), 'Exclusive request overlapped physical service or exceeded read slots'
             tag = int(fields[5], 16)
+            assert not dual or transport_tag == tag, 'Physical context tag disagrees with payload'
+            same_client = [owner for key, owner in owners.items() if (key[0] if dual else key) == physical_source]
+            assert len(same_client) < (2 if dual and physical_source % 2 else 1), 'Client context capacity exceeded'
             previous = architectural[hart]
             if previous and 'lineValue' in previous and event[0] != 'fetch':
                 assert previous.get('invalidated') and not previous.get('retry') and event == previous['event'] and tag == previous['tag'], 'Clean line retried without matching write invalidation'
@@ -1561,7 +1688,7 @@ def check_multicore(lines, config, program, name, atomic_metadata=False, softwar
             access = data_owner(hart, event, tag, expanded=True) if observed_data and event[0] != 'fetch' and cache_operation != 2 else None
             privilege = 1 if access and access.get('walk') else fetch_privileges[hart] if event[0] == 'fetch' else models[hart].data_privilege() if hasattr(models[hart], 'data_privilege') else 3
             active = dict(hart=hart, event=event, tag=tag, cacheOperation=cache_operation, bus=False, response=None, expectedPrivileged=privilege != 0)
-            owners[hart] = active
+            owners[source] = active
             if event[0] == 'fetch' and event[2] == 64:
                 assert config.get('enableBurstRefill') and event[1] % 64 == 0, 'Unconfigured or unaligned line read'
                 context = fetch_protection[hart]
@@ -1584,6 +1711,7 @@ def check_multicore(lines, config, program, name, atomic_metadata=False, softwar
                 access['physical'] = True
                 active['walk'] = access.get('walk', False)
                 active['expanded'] = expanded
+                active['access'] = access
                 cache_counts[hart]['physicalReads'] += int(event[0] == 'read' and not active['walk'])
                 if event[0] == 'read' and not active['walk']:
                     cache_counts[hart]['lineReads'] += int(event[2] == 64)
@@ -1594,8 +1722,7 @@ def check_multicore(lines, config, program, name, atomic_metadata=False, softwar
                 assert instruction & 127 == 47 and (instruction >> 12) & 7 == 3 and operation in (0, 1, 2, 3, 8)
                 assert operation != 2 or (instruction >> 20) & 31 == 0
                 active.update(operation=operation, eligible=operation == 3 and models[hart].local_reservation == event[1:3])
-            source = 2 * hart + int(event[0] != 'fetch')
-            sources.add(source)
+            sources.add(2 * hart + int(event[0] != 'fetch'))
             if tag in tags and tags[tag] != hart:
                 collisions.add(tag)
             tags[tag] = hart
@@ -1640,7 +1767,7 @@ def check_multicore(lines, config, program, name, atomic_metadata=False, softwar
                 if event[0] == 'exclusive_read':
                     assert active['operation'] != 3 and active.get('phase') in (None, 'retry') and event[3] == 0
                     active.update(bus=True, phase='read')
-                    read_started(hart)
+                    read_started(source)
                 else:
                     if active['operation'] == 3:
                         assert active.get('phase') is None and active['eligible'] and event[3] == addend, 'SC without a matching local LR or incorrect operand'
@@ -1652,7 +1779,7 @@ def check_multicore(lines, config, program, name, atomic_metadata=False, softwar
             assert active and active['hart'] == hart and active['event'] == event and not active['bus']
             active['bus'] = True
             if event[0] in ('read', 'fetch'):
-                read_started(hart)
+                read_started(source)
             if event[0] == 'read' and not active.get('walk'):
                 cache_counts[hart]['axiReadAddresses'] += 1
                 cache_counts[hart]['axiReadBytes'] += event[2]
@@ -1676,11 +1803,11 @@ def check_multicore(lines, config, program, name, atomic_metadata=False, softwar
             line_beats += 1
             cache_counts[hart]['lineBeats'] += int(active['event'][0] == 'read')
             if last:
-                read_completed(hart)
+                read_completed(source)
         elif kind == 'READ':
             assert active and active['hart'] == hart and active['bus'] and active['response'] is None
             access, address, size, _ = active['event']
-            read_completed(hart)
+            read_completed(source)
             expected = sum(physical_memory.get(address + byte, 0) << (byte * 8) for byte in range(size))
             if writeback and cacheable(address, size):
                 assert expected == sum(memory.get(address + byte, 0) << (byte * 8) for byte in range(size)), 'Physical read preceded required dirty recall'
@@ -1744,7 +1871,7 @@ def check_multicore(lines, config, program, name, atomic_metadata=False, softwar
             if active.get('cacheOperation'):
                 assert channel == 1 and tag == active['tag'] and last and not fault and data == 0 and maintenance is None, 'Internal cache operation completion'
                 transactions += 1
-                owners[hart] = active = None
+                owners.pop(source); active = None
                 continue
             if active['event'][2] == 64 and active['bus']:
                 assert channel == int(active['event'][0] != 'fetch') and tag == active['tag'] and active['chunks'], 'Line chunk has wrong owner or precedes physical service'
@@ -1766,7 +1893,7 @@ def check_multicore(lines, config, program, name, atomic_metadata=False, softwar
                     else:
                         access['lineValue'] = (active['demandData'] >> (8 * (access['event'][1] & 7))) & ((1 << (8 * access['event'][2])) - 1)
                         complete_data(hart)
-                owners[hart] = active = None
+                owners.pop(source); active = None
                 continue
             assert last, 'Scalar completion must be terminal'
             transactions += 1
@@ -1779,7 +1906,7 @@ def check_multicore(lines, config, program, name, atomic_metadata=False, softwar
                     sc_results[hart, False] += 1
                 else:
                     assert fault, 'Locally rejected request did not fault'
-                if channel and fault:
+                if channel and fault and not (dual and active['event'][0] == 'read'):
                     assert pending[hart] is None
                     first = len(models[hart].requests)
                     pending[hart] = models[hart].step()
@@ -1800,12 +1927,12 @@ def check_multicore(lines, config, program, name, atomic_metadata=False, softwar
                     assert pending[hart] is None and 'response' not in access and not access.get('retry'), 'Expanded fault published or retried more than once'
                     access['physical'], access['retry'] = False, True
                     cache_counts[hart]['refillRetries'] += 1
-                    owners[hart] = active = None
+                    owners.pop(source); active = None
                     continue
                 access['expected'] = (((data >> (8 * (access['event'][1] & 7))) & ((1 << (8 * access['event'][2])) - 1)), 0) if active.get('expanded') else active['response'] if active['bus'] else (1, 0) if not fault else (0, 1)
                 cache_counts[hart]['expandedReads'] += int(active.get('expanded', False))
                 (complete_walk if active.get('walk') else complete_data)(hart)
-            owners[hart] = active = None
+            owners.pop(source); active = None
         elif kind == 'IRQ':
             if device is None:
                 models[hart].set_interrupts(int(fields[1], 16))
@@ -1817,6 +1944,19 @@ def check_multicore(lines, config, program, name, atomic_metadata=False, softwar
         elif kind == 'TRACE':
             assert not waiting[hart], 'Architectural event while waiting without a wakeup'
             observed = tuple(int(v, 16) for v in fields[1:])
+            if dual and lsu_order[hart] and lsu_order[hart][0]['pc'] == observed[1]:
+                access = lsu_order[hart][0]
+                assert access.get('done') and access['instruction'] == observed[2], 'Retirement preceded its LSU completion'
+                assert access['completion'] == (observed[7], observed[8], observed[9]), 'Retirement changed the LSU fault context'
+                if access.get('event', (None,))[0] == 'read':
+                    assert access.get('complete'), 'Retirement preceded its data response'
+                    service(hart, access['event'], read_value=access['expected'][0], replay=True)
+                elif 'event' not in access:
+                    assert access['completion'][0] and pending[hart] is None, 'Unserviced LSU operation did not fault'
+                    pending[hart] = models[hart].step()
+                    assert pending[hart][7], 'LSU-local rejection differs from instruction model'
+                lsu_order[hart].popleft()
+                del lsu_slots[hart][access['tag']]
             if translated and translation_maintenance(observed):
                 translation_history[hart].clear()
                 for walk in walks[hart]:
@@ -1824,8 +1964,8 @@ def check_multicore(lines, config, program, name, atomic_metadata=False, softwar
                         walk['stale'] = True
             eligible, owned = models[hart].interrupt_cause(), pending[hart] is not None
             if pending[hart] is not None:
-                assert active is None or active['hart'] != hart or active['event'][0] == 'fetch', 'Memory operation retired before its response'
-                assert not observed_data or architectural[hart] is None, 'Memory operation retired before architectural response'
+                assert dual or active is None or active['hart'] != hart or active['event'][0] == 'fetch', 'Memory operation retired before its response'
+                assert dual or not observed_data or architectural[hart] is None, 'Memory operation retired before architectural response'
                 wanted, pending[hart] = pending[hart], None
             elif observed[8] >> 63:
                 wanted = models[hart].interrupt()
@@ -1836,7 +1976,7 @@ def check_multicore(lines, config, program, name, atomic_metadata=False, softwar
                 wanted = models[hart].step()
                 assert not observed_data or not any(event[0] != 'fetch' for event in models[hart].requests[first:]), 'Retirement omitted an architectural data request'
             if eligible and not wanted[7]:
-                deferred[hart] = defer_interrupt(wanted, retirement_groups[hart], deferred[hart], owned)
+                deferred[hart] = defer_interrupt(wanted, retirement_groups[hart], deferred[hart], owned, config.get('loadQueueEntries', 1))
             else:
                 deferred[hart] = None
             fetch_checks[hart].send((line, fields))
@@ -1857,13 +1997,16 @@ def check_multicore(lines, config, program, name, atomic_metadata=False, softwar
             wake_mask = (wake_mask & ~(1 << hart)) | (int(wake[hart]) << hart)
             if wanted[7]:
                 waiting[hart] = False
+                if dual:
+                    assert all(access.get('done') for access in lsu_order[hart]), 'Trap changed context before accepted reads drained'
+                    lsu_order[hart].clear(); lsu_slots[hart].clear()
             elif wanted[2] == 0x10500073:
                 waiting[hart] = config['enableInterrupts'] and not wake[hart]
                 if waiting[hart]:
                     wait_started[hart] = device.cycle + 1 if device is not None else 0
             waiting_mask = (waiting_mask & ~(1 << hart)) | (int(waiting[hart]) << hart)
             events += 1
-            if any(owner is not None for peer, owner in enumerate(owners) if peer != hart):
+            if any(owner is not None for owner in owners.values() if owner and owner['hart'] != hart):
                 concurrent['trapDuringPeerService'] += int(bool(wanted[7]))
                 concurrent['redirectDuringPeerService'] += int(wanted[3] != wanted[1] + 4)
             if not wanted[7] and wanted[1] == program.stop:
@@ -1879,8 +2022,8 @@ def check_multicore(lines, config, program, name, atomic_metadata=False, softwar
             if waiting[hart]:
                 sleep_cycles[hart] += device.cycle - wait_started[hart] + 1
     assert finished == set(range(harts)) and all(record is None for record in pending)
-    assert all(owner is None or owner['event'][0] == 'fetch' for owner in owners), 'Unretired data access at completion'
-    assert all(access is None for access in architectural), 'Uncompleted architectural data access'
+    assert all(owner is None or owner['event'][0] == 'fetch' for owner in owners.values()), 'Unretired data access at completion'
+    assert all(not slots for slots in lsu_slots) if dual else all(access is None for access in architectural), 'Uncompleted architectural data access'
     assert failures == 0, 'Exclusive failure stimulus was not consumed'
     if hasattr(program, 'dirty_pte'):
         assert sum(c['dirtyPteStores'] for c in cache_counts) == 1 and translation_counts['dirtyPteReads'] == 1, 'Missing dirty PTE store or synchronized page walk'
@@ -1992,9 +2135,14 @@ def check_multicore(lines, config, program, name, atomic_metadata=False, softwar
     assert line_observed is None or line_observed[0] == line_peak, 'Line concurrency differs from independent accepted addresses'
     if getattr(program, 'parallel_reads', False):
         assert read_peak == 2 and read_reordered > 0, 'Missing simultaneous addresses or reordered read completion'
+    if dual and getattr(program, 'load_window', False) and not writeback and read_slots:
+        assert max(data_read_peak) == min(2, read_slots) and (read_slots == 1 or sum(data_read_reordered) > 0), 'Missing data-read capacity or reversed return'
+    if dual and name == 'load_cancel' and not config.get('iCacheBytes') and read_slots >= 2:
+        assert concurrent['instructionCancelDuringDataService'], 'No instruction cancellation with outstanding I/D owners'
     return dict(**(dict(results=results) if software_output else {}), **(dict(dataCache=[dict(count) for count in cache_counts]) if data_cache else {}), **(dict(translation=dict(translation_counts)) if translated else {}), events=events, activeHarts=len(finished), sources=sorted(sources),
                 cycles=elapsed_cycles, transactions=transactions, axiTransactions=axi_transactions, lineReadBeats=line_beats,
                 readConcurrency=dict(maxOutstanding=read_peak, reorderedResponses=read_reordered),
+                dataReadConcurrency=dict(maxOutstanding=data_read_peak, reorderedResponses=data_read_reordered),
                 lineConcurrency=dict(maxOutstanding=line_peak, overlapCycles=line_observed[1] if line_observed else 0),
                 collidingTags=len(collisions), readsBeforePeerRetirement=overtaken, concurrency=dict(concurrent),
                 platformCycles=device.cycle + 1 if device is not None else 0,
@@ -2027,8 +2175,12 @@ def compare_multicore(binary, directory, config, selected=(), platform=False):
             command = [binary, f'+IMAGE={image.resolve()}', f'+BASE={base:x}', f'+STOP={program.stop:x}', f'+SEED={seed}']
             command += [f'+FAULT_{kind.upper()}={address:x}' for kind, address in program.faults.items()]
             command += [f'+{key.upper()}={getattr(program, key, 0)}' for key in ('exclusive_failures', 'interference')]
-            if hasattr(program, 'parallel_reads'):
+            if hasattr(program, 'parallel_reads') or getattr(program, 'load_window', False):
                 command.append('+REORDER_READS=1')
+            if hasattr(program, 'data_cache') and 'work' in program.data_cache:
+                command += [f'+WORK_{key.upper()}={program.data_cache["work"][key]:x}' for key in ('begin', 'end')]
+            if name == 'load_cancel':
+                command.append('+FIXED_READ_DELAY=128')
             if hasattr(program, 'interrupts'):
                 command += [f'+IRQ_{key.upper()}={value:x}' if key == 'target' else f'+IRQ_{key.upper()}={value}'
                             for key, value in program.interrupts.items()]
@@ -2049,14 +2201,20 @@ def compare_multicore(binary, directory, config, selected=(), platform=False):
 
 def check_data_oracle():
     limit = defer_interrupt((0, 0, 0x3003), (0, 3, 0), None, True)
-    assert defer_interrupt((1, 0, 0x13), (0, 3, 1), limit, False) == 3
+    assert defer_interrupt((1, 0, 0x13), (0, 3, 1), limit, False) == limit
+    second = defer_interrupt((3, 0, 0x3003), (3, 5, 0), limit, True, 2)
+    assert second == (5, 2, True) and defer_interrupt((4, 0, 0x13), (3, 5, 1), second, False, 2) == second
     interrupt_guards = []
-    for label, record, group, previous, owned in (
-            ('interruptNextGroup', (3, 0, 0x13), (3, 4, 0), limit, False),
-            ('interruptWithoutOwner', (0, 0, 0x13), (0, 1, 0), None, False),
-            ('interruptMultiplyFollower', (1, 0, 0x02000033), (0, 3, 1), limit, False)):
+    for label, record, group, previous, owned, maximum in (
+            ('interruptNextGroup', (3, 0, 0x13), (3, 4, 0), limit, False, 1),
+            ('interruptWithoutOwner', (0, 0, 0x13), (0, 1, 0), None, False, 1),
+            ('interruptMultiplyFollower', (1, 0, 0x02000033), (0, 3, 1), limit, False, 1),
+            ('interruptSingleReadLimit', (3, 0, 0x3003), (3, 5, 0), limit, True, 1),
+            ('interruptThirdRead', (5, 0, 0x3003), (5, 6, 0), second, True, 2),
+            ('interruptYoungerStore', (3, 0, 0x3023), (3, 4, 0), limit, True, 2),
+            ('interruptDualMultiply', (5, 0, 0x02000033), (5, 6, 0), second, False, 2)):
         try:
-            defer_interrupt(record, group, previous, owned)
+            defer_interrupt(record, group, previous, owned, maximum)
         except AssertionError:
             interrupt_guards.append(label)
             continue
@@ -2465,7 +2623,7 @@ def verify_software_matrix(args):
             config_path = directory / 'input.json'
             config_path.write_text(json.dumps(dict(template, hartCount=harts, issueWidth=width, enableBranchPrediction=args.branch_prediction,
                 axiDataBits=512 if harts == 16 else 64, iCacheBytes=args.icache_bytes,
-                dCacheBytes=args.dcache_bytes, dCacheRefillBytes=refill, dCacheWriteback=args.dcache_writeback, enableBurstRefill=args.burst_refill,
+                dCacheBytes=args.dcache_bytes, dCacheRefillBytes=refill, dCacheWriteback=args.dcache_writeback, enableBurstRefill=args.burst_refill, loadQueueEntries=args.load_queue_entries,
                 **(dict(fabricReadSlots=selection) if args.software_read_matrix else {})), indent=2) + '\n')
             software = directory / 'software'
             run(['python3', 'scripts/build_software.py', '--config', config_path,
@@ -2507,6 +2665,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--width', type=int, choices=(64, 128, 256, 512), action='append')
     parser.add_argument('--issue-width', type=int, choices=(1, 2, 3), default=1)
+    parser.add_argument('--load-queue-entries', type=int, choices=(1, 2), default=1)
     parser.add_argument('--fabric-read-slots', type=int, choices=(1, 2, 3, 4))
     parser.add_argument('--use-generated', action='store_true')
     parser.add_argument('--elf', type=Path)
@@ -2538,8 +2697,8 @@ def main():
     parser.add_argument('--case', dest='selected', action='append', default=[])
     parser.add_argument('--traffic-baseline', type=Path)
     args = parser.parse_args()
-    if args.fabric_read_slots is not None and not args.multicore_only:
-        parser.error('--fabric-read-slots requires --multicore-only; software uses its configuration')
+    if args.fabric_read_slots is not None and args.elf:
+        parser.error('Software read slots use their configuration')
     if args.burst_refill and not args.icache_bytes and not args.elf:
         parser.error('--burst-refill requires --icache-bytes')
     if (args.dcache_refill_bytes == 64 or args.software_refill_matrix) and not args.dcache_bytes and not args.elf:
@@ -2604,7 +2763,9 @@ def main():
         directory = args.output / f'{"irq-" if interrupts else ""}{"pmp16-" if entries else ""}axi{width}'
         directory.mkdir(parents=True, exist_ok=True)
         config = configuration(width)
-        config.update(issueWidth=args.issue_width, pmpEntries=entries, enableInterrupts=interrupts, iCacheBytes=args.icache_bytes, dCacheBytes=args.dcache_bytes, dCacheRefillBytes=args.dcache_refill_bytes, dCacheWriteback=args.dcache_writeback, tlbEntries=args.tlb_entries, enableBurstRefill=args.burst_refill, enableBranchPrediction=args.branch_prediction)
+        config.update(issueWidth=args.issue_width, loadQueueEntries=args.load_queue_entries, pmpEntries=entries, enableInterrupts=interrupts, iCacheBytes=args.icache_bytes, dCacheBytes=args.dcache_bytes, dCacheRefillBytes=args.dcache_refill_bytes, dCacheWriteback=args.dcache_writeback, tlbEntries=args.tlb_entries, enableBurstRefill=args.burst_refill, enableBranchPrediction=args.branch_prediction)
+        if args.fabric_read_slots is not None:
+            config['fabricReadSlots'] = args.fabric_read_slots
         config['memoryRegions'][0]['dataCacheable'] = bool(args.dcache_bytes)
         if args.user_mode:
             config['enableUserMode'] = True
@@ -2633,7 +2794,7 @@ def main():
         report = compare(binary, directory, manifest['parameters'], selected=args.selected)
         report['interfaceContracts'] = interface_contracts
         report['instructionStorage'] = storage
-        report.update(issueWidth=args.issue_width, axiDataBits=width, physicalAddressBits=config['physicalAddressBits'], pmpEntries=entries, enableInterrupts=interrupts, iCacheBytes=args.icache_bytes, dCacheBytes=args.dcache_bytes, dCacheRefillBytes=args.dcache_refill_bytes, dCacheWriteback=args.dcache_writeback)
+        report.update(issueWidth=args.issue_width, loadQueueEntries=args.load_queue_entries, axiDataBits=width, physicalAddressBits=config['physicalAddressBits'], pmpEntries=entries, enableInterrupts=interrupts, iCacheBytes=args.icache_bytes, dCacheBytes=args.dcache_bytes, dCacheRefillBytes=args.dcache_refill_bytes, dCacheWriteback=args.dcache_writeback)
         summary['configurations'].append(report)
         core = directory / 'core'
         core_config = dict(config, axiDataBits=256, dCacheBytes=0, dCacheRefillBytes=8, dCacheWriteback=False)
@@ -2668,7 +2829,7 @@ def main():
                 continue
             directory = args.output / f'harts{harts}-axi{width}'
             directory.mkdir(parents=True, exist_ok=True)
-            config = dict(configuration(width), issueWidth=args.issue_width, hartCount=harts, pmpEntries=entries, enableInterrupts=interrupts, iCacheBytes=args.icache_bytes, dCacheBytes=args.dcache_bytes, dCacheRefillBytes=args.dcache_refill_bytes, dCacheWriteback=args.dcache_writeback, tlbEntries=args.tlb_entries, enableBurstRefill=args.burst_refill, enableBranchPrediction=args.branch_prediction)
+            config = dict(configuration(width), issueWidth=args.issue_width, loadQueueEntries=args.load_queue_entries, hartCount=harts, pmpEntries=entries, enableInterrupts=interrupts, iCacheBytes=args.icache_bytes, dCacheBytes=args.dcache_bytes, dCacheRefillBytes=args.dcache_refill_bytes, dCacheWriteback=args.dcache_writeback, tlbEntries=args.tlb_entries, enableBurstRefill=args.burst_refill, enableBranchPrediction=args.branch_prediction)
             if args.fabric_read_slots is not None:
                 config['fabricReadSlots'] = args.fabric_read_slots
             config['memoryRegions'][0]['dataCacheable'] = bool(args.dcache_bytes)
@@ -2695,11 +2856,12 @@ def main():
             binary = compile_tb(rtl, directory, width, config['physicalAddressBits'])
             report = compare_multicore(binary, directory, manifest['parameters'], args.selected, args.platform_only)
             report['interfaceContracts'] = verify_contracts(
-                rtl, directory / 'contracts', modules=('DitDahA1MemoryArbiter', 'DitDahA1MemoryFabric', *(('DitDahA1ReadQueue',) if harts > 1 else ()),
+                rtl, directory / 'contracts', modules=('DitDahA1MemoryArbiter', 'DitDahA1MemoryFabric', *(('DitDahA1ReadQueue',) if config.get('fabricReadSlots') or harts > 1 else ()),
+                                                      *(('DitDahA1Backend', 'DitDahA1Lsu') if args.load_queue_entries == 2 and not args.sv39 else ()),
                                                       *(('DitDahA1DataCache', 'DitDahA1Coherence') if args.dcache_bytes else ()),
                                                       *(('DitDahA1LocalInterrupts',) if args.platform_only else ())))
             report['instructionStorage'] = verify_storage(rtl, directory / 'storage')
-            report.update(issueWidth=args.issue_width, hartCount=harts, axiDataBits=width, pmpEntries=entries, enableInterrupts=interrupts, iCacheBytes=args.icache_bytes, dCacheBytes=args.dcache_bytes, dCacheRefillBytes=args.dcache_refill_bytes, dCacheWriteback=args.dcache_writeback)
+            report.update(issueWidth=args.issue_width, loadQueueEntries=args.load_queue_entries, hartCount=harts, axiDataBits=width, pmpEntries=entries, enableInterrupts=interrupts, iCacheBytes=args.icache_bytes, dCacheBytes=args.dcache_bytes, dCacheRefillBytes=args.dcache_refill_bytes, dCacheWriteback=args.dcache_writeback)
             if not args.icache_bytes and not args.dcache_bytes and not args.platform_only:
                 for count in ((15, 16) if harts == 16 else (harts,)):
                     Path(f'result/harts{count}-input.json').write_text(json.dumps(dict(config, hartCount=count), indent=2) + '\n')

@@ -43,7 +43,9 @@ object DitDahA1Core extends Generator[DitDahA1Parameter, DitDahA1Layers, DitDahA
       if parameter.pmpEntries != 0 then translation.io.pmp.get :<= backend.io.pmp.get
       translation.io.ports(0) :<>= frontend.io.translation.get
       translation.io.ports(1) :<>= backend.io.translation.get
-      DitDahA1MemoryArbiter.arbitrate(Seq(backend.io.data, translation.io.memory), io.data)
+      if parameter.loadQueueEntries == 1 then
+        DitDahA1MemoryArbiter.arbitrate(Seq(backend.io.data, translation.io.memory), io.data)
+      else DitDahA1MemoryArbiter.dataTranslation(backend.io.data, translation.io.memory, io.data)
     io.status :<= backend.io.status
     layer("DV"):
       probe.valid <== backend.probe.valid
@@ -99,6 +101,11 @@ object DitDahA1Backend extends Generator[DitDahA1Parameter, DitDahA1Layers, DitD
     val commitPacket = commitPackets(0)
     val commitResolved = RegInit(false.B)
     val memoryPending = RegInit(false.B)
+    val concurrent = parameter.loadQueueEntries == 2
+    val extraCount = Option.when(concurrent)(RegInit(0.U(countBits)))
+    val extraPackets = Option.when(concurrent)(Reg(Vec(width, new ResultPacket)))
+    val extraPending = Option.when(concurrent)(RegInit(false.B))
+    val extraValid = extraCount.map(_ =/= 0.U).getOrElse(false.B)
     val executePending = RegInit(false.B)
     val resumePc = Option.when(parameter.enableInterrupts)(RegInit(parameter.resetVector.U(64)))
     val sleep = Option.when(parameter.enableInterrupts)(RegInit(false.B))
@@ -142,7 +149,9 @@ object DitDahA1Backend extends Generator[DitDahA1Parameter, DitDahA1Layers, DitD
     csr.io.readAddress := execute.io.csrAddress
     // Completed data operations keep ownership until their architectural event.
     val takeInterrupt = if parameter.enableInterrupts then
-      csr.io.interruptPending.get & !memoryPending & !(commitValid & (commitPacket.load | commitPacket.store | commitPacket.instruction.fault))
+      csr.io.interruptPending.get & !memoryPending &
+        (if concurrent then !extraValid & !(memoryValid & (memoryPacket.load | memoryPacket.store)) else true.B) &
+        !(commitValid & (commitPacket.load | commitPacket.store | commitPacket.instruction.fault))
     else false.B
     val interruptCause = if parameter.enableInterrupts then csr.io.interruptCause.get else 0.U(64)
     commit.io.input.valid := (if parameter.enableInterrupts then commitValid & !takeInterrupt else commitValid)
@@ -174,9 +183,16 @@ object DitDahA1Backend extends Generator[DitDahA1Parameter, DitDahA1Layers, DitD
     val memoryCompletion = (memoryPacket.load | memoryPacket.store) & !memoryPacket.instruction.fault
     val completion = Wire(new ResultPacket)
     completion :<= memoryPacket
-    when(memoryPending) { completion :<= lsu.io.output.bits }
-    val memoryAdvance = memoryValid & (!memoryCompletion | (memoryPending & lsu.io.output.valid)) & commitReady & !redirect
-    val resultAdvance = resultValid & (!memoryValid | memoryAdvance) &
+    when(memoryPending & (if concurrent then lsu.io.output.valid else true.B)) { completion :<= lsu.io.output.bits }
+    val memoryFault = memoryValid & completion.instruction.fault
+    val tailReceiving = extraPending.getOrElse(false.B) & !memoryPending & lsu.io.output.valid
+    val memoryReady = if concurrent then !memoryPending | lsu.io.output.valid else !memoryCompletion | (memoryPending & lsu.io.output.valid)
+    val memoryAdvance = memoryValid & memoryReady & commitReady & !redirect &
+      (if concurrent then !tailReceiving & (!memoryFault | !extraPending.get) else true.B)
+    val append = if !concurrent then false.B else memoryValid & !extraValid & !memoryAdvance & !memoryFault &
+      memoryPacket.load & !memoryPacket.store & !memoryPacket.atomic &
+      resultPacket.load & !resultPacket.store & !resultPacket.atomic & !resultPacket.instruction.fault
+    val resultAdvance = resultValid & ((!memoryValid | (memoryAdvance & !extraValid)) | append) &
       (!memoryOperation | (lsu.io.input.valid & lsu.io.input.ready)) & !redirect
     val isMultiply = (issuedPacket.decoded.operation === DitDahA1Isa.Mul.U(DitDahA1Isa.operationBits)) & !issuedPacket.decoded.instruction.fault
     multiply.io.input.valid := issuedValid & isMultiply & !executePending & !redirect
@@ -204,8 +220,11 @@ object DitDahA1Backend extends Generator[DitDahA1Parameter, DitDahA1Layers, DitD
       val packet = memoryPackets(lane)
       val completed = if lane == 0 then completion else packet
       ((lane.U < memoryCount) & packet.rdWrite, packet.rd,
-        (if lane == 0 then !memoryCompletion | (memoryPending & lsu.io.output.valid) else true.B) & !completed.instruction.fault, completed.value)
-    } ++ (0 until width).map { lane =>
+        (if lane == 0 then (if concurrent then !memoryPending | lsu.io.output.valid else !memoryCompletion | (memoryPending & lsu.io.output.valid)) else true.B) & !completed.instruction.fault, completed.value)
+    } ++ (if !concurrent then Seq.empty else (0 until width).map { lane =>
+      val packet = extraPackets.get(lane)
+      ((lane.U < extraCount.get) & packet.rdWrite, packet.rd, !extraPending.get & !packet.instruction.fault, packet.value)
+    }) ++ (0 until width).map { lane =>
       val packet = resultPackets(lane)
       ((lane.U < resultCount) & packet.rdWrite, packet.rd,
         (if lane == 0 then !memoryOperation else true.B) & !packet.instruction.fault, packet.value)
@@ -274,10 +293,12 @@ object DitDahA1Backend extends Generator[DitDahA1Parameter, DitDahA1Layers, DitD
     val received = io.instruction.valid & io.instruction.ready
     io.redirect := flushYounger
     io.redirectPc := earlyRedirect.?(execution(0).nextPc, retire.bits.nextPc)
-    lsu.io.input.valid := resultValid & memoryOperation & !memoryPending & !memoryValid & !commitValid & !redirect
+    lsu.io.input.valid := resultValid & memoryOperation & !commitValid & !redirect &
+      (if concurrent then ((!memoryValid & !extraValid) | append) & !memoryFault else !memoryPending & !memoryValid)
     lsu.io.input.bits :<= resultPacket
-    lsu.io.storeAllowed := !memoryValid & !commitValid & !redirect
-    lsu.io.output.ready := memoryValid & memoryPending & commitReady & !redirect
+    lsu.io.storeAllowed := (if concurrent then !memoryValid | memoryPending else !memoryValid) & !commitValid & !redirect & !memoryFault
+    lsu.io.output.ready := (if concurrent then memoryPending | extraPending.get else memoryValid & memoryPending & commitReady) & !redirect
+    lsu.io.cancel.foreach(_ := memoryFault | redirect)
     for lane <- 0 until width do
       gpr.io.we(lane) := (lane.U < retireCount) & retirement(lane).rdWrite
       gpr.io.waddr(lane) := retirement(lane).rd
@@ -314,8 +335,21 @@ object DitDahA1Backend extends Generator[DitDahA1Parameter, DitDahA1Layers, DitD
       commitPackets(0) :<= completion
       commitResolved := memoryResolved
       memoryCount := 0.U
+      if concurrent then
+        memoryPending := false.B
+        when(extraValid & !memoryFault) {
+          memoryCount := extraCount.get; memoryPackets :<= extraPackets.get; memoryResolved := false.B
+          memoryPending := extraPending.get
+        }
+        extraCount.get := 0.U; extraPending.get := false.B
     }
-    when(resultAdvance) { memoryCount := resultCount; memoryPackets :<= resultPackets; memoryResolved := resultResolved; resultCount := 0.U }
+    when(resultAdvance) {
+      resultCount := 0.U
+      if concurrent then
+        when(append) { extraCount.get := resultCount; extraPackets.get :<= resultPackets; extraPending.get := true.B }
+          .otherwise { memoryCount := resultCount; memoryPackets :<= resultPackets; memoryResolved := resultResolved }
+      else { memoryCount := resultCount; memoryPackets :<= resultPackets; memoryResolved := resultResolved }
+    }
     when(executed) { resultPackets :<= execution; resultResolved := resolved; resultCount := issuedCount; issuedCount := 0.U }
     // Accepted arithmetic drains before the issued group is reused.
     when(multiply.io.input.valid & multiply.io.input.ready) { executePending := true.B }
@@ -336,8 +370,14 @@ object DitDahA1Backend extends Generator[DitDahA1Parameter, DitDahA1Layers, DitD
       }
     compact(decodedCount, decodedPackets, issueCount, decodedInput, decodeCount)
     compact(instructionCount, instructionPackets, decodeCount, io.instruction.bits.packets, received.?(io.instruction.bits.count, 0.U(countBits)))
-    when(lsu.io.input.valid & lsu.io.input.ready) { memoryPending := true.B }
-    when(lsu.io.output.valid & lsu.io.output.ready) { memoryPending := false.B }
+    when(lsu.io.input.valid & lsu.io.input.ready & !append) { memoryPending := true.B }
+    when(lsu.io.output.valid & lsu.io.output.ready) {
+      if concurrent then
+        when(memoryPending) {
+          when(!memoryAdvance) { memoryPackets(0) :<= lsu.io.output.bits; memoryPending := false.B }
+        }.otherwise { extraPackets.get(0) :<= lsu.io.output.bits; extraPending.get := false.B }
+      else memoryPending := false.B
+    }
     when(earlyRedirect) { instructionCount := 0.U; decodedCount := 0.U }
     when(redirect) {
       instructionCount := 0.U
@@ -346,6 +386,7 @@ object DitDahA1Backend extends Generator[DitDahA1Parameter, DitDahA1Layers, DitD
       resultCount := 0.U
       memoryCount := 0.U
       commitCount := 0.U
+      if concurrent then { extraCount.get := 0.U; extraPending.get := false.B; memoryPending := false.B }
     }
     layer("DV"):
       val traceCount = Wire(UInt(countBits))
@@ -368,7 +409,7 @@ object DitDahA1Backend extends Generator[DitDahA1Parameter, DitDahA1Layers, DitD
       val occupancyBits = parameter.pipelineOccupancyBits
       val pipelineOccupancy = Wire(UInt(occupancyBits))
       val pipelineStall = Wire(Bool())
-      pipelineOccupancy := Seq(instructionCount, decodedCount, issuedCount, resultCount, memoryCount, commitCount)
+      pipelineOccupancy := (Seq(instructionCount, decodedCount, issuedCount, resultCount, memoryCount, commitCount) ++ extraCount.toSeq)
         .map(count => (0.U(occupancyBits) + count)).reduce(_ + _).asBits.bits(occupancyBits - 1, 0).asUInt
       pipelineStall := decodedValid & stalled
       for lane <- 0 until width do

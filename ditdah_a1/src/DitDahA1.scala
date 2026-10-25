@@ -54,7 +54,7 @@ object DitDahA1MemoryFabric extends Generator[DitDahA1Parameter, DitDahA1UnitLay
     val arbiter = DitDahA1MemoryArbiter.instantiate(parameter)
     val memory = DitDahA1Memory.instantiate(parameter)
     val axi = DitDahA1Axi.instantiate(parameter)
-    val readers = Option.when(parameter.hartCount > 1)(DitDahA1ReadQueue.instantiate(parameter))
+    val readers = Option.when(parameter.resolvedFabricReadSlots > 0)(DitDahA1ReadQueue.instantiate(parameter))
     arbiter.io.clock := io.clock
     arbiter.io.reset := io.reset
     memory.io.clock := io.clock

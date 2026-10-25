@@ -174,7 +174,31 @@ def memory_group_cases(base, protection, interrupts, sv39):
         yield 'memory_group_interrupt', p
 
 
+def load_window_program(base, harts=1, cancel=False):
+    p = Program(base)
+    p.emit(csr(2, 0xf14, 0, True), alu(3, 2, 7, 1, immediate=True))
+    p.address(10, 0x1800)
+    begin = base + p.offset
+    p.emit(add(10, 10, 3), ld(3, 10))
+    if cancel:
+        p.emit(jal(0, 12), sd(0, 0), 0)
+    p.emit(ld(4, 10, 64), add(5, 3, 4))
+    end = base + p.offset - 4
+    p.address(11, 0x3000)
+    p.emit(alu(6, 2, 3, 1, immediate=True), add(11, 11, 6), sd(5, 11), sd(5, 11, 0x100), sd(5, 11, 0x200))
+    for hart in range(harts):
+        for offset, value in ((0, 11 + hart), (64, 22 + hart)):
+            p.memory[base + 0x1800 + 128 * hart + offset] = value
+    p.load_window = not cancel
+    p.data_cache = dict(minHits=0, finalRegisters=[{3: 11 + hart, 4: 22 + hart, 5: 33 + 2 * hart} for hart in range(harts)])
+    p.data_cache['work'] = dict(begin=begin, end=end, reads={8: 2, 64: 2})
+    return p.finish()
+
+
 def cases(base, protection=False, interrupts=False, user=False, local_interrupt_base=None, supervisor=False, sv39=False, writeback=False):
+    if not sv39:
+        yield 'load_window', load_window_program(base)
+        yield 'load_cancel', load_window_program(base, cancel=True)
     yield from memory_group_cases(base, protection, interrupts, sv39)
     for fault in (False, True):
         p = Program(base)
@@ -840,6 +864,8 @@ def interrupt_cases(base, protection):
 
 
 def multicore_cases(base, harts, protection=False, interrupts=False, user=False, writeback=False):
+    yield 'load_window', load_window_program(base, harts)
+    yield 'load_cancel', load_window_program(base, harts, cancel=True)
     p = Program(base)
     p.emit(csr(2, 0xf14, 0, True), alu(3, 2, 3, 1, immediate=True))
     p.address(10, 0x1800)

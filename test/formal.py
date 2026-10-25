@@ -168,8 +168,9 @@ def backend_names(text, source):
 
 
 def pipeline_case(source, parameters):
-    width, capacity = parameters['issueWidth'], 6 * parameters['issueWidth']
-    stages = ('commit', 'memory', 'result', 'issued', 'decoded', 'instruction')
+    dual = parameters.get('loadQueueEntries', 1) == 2
+    width, capacity = parameters['issueWidth'], (5 + parameters.get('loadQueueEntries', 1)) * parameters['issueWidth']
+    stages = ('commit', 'memory', *(('extra',) if dual else ()), 'result', 'issued', 'decoded', 'instruction')
     prediction = parameters.get('enableBranchPrediction', False)
     identity_bits = 97 if prediction else 96
     identity = lambda p, live=True: '{' + ((p + '_predictedTaken' if live else "1'b0") + ', ' if prediction else '') + p + '_pc, ' + p + '_instruction}'
@@ -180,7 +181,8 @@ def pipeline_case(source, parameters):
   (* anyconst *) reg [6:0] pipeline_bit;
   wire [{identity_bits-1}:0] pipeline_input[{width}];
   wire [{width.bit_length()-1}:0] pipeline_added = received ? instruction_bits_count : 0;
-  wire [{capacity.bit_length()-1}:0] pipeline_remaining = pipeline_owned - retireCount - (earlyRedirect ? instructionCount + decodedCount : 0);
+  wire [{capacity.bit_length()-1}:0] pipeline_discarded = {"memoryAdvance && memoryFault ? extraCount : 0" if dual else '0'};
+  wire [{capacity.bit_length()-1}:0] pipeline_remaining = pipeline_owned - retireCount - (earlyRedirect ? instructionCount + decodedCount : 0) - pipeline_discarded;
   always @* assume(pipeline_bit < {identity_bits});
 '''
     for lane in range(width):
@@ -206,7 +208,8 @@ def pipeline_case(source, parameters):
       pipeline_owned <= pipeline_remaining + pipeline_added;
       for (pipeline_i = 0; pipeline_i < {capacity}; pipeline_i = pipeline_i + 1) begin
         if (pipeline_i < pipeline_remaining)
-          pipeline_fifo[pipeline_i] <= pipeline_fifo[pipeline_i + retireCount];
+          pipeline_fifo[pipeline_i] <= pipeline_fifo[pipeline_i + retireCount +
+            (pipeline_discarded != 0 && pipeline_i >= commitCount + memoryCount - retireCount ? pipeline_discarded : 0)];
         else if (pipeline_i < pipeline_remaining + pipeline_added)
           pipeline_fifo[pipeline_i] <= pipeline_input[pipeline_i - pipeline_remaining][pipeline_bit];
       end
@@ -220,16 +223,35 @@ def pipeline_case(source, parameters):
       if (earlyRedirect) assert(!redirect_0 && !received && !issued && executed && issuedCount == 1);
       cover(earlyRedirect && memoryPending);
       cover(commitResolved && retireCount != 0 && !redirect_0);
-      if (memoryPending) assert(memoryCount >= 1 && !commitValid);
+      if (memoryPending) assert(memoryCount >= 1{"" if dual else ' && !commitValid'});
       if (lsu_input_valid) assert(resultCount >= 1);
       if (multiply_input_valid) assert(issuedCount == 1);
-      cover(pipeline_owned == {capacity} && received && retireCount == {width});
+      cover(pipeline_owned == {6 * width} && received && retireCount == {width});
       cover(memoryPending && decodedValid && !issued);
       cover(issueCount == {width} && retireCount == {width});
       cover(issueCount == 0 && pipeline_owned != 0);
 '''
     if width > 1:
         body += f'      cover(issueCount > 0 && issueCount < {width} && decodedCount == {width});\n'
+    if dual:
+        body += '''      assert(!extraPending || extraCount != 0);
+      if (commitCount != 0 && (memoryPending || extraPending))
+        assert(commitPackets_0_load && !commitPackets_0_store && !commitPackets_0_atomic && !commitPackets_0_instruction_fault);
+      if (memoryPending) assert((memoryPackets_0_load || memoryPackets_0_store) && !memoryPackets_0_instruction_fault);
+      if (extraPending) assert(!extraPackets_0_instruction_fault);
+      if (extraCount != 0) begin
+        assert(memoryCount != 0 && memoryPackets_0_load && !memoryPackets_0_store && !memoryPackets_0_atomic);
+        assert(extraPackets_0_load && !extraPackets_0_store && !extraPackets_0_atomic && !extraPackets_0_csrWrite);
+        assert(extraPackets_0_instruction_instruction[6:0] == 7'h03);
+      end
+      if (memoryFault) begin
+        assert(!lsu_input_valid);
+        if (data_request_valid) assert(!data_request_bits_write && !data_request_bits_atomic);
+        if (extraPending) assert(!memoryAdvance);
+      end
+      cover(extraCount != 0 && memoryPending && extraPending);
+      cover(memoryFault && extraPending);
+'''
     body += '    end\n  end\n'
     for stage in stages:
         body += f'  always @(posedge clock) if (!reset) assert({stage}Count <= {width});\n'
@@ -250,6 +272,24 @@ def pipeline_case(source, parameters):
         effects = ' || '.join(f'{stage}Packets_0_{field}' for field in ('load', 'store', 'atomic', 'csrWrite', 'mret', 'sret', 'wfi', 'fenceI', 'sfenceVma')
                              if re.search(rf'\b{stage}Packets_0_{field}\b', source))
         body += f'  always @(posedge clock) if (!reset && {stage}Count != 0 && {stage}Resolved) assert(!({effects}));\n'
+        if dual:
+            p = f'{stage}Packets_0'
+            body += f'''  always @(posedge clock) if (!reset && {stage}Count != 0 && !{p}_atomic) begin
+    if ({p}_load) assert({p}_instruction_instruction[6:0] == 7'h03);
+    if ({p}_store) assert({p}_instruction_instruction[6:0] == 7'h23);
+  end
+'''
+    if dual:
+        for stage in ('result', 'memory', 'extra', 'commit'):
+            p = f'{stage}Packets_0'
+            effects = ' || '.join(p + '_' + field for field in ('csrWrite', 'mret', 'sret', 'wfi', 'fenceI', 'sfenceVma')
+                                  if re.search(rf'\b{p}_{field}\b', source))
+            body += f'''  always @(posedge clock) if (!reset && {stage}Count != 0 && ({p}_load || {p}_store)) begin
+    assert({p}_nextPc == {p}_instruction_pc + {p}_instruction_length);
+    assert(!({effects}));
+    if (!{p}_atomic) assert(!({p}_load && {p}_store));
+  end
+'''
 
     gpr = instance_ports(source, 'DitDahA1Gpr')[0][1]
     for lane in range(width):
@@ -268,6 +308,10 @@ def pipeline_case(source, parameters):
             body += f'  wire pipeline_simple_{stage}_{lane} = !{packet}_instruction_fault && ({simple});\n'
             control = ' || '.join(f'{packet}_operation == {op}' for op in (5, 6, 7, 25))
             body += f'  always @(posedge clock) if (!reset && {stage}Count > {lane}) assert(({control}) == {control_encoding(packet + "_instruction_instruction")});\n'
+            if dual and lane == 0:
+                for operations, opcode in (((8, 18, 19, 26), 3), ((9, 20, 27), 0x23), ((15, 30), 0x2f)):
+                    selected = ' || '.join(f'{packet}_operation == {op}' for op in operations)
+                    body += f"  always @(posedge clock) if (!reset && {stage}Count != 0 && ({selected})) assert({packet}_instruction_instruction[6:0] == 7'h{opcode:x});\n"
 
         if lane == 0:
             for stage, packet in (('decoded', d), ('issued', 'issuedPackets_0_decoded')):
@@ -277,7 +321,7 @@ def pipeline_case(source, parameters):
         blocked = []
         for operand in (1, 2):
             writers = []
-            for stage in ('issued', 'result', 'memory', 'commit'):
+            for stage in ('issued', 'result', *(('extra',) if dual else ()), 'memory', 'commit'):
                 for previous in reversed(range(width)):
                     p = f'{stage}Packets_{previous}'
                     if stage == 'issued':
@@ -286,9 +330,11 @@ def pipeline_case(source, parameters):
                         value = 'isMultiply ? _multiply_output_bits : _execute_output_bits_value' if previous == 0 else f'pipeline_execution_{previous}'
                     else:
                         ready = ('!memoryOperation && ' if stage == 'result' and previous == 0 else
+                                 '(!memoryPending || _lsu_output_valid) && ' if dual and stage == 'memory' and previous == 0 else
+                                 '!extraPending && ' if stage == 'extra' else
                                  '(!memoryCompletion || (memoryPending && _lsu_output_valid)) && ' if stage == 'memory' and previous == 0 else '') + (
                                      '!completion_instruction_fault' if stage == 'memory' and previous == 0 else '!' + p + '_instruction_fault')
-                        value = 'memoryPending ? _lsu_output_bits_value : ' + p + '_value' if stage == 'memory' and previous == 0 else p + '_value'
+                        value = ('memoryPending && _lsu_output_valid ? _lsu_output_bits_value : ' if dual else 'memoryPending ? _lsu_output_bits_value : ') + p + '_value' if stage == 'memory' and previous == 0 else p + '_value'
                     present = f'{stage}Count > {previous} && {p}_{"writesRd" if stage == "issued" else "rdWrite"} && {p}_rd != 0 && {d}_rs{operand} == {p}_rd'
                     writers.append((present, ready, value))
             stem = f'pipeline_operand_{lane}_{operand}'
@@ -333,24 +379,33 @@ def pipeline_case(source, parameters):
 """
     before = re.search(r'commitPackets_0_instruction_pc <=\s*[^;]+;', source).group()
     translation = ' || translation_request_valid || translation_response_ready' if parameters.get('virtualAddressBits') == 39 else ''
-    body += f'''  always @(posedge clock) if (!reset)
-    assert(memoryPending == backend_memory_owned);
+    if dual:
+        body += '''  always @(posedge clock) if (!reset && backend_memory_owned != 0) begin
+    assert(memoryPending || extraPending);
+    assert(_lsu_output_bits_instruction_pc == (memoryPending ? memoryPackets_0_instruction_pc : extraPackets_0_instruction_pc));
+    assert(_lsu_output_bits_instruction_tag == (memoryPending ? memoryPackets_0_instruction_tag : extraPackets_0_instruction_tag));
+    assert(_lsu_output_bits_instruction_instruction == (memoryPending ? memoryPackets_0_instruction_instruction : extraPackets_0_instruction_instruction));
+  end
 '''
-    body += '''  always @(posedge clock) if (!reset && memoryPending) begin
+    else:
+        body += '''  always @(posedge clock) if (!reset) assert(memoryPending == backend_memory_owned);
+  always @(posedge clock) if (!reset && memoryPending) begin
     assert(memoryPackets_0_instruction_tag == _lsu_output_bits_instruction_tag &&
       memoryPackets_0_instruction_pc == _lsu_output_bits_instruction_pc &&
       memoryPackets_0_instruction_instruction == _lsu_output_bits_instruction_instruction);
   end
 '''
     lsu = instance_ports(source, 'DitDahA1Lsu')[0][1]
-    for field in ('load', 'store', 'atomic', 'csrWrite', 'mret', 'sret', 'wfi', 'fenceI', 'sfenceVma', 'instruction_predictedTaken'):
+    for field in ('load', 'store', 'atomic', 'csrWrite', 'mret', 'sret', 'wfi', 'fenceI', 'sfenceVma', 'instruction_predictedTaken', *(('nextPc', 'instruction_length') if dual else ())):
         if not re.search(rf'\b_lsu_output_bits_{field}\b', source):
             continue
         expected = f'memoryPackets_0_{field}'
         if not re.search(rf'\b{expected}\b', source):
             expected = lsu[f'input_bits_{field}']
             assert re.fullmatch(r"\d+'[hbd][0-9a-fA-F]+", expected), expected
-        body += f'  always @(posedge clock) if (!reset && memoryPending) assert({expected} == _lsu_output_bits_{field});\n'
+        if dual:
+            expected = f'(memoryPending ? {expected} : extraPackets_0_{field})'
+        body += f'  always @(posedge clock) if (!reset && {"backend_memory_owned != 0" if dual else "memoryPending"}) assert({expected} == _lsu_output_bits_{field});\n'
     return ('PipelineBackend', backend_names(body, source), before, "commitPackets_0_instruction_pc <= 64'h0;")
 
 
@@ -478,7 +533,7 @@ def pipeline_witness(parameters, mode):
     if (data_response_valid && data_response_ready) pending <= 0;
   end
 '''
-    scenario = 3 if mode.startswith('mutation-recovery') or mode == 'cover-recovery' else 4 if mode.startswith('mutation-memory') else {'cover-memory': 1, 'cover-dependency': 2}.get(mode, 0)
+    scenario = 3 if mode.startswith('mutation-recovery') or mode == 'cover-recovery' else 4 if mode.startswith('mutation-memory') else {'cover-memory': 1, 'cover-dependency': 2, 'cover-dual': 5, 'cover-drain': 6, 'mutation-dual-owner': 5, 'mutation-dual-drain': 6}.get(mode, 0)
     body = body.replace('(* anyconst *) reg [2:0] scenario;', f"wire [2:0] scenario = {scenario};")
     values = dict(instruction_valid=1, instruction_bits_count=f'scenario == 3 || (scenario == 1 && !started) ? 1 : {width}',
                   data_request_ready=1, data_response_valid='pending && (scenario == 3 || respond)', data_response_bits_last=1, data_response_bits_fault='scenario == 4')
@@ -495,6 +550,20 @@ def pipeline_witness(parameters, mode):
             values[f'instruction_bits_packets_{lane}_instruction'] = f"32'h{(1 << 20) | (rs1 << 15) | (rd << 7) | 0x13:x}"
     if mode == 'mutation-recovery-retirement':
         values['instruction_bits_packets_0_instruction'] = "!started ? 32'h0080006f : 32'h13"
+    if parameters.get('loadQueueEntries', 1) == 2 and scenario in (5, 6):
+        body += '''  reg [1:0] read_pending = 0;
+  reg both_seen = 0;
+  always @(posedge clock) if (!reset) begin
+    if (data_request_valid && data_request_ready) read_pending[data_request_bits_tag[0]] <= 1;
+    if (data_response_valid && data_response_ready) read_pending[data_response_bits_tag[0]] <= 0;
+    if (&read_pending) both_seen <= 1;
+  end
+'''
+        values.update(instruction_bits_count=1,
+                      data_response_valid='both_seen && (|read_pending)',
+                      data_response_bits_tag='scenario == 5 ? (read_pending[1] ? 1 : 0) : (read_pending[0] ? 0 : 1)',
+                      data_response_bits_fault='scenario == 6 && data_response_bits_tag == 0')
+        values['instruction_bits_packets_0_instruction'] = "pc == 64'h100 ? 32'h00003083 : pc == 64'h104 ? 32'h00803103 : 32'h00100193"
     if parameters.get('virtualAddressBits') == 39:
         body += r'''
   reg translation_pending = 0;
@@ -2152,6 +2221,95 @@ def word_cases(parameters):
             ('Lsu', lsu, 'assign memory_request_bits_size =', "assign memory_request_bits_size = 3'h3 |")]
 
 
+def lsu_reads_case(parameters):
+    assert parameters.get('loadQueueEntries') == 2 and not parameters.get('pmpEntries') and parameters.get('virtualAddressBits') == 0
+    ranges = ' || '.join(f"(input_bits_address >= 64'd{int(r['base'])} && input_bits_address <= 64'd{int(r['base']) + int(r['size']) - 8})"
+                         for r in parameters['memoryRegions'] if r['readable'] and not r['device'] and int(r['size']) >= 8)
+    body = r'''
+  reg q_past = 0, q_head = 0, q_tail = 0, q_poison = 0;
+  reg [1:0] q_live = 0, q_pending = 0, q_done = 0, q_killed = 0, q_offered = 0, q_fault = 0, q_value;
+  reg [63:0] q_pc[2], q_address[2];
+  reg [7:0] q_tag[2];
+  (* anyconst *) reg [5:0] q_bit;
+  wire q_in = input_valid && input_ready;
+  wire q_out = output_valid && output_ready;
+  wire q_request = memory_request_valid && memory_request_ready;
+  wire q_response = memory_response_valid && memory_response_ready;
+  wire q_known = memory_response_bits_tag < 2 && q_pending[memory_response_bits_tag[0]];
+  always @* begin
+    assume(input_bits_load && !input_bits_store && !input_bits_atomic && !input_bits_instruction_fault);
+    assume(input_bits_memorySize == 3 && !input_bits_address[2:0] && (RANGES));
+    assume(!memory_response_valid || q_pending != 0);
+  end
+  always @(posedge clock) begin
+    q_past <= 1;
+    if (!q_past) assume(reset); else assume(!reset);
+    if (reset) begin
+      q_head <= 0; q_tail <= 0; q_poison <= 0;
+      q_live <= 0; q_pending <= 0; q_done <= 0; q_killed <= 0; q_offered <= 0; q_fault <= 0;
+    end else begin
+      if ($past(!reset && memory_response_valid && !memory_response_ready)) begin
+        assume(memory_response_valid);
+        assume($stable({memory_response_bits_data, memory_response_bits_fault, memory_response_bits_tag, memory_response_bits_last}));
+      end
+      if ($past(!reset && memory_request_valid && !memory_request_ready)) begin
+        assert(memory_request_valid);
+        assert($stable({memory_request_bits_address, memory_request_bits_data, memory_request_bits_size, memory_request_bits_mask,
+          memory_request_bits_tag, memory_request_bits_write, memory_request_bits_atomic, memory_request_bits_atomicOperation,
+          memory_request_bits_cacheOperation, memory_request_bits_privileged, memory_request_bits_refillSize, memory_request_bits_scEligible}));
+      end
+      if ($past(!reset && output_valid && !output_ready)) begin
+        assert(output_valid);
+        assert($stable({output_bits_value, output_bits_address, output_bits_instruction_pc, output_bits_instruction_tag,
+          output_bits_instruction_fault, output_bits_instruction_cause, output_bits_instruction_tval}));
+      end
+      if (q_poison || cancel) assert(!q_in);
+      if (memory_request_valid) begin
+        assert(memory_request_bits_tag < 2 && q_live[memory_request_bits_tag[0]] && !q_pending[memory_request_bits_tag[0]]);
+        assert(!memory_request_bits_write && !memory_request_bits_atomic && !memory_request_bits_fetch && memory_request_bits_size == 3);
+        assert(memory_request_bits_address == q_address[memory_request_bits_tag[0]]);
+        if (q_killed[memory_request_bits_tag[0]] || cancel || q_poison) assert(q_offered[memory_request_bits_tag[0]]);
+      end
+      if (output_valid) begin
+        assert(q_live[q_head]);
+        assert(q_done[q_head] || (!q_pending[q_head] && !q_offered[q_head] && (q_killed[q_head] || q_poison)));
+        assert(output_bits_instruction_pc == q_pc[q_head] && output_bits_instruction_tag == q_tag[q_head]);
+        assert(output_bits_address == q_address[q_head]);
+        if (!q_killed[q_head]) begin
+          assert(output_bits_instruction_fault == (q_done[q_head] ? q_fault[q_head] : q_poison));
+          if (!output_bits_instruction_fault) assert(output_bits_value[q_bit] == q_value[q_head]);
+        end
+      end
+      for (integer n = 0; n < 2; n++) begin
+        if (q_out && q_head == n) begin q_live[n] <= 0; q_done[n] <= 0; q_offered[n] <= 0; end
+        if (cancel && q_live[n]) q_killed[n] <= 1;
+        if (q_in && q_tail == n) begin
+          assert(!q_live[n]); q_live[n] <= 1; q_done[n] <= 0; q_killed[n] <= 0; q_offered[n] <= 0; q_fault[n] <= 0;
+          q_pc[n] <= input_bits_instruction_pc; q_tag[n] <= input_bits_instruction_tag; q_address[n] <= input_bits_address;
+        end
+        if (memory_request_valid && !memory_request_ready && memory_request_bits_tag == n) q_offered[n] <= 1;
+        if (q_request && memory_request_bits_tag == n) begin
+          assert(q_live[n] && !q_pending[n] && !q_done[n]); q_pending[n] <= 1;
+        end
+        if (q_response && q_known && memory_response_bits_tag == n) begin
+          q_value[n] <= memory_response_bits_data[q_bit];
+          q_fault[n] <= q_fault[n] || memory_response_bits_fault || !memory_response_bits_last || q_poison;
+          if (memory_response_bits_last) begin q_pending[n] <= 0; q_done[n] <= 1; q_offered[n] <= 0; end
+        end
+      end
+      if (q_in) q_tail <= !q_tail;
+      if (q_out) q_head <= !q_head;
+      if (q_response && !q_known) q_poison <= 1;
+      cover(q_pending == 3);
+      cover(q_pending[q_head] && q_done[!q_head]);
+      cover(q_pending == 3 && cancel);
+      cover(q_poison && q_pending == 0 && q_live == 0);
+    end
+  end
+'''.replace('RANGES', ranges)
+    return 'LsuReads', body, 'assign memory_request_bits_tag =', "assign memory_request_bits_tag = 8'h1 ^"
+
+
 def integer_cases(parameters):
     decode = r'''
   wire [31:0] i_word = input_bits_instruction;
@@ -3555,7 +3713,7 @@ def fabric_case(parameters):
     if (!reset) begin
       assert($onehot0(fabric_accepted));
       if (|fabric_accepted) assert(!(&fabric_live));
-      {''.join(f'if (fabric_live[{n}] && fabric_live[{m}]) assert((fabric_owner[{n}] >> 1) != (fabric_owner[{m}] >> 1));' for n in range(depth) for m in range(n))}
+      {''.join(f'if (fabric_live[{n}] && fabric_live[{m}]) assert(fabric_owner[{n}] != fabric_owner[{m}]);' for n in range(depth) for m in range(n))}
       assert($countones(fabric_owned) <= {depth});
       assert((fabric_owned & ~fabric_exclusive) == formal_queue_live);
       assert(fabric_exclusive == formal_single_live);
@@ -3588,13 +3746,12 @@ def fabric_case(parameters):
     ({req}_bits_size > 3 && !({req}_bits_size == 6 &&
       ({req}_bits_fetch ? {int(bool(parameters.get('enableBurstRefill')))} : {int(parameters.get('dCacheRefillBytes') == 64)}))) || ({device});
   always @(posedge clock) if (!reset) begin
-    assert(!(fabric_owned[{i}] && fabric_owned[{i ^ 1}]));
     if ({resp}_valid) begin
       assert(fabric_owned[{i}]);
       assert({resp}_bits_tag == fabric_tag_{i});
     end
     if (fabric_accepted[{i}]) begin
-      assert(!fabric_owned[{i}] && !fabric_owned[{i ^ 1}] && !fabric_single);
+      assert(!fabric_owned[{i}] && !fabric_single);
       if (fabric_special_{i}) assert(fabric_owned == 0);
     end
     if ($past(!reset && {resp}_valid && !{resp}_ready)) begin
@@ -4032,6 +4189,7 @@ def read_schedule_case(depth):
 
 def read_queue_case(parameters):
     harts, width = parameters['hartCount'], parameters['axiDataBits']
+    dual = parameters.get('loadQueueEntries', 1) == 2
     depth = parameters.get('fabricReadSlots') or 2
     suffixes = tuple('' if n == 0 else f'_{n-1}' for n in range(depth))
     states = tuple('state' + suffix for suffix in suffixes)
@@ -4051,9 +4209,9 @@ def read_queue_case(parameters):
   reg [7:0] rq_tag [0:{depth-1}];
   reg [{slices-1}:0] rq_data [0:{depth-1}];
   reg [3:0] rq_count [0:{depth-1}], rq_beats [0:{depth-1}];
-  reg [{owner_bits-2}:0] rq_first_id, rq_previous_id;
+  reg [{max(1, (max(harts, depth) - 1).bit_length())-1}:0] rq_first_id, rq_previous_id;
   wire [{depth-1}:0] rq_waiting = rq_owned & rq_sent & ~rq_terminal;
-  wire [{depth-1}:0] rq_matches = {{{', '.join(f'rq_waiting[{n}] && r_bits_id == (rq_owner[{n}] >> 1)' for n in reversed(range(depth)))}}};
+  wire [{depth-1}:0] rq_matches = {{{', '.join(f'rq_waiting[{n}] && r_bits_id == {n}' for n in reversed(range(depth)))}}};
   wire rq_known = |rq_matches;
   wire [{depth.bit_length()-1}:0] rq_wait_count = $countones(rq_waiting);
 '''
@@ -4072,7 +4230,9 @@ def read_queue_case(parameters):
             ranges.append(f"({size} == 3'd{amount} && ({address} & 64'd{(1<<amount)-1}) == 0 && ({' || '.join(terms) or '0'}))")
         return f"!{field('write')} && !{field('atomic')} && (" + ' || '.join(ranges) + ')'
     for slot, suffix in enumerate(suffixes):
-        ready = ' || '.join(f'(rq_owner[{slot}] == {port} && ports_{port}_response_ready)' for port in range(2 * harts))
+        ready = ' || '.join(f'(rq_owner[{slot}] == {port} && ports_{port}_response_ready' +
+                            (f' && ports_{port}_response_valid && ports_{port}_response_bits_tag == rq_tag[{slot}]' if dual else '') + ')'
+                            for port in range(2 * harts))
         body += f'''  wire rq_permission_{slot} = {permission(suffix)};
   wire [63:0] rq_word_{slot} = READ_QUEUE_DATA_{slot};
   wire rq_take_{slot} = rq_owned[{slot}] && rq_count[{slot}] != 0 && ({ready});
@@ -4093,10 +4253,11 @@ def read_queue_case(parameters):
       assert(poisoned == rq_poison);
       assert({' && '.join(f'{state} <= {6 if burst else 4}' for state in states)});
       assert($onehot0({{{', '.join(state + ' == 2' for state in states)}}}));
-      {''.join(f'if (rq_owned[{n}] && rq_owned[{m}]) assert((rq_owner[{n}] >> 1) != (rq_owner[{m}] >> 1));' for n in range(depth) for m in range(n))}
+      {''.join(f'if (rq_owned[{n}] && rq_owned[{m}] && rq_owner[{n}] == rq_owner[{m}]) assert(' +
+               (f'rq_owner[{n}][0] && rq_tag[{n}] != rq_tag[{m}]' if dual else "1'b0") + ');' for n in range(depth) for m in range(n))}
       if (rq_poison) assert(rq_accepted == 0);
       if (ar_valid) begin
-        assert({' || '.join(f'(rq_owned[{n}] && ar_bits_id == (rq_owner[{n}] >> 1))' for n in range(depth))});
+        assert({' || '.join(f'(rq_owned[{n}] && ar_bits_id == {n})' for n in range(depth))});
         assert(ar_bits_burst == 1 && !ar_bits_lock && ar_bits_cache == 0 && ar_bits_qos == 0);
         if (ar_ready && rq_wait_count == 0) rq_first_id <= ar_bits_id;
       end
@@ -4134,7 +4295,7 @@ def read_queue_case(parameters):
         rq_checked[{n}] <= 1; rq_allowed[{n}] <= rq_permission_{n};
         if (!rq_permission_{n}) begin rq_count[{n}] <= 1; rq_terminal[{n}] <= 1; rq_fault[{n}] <= 1; rq_data[{n}] <= 0; end
       end
-      if (ar_valid && ar_bits_id == (rq_owner[{n}] >> 1) && rq_owned[{n}]) begin
+      if (ar_valid && ar_bits_id == {n} && rq_owned[{n}]) begin
         assert(rq_checked[{n}] && rq_allowed[{n}] && !rq_sent[{n}] && !rq_terminal[{n}]);
         assert(ar_bits_len == (rq_line[{n}] ? {beats-1} : 0));
         assert(ar_bits_size == (rq_line[{n}] ? {lane_bits} : rq_size[{n}]));
@@ -4178,6 +4339,7 @@ def read_queue_case(parameters):
         if ({state} != 1) assert(rq_checked[{n}]);
         assert(rq_sent[{n}] == ({state} >= 3 && ({state} != 4 || rq_allowed[{n}])));
         assert(rq_owner[{n}] < {2*harts} && {owner} == rq_owner[{n}]);
+        {f'assert(request_tag{suffix} == rq_tag[{n}]);' if dual else ''}
         assert(request_size{suffix} == rq_size[{n}] && request_fetch{suffix} == rq_fetch[{n}] && request_write{suffix} == rq_write[{n}] && request_atomic{suffix} == rq_atomic[{n}]);
         assert(request_address{suffix}[rq_bit] == rq_address[{n}] && request_address{suffix}[{lane_bits-1}:0] == rq_offset[{n}] && request_tag{suffix} == rq_tag[{n}]);
         assert(rq_line[{n}] == (!rq_write[{n}] && !rq_atomic[{n}] && rq_size[{n}] == 6 && (rq_fetch[{n}] ? {instruction_line} : {data_line})));
@@ -4214,14 +4376,28 @@ def read_queue_case(parameters):
         body += '      end\n'
     for port in range(2 * harts):
         prefix = f'ports_{port}'
+        owned = [f'(rq_owned[{n}] && rq_owner[{n}] == {port})' for n in range(depth)]
+        if dual:
+            body += f"      assert($countones({{{', '.join(owned)}}}) <= {2 if port % 2 else 1});\n"
+            if port % 2 and depth > 1:
+                suffix = '' if port == 1 else f'_{port // 2 - 1}'
+                body += f'      if (held{suffix}) assert(saved{suffix} < {depth} && rq_owned[saved{suffix}] && rq_owner[saved{suffix}] == {port} && rq_count[saved{suffix}] != 0);\n'
+        availability = (f"$countones({{{', '.join(owned)}}}) < 2 && " + ' && '.join(
+            f'(!{owned[n]} || rq_tag[{n}] != {prefix}_request_bits_tag)' for n in range(depth))) if dual and port % 2 else ' && '.join(
+            f'!{term}' for term in owned)
         body += f'''      if (rq_accept_{port}) begin
         assert(!(&rq_owned));
-        assert({' && '.join(f'(!rq_owned[{n}] || (rq_owner[{n}] >> 1) != {port//2})' for n in range(depth))});
+        assert({availability});
       end
       assert({prefix}_response_valid == ({' || '.join(f'(rq_owned[{n}] && rq_owner[{n}] == {port} && rq_count[{n}] != 0)' for n in range(depth))}));
 '''
+        if dual:
+            body += f"      if ({prefix}_response_valid) assert(" + ' || '.join(
+                f'(rq_owned[{n}] && rq_owner[{n}] == {port} && rq_count[{n}] != 0 && {prefix}_response_bits_tag == rq_tag[{n}])'
+                for n in range(depth)) + ');\n'
         for n in range(depth):
-            body += f'''      if ({prefix}_response_valid && rq_owner[{n}] == {port} && rq_owned[{n}]) begin
+            selection = f' && rq_count[{n}] != 0 && {prefix}_response_bits_tag == rq_tag[{n}]' if dual else ''
+            body += f'''      if ({prefix}_response_valid && rq_owner[{n}] == {port} && rq_owned[{n}]{selection}) begin
         assert({prefix}_response_bits_fault == rq_fault[{n}] && {prefix}_response_bits_last == (rq_terminal[{n}] && rq_count[{n}] == 1));
         assert({prefix}_response_bits_tag == rq_tag[{n}] && {prefix}_response_bits_data[rq_bit] == rq_data[{n}][0]);
       end
@@ -4229,9 +4405,14 @@ def read_queue_case(parameters):
         body += f'''      if ($past(!reset && {prefix}_response_valid && !{prefix}_response_ready)) begin
         assert({prefix}_response_valid); assert($stable({{{prefix}_response_bits_fault, {prefix}_response_bits_last}}));
         assert($stable({{{prefix}_response_bits_data[rq_bit], {prefix}_response_bits_tag}}));
+        {f'assert($stable({prefix}_response_bits_tag));' if dual else ''}
       end
 '''
     body += '    end\n  end\n'
+    if dual and depth > 1:
+        pairs = ' || '.join(f'(rq_owner[{n}] == rq_owner[{m}] && rq_owner[{n}][0] && rq_waiting[{n}] && rq_waiting[{m}])'
+                            for n in range(depth) for m in range(n))
+        body += f'  always @(posedge clock) if (!reset) cover({pairs});\n'
     for hart in range(harts):
         for kind, condition in (
             ('denied', 'rq_checked[N] && !rq_allowed[N] && rq_count[N] == 1'),
@@ -4243,7 +4424,8 @@ def read_queue_case(parameters):
     return ('ReadQueue', body, 'assign ar_bits_len =', "assign ar_bits_len = 8'h80 |")
 
 
-def verify(rtl, directory, modules=None):
+def verify(rtl, directory, modules=None, mutations=None):
+    assert mutations is None or modules and all(mode.startswith('mutation') for mode in mutations), 'Select modules and negative controls'
     directory.mkdir(parents=True, exist_ok=True)
     summary = directory / 'summary.json'
     summary.unlink(missing_ok=True)
@@ -4273,6 +4455,8 @@ def verify(rtl, directory, modules=None):
             ('Backend', BACKEND, '(~issuedValid | executed) & ~executePending & ~redirect_0', '(~issuedValid | executed) & ~redirect_0'))
     cases = [*cases, gpr_case(manifest['parameters']), *word_cases(manifest['parameters']), *integer_cases(manifest['parameters']), *wfi_cases(manifest['parameters']), synchronization_case(manifest['parameters']),
              arbiter_case(manifest['parameters']), memory_case(manifest['parameters']), axi_case(manifest['parameters'])]
+    if manifest['parameters'].get('loadQueueEntries', 1) == 2 and not enabled and manifest['parameters'].get('virtualAddressBits') == 0:
+        cases.append(lsu_reads_case(manifest['parameters']))
     if 'DitDahA1ReadQueue.sv' in sources:
         cases.append(read_queue_case(manifest['parameters']))
     if 'DitDahA1Backend.sv' in sources:
@@ -4306,6 +4490,8 @@ def verify(rtl, directory, modules=None):
         unit = name.removeprefix('Interrupt').removeprefix('Synchronization').removeprefix('Pipeline').removeprefix('Word').removeprefix('Integer').removeprefix('Wfi').removeprefix('User').removeprefix('Supervisor').removeprefix('Wide')
         if name == 'DataCacheWriteback':
             unit = 'DataCache'
+        if name == 'LsuReads':
+            unit = 'Lsu'
         machine = 'privilege != 0' if manifest['parameters'].get('enableUserMode') else "1'b1"
         if name in ('Pmp', 'PmpDecode') and (manifest['parameters'].get('enableBurstRefill') or manifest['parameters'].get('dCacheRefillBytes', 8) == 64 or manifest['parameters'].get('iCacheBytes') and manifest['parameters']['issueWidth'] == 3):
             span = re.search(r'&\s+(\w+\[size\]) > base', sources['DitDahA1Pmp.sv']).group(1)
@@ -4388,7 +4574,7 @@ def verify(rtl, directory, modules=None):
         if unit == 'InstructionCache' and manifest['parameters'].get('enableBurstRefill'):
             write = ports[0]['W0_data']
             body += f'\n  wire [31:0] formal_cache_write_data = {write};\n'
-        if unit in ('Lsu', 'InstructionCache'):
+        if unit in ('Lsu', 'InstructionCache') and name != 'LsuReads':
             request = 'input' if unit == 'Lsu' else 'upstream_request'
             output = 'memory_request' if unit == 'Lsu' else 'downstream_request'
             if manifest['parameters'].get('enableUserMode'):
@@ -4535,7 +4721,7 @@ def verify(rtl, directory, modules=None):
     if (formal_local_live) assert(formal_local_tag == fabric_single_tag);
   end
 '''
-            queue_invariants = ''.join(f'assert(!(state{a} != 0 && state{b} != 0) || (owner{a} >> 1) != (owner{b} >> 1));\n' for n, a in enumerate(read_suffixes) for b in read_suffixes[:n])
+            queue_invariants = ''.join(f'assert(!(state{a} != 0 && state{b} != 0) || owner{a} != owner{b});\n' for n, a in enumerate(read_suffixes) for b in read_suffixes[:n])
             queue_invariants += 'assert($onehot0({' + ', '.join('state' + suffix + ' == 2' for suffix in read_suffixes) + '}));\n'
             if manifest['parameters']['axiDataBits'] > 64 and (manifest['parameters'].get('enableBurstRefill') or manifest['parameters'].get('dCacheRefillBytes') == 64):
                 queue_invariants += 'assert($onehot0({' + ', '.join('state' + suffix + ' == 5' for suffix in read_suffixes) + '}));\n'
@@ -4626,10 +4812,52 @@ def verify(rtl, directory, modules=None):
                 body += f'\n  wire rq_dut_permission_{slot} = {candidates[0]};\n'
         if unit in ('Backend', 'Frontend', 'Gpr', 'Multiply', 'Csr', 'MemoryArbiter', 'ReadQueue', 'MemoryFabric', 'Memory', 'Axi', 'InstructionCache', 'DataCache', 'Coherence', 'Lsu', 'LocalInterrupts', 'Translation') or (enabled and unit not in ('Decode', 'Execute')) or unit == 'Fetch' and manifest['parameters'].get('iCacheBytes'):
             if unit == 'Backend':
-                files['DitDahA1Lsu.sv'] = files['DitDahA1Lsu.sv'].replace(');', ', output formal_owned);', 1).replace('endmodule', 'assign formal_owned = state != 0;\nendmodule', 1)
+                dual = manifest['parameters'].get('loadQueueEntries', 1) == 2
+                owned = '{1\'b0, contexts != 0} + {1\'b0, contexts_0 != 0}' if dual else 'state != 0'
+                files['DitDahA1Lsu.sv'] = files['DitDahA1Lsu.sv'].replace(');', ', output [1:0] formal_owned);' if dual else ', output formal_owned);', 1).replace('endmodule', f'assign formal_owned = {owned};\nendmodule', 1)
+                if dual:
+                    fields = dict(instruction_pc=64, instruction_tag=8, instruction_instruction=32,
+                                  instruction_length=3, nextPc=64,
+                                  load=1, store=1, atomic=1, csrWrite=1, mret=1, sret=1,
+                                  wfi=1, fenceI=1, sfenceVma=1, instruction_predictedTaken=1)
+                    metadata = lambda prefix: '{' + ', '.join(prefix + field for field in fields) + '}'
+                    metadata_bits = sum(fields.values())
+                    files['DitDahA1Lsu.sv'] = files['DitDahA1Lsu.sv'].replace(');', f', output [{metadata_bits-1}:0] formal_second);', 1).replace(
+                        'endmodule', f'assign formal_second = head ? {metadata("packet_")} : {metadata("packets_")};\nendmodule', 1)
+                    files[module + '.sv'], connected = re.subn(r'(DitDahA1Lsu\s+\w+\s*\()', r'\1\n.formal_second(backend_lsu_second),', files[module + '.sv'])
+                    assert connected == 1
+                    body += f'''  wire [{metadata_bits-1}:0] backend_lsu_second;
+  always @(posedge clock) if (!reset && memoryPending && extraPending)
+    assert(backend_lsu_second == {metadata('extraPackets_0_')});
+'''
+                    files['DitDahA1Lsu.sv'] = files['DitDahA1Lsu.sv'].replace('endmodule', '''
+  always @(posedge clock) if (!reset) begin
+    if (state != 0) assert(owner ? contexts_0 == 1 : contexts == 1);
+    if (contexts == 1 || contexts_0 == 1) assert(state != 0);
+    assert(!(contexts == 1 && contexts_0 == 1));
+    if (head != tail) assert(head ? contexts_0 != 0 && contexts == 0 : contexts != 0 && contexts_0 == 0);
+    else assert((contexts == 0) == (contexts_0 == 0));
+    if (contexts != 0 || contexts_0 != 0) assert(head ? contexts_0 != 0 : contexts != 0);
+  end
+endmodule''', 1)
                 files[module + '.sv'], connected = re.subn(r'(DitDahA1Lsu\s+\w+\s*\()', r'\1\n.formal_owned(backend_lsu_owned),', files[module + '.sv'])
                 assert connected == 1
-                body += '''
+                body += ('''
+  wire [1:0] backend_lsu_owned;
+  reg [1:0] backend_memory_owned = 0;
+  always @(posedge clock) begin
+    if (reset) backend_memory_owned <= 0;
+    else begin
+      case ({lsu_input_valid && _lsu_input_ready, _lsu_output_valid && lsu_output_ready})
+        2'b10: backend_memory_owned <= backend_memory_owned + 1;
+        2'b01: backend_memory_owned <= backend_memory_owned - 1;
+      endcase
+      assert(backend_memory_owned <= 2 && backend_lsu_owned == backend_memory_owned);
+      assert(backend_memory_owned == {1'b0, memoryPending} + {1'b0, extraPending});
+      if (data_request_valid || data_response_ready || _lsu_output_valid) assert(backend_memory_owned != 0);
+    end
+  end
+''' if dual else '''
   wire backend_lsu_owned;
   reg backend_memory_owned = 0;
   always @(posedge clock) begin
@@ -4641,7 +4869,7 @@ def verify(rtl, directory, modules=None):
       if (data_request_valid || data_response_ready || _lsu_output_valid) assert(backend_memory_owned);
     end
   end
-'''
+''')
                 files['DitDahA1Multiply.sv'] = license + header(sources['DitDahA1Multiply.sv']) + RESOURCE + 'endmodule\n'
             if name == 'InterruptBackend':
                 observed = files[module + '.sv']
@@ -4683,6 +4911,9 @@ def verify(rtl, directory, modules=None):
             before = re.search(r': ~\w+ \| abort \| responseFault \| bypass \| ~complete', sources[module + '.sv']).group()
             after = before.replace(' | abort', '')
         checks = [('prove', before, after), ('cover', before, after), ('mutation', before, after)]
+        if name == 'LsuReads':
+            checks += [('mutation-value', 'assign output_bits_value =', "assign output_bits_value = 64'h1 ^"),
+                       ('mutation-cancel', 'assign memory_request_valid =', 'assign memory_request_valid = ~cancel &')]
         if unit == 'MemoryFabric':
             original = sources[module + '.sv']
             tag_modes = [f'prove-tags-{bit}' for bit in range(8)] if read_slots > 2 else ['prove-tags']
@@ -4706,12 +4937,20 @@ def verify(rtl, directory, modules=None):
             bindings = re.findall(r'\.rdata1\s*\([^()]*\)', sources[module + '.sv'])
             assert len(bindings) == manifest['parameters']['issueWidth'], bindings
             checks += [('mutation-forward', bindings[-1], f'.rdata1(_gpr_rdata1_{len(bindings)-1})')]
+            if manifest['parameters'].get('loadQueueEntries', 1) == 2:
+                advance = re.search(r'wire\s+memoryAdvance\s*=[^;]+;', sources[module + '.sv']).group()
+                assert '~memoryFault | ~extraPending' in advance
+                checks += [('mutation-dual-owner', 'memoryPackets_0_instruction_pc <= extraPackets_0_instruction_pc;',
+                            "memoryPackets_0_instruction_pc <= 64'h0;"),
+                           ('mutation-dual-drain', advance, advance.replace('~memoryFault | ~extraPending', "1'h1"))]
             if manifest['parameters']['issueWidth'] > 1:
                 prefix = re.search(r'wire\s+prefix_1\s*=[^;]+;', sources[module + '.sv']).group()
                 assert 'decodedPackets_0_writesRd' in prefix
                 checks += [('mutation-dependency', prefix, prefix.replace('decodedPackets_0_writesRd', "1'h0"))]
         if name == 'PipelineBackend':
-            checks[2:2] = [(mode, before, after) for mode in ('cover-memory', 'cover-recovery') + (('cover-dependency',) if manifest['parameters']['issueWidth'] > 1 else ())]
+            checks[2:2] = [(mode, before, after) for mode in ('cover-memory', 'cover-recovery') +
+                          (('cover-dual', 'cover-drain') if manifest['parameters'].get('loadQueueEntries', 1) == 2 else ()) +
+                          (('cover-dependency',) if manifest['parameters']['issueWidth'] > 1 else ())]
             original = sources[module + '.sv']
             early = re.search(r'wire\s+earlyRedirect\s*=[^;]+;', original).group()
             younger = re.search(r'resultCount <=\s*~redirect_0[^;]+;' if manifest['parameters']['issueWidth'] == 1
@@ -4904,7 +5143,7 @@ def verify(rtl, directory, modules=None):
         if name == 'Pmp':
             checks += [('mutation-atomic-read', 'state_config[0] & state_config[1]', 'state_config[1]'),
                        ('mutation-atomic-write', 'state_config[0] & state_config[1]', 'state_config[0]')]
-        if unit == 'Lsu':
+        if unit == 'Lsu' and name != 'LsuReads':
             mask_assignment = re.search(r'assign memory_request_bits_mask\s*=\s*[^;]+;', sources[module + '.sv']).group(0)
             checks += [('mutation-mask', mask_assignment,
                         "assign memory_request_bits_mask = 8'hff;"),
@@ -5046,11 +5285,12 @@ def verify(rtl, directory, modules=None):
             permission = re.search(r'wire rq_dut_permission_0 = (\w+);', body)[1]
             update = re.search(r'wire\s+' + permission + r'\s*=[^;]+;', original).group()
             checks.append(('mutation-permission', update, update.split('=', 1)[0] + "= 1'h1;"))
-            update = re.search(r'assign ports_2_response_valid\s*=[^;]+;', original).group()
-            checks.append(('mutation-route', update, 'assign ports_2_response_valid = ports_0_response_valid;'))
+            peer = min(2, 2 * manifest['parameters']['hartCount'] - 1)
+            update = re.search(rf'assign ports_{peer}_response_valid\s*=[^;]+;', original).group()
+            checks.append(('mutation-route', update, f'assign ports_{peer}_response_valid = ports_0_response_valid;'))
             for mode, signal in (('tag', 'ports_0_response_bits_tag'), ('data', 'ports_0_response_bits_data'), ('id', 'ar_bits_id')):
                 update = re.search(r'assign ' + signal + r'\s*=[^;]+;', original).group()
-                checks.append(('mutation-' + mode, update, 'assign ' + signal + " = 0;"))
+                checks.append(('mutation-' + mode, update, 'assign ' + signal + f" = {int(mode == 'id')};"))
             if manifest['parameters'].get('enableBurstRefill') or manifest['parameters'].get('dCacheRefillBytes') == 64:
                 update = re.search(r'assign ports_0_response_bits_last\s*=[^;]+;', original).group()
                 checks.append(('mutation-line-last', update, 'assign ports_0_response_bits_last = 1;'))
@@ -5072,11 +5312,17 @@ def verify(rtl, directory, modules=None):
                        ('mutation-writeback-error', failure, "wire writebackFault = 1'h0;")]
         if name == 'PipelineBackend' and manifest['parameters']['issueWidth'] > 1:
             checks[:1] = [(f'prove-bits-{bit}', before, after) for bit in range(0, 97 if manifest['parameters'].get('enableBranchPrediction') else 96, 4 if manifest['parameters']['issueWidth'] == 3 else 8)]
+        if name == 'PipelineBackend' and manifest['parameters'].get('loadQueueEntries', 1) == 2:
+            checks[:0] = [('prove-control', before, after)]
+            checks = [('prove-identity' if mode == 'prove' else mode, *rest) for mode, *rest in checks]
+            checks.sort(key=lambda check: check[0].startswith('prove'))
         proof_top = top
         for check in checks:
             top = proof_top
             files.pop('witness.sv', None)
             mode, before, after, *target = check
+            if mutations is not None and mode not in mutations:
+                continue
             mutated_file = target[0] if target else module + '.sv'
             mutating = mode.startswith('mutation')
             proving = mode.startswith('prove')
@@ -5087,6 +5333,11 @@ def verify(rtl, directory, modules=None):
             work = directory / f'{name.lower()}-{mode}'
             work.mkdir(exist_ok=True)
             for filename, text in files.items():
+                if name == 'PipelineBackend' and manifest['parameters'].get('loadQueueEntries', 1) == 2 and proving:
+                    def partition_pipeline(match):
+                        identity = '[pipeline_bit]' in match[0]
+                        return ('assert(1);' if identity else match[0]) if mode == 'prove-control' else match[0] if identity else match[0].replace('assert(', 'assume(', 1)
+                    text = re.sub(r'\bassert\([^;]+;', partition_pipeline, text)
                 if name == 'DataCacheWriteback' and 'storage' in mode:
                     if filename == module + '.sv':
                         if mutating:
@@ -5143,10 +5394,11 @@ def verify(rtl, directory, modules=None):
                     guidance = '  (* anyconst *) reg fabric_read_scenario;\n  always @* begin\n    assume(fabric_read_scenario || data_15_request_valid);\n    assume(axi_ar_ready && axi_r_bits_data == 0 && axi_r_bits_resp == 0 && axi_r_bits_last);\n'
                     if mutating:
                         guidance += f'    assume(fabric_read_scenario == {int(mode != "mutation")});\n'
+                    readers = 1 if mode == 'mutation-isolation' else read_slots
                     for port in range(32):
                         prefix = f'{"instruction" if port % 2 == 0 else "data"}_{port//2}_request'
                         if port != 31:
-                            guidance += f'    assume({prefix}_valid == {"fabric_read_scenario" if port % 2 == 0 and port // 2 < read_slots else "0"});\n'
+                            guidance += f'    assume({prefix}_valid == {"fabric_read_scenario" if port % 2 == 0 and port // 2 < readers else "0"});\n'
                         guidance += f"    assume({prefix}_bits_cacheOperation == 0 && {prefix}_bits_address == 64'd{base if port == 31 else read_base} && {prefix}_bits_size == {3 if port == 31 else 2} && {prefix}_bits_tag == 0 && {prefix}_bits_data == 0 && {prefix}_bits_mask == 255);\n"
                         guidance += f'    assume({prefix}_bits_atomic == {int(port == 31 and mode == "mutation")} && {prefix}_bits_atomicOperation == 0 && {prefix}_bits_write == {int(port == 31)} && {prefix}_bits_fetch == {int(port != 31)});\n'
                     text = text.replace('\nendmodule', '\n' + guidance + '  end\nendmodule')
@@ -5220,7 +5472,8 @@ def verify(rtl, directory, modules=None):
                                 text = text.replace('\nendmodule', f'\n  always @(posedge clock) if (rq_past && $past(!reset && state{suffix} != 0)) assume($stable(rq_dut_permission_{slot}));\nendmodule')
                             def partition(match):
                                 expression = match.group()
-                                payload = any(token in expression for token in ('rq_address', 'rq_offset', 'rq_tag', 'rq_data', 'rq_bit'))
+                                payload = any(token in expression for token in ('rq_address', 'rq_offset', 'rq_data', 'rq_bit',
+                                    *(() if manifest['parameters'].get('loadQueueEntries', 1) == 2 else ('rq_tag',))))
                                 port = re.search(r'ports_(\d+)_', expression)
                                 if mode == 'prove-control':
                                     return 'assert(1);' if payload or response_modes and port else expression
@@ -5272,14 +5525,14 @@ def verify(rtl, directory, modules=None):
                                     guidance += f'    assume({prefix}_bits_size == 2 || {prefix}_bits_size == 6);\n'
                         text = text.replace('\nendmodule', '\n' + witnesses + guidance + '  end\nendmodule')
                 if unit == 'ReadQueue' and filename == module + '.sv' and mode in ('mutation', 'mutation-capacity'):
-                    base = next((int(r['base']) + 3) & ~3 for r in manifest['parameters']['memoryRegions'] if r['executable'] and not r['device'] and
+                    base = next((int(r['base']) + 3) & ~3 for r in manifest['parameters']['memoryRegions'] if r['executable'] and r['readable'] and not r['device'] and
                                 ((int(r['base']) + 3) & ~3) + 4 <= int(r['base']) + int(r['size']))
                     readers = read_slots if mode == 'mutation-capacity' else 1
                     guidance = f'  always @* begin\n    assume(ar_ready == {int(mode == "mutation")} && !r_valid);\n'
                     for port in range(2 * manifest['parameters']['hartCount']):
                         prefix = f'ports_{port}_request'
-                        guidance += f'    assume({prefix}_valid == {int(port % 2 == 0 and port // 2 < readers)} && !ports_{port}_response_ready);\n'
-                        guidance += f"    assume(!{prefix}_bits_write && !{prefix}_bits_atomic && {prefix}_bits_fetch && {prefix}_bits_size == 2 && {prefix}_bits_address == 64'd{base});\n"
+                        guidance += f'    assume({prefix}_valid == {int(port < readers)} && !ports_{port}_response_ready);\n'
+                        guidance += f"    assume(!{prefix}_bits_write && !{prefix}_bits_atomic && {prefix}_bits_fetch == {int(port % 2 == 0)} && {prefix}_bits_size == 2 && {prefix}_bits_address == 64'd{base});\n"
                     text = text.replace('\nendmodule', '\n' + guidance + '  end\nendmodule')
                 if unit == 'ReadQueue' and filename == module + '.sv' and (mode.startswith('mutation-line-') or mode in ('mutation-sticky-fault', 'mutation-fault-release')):
                     line = mode.startswith('mutation-line-')
@@ -5304,18 +5557,19 @@ def verify(rtl, directory, modules=None):
                 if unit == 'ReadQueue' and filename == module + '.sv' and mode in ('mutation-route', 'mutation-data', 'mutation-tag', 'mutation-id'):
                     region = next((r for r in manifest['parameters']['memoryRegions'] if r['readable'] and r['executable'] and not r['device'] and int(r['size']) >= 8 and int(r['base']) % 4 == 0), None)
                     if region is not None:
-                        constraints = [f'assume(r_valid == ($countones(rq_waiting) == {min(2, read_slots)}) && r_bits_id == (rq_owner[0] >> 1) && r_bits_resp == 0 && r_bits_last);',
-                                       'assume(ar_ready && ports_0_response_ready && ports_2_response_ready && rq_bit == 0);',
+                        peer = min(2, 2 * manifest['parameters']['hartCount'] - 1)
+                        constraints = [f'assume(r_valid == ($countones(rq_waiting) == {min(2, read_slots)}) && r_bits_id == 0 && r_bits_resp == 0 && r_bits_last);',
+                                       f'assume(ar_ready && ports_0_response_ready && ports_{peer}_response_ready && rq_bit == 0);',
                                        f"assume(r_bits_data == {manifest['parameters']['axiDataBits']}'h{(1 << manifest['parameters']['axiDataBits']) - 1:x});"]
                         for port in range(2 * manifest['parameters']['hartCount']):
-                            if port in (0, 2):
+                            if port in (0, peer):
                                 constraints.append(f'assume(ports_{port}_request_valid && ports_{port}_request_bits_tag == {37+port});')
-                                constraints.append(f"assume(!ports_{port}_request_bits_write && !ports_{port}_request_bits_atomic && ports_{port}_request_bits_fetch && ports_{port}_request_bits_size == 2 && ports_{port}_request_bits_address == {manifest['parameters']['physicalAddressBits']}'d{int(region['base']) + 4});")
+                                constraints.append(f"assume(!ports_{port}_request_bits_write && !ports_{port}_request_bits_atomic && ports_{port}_request_bits_fetch == {int(port % 2 == 0)} && ports_{port}_request_bits_size == 2 && ports_{port}_request_bits_address == {manifest['parameters']['physicalAddressBits']}'d{int(region['base']) + 4});")
                             else:
                                 constraints.append(f'assume(!ports_{port}_request_valid);')
                         guidance = '  always @* begin\n    ' + '\n    '.join(constraints) + '\n  end\n'
                         guidance += ('  always @(posedge clock) if (!reset && r_valid && r_ready)\n'
-                                     f'    assert(rq_owned[0] && rq_sent[0]{" && rq_owned[1] && rq_sent[1] && (owner >> 1) != (owner_0 >> 1)" if read_slots > 1 else ""});\n')
+                                     f'    assert(rq_owned[0] && rq_sent[0]{" && rq_owned[1] && rq_sent[1] && owner != owner_0" if read_slots > 1 else ""});\n')
                         text = text.replace('\nendmodule', '\n' + guidance + 'endmodule')
                 if unit == 'Backend' and proving and filename == 'DitDahA1Gpr.sv':
                     text = license + header(text)
@@ -5338,11 +5592,11 @@ def verify(rtl, directory, modules=None):
                         guidance += f"  always @* assume(_fetch_output_bits_following_{lane-1} == 32'h13);\n"
                     text = text.replace('endmodule', guidance + 'endmodule', 1)
                 if name == 'PipelineBackend' and mutating and filename == module + '.sv':
-                    bit = 40 if mode == 'mutation' else 96 if mode == 'mutation-recovery-metadata' else 0
+                    bit = 40 if mode in ('mutation', 'mutation-dual-owner') else 96 if mode == 'mutation-recovery-metadata' else 0
                     text = text.replace('(* anyconst *) reg [6:0] pipeline_bit;', f"wire [6:0] pipeline_bit = 7'd{bit};")
                 if name == 'PipelineBackend' and mode.startswith('cover') and filename == module + '.sv':
                     def cover_mode(expression):
-                        return 'cover-recovery' if expression.startswith(('earlyRedirect', 'commitResolved')) else 'cover-memory' if expression.startswith('memoryPending') else 'cover-dependency' if 'decodedCount ==' in expression else 'cover'
+                        return 'cover-dual' if expression.startswith('extraCount') else 'cover-drain' if expression.startswith('memoryFault') else 'cover-recovery' if expression.startswith(('earlyRedirect', 'commitResolved')) else 'cover-memory' if expression.startswith('memoryPending') else 'cover-dependency' if 'decodedCount ==' in expression else 'cover'
                     text = re.sub(r'^\s*cover\((.*?)\);\n', lambda match: match[0] if cover_mode(match[1]) == mode else '', text, flags=re.M)
                 if unit == 'Translation' and mode == 'mutation-alias' and filename == module + '.sv':
                     base = int(manifest['parameters']['resetVector'])
@@ -5444,7 +5698,7 @@ def verify(rtl, directory, modules=None):
   end
 '''
                     text = text.replace('endmodule', guidance + '\nendmodule', 1)
-                if unit == 'Lsu' and mutating and filename == module + '.sv':
+                if unit == 'Lsu' and name != 'LsuReads' and mutating and filename == module + '.sv':
                     load = mode == 'mutation-extension'
                     atomic = mode in ('mutation-consume', 'mutation-pair', 'mutation-alias', 'mutation-lr-fault', 'mutation-pmp-direction')
                     guidance = f'''
@@ -5707,7 +5961,7 @@ def verify(rtl, directory, modules=None):
                 timeout = 180
             if name == 'WfiFrontend' and task == 'prove' and manifest['parameters']['issueWidth'] == 3:
                 timeout = 300
-            if unit == 'Backend' and task == 'prove' and manifest['parameters']['issueWidth'] > 1:
+            if unit == 'Backend' and task == 'prove' and (manifest['parameters']['issueWidth'] > 1 or manifest['parameters'].get('loadQueueEntries', 1) == 2):
                 timeout = 180
             if name == 'WideFetch' and task == 'cover' and manifest['parameters'].get('virtualAddressBits') == 39:
                 timeout = 180
@@ -5750,7 +6004,7 @@ timeout {timeout}
 {witness_option}[engines]
 {engine}
 [script]
-read -formal -sv {' '.join(files)}
+read -formal -sv {'-noautowire ' if name == 'PipelineBackend' else ''}{' '.join(files)}
 {preparation}
 [files]
 ''' + '\n'.join(files) + '\n'
@@ -5774,10 +6028,16 @@ read -formal -sv {' '.join(files)}
     assert checker_hash == hashlib.sha256(Path(__file__).read_bytes()).hexdigest(), 'Checker changed during proofs'
     assert all(hashlib.sha256(Path(p).read_bytes()).hexdigest() == h for p, h in manifest['sourceHashes'].items())
     proved = {report['propertyGroup'] for report in reports if report['mode'].startswith('prove') and report['status'] == 'PASS'}
+    if mutations is not None:
+        assert set(mutations) == {report['mode'] for report in reports}, 'Incomplete negative-control selection'
     if 'DataCacheWriteback' in proved:
         assert {'prove', 'cover', 'mutation', 'mutation-store-missing', 'prove-storage-shape', 'prove-storage-bytes', 'prove-storage', 'cover-storage', 'mutation-storage-mask', 'mutation-storage-word'} <= {r['mode'] for r in reports if r['propertyGroup'] == 'DataCacheWriteback'}, 'Incomplete writeback authorization proof'
     if 'PipelineBackend' in proved:
         covers = {'cover', 'cover-memory', 'cover-recovery'} | ({'cover-dependency'} if manifest['parameters']['issueWidth'] > 1 else set())
+        if manifest['parameters'].get('loadQueueEntries', 1) == 2:
+            covers |= {'prove-control', 'cover-dual', 'cover-drain', 'mutation-dual-owner', 'mutation-dual-drain'}
+            if manifest['parameters']['issueWidth'] == 1:
+                covers |= {'prove-identity'}
         assert covers <= {report['mode'] for report in reports if report['propertyGroup'] == 'PipelineBackend'}, 'Incomplete pipeline covers'
     if 'PipelineBackend' in proved and manifest['parameters']['issueWidth'] > 1:
         assert {f'prove-bits-{bit}' for bit in range(0, 97 if manifest['parameters'].get('enableBranchPrediction') else 96, 4 if manifest['parameters']['issueWidth'] == 3 else 8)} <= {report['mode'] for report in reports}, 'Incomplete identity proof'
@@ -5800,7 +6060,7 @@ read -formal -sv {' '.join(files)}
             expected.add('mutation-capacity')
             if manifest['parameters']['hartCount'] == 16:
                 expected |= {f'prove-response-{port}' for port in range(0, 32, 8)}
-        assert sum(r['covers'] for r in reports if r['propertyGroup'] == 'ReadQueue' and r['mode'] in cover_modes) == 4 * manifest['parameters']['hartCount'] + (4 if line else 3) + (2 if line else 1) * (read_slots > 1), 'Incomplete read queue covers'
+        assert sum(r['covers'] for r in reports if r['propertyGroup'] == 'ReadQueue' and r['mode'] in cover_modes) == 4 * manifest['parameters']['hartCount'] + (4 if line else 3) + (2 if line else 1) * (read_slots > 1) + int(manifest['parameters'].get('loadQueueEntries', 1) == 2 and read_slots > 1), 'Incomplete read queue covers'
         assert expected <= {r['mode'] for r in reports if r['propertyGroup'] == 'ReadQueue'}, 'Incomplete read queue proof'
     if 'Pmp' in proved:
         assert {'PmpInterval', 'PmpDecode'} <= proved, 'Missing PMP composition prerequisites'
@@ -5813,7 +6073,8 @@ read -formal -sv {' '.join(files)}
     if 'Axi' in proved and manifest['parameters']['axiDataBits'] == 512:
         assert {'prove-control', 'prove-payload', 'cover'} <= {r['mode'] for r in reports if r['propertyGroup'] == 'Axi'}, 'Incomplete AXI proof'
     summary.write_text(json.dumps(dict(
-        scope='module-level safety, cover reachability and mutation detection', propertyGroups=sorted(proved),
+        scope='selected negative controls only' if mutations is not None else 'module-level safety, cover reachability and mutation detection',
+        selectedMutations=mutations, propertyGroups=sorted(proved),
         assumptions='initial reset, then no reset except CSR proofs; Fetch responses require accepted requests and stable blocked payloads; enabled control proofs abstract combinational authorization',
         fabricProbeAssumptions='probe responses require accepted requests and stable held frames; concrete cache endpoint proofs discharge these contracts; controller/physical ownership overlap and retained maintenance tags are checked, including noncacheable-line-base internal releases' if any(r['propertyGroup'] == 'MemoryFabric' and r['mode'] == 'prove-control' for r in reports) and manifest['parameters'].get('dCacheBytes') else None,
         cacheRoutingMutation=dict(applicable=cache_routing_base is not None, lineBase=cache_routing_base,
@@ -5826,8 +6087,9 @@ read -formal -sv {' '.join(files)}
         registerFile='arbitrary nonzero architectural register and immutable data bit, exact reset and ordered multiport writes, zero-register isolation and every asynchronous read port; unrestricted addresses, data and same-address writes' if 'Gpr' in proved else None,
         backendAbstraction='arbitrary multiply result and completion delay; safety overapproximates nonzero GPR reads, with actual GPR retained for covers/mutations; resource and register contracts are separately proved',
         resourceWitnessGuidance='cover/mutations only: faulting SD or configured PMP update followed by MUL and NOP, arbitrary response delay and quiescent interrupts' if 'Backend' in proved else None,
-        pipelineMutationGuidance='mutations only: legal ADDI forwarding/dependency groups, SD/ALU/JAL or leading-JAL recovery sequences, or faulted grouped LD and ALUs; observed PC/prediction bit selected for identity corruption; actual arithmetic and register storage' if 'PipelineBackend' in proved else None,
-        pipelineCoverGuidance='cover only: independent ADDI groups, a leading SD with arbitrary response delay, or a lane-0-to-lane-1 RAW; separate recovery cover drives SD, ALU and JAL with prompt memory service; translated witnesses use retained identity replies' if 'PipelineBackend' in proved else None,
+        pipelineMutationGuidance='mutations only: legal ADDI forwarding/dependency groups, SD/ALU/JAL or leading-JAL recovery sequences, faulted grouped LD and ALUs, or two loads with reverse returns or an older fault; observed PC/prediction bit selected for identity corruption; actual arithmetic and register storage' if 'PipelineBackend' in proved else None,
+        pipelineCoverGuidance='cover only: independent ADDI groups, a leading SD with arbitrary response delay, lane-0-to-lane-1 RAW, recovery, or two loads with reverse returns or an older fault; translated witnesses use retained identity replies' if 'PipelineBackend' in proved else None,
+        pipelineComposition='dual-context control, ownership, metadata and architectural write/forwarding contracts proved first; accepted PC/encoding FIFO then consumes only those proved assertions; faulting head discards the younger memory group after draining' if 'PipelineBackend' in proved and manifest['parameters'].get('loadQueueEntries', 1) == 2 else None,
         pipeline='independent FIFO of accepted PC/encoding/prediction bits checks every valid stage lane; multi-issue partitions all identity bits into four- or eight-bit proof domains; prediction provenance covers every pre-issue lane and each later head, whose control operations execute alone; greedy oldest prefix, youngest older writer, scalar effect ownership and every GPR write port; generated observation registers inlined; safety overapproximates nonzero GPR reads, with actual GPR retained for covers/mutations and separately proved' if 'PipelineBackend' in proved else None,
         synchronization='raw barrier encodings, independent accepted-data ownership until retirement, sequential instruction synchronization redirect and younger flush; no data response timing assumptions' if 'SynchronizationBackend' in proved else None,
         synchronizationWitnessGuidance='cover/mutations only: port-driven zero-address SD, FENCE/FENCE.I, one request and response stall, faulted FENCE.I and quiescent interrupts; unrestricted safety proof' if 'SynchronizationBackend' in proved else None,
@@ -5855,6 +6117,7 @@ read -formal -sv {' '.join(files)}
         axiComposition='512-bit configurations prove all control first; payload consumes exactly those proved assertions without restricting data, addresses, operations or response timing' if 'Axi' in proved and manifest['parameters']['axiDataBits'] == 512 else None,
         axiMutationGuidance='mutations only: aligned D ADD/OR/SWAP/LR/SC at address8, operand1, values7 then11 after retry, immediate service, per-fault codes, SC eligibility and valid hart1 with changing live sideband for retained-ID check; prove and cover unrestricted' if 'Axi' in proved else None,
         wordMemory='independent decode and execution metadata, accepted LSU ownership, size/mask, alignment, authorization, narrow extension and response fault attribution; metadata inputs unrestricted, functional completion checked for byte/halfword/word/doubleword sizes' if 'Lsu' in proved else None,
+        dualReadOwnership='Bare aligned ordinary doubleword reads without PMP; independent two-context acceptance and completion ledger, arbitrary stalls/data/errors/tags/cancellation, all payload bits, in-order completion and held-request retention; no device, translation or progress claim' if 'LsuReads' in proved else None,
         reservation='independent last-LR physical word and validity, successful matching LR completion only, any atomic acceptance consumes old pair, full-EA SC qualification captured before protection and stable through backpressure; endpoint exclusivity is separate' if 'Lsu' in proved else None,
         physicalMemory='independent configured region/permission/shape model; D-only atomic directions/opcodes, malformed and denied SC isolation regardless of eligibility, retained local-fault response and complete request payload forwarding' if 'Memory' in proved else None,
         integerExecution='independent raw encoding validity and dependency decode, D-only atomic encodings/LR rs2 and direction metadata, integer ALU and 5/6-bit shifts, word truncation/sign extension, branches, narrow metadata and CSR semantics; combinational safety with unrestricted inputs' if 'IntegerExecute' in proved else None,
@@ -5877,6 +6140,7 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--rtl', type=Path, default=Path('result/production'))
     parser.add_argument('--output', type=Path, default=Path('result/formal'))
-    parser.add_argument('--modules', nargs='+', choices=('Fetch', 'WideFetch', 'Gpr', 'Multiply', 'Backend', 'PipelineBackend', 'Pmp', 'PmpDecode', 'PmpInterval', 'PmpSubset', 'Csr', 'UserCsr', 'UserExecute', 'SupervisorCsr', 'SupervisorExecute', 'SupervisorFetch', 'Lsu', 'InterruptCsr', 'InterruptBackend', 'SynchronizationBackend', 'InstructionCache', 'DataCache', 'DataCacheWriteback', 'Coherence', 'MemoryArbiter', 'ReadQueue', 'MemoryFabric', 'Memory', 'Axi', 'WordDecode', 'WordExecute', 'IntegerDecode', 'IntegerExecute', 'WfiBackend', 'WfiFrontend', 'LocalInterrupts', 'Translation'))
+    parser.add_argument('--mutations', nargs='+')
+    parser.add_argument('--modules', nargs='+', choices=('Fetch', 'WideFetch', 'Gpr', 'Multiply', 'Backend', 'PipelineBackend', 'Pmp', 'PmpDecode', 'PmpInterval', 'PmpSubset', 'Csr', 'UserCsr', 'UserExecute', 'SupervisorCsr', 'SupervisorExecute', 'SupervisorFetch', 'Lsu', 'LsuReads', 'InterruptCsr', 'InterruptBackend', 'SynchronizationBackend', 'InstructionCache', 'DataCache', 'DataCacheWriteback', 'Coherence', 'MemoryArbiter', 'ReadQueue', 'MemoryFabric', 'Memory', 'Axi', 'WordDecode', 'WordExecute', 'IntegerDecode', 'IntegerExecute', 'WfiBackend', 'WfiFrontend', 'LocalInterrupts', 'Translation'))
     args = parser.parse_args()
-    verify(args.rtl, args.output, args.modules)
+    verify(args.rtl, args.output, args.modules, args.mutations)

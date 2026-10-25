@@ -20,6 +20,7 @@ case class DitDahA1Parameter(
   axiDataBits: Int = 128,
   pmpEntries: Int = 16,
   issueWidth: Int = 1,
+  loadQueueEntries: Int = 1,
   enableInterrupts: Boolean = false,
   enableUserMode: Boolean = false,
   enableSupervisorMode: Boolean = false,
@@ -45,6 +46,7 @@ case class DitDahA1Parameter(
   require(Set(64, 128, 256, 512).contains(axiDataBits), "axiDataBits must be 64, 128, 256, or 512")
   require(Set(0, 16, 64).contains(pmpEntries), "pmpEntries must be 0, 16 or 64")
 
+  require(Set(1, 2).contains(loadQueueEntries), "loadQueueEntries must be one or two")
   require(issueWidth >= 1 && issueWidth <= 3, "issueWidth must be between 1 and 3")
   memoryRegions.foreach(r => require(r.base + r.size <= (BigInt(1) << physicalAddressBits), "Memory region exceeds physical address space"))
   memoryRegions.sortBy(_.base).sliding(2).filter(_.size == 2).foreach { pair =>
@@ -81,9 +83,9 @@ case class DitDahA1Parameter(
   def resolvedFabricReadSlots: Int = fabricReadSlots.getOrElse(if hartCount > 1 then 2 else 0)
 
   def validateReadSlots(): Unit =
-    require(if hartCount == 1 then resolvedFabricReadSlots == 0 else
-      resolvedFabricReadSlots >= 1 && resolvedFabricReadSlots <= hartCount,
-      "Shared read slots require distinct harts; a single hart uses the bridge")
+    require(resolvedFabricReadSlots >= (if hartCount == 1 then 0 else 1) &&
+      resolvedFabricReadSlots <= (loadQueueEntries + 1) * hartCount,
+      "Read slots must fit the instruction and data clients")
 
   def validateFabric(): Unit =
     validateReadSlots()
@@ -100,7 +102,7 @@ case class DitDahA1Parameter(
   def enableLineRefill: Boolean = enableBurstRefill || enableDataBurstRefill
 
   val xlen: Int = 64
-  val axiIdBits: Int = math.max(1, 32 - Integer.numberOfLeadingZeros(hartCount - 1))
+  val axiIdBits: Int = math.max(1, 32 - Integer.numberOfLeadingZeros(math.max(hartCount, resolvedFabricReadSlots) - 1))
   val registerCount: Int = 32
   val pipelineStages: Int = 8
   val cacheLineBytes: Int = 64
@@ -108,7 +110,7 @@ case class DitDahA1Parameter(
   val fetchCountBits: Int = 32 - Integer.numberOfLeadingZeros(fetchWords)
   val frontendCapacity: Int = if iCacheBytes == 0 then issueWidth else 2 * math.max(1, fetchWords - 1)
   val issueCountBits: Int = 32 - Integer.numberOfLeadingZeros(issueWidth)
-  val backendCapacity: Int = 6 * issueWidth
+  val backendCapacity: Int = (5 + loadQueueEntries) * issueWidth
   val pipelineOccupancyBits: Int = 32 - Integer.numberOfLeadingZeros(backendCapacity)
   val maxInflight: Int = backendCapacity + frontendCapacity
   val productName: String = "DitDah-A1"

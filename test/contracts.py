@@ -253,6 +253,153 @@ LSU += '''
 '''
 
 
+def lsu_queue_contract(parameters):
+    translated = parameters.get('virtualAddressBits') == 39 and parameters.get('enableSupervisorMode')
+    user = parameters.get('enableUserMode', False)
+    pmp_address = (1 << (parameters['physicalAddressBits'] - 2)) - 1
+
+    def submit(address, pc, rd, operation=None, physical=None, overlap=False):
+        instruction = ld(rd, 1) if operation is None else amo(operation, rd, 1, 0 if operation == 2 else 2)
+        body = f'''    privilege = {0 if user else 3}; input_bits_instruction_pc = 'h{pc:x}; input_bits_instruction_tag = 73;
+    input_bits_instruction_instruction = 32'h{instruction:x}; input_bits_instruction_length = 4;
+    input_bits_address = 'h{address:x}; input_bits_rd = {rd}; input_bits_rdWrite = 1;
+    input_bits_load = {int(operation != 3)}; input_bits_store = {int(operation is not None and operation != 2)};
+    input_bits_atomic = {int(operation is not None)}; input_bits_memorySize = 3;
+    input_valid = 1; #1; while (!input_ready) tick(); tick(); input_valid = 0;
+'''
+        if overlap:
+            body += '    memory_response_valid = 0;\n'
+        if translated:
+            body += f'''    while (!translation_request_valid) tick();
+    check(translation_request_bits_address == 'h{address:x}, "Translation retains its input owner");
+    translation_request_ready = 1; tick(); translation_request_ready = 0;
+    translation_response_bits_address = 'h{address if physical is None else physical:x}; translation_response_valid = 1;
+    while (!translation_response_ready) tick(); tick(); translation_response_valid = 0;
+'''
+        return body
+
+    def issue(index, address, write=False):
+        return f'''    while (!memory_request_valid) tick();
+    bus_id[{index}] = memory_request_bits_tag; privilege = 3;
+    repeat (3) begin
+      check(memory_request_valid && memory_request_bits_address == 'h{address:x} && memory_request_bits_tag == bus_id[{index}] && memory_request_bits_write == {int(write)} && memory_request_bits_privileged == {int(not user)}, "Memory offer retains context and effective privilege"); tick();
+    end
+    memory_request_ready = 1; tick(); memory_request_ready = 0;
+'''
+
+    def respond(index, value, fault=False, last=True):
+        return f'''    memory_response_bits_tag = bus_id[{index}]; memory_response_bits_data = {value};
+    memory_response_bits_fault = {int(fault)}; memory_response_bits_last = {int(last)}; memory_response_valid = 1;
+    check(memory_response_ready, "Owned response can drain"); tick(); memory_response_valid = 0;
+'''
+
+    def complete(pc, rd, value, fault=False):
+        payload = f'output_bits_value == {value}' if value is not None else "1'b1"
+        failure = f" && output_bits_instruction_cause == 5 && output_bits_instruction_tval == 'h{0x1000 + 16 * (pc - 0x100):x}" if fault else ''
+        return f'''    while (!output_valid) tick();
+    repeat (3) begin
+      check(output_valid && output_bits_instruction_pc == 'h{pc:x} && output_bits_instruction_tag == 73 && output_bits_rd == {rd} && {payload} && output_bits_instruction_fault == {int(fault)}{failure}, "In-order completion retains instruction, value and fault"); tick();
+    end
+    output_ready = 1; tick(); output_ready = 0;
+'''
+
+    body = '''    begin
+      integer bus_id[2];
+      storeAllowed = 1;
+'''
+    if parameters['pmpEntries']:
+        body += f"    pmp_config = 'h1f; pmp_address = 'h{pmp_address:x};\n"
+    for fault in (False, True):
+        body += submit(0x1000, 0x100, 5) + issue(0, 0x1000)
+        body += submit(0x1040, 0x104, 6) + issue(1, 0x1040)
+        body += '''    check(bus_id[0] != bus_id[1] && !input_ready && !output_valid, "Two real reads own distinct contexts before either returns");
+'''
+        body += respond(1, 202)
+        body += '    repeat (3) begin check(!output_valid, "Younger return cannot pass the completion head"); tick(); end\n'
+        body += respond(0, 101, fault) + complete(0x100, 5, 101, fault) + complete(0x104, 6, 202)
+        body += '    check(input_ready && !output_valid, "Completed contexts can be reused");\n'
+    body += submit(0x1080, 0x108, 7) + issue(0, 0x1080)
+    body += submit(0x10c0, 0x10c, 8)
+    body += '''    while (!memory_request_valid) tick(); bus_id[1] = memory_request_bits_tag;
+    repeat (2) tick(); cancel = 1;
+    check(memory_request_valid && memory_request_bits_tag == bus_id[1], "Cancellation cannot withdraw a sampled read"); tick(); cancel = 0;
+    repeat (3) begin
+      check(memory_request_valid && memory_request_bits_tag == bus_id[1] && memory_request_bits_address == 'h10c0 && !input_ready, "Cancellation retains the offered read"); tick();
+    end
+    memory_request_ready = 1; tick(); memory_request_ready = 0;
+'''
+    body += respond(1, 404) + respond(0, 303) + complete(0x108, 7, 303) + complete(0x10c, 8, 404)
+    body += '    check(input_ready && !memory_request_valid, "Cancelled ownership drains before reuse");\n'
+    body += submit(0x1000, 0x100, 5) + issue(0, 0x1000)
+    body += '    memory_response_bits_tag = bus_id[0]; memory_response_bits_data = 505; memory_response_valid = 1;\n'
+    body += submit(0x1040, 0x104, 6, overlap=True) + issue(1, 0x1040) + respond(1, 606)
+    body += complete(0x100, 5, 505) + complete(0x104, 6, 606)
+    body += submit(0x1000, 0x100, 5) + issue(0, 0x1000) + submit(0x1000, 0x104, 6)
+    body += '    repeat (4) begin check(!memory_request_valid, "Same physical word waits for its older reply"); tick(); end\n'
+    body += respond(0, 101) + issue(1, 0x1000) + respond(1, 202)
+    body += complete(0x100, 5, 101) + complete(0x104, 6, 202)
+    if translated:
+        body += submit(0x1000, 0x100, 5, physical=0x3000) + issue(0, 0x3000)
+        body += submit(0x2000, 0x104, 6, physical=0x3000)
+        body += '    repeat (4) begin check(!memory_request_valid, "Virtual aliases serialize by their physical word"); tick(); end\n'
+        body += respond(0, 101, True) + issue(1, 0x3000) + respond(1, 202)
+        body += complete(0x100, 5, 101, True) + complete(0x104, 6, 202)
+    devices = [int(region['base']) for region in parameters['memoryRegions'] if region['device']]
+    if devices:
+        body += submit(devices[0], 0x100, 5) + '    storeAllowed = 0;\n' + issue(0, devices[0])
+        body += respond(0, 707) + complete(0x100, 5, 707) + '    storeAllowed = 1;\n'
+        body += submit(0x1000, 0x100, 5) + issue(0, 0x1000)
+        body += '    storeAllowed = 0;\n' + submit(devices[0], 0x104, 6)
+        body += '    repeat (3) begin check(!memory_request_valid, "Device read waits behind its older owner"); tick(); end\n'
+        body += respond(0, 101) + complete(0x100, 5, 101)
+        body += '''    repeat (3) begin check(!memory_request_valid, "Oldest device read still needs effect permission"); tick(); end
+    storeAllowed = 1; tick(); storeAllowed = 0;
+'''
+        body += issue(1, devices[0]) + respond(1, 202) + complete(0x104, 6, 202) + '    storeAllowed = 1;\n'
+        body += submit(0x1000, 0x100, 5) + issue(0, 0x1000)
+        body += '    storeAllowed = 0;\n' + submit(devices[0], 0x104, 6)
+        body += '    repeat (4) begin check(!memory_request_valid, "Younger device read has no effect permission"); tick(); end\n'
+        body += respond(0, 101, True)
+        body += '''    check(output_valid && output_bits_instruction_fault, "Older fault precedes device cancellation");
+    cancel = 1; output_ready = 1; tick(); cancel = 0; output_ready = 0;
+    while (!output_valid) begin check(!memory_request_valid, "Cancelled device read cannot issue"); tick(); end
+'''
+        body += complete(0x104, 6, None) + '    storeAllowed = 1;\n'
+    if parameters['pmpEntries']:
+        body += "    pmp_config = 'h98; pmp_address = 'h400;\n" + submit(0x1000, 0x100, 5)
+        body += '''    while (!output_valid) begin check(!memory_request_valid, "Denied load cannot issue a request"); tick(); end
+    check(output_bits_instruction_fault && output_bits_instruction_cause == 5 && output_bits_instruction_tval == 'h1000, "Protection fault retains its original address");
+    output_ready = 1; tick(); output_ready = 0; reset = 1; tick();
+'''
+        body += f"    pmp_config = 'h1f; pmp_address = 'h{pmp_address:x}; reset = 0; tick();\n"
+    body += submit(0x1000, 0x100, 5, 2) + issue(0, 0x1000)
+    body += '''    input_bits_atomic = 0; input_bits_store = 0; input_bits_load = 1; input_valid = 1;
+    repeat (3) begin check(!input_ready, "Pending atomic excludes younger data requests"); tick(); end
+    input_valid = 0;
+'''
+    body += respond(0, 101) + complete(0x100, 5, 101)
+    body += submit(0x1000, 0x104, 6, 3)
+    body += '    while (!memory_request_valid) tick(); check(memory_request_bits_scEligible, "Shared reservation survives its completed LR");\n'
+    body += issue(1, 0x1000, True) + respond(1, 0) + complete(0x104, 6, 0)
+    body += submit(0x1000, 0x100, 5, 3)
+    body += '    while (!memory_request_valid) tick(); check(!memory_request_bits_scEligible, "SC consumes the shared reservation");\n'
+    body += issue(0, 0x1000, True) + respond(0, 1) + complete(0x100, 5, 1)
+    body += submit(0x1000, 0x100, 5) + issue(0, 0x1000) + submit(0x1040, 0x104, 6) + issue(1, 0x1040)
+    body += respond(0, 101, last=False) + respond(1, 202)
+    body += '    repeat (3) begin check(!output_valid, "Nonterminal response retains its owner"); tick(); end\n'
+    body += respond(0, 303) + complete(0x100, 5, 303, True) + complete(0x104, 6, 202)
+    body += submit(0x1000, 0x100, 5) + issue(0, 0x1000) + submit(0x1040, 0x104, 6) + issue(1, 0x1040)
+    body += '''    memory_response_bits_tag = 2; memory_response_valid = 1; tick(); memory_response_valid = 0;
+    check(!output_valid && !input_ready, "Unknown context cannot complete a real owner");
+'''
+    body += respond(1, 202) + respond(0, 101) + complete(0x100, 5, 101, True) + complete(0x104, 6, 202, True)
+    return body + '''    check(!input_ready && !memory_request_valid, "Protocol containment blocks new ownership");
+    reset = 1; tick(); reset = 0; tick();
+    check(input_ready && !output_valid, "Reset clears drained context state");
+    end
+'''
+
+
 def lsu_reservation_contract(parameters):
     body, serial = '', 0
 
@@ -1292,6 +1439,91 @@ def lsu_refill_contract(parameters):
     return body
 
 
+def data_cache_queue_contract(parameters):
+    base = int(next(r for r in parameters['memoryRegions'] if r.get('dataCacheable'))['base']) + 0x1000
+    addresses, tags = (base + 24, base + 104), (17, 34)
+    line = parameters['dCacheRefillBytes'] == 64
+    chunks = 8 if line else 1
+
+    def request(index):
+        return f'''    @(negedge clock);
+    upstream_request_bits_address = 64'h{addresses[index]:x}; upstream_request_bits_tag = {tags[index]};
+    upstream_request_bits_size = 3; upstream_request_bits_refillSize = {6 if line else 0}; upstream_request_valid = 1;
+    #1; while (!upstream_request_ready) tick(); tick(); upstream_request_valid = 0;
+'''
+
+    def offer(index, accept=True):
+        address = addresses[index] & ~63 if line else addresses[index]
+        return f'''    while (!downstream_request_valid) tick();
+    check(downstream_request_bits_address == 64'h{address:x} && downstream_request_bits_tag == {tags[index]} &&
+          downstream_request_bits_size == {6 if line else 3} && !downstream_request_bits_write && !downstream_request_bits_cacheOperation,
+          "Independent cache miss identity");
+''' + ('    downstream_request_ready = 1; tick(); downstream_request_ready = 0;\n' if accept else '')
+
+    def response(index, word):
+        return f'''    @(negedge clock); downstream_response_bits_tag = {tags[index]};
+    downstream_response_bits_data = {4096 + 256 * index + word}; downstream_response_bits_last = {int(word == chunks - 1)};
+    downstream_response_valid = 1; #1; while (!downstream_response_ready) tick(); tick(); downstream_response_valid = 0;
+'''
+
+    body = ''
+    for held in (False, True):
+        body += '''    begin
+    integer seen;
+    bit holding;
+    seen = 0; holding = 0;
+    upstream_response_ready = 0; downstream_request_ready = 0;
+    reset = 1; tick(); reset = 0; tick(); upstream_response_ready = 1;
+    fork
+      forever begin
+        @(posedge clock);
+        if (upstream_response_valid && upstream_response_ready) begin
+'''
+        for index, tag in enumerate(tags):
+            expected = 4096 + 256 * index + ((addresses[index] >> 3) & 7 if line else 0)
+            body += f'''          {'if' if index == 0 else 'else if'} (upstream_response_bits_tag == {tag}) begin
+            if ((seen & {1 << index}) || upstream_response_bits_data !== 64'd{expected} || upstream_response_bits_fault || !upstream_response_bits_last)
+              $fatal(1, "Concurrent cache response association");
+            seen = seen | {1 << index};
+          end
+'''
+        body += '''          else $fatal(1, "Unknown cache completion tag");
+        end
+'''
+        address = addresses[1] & ~63 if line else addresses[1]
+        body += f'''        if (holding && (!downstream_request_valid || downstream_request_bits_tag != 34 ||
+            downstream_request_bits_address != 64'h{address:x} || downstream_request_bits_size != {6 if line else 3}))
+          $fatal(1, "Held cache offer changed while older response progressed");
+      end
+    join_none
+'''
+        body += request(0) + offer(0) + request(1) + offer(1, not held)
+        if held:
+            body += '    holding = 1;\n'
+            body += ''.join(response(0, word) for word in range(chunks))
+            body += '''    while (!(seen & 1)) tick();
+    repeat (3) tick(); holding = 0;
+    downstream_request_ready = 1; tick(); downstream_request_ready = 0;
+'''
+            body += ''.join(response(1, word) for word in range(chunks))
+        else:
+            body += ''.join(response(index, word) for word in range(chunks) for index in (1, 0))
+        body += '''    while (seen != 3) tick();
+    repeat (3) tick(); disable fork; upstream_response_ready = 0;
+'''
+        body += request(0).replace('upstream_request_bits_tag = 17', 'upstream_request_bits_tag = 51')
+        expected = 4096 + ((addresses[0] >> 3) & 7 if line else 0)
+        body += f'''    while (!upstream_response_valid) begin check(!downstream_request_valid, "Concurrent refill failed to populate cache"); tick(); end
+    repeat (3) begin
+      check(upstream_response_bits_data == {expected} && upstream_response_bits_tag == 51 && !upstream_response_bits_fault && !downstream_request_valid,
+            "Concurrent refill hit and held completion"); tick();
+    end
+    upstream_response_ready = 1; tick(); upstream_response_ready = 0;
+    end
+'''
+    return body
+
+
 def data_cache_contract(parameters):
     region = next(r for r in parameters['memoryRegions'] if r.get('dataCacheable'))
     base, size = int(region['base']), parameters['dCacheBytes']
@@ -1701,16 +1933,16 @@ def line_read_window(parameters, expected_peak=None, fault_beat=-1, terminal='no
     width, harts = parameters['axiDataBits'], parameters['hartCount']
     base = int(next(r['base'] for r in parameters['memoryRegions'] if not r['device'] and
                    (r['readable'] and r.get('dataCacheable') if data else r['executable'])))
-    count = min(harts, 4)
-    identities = (*range(count - 1), harts - 1)
-    ports = tuple(2 * hart + int(data) for hart in identities)
+    count = min(harts * (2 if data and parameters.get('enableBurstRefill') else 1), 4)
+    ports = (*range(count - 1), 2 * harts - 1) if data and parameters.get('enableBurstRefill') else tuple(
+        2 * hart + int(data) for hart in (*range(count - 1), harts - 1))
     if expected_peak is None:
         expected_peak = min(count, parameters.get('fabricReadSlots') or 2)
     target, beats, slices = expected_peak - 1, 512 // width, width // 64
     lengths = [slices if n == target and terminal == 'early' else 9 if n == target and terminal == 'late' else 8 for n in range(count)]
     body = f'''    reset = 1; tick(); reset = 0; tick();
     begin
-      integer cycles, peak, selected, id, expected, delay[{count}], sent[{count}], received[{count}];
+      integer cycles, peak, selected, id, expected, bus_id[{count}], delay[{count}], sent[{count}], received[{count}];
       bit [{count-1}:0] accepted, issued, live, done;
       bit holding;
       cycles = 0; peak = 0; selected = 0; accepted = 0; issued = 0; live = 0; done = 0; holding = 0;
@@ -1723,7 +1955,7 @@ def line_read_window(parameters, expected_peak=None, fault_beat=-1, terminal='no
     for n, port in enumerate(ports):
         body += f'''        ports_{port}_request_valid = !accepted[{n}];
         ports_{port}_request_bits_address = 64'h{base + 0x100 + 64 * n:x};
-        ports_{port}_request_bits_size = 6; ports_{port}_request_bits_fetch = {int(not data)};
+        ports_{port}_request_bits_size = 6; ports_{port}_request_bits_fetch = {int(port % 2 == 0)};
         ports_{port}_request_bits_write = 0; ports_{port}_request_bits_atomic = 0;
         ports_{port}_request_bits_tag = {71 + n}; ports_{port}_response_ready = {'cycles % 5 != 0' if stalls else '1'};
 '''
@@ -1733,7 +1965,7 @@ def line_read_window(parameters, expected_peak=None, fault_beat=-1, terminal='no
             selected = n; r_valid = 1;
           end
           if (r_valid) begin
-            r_bits_id = selected == {count-1} ? {harts - 1} : selected; r_bits_resp = selected == {target} && sent[selected] == {fault_beat} ? 2 : 0;
+            r_bits_id = bus_id[selected]; r_bits_resp = selected == {target} && sent[selected] == {fault_beat} ? 2 : 0;
             r_bits_last = sent[selected] == (selected == {target} ? {0 if terminal == 'early' else beats if terminal == 'late' else beats - 1} : {beats - 1});
             for (integer chunk = 0; chunk < {width // 64}; chunk++)
               r_bits_data[64 * chunk +: 64] = 64'h1000000000000000 + 256 * selected + sent[selected] * {width // 64} + chunk;
@@ -1757,10 +1989,12 @@ def line_read_window(parameters, expected_peak=None, fault_beat=-1, terminal='no
         end
 '''
     body += f'''        if (ar_valid && ar_ready) begin
-          id = ar_bits_id == {harts - 1} ? {count-1} : integer'(ar_bits_id);
-          if (id >= {count} || !accepted[id] || issued[id] || ar_bits_id != (id == {count-1} ? {harts - 1} : id) ||
+          id = integer'((ar_bits_addr - 64'h{base + 0x100:x}) / 64);
+          if (id < 0 || id >= {count} || !accepted[id] || issued[id] ||
               ar_bits_addr != 64'h{base + 0x100:x} + 64 * id || ar_bits_len != {512 // width - 1} ||
               ar_bits_size != {int(width // 8).bit_length() - 1}) $fatal(1, "Line window address identity");
+          for (integer n = 0; n < {count}; n++) if (live[n] && bus_id[n] == ar_bits_id) $fatal(1, "Live read ID reused");
+          bus_id[id] = ar_bits_id;
           issued[id] = 1; live[id] = 1; delay[id] = 24;
           if ($countones(live) > peak) peak = $countones(live);
         end
@@ -1793,6 +2027,9 @@ def line_read_contract(parameters):
     scenarios += [(kinds[0], kinds[0], 6, -1, mode) for mode in ('early', 'late') if mode != 'early' or beats > 1]
     for first, second, second_size, error, mode in scenarios:
         ports = (int(not first), 2 * (harts - 1) + int(not second))
+        if ports[0] == ports[1]:
+            continue
+        body += '    begin\n      integer bus_id[2];\n'
         for n, port in enumerate(ports):
             size, fetch = (6, first) if n == 0 else (second_size, second)
             body += f'''    ports_{port}_request_bits_address = 64'h{base + 0x100 + 64 * n:x};
@@ -1805,8 +2042,10 @@ def line_read_contract(parameters):
             size = 6 if n == 0 else second_size
             body += f'''    while (!ar_valid) tick();
     repeat (3) begin
-      check(ar_bits_id == {0 if n == 0 else harts - 1} && ar_bits_addr == 64'h{base + 0x100 + 64 * n:x} && ar_bits_len == {beats - 1 if size == 6 else 0} && ar_bits_size == {int(width // 8).bit_length() - 1 if size == 6 else size}, "Concurrent line AR stable before any R"); tick();
+      check(ar_bits_addr == 64'h{base + 0x100 + 64 * n:x} && ar_bits_len == {beats - 1 if size == 6 else 0} && ar_bits_size == {int(width // 8).bit_length() - 1 if size == 6 else size}, "Concurrent line AR stable before any R"); tick();
     end
+    bus_id[{n}] = ar_bits_id;
+    {'check(bus_id[0] != bus_id[1], "Concurrent lines have distinct IDs");' if n == 1 else ''}
     ar_ready = 1; tick(); ar_ready = 0;
 '''
         for beat in range(beats):
@@ -1820,7 +2059,7 @@ def line_read_contract(parameters):
                 parts = slices if size == 6 else 1
                 words = [(0x2000000000000000 + 256 * n + beat * slices + part) if size == 6 else 0x76543210 for part in range(parts)]
                 value = sum(word << (64 * part) for part, word in enumerate(words))
-                body += f'''    r_bits_id = {0 if n == 0 else harts - 1}; r_bits_data = {width}'h{value:x};
+                body += f'''    r_bits_id = bus_id[{n}]; r_bits_data = {width}'h{value:x};
     r_bits_resp = {2 if n == 0 and error == beat else 0}; r_bits_last = {int(last)}; r_valid = 1; #1;
     while (!r_ready) tick(); tick(); r_valid = 0;
 '''
@@ -1833,7 +2072,7 @@ def line_read_contract(parameters):
 '''
         if mode == 'late':
             port = ports[0]
-            body += f'''    r_bits_id = 0; r_bits_resp = 0; r_bits_last = 0; r_valid = 1; #1;
+            body += f'''    r_bits_id = bus_id[0]; r_bits_resp = 0; r_bits_last = 0; r_valid = 1; #1;
     while (!r_ready) tick(); tick(); r_valid = 0;
     check(!ports_{port}_response_valid && !empty, "Overlong line drains without extra chunks");
     r_bits_last = 1; r_valid = 1; tick(); r_valid = 0;
@@ -1841,7 +2080,7 @@ def line_read_contract(parameters):
     check(ports_{port}_response_bits_fault && ports_{port}_response_bits_last && ports_{port}_response_bits_tag == 91, "Overlong line terminates with owned error");
     ports_{port}_response_ready = 1; tick(); ports_{port}_response_ready = 0;
 '''
-        body += '    check(empty, "Both interleaved transactions consumed");\n'
+        body += '    check(empty, "Both interleaved transactions consumed");\n    end\n'
     if beats > 1:
         port = int(not kinds[0])
         body += f'''    ports_{port}_request_bits_address = 64'h{base + 0x100:x};
@@ -1887,14 +2126,14 @@ def read_queue_serial_contract(parameters):
 '''
             else:
                 body += f'''    while (!ar_valid) tick();
-    repeat (3) begin check(ar_bits_id == {hart} && ar_bits_addr == 64'h{address:x} && ar_bits_len == 0 && !ports_{port-1}_request_ready, "Serial AR stability and hart exclusion"); tick(); end
+    repeat (3) begin check(ar_bits_id == 0 && ar_bits_addr == 64'h{address:x} && ar_bits_len == 0 && !ports_{port}_request_ready, "Serial AR stability and client exclusion"); tick(); end
     ar_ready = 1; tick(); ar_ready = 0;
 '''
                 if mode == 'unknown':
-                    body += f'''    r_bits_id = {hart ^ 1}; r_valid = 1; tick(); r_valid = 0;
+                    body += f'''    r_bits_id = 1; r_valid = 1; tick(); r_valid = 0;
     check(!ports_{port}_response_valid && !empty, "Unknown RID cannot complete a real owner");
 '''
-                body += f'''    r_bits_id = {hart}; r_bits_data = 64'h123456789abcdef0; r_valid = 1;
+                body += f'''    r_bits_id = 0; r_bits_data = 64'h123456789abcdef0; r_valid = 1;
 '''
                 if mode == 'late':
                     body += f'''    r_bits_last = 0; tick(); r_valid = 0;
@@ -1904,7 +2143,7 @@ def read_queue_serial_contract(parameters):
                 body += '    tick(); r_valid = 0;\n'
             body += f'''    repeat (3) begin
       check(ports_{port}_response_valid && ports_{port}_response_bits_tag == 59 && ports_{port}_response_bits_last &&
-        ports_{port}_response_bits_fault == {int(mode != 'short')} && !ports_{port-1}_request_ready &&
+        ports_{port}_response_bits_fault == {int(mode != 'short')} && !ports_{port}_request_ready &&
         (ports_{port}_response_bits_fault || ports_{port}_response_bits_data == 64'h123456789abcdef0), "Serial completion identity, data and retention"); tick();
     end
     ports_{port}_response_ready = 1; tick(); ports_{port}_response_ready = 0;
@@ -1912,6 +2151,46 @@ def read_queue_serial_contract(parameters):
     ports_{port}_request_bits_write = 0; ports_{port}_request_bits_atomic = 0;
 '''
     return body + '    reset = 1; tick(); reset = 0; tick();\n'
+
+
+def read_queue_data_contract(parameters):
+    if parameters.get('loadQueueEntries', 1) != 2 or (parameters.get('fabricReadSlots') or 2) < 2:
+        return ''
+    width = parameters['axiDataBits']
+    base = int(parameters['memoryRegions'][0]['base'])
+    body = '''    begin
+    integer ids[2];
+    reset = 1; tick(); reset = 0; tick(); ports_1_response_ready = 0;
+'''
+    for index, address in enumerate((base + 0x100, base + 0x140)):
+        body += f'''    ports_1_request_bits_address = 'h{address:x}; ports_1_request_bits_size = 3; ports_1_request_bits_fetch = 0;
+    ports_1_request_bits_tag = {17 + 17 * index}; ports_1_request_valid = 1;
+    #1; while (!ports_1_request_ready) tick(); tick(); ports_1_request_valid = 0;
+    while (!ar_valid) tick(); ids[{index}] = ar_bits_id;
+    check(ar_bits_addr == 'h{address:x} && ar_bits_len == 0, "Two same-client AXI addresses before either reply");
+    ar_ready = 1; tick(); ar_ready = 0;
+'''
+    body += '''    check(ids[0] != ids[1], "Same-client reads require distinct live IDs");
+    ports_1_request_bits_tag = 51; ports_1_request_valid = 1;
+    repeat (3) begin check(!ports_1_request_ready && !empty, "Data client capacity is two"); tick(); end
+    ports_1_request_valid = 0;
+'''
+    for index in (1, 0):
+        body += f'''    r_bits_id = ids[{index}]; r_bits_data = {width}'d{11 + 11 * index}; r_bits_last = 1; r_bits_resp = 0; r_valid = 1;
+    #1; while (!r_ready) tick(); tick(); r_valid = 0;
+    repeat (3) begin
+      check(ports_1_response_valid && ports_1_response_bits_tag == 34 && ports_1_response_bits_data == 22,
+            "Held response survives another completed context"); tick();
+    end
+'''
+    body += '''    ports_1_response_ready = 1; tick(); ports_1_response_ready = 0;
+    check(!empty && ports_1_response_valid && ports_1_response_bits_tag == 17 && ports_1_response_bits_data == 11,
+          "One response handshake releases exactly one context");
+    repeat (3) tick(); ports_1_response_ready = 1; tick(); ports_1_response_ready = 0;
+    check(empty && !ports_1_response_valid, "Both data contexts drain once");
+    end
+'''
+    return body
 
 
 def read_queue_contract(parameters):
@@ -1922,39 +2201,41 @@ def read_queue_contract(parameters):
     if parameters.get('fabricReadSlots') == 1:
         return read_queue_serial_contract(parameters) + line_read_window(parameters) + stress
     base = int(parameters['memoryRegions'][0]['base'])
-    last = 2*parameters['hartCount']-1
-    hart = parameters['hartCount']-1
+    last = 0
     width = parameters['axiDataBits']
     first_address, second_address = base+0x138, base+0x124
     first_data, second_data = 0x1122334455667788, 0x98765432
-    body = f'''
+    body = f'''    begin
+        integer first_id, second_id, held_id;
         ports_1_request_bits_address = 64'h{first_address:x}; ports_1_request_bits_size = 3;
         ports_1_request_bits_tag = 17; ports_1_request_valid = 1;
         check(ports_1_request_ready, "First read acceptance"); tick(); ports_1_request_valid = 0;
         ports_{last}_request_bits_address = 64'h{second_address:x}; ports_{last}_request_bits_size = 2;
-        ports_{last}_request_bits_tag = 34; ports_{last}_request_valid = 1;
-        check(ports_{last}_request_ready, "Different hart overlap"); tick(); ports_{last}_request_valid = 0;
-        ports_0_request_bits_address = 64'h{base+0x180:x}; ports_0_request_bits_size = 2;
-        ports_0_request_bits_fetch = 1; ports_0_request_valid = 1;
+        ports_{last}_request_bits_tag = 17; ports_{last}_request_bits_fetch = 1; ports_{last}_request_valid = 1;
+        check(ports_{last}_request_ready, "Same hart instruction and data overlap"); tick(); ports_{last}_request_valid = 0;
+        ports_1_request_bits_address = 64'h{base+0x180:x}; ports_1_request_bits_size = 2;
+        ports_1_request_valid = 1;
         while (!ar_valid) tick();
+        first_id = ar_bits_id;
         repeat (3) begin
-          check(ar_bits_id == 0 && ar_bits_addr == 64'h{first_address:x} && ar_bits_len == 0 && !ports_0_request_ready, "First AR hold and hart ownership"); tick();
+          check(ar_bits_id == first_id && ar_bits_addr == 64'h{first_address:x} && ar_bits_len == 0 && !ports_1_request_ready, "First AR hold and client ownership"); tick();
         end
         ar_ready = 1; tick(); ar_ready = 0;
         while (!ar_valid) tick();
-        check(ar_bits_id == {hart} && ar_bits_addr == 64'h{second_address:x}, "Second AR before first response");
+        second_id = ar_bits_id;
+        check(first_id != second_id && ar_bits_addr == 64'h{second_address:x}, "Second AR before first response");
         ar_ready = 1; tick(); ar_ready = 0;
-        r_bits_id = {hart}; r_bits_data = {width}'h{second_data << (8*(second_address%(width//8))):x}; r_bits_last = 1; r_valid = 1;
+        r_bits_id = second_id; r_bits_data = {width}'h{second_data << (8*(second_address%(width//8))):x}; r_bits_last = 1; r_valid = 1;
         check(r_ready, "Reordered return accepted"); tick(); r_valid = 0;
         repeat (3) begin
-          check(ports_{last}_response_valid && ports_{last}_response_bits_data == 64'h{second_data:x} && ports_{last}_response_bits_tag == 34 && !ports_{last}_response_bits_fault && !ports_1_response_valid && !ports_0_request_ready && !empty, "Reordered response retained"); tick();
+          check(ports_{last}_response_valid && ports_{last}_response_bits_data == 64'h{second_data:x} && ports_{last}_response_bits_tag == 17 && !ports_{last}_response_bits_fault && !ports_1_response_valid && !ports_1_request_ready && !empty, "Same tag reordered response retained by client"); tick();
         end
         ports_{last}_response_ready = 1; tick(); ports_{last}_response_ready = 0;
-        r_bits_id = 0; r_bits_data = {width}'h{first_data << (8*(first_address%(width//8))):x}; r_valid = 1;
+        r_bits_id = first_id; r_bits_data = {width}'h{first_data << (8*(first_address%(width//8))):x}; r_valid = 1;
         tick(); r_valid = 0;
-        check(ports_1_response_valid && ports_1_response_bits_data == 64'h{first_data:x} && ports_1_response_bits_tag == 17 && !ports_1_response_bits_fault && !ports_0_request_ready, "First response identity");
+        check(ports_1_response_valid && ports_1_response_bits_data == 64'h{first_data:x} && ports_1_response_bits_tag == 17 && !ports_1_response_bits_fault && !ports_1_request_ready, "First response identity");
         ports_1_response_ready = 1; tick(); ports_1_response_ready = 0;
-        check(ports_0_request_ready && empty, "Hart released only after response consumption"); ports_0_request_valid = 0;
+        check(ports_1_request_ready && empty, "Client released only after response consumption"); ports_1_request_valid = 0;
         ports_1_request_bits_address = 64'h{1<<parameters['physicalAddressBits']:x}; ports_1_request_bits_tag = 51; ports_1_request_valid = 1;
         tick(); ports_1_request_valid = 0;
         while (!ports_1_response_valid) begin check(!ar_valid, "PMA denial reached AXI"); tick(); end
@@ -1962,8 +2243,8 @@ def read_queue_contract(parameters):
         ports_1_response_ready = 1; tick(); ports_1_response_ready = 0;
         ports_{last}_request_bits_size = 3; ports_{last}_request_bits_address = 64'h{base+0x130:x}; ports_{last}_request_valid = 1;
         tick(); ports_{last}_request_valid = 0;
-        while (!ar_valid) tick(); ar_ready = 1; tick(); ar_ready = 0;
-        r_bits_id = {hart}; r_bits_last = 0; r_valid = 1; tick(); r_valid = 0;
+        while (!ar_valid) tick(); first_id = ar_bits_id; ar_ready = 1; tick(); ar_ready = 0;
+        r_bits_id = first_id; r_bits_last = 0; r_valid = 1; tick(); r_valid = 0;
         check(!ports_{last}_response_valid && r_ready, "Malformed response drains");
         r_bits_last = 1; r_valid = 1; tick(); r_valid = 0;
         check(ports_{last}_response_valid && ports_{last}_response_bits_fault, "Malformed response reports fault");
@@ -1972,24 +2253,25 @@ def read_queue_contract(parameters):
     '''
     body += f'''    ports_{last}_response_ready = 0; r_bits_last = 1;
     ports_{last}_request_valid = 1; tick(); ports_{last}_request_valid = 0;
-    while (!ar_valid) tick(); ar_ready = 1; tick(); ar_ready = 0;
+    while (!ar_valid) tick(); first_id = ar_bits_id; ar_ready = 1; tick(); ar_ready = 0;
     ports_1_request_bits_address = 64'h{first_address:x}; ports_1_request_valid = 1;
     tick(); ports_1_request_valid = 0; while (!ar_valid) tick();
-    r_bits_id = 0; r_valid = 1; tick(); r_valid = 0;
+    held_id = ar_bits_id; r_bits_id = held_id; r_valid = 1; tick(); r_valid = 0;
     ports_1_request_valid = 1;
-    repeat (3) begin check(!ports_1_request_ready && ar_valid && ar_bits_id == 0 && ar_bits_addr == 64'h{first_address:x} && !empty && !ports_{last}_response_valid, "Unknown RID preserves held AR and real owners"); tick(); end
+    repeat (3) begin check(!ports_1_request_ready && ar_valid && ar_bits_id == held_id && ar_bits_addr == 64'h{first_address:x} && !empty && !ports_{last}_response_valid, "Unknown RID preserves held AR and real owners"); tick(); end
     ar_ready = 1; tick(); ar_ready = 0;
-    r_bits_id = {hart}; r_valid = 1; tick(); r_valid = 0;
+    r_bits_id = first_id; r_valid = 1; tick(); r_valid = 0;
     check(ports_{last}_response_valid && ports_{last}_response_bits_fault, "Known response drains after protocol fault");
     ports_{last}_response_ready = 1; tick(); ports_{last}_response_ready = 0;
-    r_bits_id = 0; r_valid = 1; tick(); r_valid = 0;
+    r_bits_id = held_id; r_valid = 1; tick(); r_valid = 0;
     check(ports_1_response_valid && ports_1_response_bits_fault, "Previously held AR drains with owned fault");
     ports_1_response_ready = 1; tick(); ports_1_response_ready = 0;
     check(!empty && !ports_1_request_ready && !ar_valid, "Protocol fault blocks exclusive handover and ID reuse");
     ports_1_request_valid = 0; reset = 1; tick(); reset = 0; tick();
     check(empty, "Reset clears protocol containment");
+    end
 '''
-    return body + line_read_contract(parameters) + stress
+    return read_queue_serial_contract(parameters) + body + line_read_contract(parameters) + stress + read_queue_data_contract(parameters)
 
 
 def coherent_fabric_contract(parameters):
@@ -2067,7 +2349,7 @@ def fabric_contract(parameters):
     data_request_bits_address = 64'h{data_address:x}; data_request_bits_size = 3;
     data_request_bits_tag = 34; data_request_valid = 1;
     check(data_request_ready && !instruction_request_ready, "Initial data request ownership");
-    tick(); data_request_valid = 0; instruction_request_valid = {int(parameters["hartCount"] == 1)};
+    tick(); data_request_valid = 0; instruction_request_valid = 0;
     while (!axi_ar_valid) tick();
     repeat (3) begin
       check(axi_ar_bits_addr == 'h{data_address:x} && axi_ar_bits_prot == 1 && axi_ar_bits_id == 0 && !instruction_response_valid, "Data ownership under AXI backpressure"); tick();
@@ -2083,9 +2365,9 @@ def fabric_contract(parameters):
     check(instruction_request_ready, "Instruction client did not recover");
     tick(); instruction_request_valid = 0;
     while (!axi_ar_valid) tick();
-    check(axi_ar_bits_addr == 'h{instruction_address:x} && axi_ar_bits_prot == 5 && axi_ar_bits_id == {parameters['hartCount'] - 1}, "Instruction ownership");
+    check(axi_ar_bits_addr == 'h{instruction_address:x} && axi_ar_bits_prot == 5 && axi_ar_bits_id == {parameters['hartCount'] - 1 if not (parameters.get('fabricReadSlots') or parameters['hartCount'] > 1) else 0}, "Instruction ownership");
     axi_ar_ready = 1; tick(); axi_ar_ready = 0;
-    axi_r_bits_data = 'h{instruction_value << instruction_shift:x}; axi_r_bits_id = {parameters['hartCount'] - 1}; axi_r_valid = 1;
+    axi_r_bits_data = 'h{instruction_value << instruction_shift:x}; axi_r_bits_id = {parameters['hartCount'] - 1 if not (parameters.get('fabricReadSlots') or parameters['hartCount'] > 1) else 0}; axi_r_valid = 1;
     tick(); axi_r_valid = 0;
     repeat (3) begin
       check(instruction_response_valid && instruction_response_bits_tag == 17 && instruction_response_bits_data == 64'h{instruction_value:x} && !instruction_response_bits_fault && !data_response_valid, "Held instruction completion retains owner"); tick();
@@ -2130,7 +2412,7 @@ def fabric_contract(parameters):
     data_response_ready = 1; tick(); data_response_ready = 0;
 '''
     body = body.replace('instruction_', f"instruction_{parameters['hartCount']-1}_").replace('data_request_', 'data_0_request_').replace('data_response_', 'data_0_response_')
-    if parameters['hartCount'] > 1:
+    if parameters.get('fabricReadSlots') or parameters['hartCount'] > 1:
         overlap = read_queue_contract(parameters)
         overlap = re.sub(r'\bports_(\d+)_', lambda m: f'{"instruction" if int(m[1]) % 2 == 0 else "data"}_{int(m[1]) // 2}_', overlap)
         overlap = re.sub(r'\b(ar|r)_', r'axi_\1_', overlap).replace('empty', 'dut.readers.empty')
@@ -2157,15 +2439,22 @@ def fabric_exclusive_contract(parameters):
 '''
         return body
     depth = parameters.get('fabricReadSlots') or 2
-    identities = (*range(depth - 1), hart)
-    body = '    axi_r_bits_resp = 0; axi_r_bits_last = 1;\n'
-    for index, reader in enumerate(identities):
-        body += f'''    data_{reader}_request_bits_write = 0; data_{reader}_request_bits_atomic = 0; data_{reader}_request_bits_fetch = 0;
-    data_{reader}_request_bits_address = 'h{base+0x100+8*index:x}; data_{reader}_request_bits_size = 3;
-    data_{reader}_response_ready = 0; data_{reader}_request_valid = 1; #1;
-    while (!data_{reader}_request_ready) tick(); tick(); data_{reader}_request_valid = 0;
+    identities = (*range(depth - 1), 2 * parameters['hartCount'] - 1)
+    body = f'    begin\n      integer bus_id[{depth}], post_id, index;\n      axi_r_bits_resp = 0; axi_r_bits_last = 1;\n'
+    for index, source in enumerate(identities):
+        reader = f'{"instruction" if source % 2 == 0 else "data"}_{source // 2}'
+        body += f'''    {reader}_request_bits_write = 0; {reader}_request_bits_atomic = 0; {reader}_request_bits_fetch = {int(source % 2 == 0)};
+    {reader}_request_bits_address = 'h{base+0x100+8*index:x}; {reader}_request_bits_size = {2 if source % 2 == 0 else 3};
+    {reader}_request_bits_tag = {51 + index};
+    {reader}_response_ready = 0; {reader}_request_valid = 1; #1;
+    while (!{reader}_request_ready) tick(); tick(); {reader}_request_valid = 0;
 '''
-    body += f'''    repeat ({depth}) begin while (!axi_ar_valid) tick(); axi_ar_ready = 1; tick(); axi_ar_ready = 0; end
+    body += f'''    repeat ({depth}) begin
+      while (!axi_ar_valid) tick();
+      index = integer'((axi_ar_bits_addr - 'h{base+0x100:x}) / 8);
+      check(index >= 0 && index < {depth}, "Read address belongs to accepted owner");
+      bus_id[index] = axi_ar_bits_id; axi_ar_ready = 1; tick(); axi_ar_ready = 0;
+    end
     data_0_request_bits_address = 'h{base+0x200:x}; data_0_request_bits_size = 3;
     data_0_request_bits_write = 1; data_0_request_bits_atomic = 0; data_0_request_bits_fetch = 0; data_0_request_bits_mask = 255;
     data_0_request_bits_data = 17; data_0_request_bits_tag = 85; data_0_request_valid = 1;
@@ -2175,12 +2464,13 @@ def fabric_exclusive_contract(parameters):
       check(!data_0_request_ready && !instruction_{hart}_request_ready && !axi_aw_valid && !axi_w_valid, "Exclusive request waits for all accepted reads"); tick();
     end
 '''
-    for reader in identities[:-1]:
-        body += f'''    axi_r_bits_id = {reader}; axi_r_valid = 1; tick(); axi_r_valid = 0;
-    data_{reader}_response_ready = 1; tick(); data_{reader}_response_ready = 0;
+    for index, source in enumerate(identities[:-1]):
+        reader = f'{"instruction" if source % 2 == 0 else "data"}_{source // 2}'
+        body += f'''    axi_r_bits_id = bus_id[{index}]; axi_r_valid = 1; tick(); axi_r_valid = 0;
+    {reader}_response_ready = 1; tick(); {reader}_response_ready = 0;
     check(!data_0_request_ready && !axi_aw_valid && !axi_w_valid, "Partial drain cannot release exclusive traffic");
 '''
-    body += f'''    axi_r_bits_id = {hart}; axi_r_valid = 1; tick(); axi_r_valid = 0;
+    body += f'''    axi_r_bits_id = bus_id[{depth - 1}]; axi_r_valid = 1; tick(); axi_r_valid = 0;
     repeat (3) begin
       check(data_{hart}_response_valid && !data_0_request_ready && !axi_aw_valid && !axi_w_valid, "Exclusive request waits for held read response"); tick();
     end
@@ -2204,9 +2494,9 @@ def fabric_exclusive_contract(parameters):
     check(instruction_{hart}_request_ready, "Read resumes after exclusive response");
     tick(); instruction_{hart}_request_valid = 0;
     while (!axi_ar_valid) tick();
-    check(axi_ar_bits_id == {hart}, "Post-write read identity");
+    post_id = axi_ar_bits_id;
     axi_ar_ready = 1; tick(); axi_ar_ready = 0;
-    axi_r_bits_id = {hart}; axi_r_valid = 1; tick(); axi_r_valid = 0;
+    axi_r_bits_id = post_id; axi_r_valid = 1; tick(); axi_r_valid = 0;
     instruction_{hart}_response_ready = 1; tick(); instruction_{hart}_response_ready = 0;
 '''
     if parameters.get('dCacheRefillBytes') == 64:
@@ -2242,7 +2532,7 @@ def fabric_exclusive_contract(parameters):
     check(data_{hart}_response_bits_tag == 94 && !data_{hart}_response_bits_fault, "Waiting write completes after line release");
     data_{hart}_response_ready = 1; tick(); data_{hart}_response_ready = 0;
 '''
-    return body
+    return body + '    end\n'
 
 
 def multiply_contract():
@@ -2322,6 +2612,97 @@ def backend_multiply_contract():
     check(data_request_bits_write && data_request_bits_data == 7 && data_request_bits_tag == 21,
       "Cancelled multiply wrote its destination or polluted slot reuse");
 ''' + complete
+    return body
+
+
+def backend_queue_contract(parameters):
+    def send(words, pc=0x100):
+        return ''.join(f'''    @(negedge clock); instruction_bits_pc = 'h{pc + 4 * index:x};
+    instruction_bits_instruction = 'h{word:x}; instruction_bits_tag = 73; instruction_bits_length = 4;
+    instruction_valid = 1; #1; while (!instruction_ready) tick(); tick(); instruction_valid = 0;
+''' for index, word in enumerate(words))
+
+    def response(tag, value, fault=False):
+        return f'''    @(negedge clock); data_response_bits_tag = {tag}; data_response_bits_data = {value};
+    data_response_bits_fault = {int(fault)}; data_response_valid = 1;
+    #1; while (!data_response_ready) tick(); tick(); data_response_valid = 0; data_response_bits_fault = 0;
+'''
+
+    body = ''
+    for mode in ('reverse', 'waw', 'old_fault', 'young_fault', *(('interrupt',) if parameters['enableInterrupts'] else ())):
+        second = 3 if mode == 'waw' else 4
+        result = 23 if mode == 'waw' else 33
+        words = (ld(3, 0, 0x200), ld(second, 0, 0x240),
+                 addi(5, 3, 1) if mode == 'waw' else alu(5, 3, 4, 0), sd(5, 0, 0x280))
+        if mode == 'interrupt':
+            words = (*words[:2], mul(5, 1, 1), addi(6, 0, 7), sd(6, 0, 0x280))
+        body += '''    begin
+    integer writes;
+    logic [7:0] saved_tag;
+    writes = 0; instruction_valid = 0; instruction_bits_fault = 0;
+    data_request_ready = 0; data_response_valid = 0; data_response_bits_fault = 0;
+    reset = 1; tick(); reset = 0; tick();
+'''
+        if mode == 'interrupt':
+            body += '    interrupts_external = 0;\n' + send((addi(1, 0, 0x400), csr(0, 0x305, 1), addi(2, 0, -1),
+                csr(0, 0x304, 2), addi(3, 0, 8), csr(0, 0x300, 3)), 0xe8) + '    while (!dut.csr.status[3]) tick();\n'
+        body += '''    fork
+      forever begin
+        @(posedge clock);
+        if (dut.gpr.we_0) begin
+'''
+        expected = ((3, 11),) if mode == 'young_fault' else () if mode == 'old_fault' else ((3, 11), (4, 22)) if mode == 'interrupt' else ((3, 11), (second, 22), (5, result))
+        checks = ' || '.join(f'(writes == {index} && dut.gpr.waddr_0 == {rd} && dut.gpr.wdata_0 == {value})'
+                            for index, (rd, value) in enumerate(expected)) or "1'b0"
+        body += f'''          if (!({checks})) $fatal(1, "Dual-load retirement order and dependencies: write=%0d rd=%0d value=%h pc=%h", writes, dut.gpr.waddr_0, dut.gpr.wdata_0, dut.commitPackets_0_instruction_pc);
+          writes++;
+        end
+      end
+    join_none
+'''
+        body += send(words)
+        for index, address in enumerate((0x200, 0x240)):
+            body += f'''    while (!data_request_valid) tick();
+    check(data_request_bits_address == 'h{address:x} && !data_request_bits_write && data_request_bits_tag == {index},
+          "Two real backend reads precede either response");
+    data_request_ready = 1; tick(); data_request_ready = 0;
+'''
+        body += '    repeat (4) begin check(!redirect && writes == 0 && !data_request_valid, "Pending reads retain architectural ownership"); tick(); end\n'
+        if mode == 'interrupt':
+            body += '    interrupts_external = 1;\n'
+        if mode == 'old_fault':
+            body += response(0, 11, True)
+            body += '    repeat (5) begin check(!redirect && writes == 0 && !data_request_valid, "Old fault waits for younger accepted read to drain"); tick(); end\n'
+            body += response(1, 22)
+        else:
+            body += response(1, 22, mode == 'young_fault')
+            body += '    repeat (4) begin check(!redirect && writes == 0 && !data_request_valid, "Younger completion cannot retire before older load"); tick(); end\n'
+            body += response(0, 11)
+        if 'fault' in mode:
+            body += f'''    while (!redirect) begin check(!data_request_valid, "Younger store escaped a load fault"); tick(); end
+    check(status_trap && dut.commitPackets_0_instruction_pc == 'h{0x100 if mode == 'old_fault' else 0x104:x} &&
+          dut.commitPackets_0_instruction_tval == 'h{0x200 if mode == 'old_fault' else 0x240:x} && writes == {len(expected)},
+          "Precise oldest fault context"); tick();
+    repeat (8) begin check(!data_request_valid && !dut.gpr.we_0 && !redirect, "Cancelled dual-load effects do not escape"); tick(); end
+'''
+        elif mode == 'interrupt':
+            body += '''    for (integer waited = 0; !redirect; waited++) begin
+      check(waited < 8 && !data_request_valid, "Interrupt waits only for accepted loads"); tick(); end
+    check(status_trap && writes == 2, "Both accepted loads retire before interrupt"); tick();
+    check(dut.csr.returnPc == 'h108, "Interrupt cancels younger arithmetic");
+    interrupts_external = 0;
+'''
+        else:
+            body += f'''    while (!data_request_valid) tick();
+    check(data_request_bits_write && data_request_bits_address == 'h280 && data_request_bits_data == {result} && writes == 3,
+          "Dependent store follows both load retirements");
+    saved_tag = data_request_bits_tag;
+    data_request_ready = 1; tick(); data_request_ready = 0;
+    data_response_bits_tag = saved_tag; data_response_valid = 1;
+    #1; while (!data_response_ready) tick(); tick(); data_response_valid = 0;
+    repeat (8) begin check(!data_request_valid && !redirect, "Dual-load window releases once"); tick(); end
+'''
+        body += '    disable fork; end\n'
     return body
 
 
@@ -3603,12 +3984,14 @@ def verify(rtl, directory, modules=None):
     enabled = parameters['pmpEntries'] != 0
     cached = bool(parameters['iCacheBytes'])
     suites = (('DitDahA1Fetch', (burst_fetch_contract(parameters) if parameters.get('enableBurstRefill') else cached_fetch_contract(parameters)) if cached else FETCH + (protection_contract(True) if enabled else '')),
-                       ('DitDahA1Lsu', LSU + lsu_reservation_contract(parameters) + (protection_contract(False) if enabled else '') + lsu_refill_contract(parameters)),
+                       ('DitDahA1Lsu', lsu_queue_contract(parameters) if parameters.get('loadQueueEntries', 1) == 2 else
+                        LSU + lsu_reservation_contract(parameters) + (protection_contract(False) if enabled else '') + lsu_refill_contract(parameters)),
                        ('DitDahA1Multiply', multiply_contract()),
                        ('DitDahA1Frontend', (burst_fetch_contract(parameters, True) if parameters.get('enableBurstRefill') else cached_fetch_contract(parameters, True)) if cached else frontend_contract(parameters)),
                        ('DitDahA1Decode', decode_contract(parameters)),
                        ('DitDahA1Execute', execute_contract()),
-                       ('DitDahA1Backend', backend_contract() + backend_fence_contract() + (backend_protection_contract() if enabled else '') +
+                       ('DitDahA1Backend', backend_queue_contract(parameters) if parameters.get('loadQueueEntries', 1) == 2 else
+                        backend_contract() + backend_fence_contract() + (backend_protection_contract() if enabled else '') +
                         (backend_interrupt_contract() if parameters['enableInterrupts'] else '')),
                        ('DitDahA1MemoryArbiter', arbiter_contract(parameters)),
                        ('DitDahA1Memory', memory_contract(parameters)),
@@ -3616,14 +3999,14 @@ def verify(rtl, directory, modules=None):
                         (burst_axi_contract(parameters) if parameters.get('enableBurstRefill') else '') +
                         (burst_axi_contract(parameters, False) if parameters.get('dCacheRefillBytes') == 64 else '')),
                        ('DitDahA1MemoryFabric', fabric_contract(parameters)))
-    if parameters['hartCount'] > 1:
+    if parameters.get('fabricReadSlots') or parameters['hartCount'] > 1:
         suites += (('DitDahA1ReadQueue', read_queue_contract(parameters)),)
     if cached:
         suites += (('DitDahA1InstructionCache', instruction_cache_contract(parameters)),)
     if parameters.get('localInterruptBase'):
         suites += (('DitDahA1LocalInterrupts', local_interrupt_contract(parameters)),)
     if parameters.get('dCacheBytes'):
-        suites += (('DitDahA1DataCache', data_cache_contract(parameters)),
+        suites += (('DitDahA1DataCache', data_cache_queue_contract(parameters) if parameters.get('loadQueueEntries', 1) == 2 else data_cache_contract(parameters)),
                    ('DitDahA1Coherence', coherence_contract(parameters)))
     if enabled:
         suites += (('DitDahA1Pmp', pmp_contract(parameters)),)
@@ -3639,13 +4022,15 @@ def verify(rtl, directory, modules=None):
                  (user_csr_contract(parameters) if parameters.get('enableUserMode') else ''))),)
     if parameters.get('enableUserMode'):
         suites = tuple((name, body + (privilege_memory_contract(parameters, name != 'DitDahA1Lsu', name == 'DitDahA1Frontend')
-                       if name in ('DitDahA1Fetch', 'DitDahA1Frontend', 'DitDahA1Lsu') else '')) for name, body in suites)
+                       if name in ('DitDahA1Fetch', 'DitDahA1Frontend', 'DitDahA1Lsu') and
+                       (name != 'DitDahA1Lsu' or parameters.get('loadQueueEntries', 1) == 1) else '')) for name, body in suites)
     if parameters.get('virtualAddressBits') == 39:
         suites = tuple((name, body) for name, body in suites if name not in
                        ('DitDahA1Fetch', 'DitDahA1Frontend', 'DitDahA1Lsu', 'DitDahA1Backend'))
         suites += (('DitDahA1Translation', translation_contract(parameters)),)
         suites += (('DitDahA1Fetch', translated_consumer_contract(parameters, True)),
-                   ('DitDahA1Lsu', translated_consumer_contract(parameters, False) + lsu_refill_contract(parameters)))
+                   ('DitDahA1Lsu', lsu_queue_contract(parameters) if parameters.get('loadQueueEntries', 1) == 2 else
+                    translated_consumer_contract(parameters, False) + lsu_refill_contract(parameters)))
         suites += (('DitDahA1Frontend', frontend_group_contract(parameters)),)
     if cached and parameters['issueWidth'] > 1:
         suites = tuple((name, body + (wide_fetch_contract(parameters) if name == 'DitDahA1Fetch' else '')) for name, body in suites)
@@ -3664,7 +4049,7 @@ def verify(rtl, directory, modules=None):
                 body = '    instruction_bits_count = 1;\n' + body
                 body = re.sub(r'\bdut\.(instruction|decoded|issued|result|memory|commit)Valid\b',
                               r'(dut.\1Count != 0)', body)
-                body += backend_group_contract(parameters) + backend_branch_contract() + backend_memory_group_contract(parameters)
+                body += backend_group_contract(parameters) + (backend_branch_contract() if parameters.get('loadQueueEntries', 1) == 1 else '') + backend_memory_group_contract(parameters)
         test.write_text(bench(module, body))
         binary = directory / name
         dependencies = [rtl / 'DitDahA1Fetch.sv'] if name == 'DitDahA1Frontend' else []
@@ -3679,7 +4064,7 @@ def verify(rtl, directory, modules=None):
                 dependencies.append(rtl / 'DitDahA1Coherence.sv')
             if parameters.get('localInterruptBase'):
                 dependencies.append(rtl / 'DitDahA1LocalInterrupts.sv')
-            if parameters['hartCount'] > 1:
+            if parameters.get('fabricReadSlots') or parameters['hartCount'] > 1:
                 dependencies.append(rtl / 'DitDahA1ReadQueue.sv')
         if name == 'DitDahA1DataCache':
             dependencies = [rtl / file for file in (rtl / 'filelist.f').read_text().splitlines()

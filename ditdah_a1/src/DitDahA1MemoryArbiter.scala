@@ -59,6 +59,28 @@ object DitDahA1MemoryArbiter extends Generator[DitDahA1Parameter, DitDahA1UnitLa
     }
     owner
 
+  def dataTranslation(data: Referable[MemoryPort], translation: Referable[MemoryPort], down: Referable[MemoryPort])
+    (using Arena, Context, Block, InstanceContext, ClockScope, ResetScope): Unit =
+    val held = RegInit(false.B)
+    val owner = Reg(UInt(1))
+    val next = RegInit(0.U(1))
+    val selected = held.?(owner, select(Seq(data.request.valid, translation.request.valid), next))
+    val translating = selected === 1.U(1)
+    down.request.valid := translating.?(translation.request.valid, data.request.valid)
+    down.request.bits :<= data.request.bits
+    when(translating) { down.request.bits :<= translation.request.bits; down.request.bits.tag := 2.U(8) }
+    data.request.ready := !translating & down.request.ready
+    translation.request.ready := translating & down.request.ready
+    when(down.request.valid & !down.request.ready) { held := true.B; owner := selected }
+    when(down.request.valid & down.request.ready) { held := false.B; next := (~selected.asBits).asUInt }
+    val translated = down.response.bits.tag === 2.U(8)
+    data.response.valid := down.response.valid & !translated
+    data.response.bits :<= down.response.bits
+    translation.response.valid := down.response.valid & translated
+    translation.response.bits :<= down.response.bits
+    translation.response.bits.tag := 0.U(8)
+    down.response.ready := translated.?(translation.response.ready, data.response.ready)
+
   def select(valid: Seq[Referable[Bool]], next: Referable[UInt])
     (using Arena, Context, Block, InstanceContext): Referable[UInt] =
     val bits = 32 - Integer.numberOfLeadingZeros(valid.size - 1)

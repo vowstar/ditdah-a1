@@ -39,17 +39,29 @@ object DitDahA1ParameterCheck:
     rejects { baseline.copy(pmpEntries = 65); () }
     rejects { DitDahA1Config.parameter(ujson.Obj("unused" -> 1)); () }
     val rtl = DitDahA1Parameter.uncached
-    for count <- Seq(2, 3, 4, 16); slots <- 1 to 4 do
+    for count <- Seq(1, 2, 3, 4, 16); slots <- 1 to 4 do
       val selected = rtl.copy(hartCount = count, fabricReadSlots = Some(slots))
       assert(DitDahA1Config.parameter(DitDahA1Config.document(selected)) == selected)
       assert(DitDahA1Config.document(selected)("implementation")("fabricReadSlots").num == slots)
-      if slots <= count then selected.validateFabric() else rejects { selected.validateFabric() }
+      assert(selected.axiIdBits == math.max(1, 32 - Integer.numberOfLeadingZeros(math.max(count, slots) - 1)))
+      if slots <= 2 * count then selected.validateFabric() else rejects { selected.validateFabric() }
     assert(DitDahA1Config.parameter(ujson.Obj("hartCount" -> 4, "fabricReadSlots" -> 3)).fabricReadSlots.contains(3))
     assert(DitDahA1Config.parameter(ujson.Obj("hartCount" -> 4, "fabricReadSlots" -> ujson.Null)).resolvedFabricReadSlots == 2)
     rtl.copy(fabricReadSlots = Some(0)).validateFabric()
     rejects { rtl.copy(fabricReadSlots = Some(-1)); () }
     rejects { rtl.copy(fabricReadSlots = Some(5)); () }
-    rejects { rtl.copy(fabricReadSlots = Some(1)).validateFabric() }
+    rtl.copy(fabricReadSlots = Some(1)).validateFabric()
+    rtl.copy(fabricReadSlots = Some(2)).validateFabric()
+    rejects { rtl.copy(fabricReadSlots = Some(3)).validateFabric() }
+    for entries <- Seq(1, 2) do
+      val selected = rtl.copy(loadQueueEntries = entries, fabricReadSlots = Some(entries + 1))
+      selected.validateRtl()
+      assert(DitDahA1Config.parameter(DitDahA1Config.document(selected)) == selected)
+      assert(selected.backendCapacity == (5 + entries) * selected.issueWidth)
+      assert(DitDahA1Config.document(selected)("implementation")("loadQueueEntries").num == entries)
+    rejects { rtl.copy(loadQueueEntries = 0); () }
+    rejects { rtl.copy(loadQueueEntries = 3); () }
+    rejects { rtl.copy(loadQueueEntries = 2, fabricReadSlots = Some(4)).validateFabric() }
     rejects { rtl.copy(hartCount = 2, fabricReadSlots = Some(0)).validateFabric() }
     rtl.copy(fabricReadSlots = Some(4)).validateCore()
     rejects { rtl.copy(enableBurstRefill = true).validateFrontend() }
