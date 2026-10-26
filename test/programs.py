@@ -199,6 +199,30 @@ def cases(base, protection=False, interrupts=False, user=False, local_interrupt_
     if not sv39:
         yield 'load_window', load_window_program(base)
         yield 'load_cancel', load_window_program(base, cancel=True)
+        for returns in (False, True):
+            p = Program(base)
+            begin = base + p.offset
+            p.emit(addi(2, 0, 32))
+            loop = p.offset
+            if returns:
+                p.emit(jal(1, 0x400 - loop))
+                recovery = {base + loop: [base + 0x400], base + 0x404: [base + loop + 4]}
+            else:
+                p.emit(beq(0, 0, 12), sd(0, 0), 0)
+                recovery = {base + loop: [base + loop + 12]}
+            p.emit(addi(2, 2, -1))
+            branch = p.offset
+            p.emit(beq(2, 0, loop - branch) ^ (1 << 12))
+            recovery[base + branch] = [base + loop, base + branch + 4]
+            p.branch_window = dict(begin=begin, end=base + p.offset)
+            p.pipeline_recovery = recovery
+            p.emit(addi(7, 0, 1))
+            if returns:
+                end = p.offset
+                p.offset = 0x400
+                p.emit(addi(5, 5, 1), jalr(0, 1))
+                p.offset = end
+            yield 'return_window' if returns else 'branch_window', p.finish()
     yield from memory_group_cases(base, protection, interrupts, sv39)
     for fault in (False, True):
         p = Program(base)

@@ -1003,8 +1003,13 @@ def check_pipeline_events(lines, config, program):
     if hasattr(program, 'recovery_counts'):
         expected = Counter({pc: counts[bool(config.get('enableBranchPrediction'))] for pc, counts in program.recovery_counts.items()})
         assert Counter(recoveries) == expected, 'Recovery counts differ from the configured prediction policy'
+    window = {}
+    if hasattr(program, 'branch_window'):
+        work = [tuple(map(int, fields[1:])) for line in lines if (fields := line.split())[:1] == ['WORK_CYCLE']]
+        assert [sample[:2] for sample in work] == [(0, 0), (0, 1)] and work[1][2] > work[0][2], 'Invalid branch measurement window'
+        window['workCycles'] = work[1][2] - work[0][2]
     return dict(groupWidths={str(pc): max(counts) for pc, counts in groups.items() if pc in getattr(program, 'pipeline_groups', {})},
-                earlyRecoveries=len(recoveries))
+                earlyRecoveries=len(recoveries), **window)
 
 
 def compare(binary, directory, config, transport='axi', selected=()):
@@ -1048,6 +1053,8 @@ def compare(binary, directory, config, transport='axi', selected=()):
             command += [f'+{key.upper()}={getattr(program, key, 0)}' for key in ('exclusive_failures', 'interference')]
             if hasattr(program, 'data_cache') and 'work' in program.data_cache:
                 command += [f'+WORK_{key.upper()}={program.data_cache["work"][key]:x}' for key in ('begin', 'end')]
+            if hasattr(program, 'branch_window'):
+                command += [f'+WORK_{key.upper()}={program.branch_window[key]:x}' for key in ('begin', 'end')]
             if getattr(program, 'load_window', False):
                 command.append('+REORDER_READS=1')
             if name == 'load_cancel':
