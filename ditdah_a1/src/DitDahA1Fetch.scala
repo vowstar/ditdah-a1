@@ -86,6 +86,7 @@ object DitDahA1Fetch extends Generator[DitDahA1Parameter, DitDahA1UnitLayers, Di
       io.output.bits.asRecord.field[UInt](field) := packet.asRecord.field[UInt](field)
     io.output.bits.fault := packet.fault
     io.output.bits.predictedTaken := false.B
+    io.output.bits.predictedPc.get := 0.U(64)
     io.output.bits.count.foreach(_ := 1.U(parameter.fetchCountBits))
     io.output.bits.following.foreach { words => for i <- 0 until parameter.fetchWords - 1 do words(i) := 0.U(32) }
     if cached then

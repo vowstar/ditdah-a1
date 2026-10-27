@@ -26,6 +26,7 @@ case class DitDahA1Parameter(
   enableSupervisorMode: Boolean = false,
   enableBurstRefill: Boolean = false,
   enableBranchPrediction: Boolean = false,
+  branchPredictorEntries: Int = 0,
   enableTrace: Boolean = false,
   localInterruptBase: Option[BigInt] = None,
   memoryRegions: Seq[MemoryRegion] = Seq(MemoryRegion())
@@ -48,6 +49,7 @@ case class DitDahA1Parameter(
 
   require(Set(1, 2).contains(loadQueueEntries), "loadQueueEntries must be one or two")
   require(issueWidth >= 1 && issueWidth <= 3, "issueWidth must be between 1 and 3")
+  require(Set(0, 8, 16).contains(branchPredictorEntries), "branchPredictorEntries must be zero, eight or sixteen")
   memoryRegions.foreach(r => require(r.base + r.size <= (BigInt(1) << physicalAddressBits), "Memory region exceeds physical address space"))
   memoryRegions.sortBy(_.base).sliding(2).filter(_.size == 2).foreach { pair =>
     require(pair.head.base + pair.head.size <= pair.last.base, "Memory regions must not overlap")
@@ -55,11 +57,16 @@ case class DitDahA1Parameter(
 
   def validateFrontend(): Unit =
     validateProtection()
+    validatePrediction()
     require(!enableBurstRefill || iCacheBytes != 0, "Burst refill requires an instruction cache")
     require((resetVector & 3) == 0, "Frontend requires a word-aligned resetVector")
 
   def validateBackend(): Unit =
     validateProtection()
+    validatePrediction()
+
+  def validatePrediction(): Unit =
+    require(branchPredictorEntries == 0 || enableBranchPrediction, "Dynamic prediction requires branch prediction")
 
   def validateCore(): Unit =
     require(Set(0, 39).contains(virtualAddressBits), "RTL supports Bare or Sv39 addressing")

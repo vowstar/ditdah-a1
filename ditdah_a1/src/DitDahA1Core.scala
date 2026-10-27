@@ -27,6 +27,7 @@ object DitDahA1Core extends Generator[DitDahA1Parameter, DitDahA1Layers, DitDahA
     if parameter.iCacheBytes != 0 then frontend.io.invalidate.get := backend.io.invalidate.get
     frontend.io.redirect := backend.io.redirect
     frontend.io.redirectPc := backend.io.redirectPc
+    frontend.io.prediction.foreach(_ :<= backend.io.prediction.get)
     frontend.io.halt := backend.io.status.sleep
     frontend.io.privilege := backend.io.privilege
     io.instruction :<>= frontend.io.memory
@@ -209,9 +210,22 @@ object DitDahA1Backend extends Generator[DitDahA1Parameter, DitDahA1Layers, DitD
     val resolved = control & !execution(0).instruction.fault
     val predictedOffset = if parameter.enableBranchPrediction then issuedPacket.decoded.instruction.predictedTaken
       .?(issuedPacket.decoded.immediate, issuedPacket.decoded.instruction.length) else issuedPacket.decoded.instruction.length
-    val predictedPc = (issuedPacket.decoded.instruction.pc + predictedOffset)
-      .asBits.bits(63, 0).asUInt
+    val predictedPc = if parameter.branchPredictorEntries != 0 then
+      issuedPacket.decoded.instruction.predictedTaken.?(issuedPacket.decoded.instruction.predictedPc.get,
+        (issuedPacket.decoded.instruction.pc + issuedPacket.decoded.instruction.length).asBits.bits(63, 0).asUInt)
+      else (issuedPacket.decoded.instruction.pc + predictedOffset).asBits.bits(63, 0).asUInt
     val earlyRedirect = executed & resolved & (execution(0).nextPc =/= predictedPc)
+    io.prediction.foreach { update =>
+      val conditional = (issuedPacket.decoded.operation === DitDahA1Isa.Beq.U(DitDahA1Isa.operationBits)) |
+        (issuedPacket.decoded.operation === DitDahA1Isa.Branch.U(DitDahA1Isa.operationBits))
+      update.clear := redirect
+      update.valid := executed & resolved & (conditional |
+        (issuedPacket.decoded.operation === DitDahA1Isa.Jalr.U(DitDahA1Isa.operationBits)))
+      update.pc := issuedPacket.decoded.instruction.pc
+      update.nextPc := execution(0).nextPc
+      update.conditional := conditional
+      update.taken := execution(0).nextPc =/= (issuedPacket.decoded.instruction.pc + issuedPacket.decoded.instruction.length).asBits.bits(63, 0).asUInt
+    }
     val flushYounger = redirect | earlyRedirect
     val destinations = (0 until width).map { lane =>
       val packet = commitPackets(lane)
@@ -490,6 +504,30 @@ object DitDahA1Frontend extends Generator[DitDahA1Parameter, DitDahA1UnitLayers,
     val reserved = Reg(UInt(parameter.fetchCountBits))
     val faultPending = RegInit(false.B)
     val flush = io.redirect | io.invalidate.getOrElse(false.B)
+    val entries = parameter.branchPredictorEntries
+    val indexBits = if entries == 0 then 0 else Integer.numberOfTrailingZeros(entries)
+    val predictor = io.prediction.map { update =>
+      val valid = RegInit(0.B(entries))
+      val tags = Reg(Vec(entries, UInt(62 - indexBits)))
+      val targets = Reg(Vec(entries, UInt(64)))
+      val counters = Reg(Vec(entries, UInt(2)))
+      val conditional = Reg(Vec(entries, Bool()))
+      val index = update.pc.asBits.bits(indexBits + 1, 2).asUInt
+      val tag = update.pc.asBits.bits(63, indexBits + 2).asUInt
+      val hit = (valid.asUInt >> index).asBits.bit(0) & (tags.ref(index) === tag) & (conditional.ref(index) === update.conditional)
+      val counter = counters.ref(index)
+      val increment = (counter === 3.U(2)).?(counter, (counter + 1.U(2)).asBits.bits(1, 0).asUInt)
+      val decrement = (counter === 0.U(2)).?(counter, (counter - 1.U(2)).asBits.bits(1, 0).asUInt)
+      when(update.valid & !update.clear) {
+        valid := valid | (1.U(entries) << index).asBits.bits(entries - 1, 0)
+        tags.ref(index) := tag
+        targets.ref(index) := update.nextPc
+        counters.ref(index) := hit.?(update.taken.?(increment, decrement), update.taken.?(2.U(2), 1.U(2)))
+        conditional.ref(index) := update.conditional
+      }
+      when(update.clear) { valid := 0.B(entries) }
+      (valid, tags, targets, counters, conditional)
+    }
     val returned = fetch.io.output.valid & !flush
     val fetched = fetch.io.output.bits
     val incoming = Wire(Vec(words, new FetchPacket))
@@ -497,6 +535,7 @@ object DitDahA1Frontend extends Generator[DitDahA1Parameter, DitDahA1UnitLayers,
       incoming(i).pc := (fetched.pc + (4 * i).U(64)).asBits.bits(63, 0).asUInt
       incoming(i).tag := (fetched.tag + i.U(8)).asBits.bits(7, 0).asUInt
       incoming(i).predictedTaken := false.B
+      incoming(i).predictedPc.get := 0.U(64)
       incoming(i).instruction := (if i == 0 then fetched.instruction else fetched.following.get(i - 1))
       incoming(i).length := 4.U(3)
       incoming(i).fault := (if i == 0 then fetched.fault else false.B)
@@ -512,14 +551,32 @@ object DitDahA1Frontend extends Generator[DitDahA1Parameter, DitDahA1UnitLayers,
         val jump = insn.bits(6, 0) === 0x6f.B(7)
         val branch = (insn.bits(6, 0) === 0x63.B(7)) &
           ((insn.bits(14, 12) === 0.B(3)) | (insn.bits(14, 12) === 1.B(3)) | insn.bit(14))
-        val taken = jump | (branch & insn.bit(31))
+        val indirect = (insn.bits(6, 0) === 0x67.B(7)) & (insn.bits(14, 12) === 0.B(3))
+        val direction = Wire(Bool())
+        val indirectHit = Wire(Bool())
+        direction := insn.bit(31)
+        indirectHit := false.B
         val branchOffset = (insn.bit(31).?(((BigInt(1) << 51) - 1).B(51), 0.B(51)) ## insn.bits(31, 31) ## insn.bits(7, 7) ## insn.bits(30, 25) ## insn.bits(11, 8) ## 0.B(1)).asUInt
         val jumpOffset = (insn.bit(31).?(((BigInt(1) << 43) - 1).B(43), 0.B(43)) ## insn.bits(31, 31) ## insn.bits(19, 12) ## insn.bits(20, 20) ## insn.bits(30, 21) ## 0.B(1)).asUInt
+        val target = Wire(UInt(64))
+        target := (incoming(i).pc + jump.?(jumpOffset, branchOffset)).asBits.bits(63, 0).asUInt
+        predictor.foreach { (valid, tags, targets, counters, conditional) =>
+          val index = incoming(i).pc.asBits.bits(indexBits + 1, 2).asUInt
+          val hit = (valid.asUInt >> index).asBits.bit(0) &
+            (tags.ref(index) === incoming(i).pc.asBits.bits(63, indexBits + 2).asUInt)
+          val learnedDirection = (0 until entries).map(n =>
+            (index === n.U(indexBits)) & counters(n).asBits.bit(1)).reduce(_ | _)
+          direction := (hit & conditional.ref(index)).?(learnedDirection, insn.bit(31))
+          indirectHit := indirect & hit & !conditional.ref(index)
+          when(indirectHit) { target := targets.ref(index) }
+        }
+        val taken = jump | (branch & direction) | indirectHit
         incoming(i).predictedTaken := taken & !fetched.fault
+        if entries != 0 then incoming(i).predictedPc.get := (taken & !fetched.fault).?(target, 0.U(64))
         when(returned & !fetched.fault & (i.U < fetched.count.getOrElse(1.U(1))) & taken) {
           predicted := true.B
           returnedCount := (i + 1).U(parameter.fetchCountBits)
-          requestPc := (incoming(i).pc + jump.?(jumpOffset, branchOffset)).asBits.bits(63, 0).asUInt
+          requestPc := target
         }
     val available = (queued + returnedCount).asBits.bits(countBits - 1, 0).asUInt
     val view = Wire(Vec(capacity + words, new FetchPacket))

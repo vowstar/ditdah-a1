@@ -199,7 +199,8 @@ def cases(base, protection=False, interrupts=False, user=False, local_interrupt_
     if not sv39:
         yield 'load_window', load_window_program(base)
         yield 'load_cancel', load_window_program(base, cancel=True)
-        for returns in (False, True):
+        for name in ('branch_window', 'return_window', 'return_switch'):
+            returns = name != 'branch_window'
             p = Program(base)
             begin = base + p.offset
             p.emit(addi(2, 0, 32))
@@ -207,6 +208,12 @@ def cases(base, protection=False, interrupts=False, user=False, local_interrupt_
             if returns:
                 p.emit(jal(1, 0x400 - loop))
                 recovery = {base + loop: [base + 0x400], base + 0x404: [base + loop + 4]}
+                if name == 'return_switch':
+                    p.emit(addi(3, 3, 1))
+                    call = p.offset
+                    p.emit(jal(1, 0x400 - call))
+                    recovery[base + call] = [base + 0x400]
+                    recovery[base + 0x404].append(base + call + 4)
             else:
                 p.emit(beq(0, 0, 12), sd(0, 0), 0)
                 recovery = {base + loop: [base + loop + 12]}
@@ -222,7 +229,7 @@ def cases(base, protection=False, interrupts=False, user=False, local_interrupt_
                 p.offset = 0x400
                 p.emit(addi(5, 5, 1), jalr(0, 1))
                 p.offset = end
-            yield 'return_window' if returns else 'branch_window', p.finish()
+            yield name, p.finish()
     yield from memory_group_cases(base, protection, interrupts, sv39)
     for fault in (False, True):
         p = Program(base)

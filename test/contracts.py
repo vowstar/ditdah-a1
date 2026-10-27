@@ -13,6 +13,13 @@ from programs import addi, alu, amo, beq, csr, sd, mul, ld, lw, sw, load, store,
 from model import Fault, LocalInterrupts, Model, MASK, atomic_value, pmp_allowed, signed, sv39_walk
 
 
+def backend_control_signals(source):
+    assert re.search(r'assign redirect\s*=\s*flushYounger;', source), 'Unknown recovery connection'
+    match = re.search(r'\bwire\s+flushYounger\s*=\s*(\w+)\s*\|\s*(\w+);', source)
+    assert match and match[2].startswith('earlyRedirect'), 'Unknown early recovery connection'
+    return match[1], match[2]
+
+
 def verify_storage(rtl, directory):
     manifest = json.loads((rtl / 'ditdah_a1_config.json').read_text())
     size = manifest['implementation']['iCacheBytes']
@@ -891,6 +898,71 @@ def frontend_contract(parameters):
     tick();
     check(memory_request_valid && memory_request_bits_address == 64'h{base+0x200:x} && memory_request_bits_tag == 3, "Redirect priority over output consumption");
 '''
+
+
+def prediction_contract(parameters):
+    entries = parameters.get('branchPredictorEntries', 0)
+    if not entries or not parameters.get('iCacheBytes') or not parameters.get('enableBurstRefill') or parameters.get('virtualAddressBits') == 39:
+        return ''
+    base = int(parameters['resetVector'])
+    body = '    begin: prediction_contract\n      logic [7:0] service_tag;\n    privilege = 3;\n'
+    if parameters.get('pmpEntries'):
+        body += "    pmp_config = '0; pmp_address = '0;\n"
+    scenarios = ((True, [1], 0, 1, False), (False, [1, 0], 0, 1, False),
+                 (True, [1]*5+[0], 0, 1, False), (False, [0]*5+[1], 0, 1, False),
+                 (False, [1], 4*entries, 1, False), (False, [1], 1 << 32, 1, False),
+                 (False, [1], 0, 1, True), (False, [1], 0, 0, False),
+                 (True, [1], 0, 0, False), (True, [1], 0, 0, False))
+    for phase, (taken, history, alias, conditional, clear) in enumerate(scenarios):
+        indirect = phase >= len(scenarios)-2
+        pc = base + (0x404 if indirect else 4 * (entries - 1))
+        denied = phase == len(scenarios)-1
+        target = base + (0x6000 if denied else 0x14) if indirect else pc + 12
+        line = pc & ~63
+        instruction = 0x00008067 if indirect else 0x00000663
+        body += f'''    halt = 1; prediction_valid = 0; prediction_clear = 0; redirect = 0; invalidate = 0;
+    memory_request_ready = 0; memory_response_valid = 0; memory_response_bits_fault = 0; output_ready = 0;
+    reset = 1; tick(); reset = 0; tick();
+    prediction_pc = 64'h{pc+alias:x}; prediction_conditional = {conditional};
+'''
+        for outcome in history:
+            body += f'''    prediction_valid = 1; prediction_clear = {int(clear)}; prediction_taken = {outcome};
+    prediction_nextPc = 64'h{target if outcome else pc+4:x}; tick();
+'''
+        body += f'''    prediction_valid = 0; prediction_clear = 0;
+    redirect = 1; redirectPc = 64'h{pc:x}; tick(); redirect = 0; halt = 0;
+    while (!memory_request_valid) tick();
+    check(memory_request_bits_address == 64'h{line:x} && memory_request_bits_size == 6,
+          "Prediction still uses the real instruction refill path");
+    service_tag = memory_request_bits_tag;
+    memory_request_ready = 1; tick(); memory_request_ready = 0;
+'''
+        for beat in range(8):
+            low = instruction if line+8*beat == pc else 0x13
+            high = instruction if line+8*beat+4 == pc else 0x13
+            body += f'''    memory_response_bits_tag = service_tag; memory_response_bits_data = 64'h{high:08x}{low:08x};
+    memory_response_bits_last = {int(beat == 7)}; memory_response_valid = 1;
+    while (!memory_response_ready) tick(); tick(); memory_response_valid = 0;
+'''
+        body += f'''    while (!output_valid) tick();
+    check(output_bits_packets_0_pc == 64'h{pc:x} && output_bits_packets_0_instruction == 32'h{instruction:08x} &&
+          output_bits_packets_0_predictedTaken == {int(taken)} && output_bits_packets_0_predictedPc == 64'h{target if taken else 0:x},
+          "Prediction direction, full tag, target and clear priority");
+    prediction_clear = 1; prediction_valid = 1; prediction_taken = 0;
+    repeat (3) begin
+      check(output_valid && output_bits_packets_0_pc == 64'h{pc:x} &&
+            output_bits_packets_0_predictedTaken == {int(taken)} && output_bits_packets_0_predictedPc == 64'h{target if taken else 0:x},
+            "Queued prediction metadata survives table updates and backpressure"); tick();
+    end
+'''
+        if denied:
+            body += f'''    output_ready = 1; tick(); output_ready = 0;
+    while (!output_valid) begin check(!memory_request_valid, "Prediction never authorizes a denied target"); tick(); end
+    check(output_bits_packets_0_pc == 64'h{target:x} && output_bits_packets_0_fault &&
+          output_bits_packets_0_cause == 1 && output_bits_packets_0_tval == 64'h{target:x} && !memory_request_valid,
+          "Predicted target still receives the real instruction access fault");
+'''
+    return body + '    prediction_clear = 0; prediction_valid = 0;\n    $display("PREDICTION_CONTRACT 10");\n    end\n'
 
 
 def instruction_cache_contract(parameters):
@@ -4034,7 +4106,7 @@ def verify(rtl, directory, modules=None):
         suites += (('DitDahA1Frontend', frontend_group_contract(parameters)),)
     if cached and parameters['issueWidth'] > 1:
         suites = tuple((name, body + (wide_fetch_contract(parameters) if name == 'DitDahA1Fetch' else '')) for name, body in suites)
-    suites = tuple((name, (body if parameters['issueWidth'] == 1 and parameters.get('virtualAddressBits') != 39 else '') + frontend_group_contract(parameters)
+    suites = tuple((name, (body if parameters['issueWidth'] == 1 and parameters.get('virtualAddressBits') != 39 else '') + frontend_group_contract(parameters) + prediction_contract(parameters)
                     if name == 'DitDahA1Frontend' else body) for name, body in suites)
     assert not modules or set(modules) <= {name for name, _ in suites}, 'Unsupported contract selection'
     for name, body in suites:

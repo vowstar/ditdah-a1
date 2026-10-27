@@ -15,7 +15,7 @@ from pathlib import Path
 import subprocess
 from types import SimpleNamespace
 
-from contracts import verify as verify_contracts, verify_storage
+from contracts import verify as verify_contracts, verify_storage, backend_control_signals
 from model import ExclusiveMonitor, Fault, LocalInterrupts, Model, MASK, atomic_value, integer_value, pmp_allowed, sv39_walk
 from programs import cases, multicore_cases, platform_program
 
@@ -144,12 +144,13 @@ def compile_tb(rtl, directory, width, pa, top='core_tb', source=None, extra_file
         backend = fetch.replace('.frontend.fetch', '.backend')
         decoded = backend + '.decodedPackets_0_instruction'
         issued = backend + '.issuedPackets_0_decoded_instruction'
+        _, recovery = backend_control_signals((rtl / 'DitDahA1Backend.sv').read_text())
         observers.append(f'''  always @(posedge clock) if (!reset && pipeline_events && issue_count[{hart}] != 0)
     $display("ISSUE_GROUP {hart} %0d %016h %08h %0d", metric_cycles, {decoded}_pc, {decoded}_instruction, issue_count[{hart}]);''')
         if re.search(r'\bearlyRedirect\b', (rtl / 'DitDahA1Backend.sv').read_text()):
-            observers.append(f'''  always @(posedge clock) if (!reset && pipeline_events && {backend}.earlyRedirect)
+            observers.append(f'''  always @(posedge clock) if (!reset && {"1'b1" if parameters.get('branchPredictorEntries') else 'pipeline_events'} && {backend}.{recovery})
     $display("RECOVERY {hart} %0d %016h %02h %016h", metric_cycles, {issued}_pc, {issued}_tag, {backend}.redirectPc);''')
-            observers.append(f'''  always @(posedge clock) if (!reset && pipeline_events && {backend}.redirect && !{backend}.earlyRedirect)
+            observers.append(f'''  always @(posedge clock) if (!reset && pipeline_events && {backend}.redirect && !{backend}.{recovery})
     $display("RETIRE_REDIRECT {hart} %016h %01h", traces[{hart}][0].tracePc, traces[{hart}][0].traceTrap);''')
         for name, probe in (('retire_count', 'count'), ('issue_count', 'issueCount')):
             retirement.append(f'  assign {name}[{hart}] = {backend}.{probes[probe]};')
@@ -170,10 +171,28 @@ def compile_tb(rtl, directory, width, pa, top='core_tb', source=None, extra_file
         suffix_format = ' %01h' + ' %08h' * (fetch_words - 1) if fetch_words > 1 else ''
         suffix_values = ', ' + ', '.join([f'{fetch}.output_bits_count',
             *(f'{fetch}.output_bits_following_{lane - 1}' for lane in range(1, fetch_words))]) if fetch_words > 1 else ''
-        early = f'{backend}.earlyRedirect' if re.search(r'\bearlyRedirect\b', (rtl / 'DitDahA1Backend.sv').read_text()) else "1'b0"
+        early = f'{backend}.{recovery}'
+        prediction = ''
+        if parameters.get('branchPredictorEntries'):
+            frontend = fetch.removesuffix('.fetch')
+            word = f'{issued}_instruction'
+            control = f"({word}[6:0] == 7'h6f || ({word}[6:0] == 7'h67 && {word}[14:12] == 0) || ({word}[6:0] == 7'h63 && ({word}[14:12] == 0 || {word}[14:12] == 1 || {word}[14])))"
+            prediction = f'''    if ({backend}.execute.output_valid && {backend}.execute.output_ready &&
+        !{backend}.execute.output_bits_instruction_fault && {control}) begin
+      {prefix}$display("BRANCH_RESOLVE %016h %02h %08h %01h %016h %016h", {issued}_pc, {issued}_tag,
+        {issued}_instruction, {issued}_predictedTaken, {issued}_predictedPc, {backend}.execute.output_bits_nextPc); end
+'''
+            feedback = f'''    if ({frontend}.prediction_clear) begin {prefix}$display("PREDICT_CLEAR"); end
+    else if ({frontend}.prediction_valid) begin
+      {prefix}$display("PREDICT_UPDATE %016h %016h %01h %01h", {frontend}.prediction_pc,
+        {frontend}.prediction_nextPc, {frontend}.prediction_conditional, {frontend}.prediction_taken); end
+'''
+        else:
+            feedback = ''
         observers.append(f'''  assign architectural_fetch_busy[{hart}] = !{fetch}.request_ready;
   assign architectural_fetch_pc[{hart}] = {fetch}.packet_pc;
   always @(posedge clock) if (!reset) begin
+{prediction}
     if ({fetch}.output_valid && {fetch}.output_ready) begin
       {prefix}$display("ARCH_FETCH %016h %01h %08h %02h{suffix_format}", {fetch}.output_bits_pc,
         {fetch}.output_bits_fault, {fetch}.output_bits_instruction, {fetch}.output_bits_tag{suffix_values});
@@ -183,6 +202,7 @@ def compile_tb(rtl, directory, width, pa, top='core_tb', source=None, extra_file
     end
     if ({fetch}.cancel) begin {prefix}$display("ARCH_CANCEL %016h %01h %016h %02h %016h", {order},
       {early}, {issued}_pc, {issued}_tag, {backend}.redirectPc); end
+{feedback}
   end''')
         translated = parameters.get('virtualAddressBits') == 39
         dual = parameters.get('loadQueueEntries', 1) == 2
@@ -504,6 +524,21 @@ def control_offset(instruction):
     return None
 
 
+def prediction_target(config, table, pc, instruction):
+    if not config.get('enableBranchPrediction'):
+        return None
+    entries = config.get('branchPredictorEntries', 0)
+    row = table.get((pc >> 2) % entries) if entries else None
+    hit = row is not None and row[0] == pc >> 2
+    offset = control_offset(instruction)
+    if offset is not None:
+        taken = instruction & 127 == 0x6f or (row[3] >= 2 if hit and row[1] else offset < 0)
+        return (pc + offset) & MASK if taken else None
+    if instruction & 0x707f == 0x67 and hit and not row[1]:
+        return row[2]
+    return None
+
+
 def retirement_group(fields, width):
     order = int(fields[1], 16)
     lane, count = map(int, fields[3:]) if len(fields) == 5 else (0, 1)
@@ -543,10 +578,15 @@ def fetch_checker(config, faults, local_faults, architectural=None, buffered=())
 
     pending, requests, demand, physical_demand = None, {}, None, None
     arch_accepted, arch_completed, arch_wraps = 0, 0, 0
+    previous_tag = None
     fetched, failed = Counter(), Counter()
     physical_fetched, physical_failed, bus_failed = Counter(), Counter(), Counter()
     cancel_order, retired_order = None, -1
     epochs, retirement_tags, retirement_lanes = deque(), {}, None
+    dynamic = config.get('branchPredictorEntries', 0)
+    prediction_table, prediction_packets = {}, {}
+    resolved_predictions, expected_recoveries, observed_recoveries = Counter(), Counter(), Counter()
+    prediction_updates = prediction_clears = prediction_resolutions = 0
 
     def discard_outputs():
         fetched.clear()
@@ -575,13 +615,39 @@ def fetch_checker(config, faults, local_faults, architectural=None, buffered=())
         if entry is None:
             break
         line, fields = entry
-        if fields[:1] == ['ARCH_REQUEST']:
+        if fields[:1] == ['PREDICT_CLEAR']:
+            assert dynamic, 'Prediction clear without a dynamic predictor'
+            prediction_table.clear()
+            prediction_clears += 1
+        elif fields[:1] == ['PREDICT_UPDATE']:
+            assert dynamic and len(fields) == 5, 'Unexpected prediction feedback'
+            pc, target, conditional, taken = (int(value, 16) for value in fields[1:])
+            assert pc % 4 == target % 4 == 0 and conditional in (0, 1) and taken == (target != (pc + 4) & MASK), 'Invalid prediction feedback'
+            index = (pc >> 2) % dynamic
+            row = prediction_table.get(index)
+            count = max(0, min(3, row[3] + (1 if taken else -1))) if row and row[:2] == (pc >> 2, conditional) else 1 + taken
+            prediction_table[index] = (pc >> 2, conditional, target, count)
+            prediction_updates += 1
+        elif fields[:1] == ['BRANCH_RESOLVE']:
+            assert dynamic and len(fields) == 7, 'Unexpected branch resolution'
+            pc, tag, instruction, taken, target, actual = (int(value, 16) for value in fields[1:])
+            word, predicted = prediction_packets.pop((pc, tag), (None, None))
+            assert word == instruction and predicted == (target if taken else (pc + 4) & MASK), 'Resolved branch lost its predicted PC or instruction owner'
+            resolved_predictions[pc, tag, instruction, actual] += 1
+            if actual != predicted:
+                expected_recoveries[pc, tag, actual] += 1
+            prediction_resolutions += 1
+        elif fields[:1] == ['RECOVERY'] and dynamic:
+            _, _, pc, tag, target = (int(value, 16 if i >= 2 else 10) for i, value in enumerate(fields[1:]))
+            observed_recoveries[pc, tag, target] += 1
+        elif fields[:1] == ['ARCH_REQUEST']:
             address, tag = (int(value, 16) for value in fields[1:])
             assert not requests and pending is None and address in reachable, 'Unexpected architectural fetch identity or control flow'
             requests[tag] = address
             demand = address
             physical_demand = address
-            arch_wraps += int(tag == 0 and arch_accepted != 0)
+            arch_wraps += int(previous_tag is not None and tag < previous_tag)
+            previous_tag = tag
             arch_accepted += 1
             reachable.add(address + 4)
         elif fields[:2] == ['TRANSLATE_RESPONSE', '0']:
@@ -631,13 +697,17 @@ def fetch_checker(config, faults, local_faults, architectural=None, buffered=())
             else:
                 if config.get('enableBranchPrediction'):
                     for lane in range(count):
-                        offset = control_offset(words[lane])
-                        if offset is not None and (words[lane] & 127 == 0x6f or offset < 0):
+                        target = prediction_target(config, prediction_table, address + 4 * lane, words[lane])
+                        if target is not None:
                             count = lane + 1
-                            reachable.add((address + 4 * lane + offset) & MASK)
+                            reachable.add(target)
                             break
                 for lane in range(count):
                     fetched[address + 4 * lane, words[lane], (tag + lane) & 255] += 1
+                    if dynamic:
+                        pc = address + 4 * lane
+                        target = prediction_target(config, prediction_table, pc, words[lane])
+                        prediction_packets[pc, (tag + lane) & 255] = (words[lane], (pc + 4) & MASK if target is None else target)
             reachable.update(address + 4 * lane for lane in range(1, count + 1))
         elif fields[:2] == ['BUS', 'fetch']:
             address, size, data = int(fields[2], 16), int(fields[3]), int(fields[4], 16)
@@ -689,6 +759,9 @@ def fetch_checker(config, faults, local_faults, architectural=None, buffered=())
                     consume(2, (pc,), tag)
             else:
                 tag = consume(0, (pc, instruction), tag)
+            if dynamic and not trap and instruction & 127 in (0x63, 0x67, 0x6f):
+                assert resolved_predictions[pc, tag, instruction, trace[3]], 'Retired control lacks its matching resolution'
+                resolved_predictions[pc, tag, instruction, trace[3]] -= 1
             if epochs and epochs[0][0] == (pc, tag):
                 epochs.popleft()
             retired_order = trace[0]
@@ -696,9 +769,12 @@ def fetch_checker(config, faults, local_faults, architectural=None, buffered=())
                 discard_outputs()
                 cancel_order = None
     assert not retirement_tags and retirement_lanes is None, 'Fetch retirement identity lacks its architectural trace'
+    assert not dynamic or observed_recoveries == expected_recoveries, 'Recovery differs from the accepted predicted PCs'
     return dict(accepted=accepted, completed=completed, architecturalAccepted=arch_accepted,
                 architecturalCompleted=arch_completed, architecturalTagWraps=arch_wraps,
-                discarded=sum(fetched.values()) + sum(failed.values()) + sum(sum(counter.values()) for _, counters in epochs for counter in counters[:2]))
+                discarded=sum(fetched.values()) + sum(failed.values()) + sum(sum(counter.values()) for _, counters in epochs for counter in counters[:2]),
+                **(dict(prediction=dict(updates=prediction_updates, clears=prediction_clears, resolutions=prediction_resolutions,
+                                       recoveries=sum(observed_recoveries.values()))) if dynamic else {}))
 
 
 def check_fetches(lines, config, faults, local_faults=()):
@@ -1000,7 +1076,7 @@ def check_pipeline_events(lines, config, program):
     if hasattr(program, 'pipeline_recovery') and config['iCacheBytes']:
         if not hasattr(program, 'recovery_fault_pc') or config['issueWidth'] > 1:
             assert recoveries, 'No early control recovery was observed'
-    if hasattr(program, 'recovery_counts'):
+    if hasattr(program, 'recovery_counts') and not config.get('branchPredictorEntries'):
         expected = Counter({pc: counts[bool(config.get('enableBranchPrediction'))] for pc, counts in program.recovery_counts.items()})
         assert Counter(recoveries) == expected, 'Recovery counts differ from the configured prediction policy'
     window = {}
@@ -1158,7 +1234,7 @@ def compare(binary, directory, config, transport='axi', selected=()):
                 fault = program.faults['fetch']
                 assert any(line.startswith(f'FETCH {fault:016x} 2 ') for line in lines), 'Wrong-path fetch fault was not exercised'
             if name == 'pipeline_reuse':
-                assert fetches['architecturalAccepted'] > 256, 'Instruction identity wraparound was not exercised'
+                assert fetches['architecturalTagWraps'] > 0, 'Instruction identity wraparound was not exercised'
             for line in lines:
                 if line.startswith('COVER '):
                     observed_coverage = list(map(int, line.split()[1:]))
@@ -1491,9 +1567,14 @@ def check_multicore(lines, config, program, name, atomic_metadata=False, softwar
             line_observed = tuple(map(int, fields[1:]))
             assert len(line_observed) == 2 and min(line_observed) >= 0
             continue
+        if fields[:1] == ['RECOVERY']:
+            hart = int(fields[1])
+            assert 0 <= hart < harts
+            fetch_checks[hart].send((line, fields))
+            continue
         if fields[:1] == ['HART']:
             hart, fields = int(fields[1]), fields[2:]
-        elif harts == 1 and fields and fields[0] in ('LSU_REQUEST', 'LSU_RESPONSE', 'SOURCE', 'REQUEST', 'ACCESS_PRIVILEGE', 'ATOMIC', 'BUS', 'READ', 'LINE_BEAT', 'WRITE', 'INTERFERE', 'RESPONSE', 'FETCH', 'IRQ', 'TRACE', 'FETCH_RETIRE', 'ARCH_REQUEST', 'ARCH_FETCH', 'ARCH_CANCEL', 'LOCAL_REQUEST', 'LOCAL_RESPONSE', 'ARCH_DATA_REQUEST', 'ARCH_DATA_RESPONSE', 'CACHE_SAMPLE', 'CACHE_STORE', 'WRITEBACK_REQUEST', 'WRITEBACK_RESPONSE', 'TRANSLATE_REQUEST', 'TRANSLATE_RESPONSE', 'WALK_REQUEST', 'WALK_RESPONSE'):
+        elif harts == 1 and fields and fields[0] in ('LSU_REQUEST', 'LSU_RESPONSE', 'SOURCE', 'REQUEST', 'ACCESS_PRIVILEGE', 'ATOMIC', 'BUS', 'READ', 'LINE_BEAT', 'WRITE', 'INTERFERE', 'RESPONSE', 'FETCH', 'IRQ', 'TRACE', 'FETCH_RETIRE', 'ARCH_REQUEST', 'ARCH_FETCH', 'ARCH_CANCEL', 'LOCAL_REQUEST', 'LOCAL_RESPONSE', 'ARCH_DATA_REQUEST', 'ARCH_DATA_RESPONSE', 'CACHE_SAMPLE', 'CACHE_STORE', 'WRITEBACK_REQUEST', 'WRITEBACK_RESPONSE', 'TRANSLATE_REQUEST', 'TRANSLATE_RESPONSE', 'WALK_REQUEST', 'WALK_RESPONSE', 'PREDICT_CLEAR', 'PREDICT_UPDATE', 'BRANCH_RESOLVE', 'RECOVERY'):
             hart = 0
         else:
             continue
@@ -1505,6 +1586,9 @@ def check_multicore(lines, config, program, name, atomic_metadata=False, softwar
         if transport_tag is not None:
             fields = fields[2:]
         kind = fields[0]
+        if kind in ('PREDICT_CLEAR', 'PREDICT_UPDATE', 'BRANCH_RESOLVE', 'RECOVERY'):
+            fetch_checks[hart].send((line, fields))
+            continue
         client = int(fields[1]) if kind == 'RESPONSE' else int(fields[1] != 'fetch') if kind in ('REQUEST', 'BUS') else 0 if kind in ('FETCH', 'ARCH_REQUEST', 'ARCH_FETCH', 'ARCH_CANCEL') else 1
         source = explicit_source if explicit_source is not None else recent_source[hart] if kind == 'ACCESS_PRIVILEGE' else 2 * hart + client
         assert 0 <= source < 2 * harts and source // 2 == hart, 'Source disagrees with hart'
@@ -2578,6 +2662,7 @@ def verify_software(args):
     assert not args.burst_refill or config.get('enableBurstRefill'), 'Software configuration does not enable burst refill'
     assert args.dcache_refill_bytes == 8 or config.get('dCacheRefillBytes') == args.dcache_refill_bytes, 'Software configuration does not enable data line refill'
     assert not args.branch_prediction or config.get('enableBranchPrediction'), 'Software configuration does not enable branch prediction'
+    assert not args.branch_predictor_entries or config.get('branchPredictorEntries') == args.branch_predictor_entries, 'Software predictor capacity mismatch'
     profile = program.software
     if profile['kind'] != 'runtime':
         assert args.software_transactions is not None, 'Set a measured or bounded --software-transactions probe budget'
@@ -2628,7 +2713,7 @@ def verify_software_matrix(args):
             directory = args.output / (f'd{selection}-h{harts}' if args.software_read_matrix else f'r{refill}-h{harts}' if args.software_refill_matrix else f'w{width}-h{harts}')
             directory.mkdir(parents=True, exist_ok=True)
             config_path = directory / 'input.json'
-            config_path.write_text(json.dumps(dict(template, hartCount=harts, issueWidth=width, enableBranchPrediction=args.branch_prediction,
+            config_path.write_text(json.dumps(dict(template, hartCount=harts, issueWidth=width, enableBranchPrediction=args.branch_prediction, branchPredictorEntries=args.branch_predictor_entries,
                 axiDataBits=512 if harts == 16 else 64, iCacheBytes=args.icache_bytes,
                 dCacheBytes=args.dcache_bytes, dCacheRefillBytes=refill, dCacheWriteback=args.dcache_writeback, enableBurstRefill=args.burst_refill, loadQueueEntries=args.load_queue_entries,
                 **(dict(fabricReadSlots=selection) if args.software_read_matrix else {})), indent=2) + '\n')
@@ -2690,6 +2775,7 @@ def main():
     parser.add_argument('--sv39', action='store_true')
     parser.add_argument('--burst-refill', action='store_true')
     parser.add_argument('--branch-prediction', action='store_true')
+    parser.add_argument('--branch-predictor-entries', type=int, choices=(0, 8, 16), default=0)
     parser.add_argument('--tlb-entries', type=int, choices=(0, 2, 4), default=0)
     parser.add_argument('--multicore-only', action='store_true')
     parser.add_argument('--platform-only', action='store_true')
@@ -2703,6 +2789,7 @@ def main():
     parser.add_argument('--dcache-refill-bytes', type=int, choices=(8, 64), default=8)
     parser.add_argument('--case', dest='selected', action='append', default=[])
     parser.add_argument('--traffic-baseline', type=Path)
+    parser.add_argument('--prediction-baseline', type=Path)
     args = parser.parse_args()
     if args.fabric_read_slots is not None and args.elf:
         parser.error('Software read slots use their configuration')
@@ -2770,7 +2857,7 @@ def main():
         directory = args.output / f'{"irq-" if interrupts else ""}{"pmp16-" if entries else ""}axi{width}'
         directory.mkdir(parents=True, exist_ok=True)
         config = configuration(width)
-        config.update(issueWidth=args.issue_width, loadQueueEntries=args.load_queue_entries, pmpEntries=entries, enableInterrupts=interrupts, iCacheBytes=args.icache_bytes, dCacheBytes=args.dcache_bytes, dCacheRefillBytes=args.dcache_refill_bytes, dCacheWriteback=args.dcache_writeback, tlbEntries=args.tlb_entries, enableBurstRefill=args.burst_refill, enableBranchPrediction=args.branch_prediction)
+        config.update(issueWidth=args.issue_width, loadQueueEntries=args.load_queue_entries, pmpEntries=entries, enableInterrupts=interrupts, iCacheBytes=args.icache_bytes, dCacheBytes=args.dcache_bytes, dCacheRefillBytes=args.dcache_refill_bytes, dCacheWriteback=args.dcache_writeback, tlbEntries=args.tlb_entries, enableBurstRefill=args.burst_refill, enableBranchPrediction=args.branch_prediction, branchPredictorEntries=args.branch_predictor_entries)
         if args.fabric_read_slots is not None:
             config['fabricReadSlots'] = args.fabric_read_slots
         config['memoryRegions'][0]['dataCacheable'] = bool(args.dcache_bytes)
@@ -2801,7 +2888,8 @@ def main():
         report = compare(binary, directory, manifest['parameters'], selected=args.selected)
         report['interfaceContracts'] = interface_contracts
         report['instructionStorage'] = storage
-        report.update(issueWidth=args.issue_width, loadQueueEntries=args.load_queue_entries, axiDataBits=width, physicalAddressBits=config['physicalAddressBits'], pmpEntries=entries, enableInterrupts=interrupts, iCacheBytes=args.icache_bytes, dCacheBytes=args.dcache_bytes, dCacheRefillBytes=args.dcache_refill_bytes, dCacheWriteback=args.dcache_writeback)
+        report.update(issueWidth=args.issue_width, loadQueueEntries=args.load_queue_entries, axiDataBits=width, physicalAddressBits=config['physicalAddressBits'], pmpEntries=entries, enableInterrupts=interrupts, iCacheBytes=args.icache_bytes, dCacheBytes=args.dcache_bytes, dCacheRefillBytes=args.dcache_refill_bytes, dCacheWriteback=args.dcache_writeback,
+                      branchPredictorEntries=args.branch_predictor_entries, enableBranchPrediction=args.branch_prediction, parameters=manifest['parameters'])
         summary['configurations'].append(report)
         core = directory / 'core'
         core_config = dict(config, axiDataBits=256, dCacheBytes=0, dCacheRefillBytes=8, dCacheWriteback=False)
@@ -2836,7 +2924,7 @@ def main():
                 continue
             directory = args.output / f'harts{harts}-axi{width}'
             directory.mkdir(parents=True, exist_ok=True)
-            config = dict(configuration(width), issueWidth=args.issue_width, loadQueueEntries=args.load_queue_entries, hartCount=harts, pmpEntries=entries, enableInterrupts=interrupts, iCacheBytes=args.icache_bytes, dCacheBytes=args.dcache_bytes, dCacheRefillBytes=args.dcache_refill_bytes, dCacheWriteback=args.dcache_writeback, tlbEntries=args.tlb_entries, enableBurstRefill=args.burst_refill, enableBranchPrediction=args.branch_prediction)
+            config = dict(configuration(width), issueWidth=args.issue_width, loadQueueEntries=args.load_queue_entries, hartCount=harts, pmpEntries=entries, enableInterrupts=interrupts, iCacheBytes=args.icache_bytes, dCacheBytes=args.dcache_bytes, dCacheRefillBytes=args.dcache_refill_bytes, dCacheWriteback=args.dcache_writeback, tlbEntries=args.tlb_entries, enableBurstRefill=args.burst_refill, enableBranchPrediction=args.branch_prediction, branchPredictorEntries=args.branch_predictor_entries)
             if args.fabric_read_slots is not None:
                 config['fabricReadSlots'] = args.fabric_read_slots
             config['memoryRegions'][0]['dataCacheable'] = bool(args.dcache_bytes)
@@ -2908,6 +2996,23 @@ def main():
                                        uncachedCycles=wanted['cycles'], cachedCycles=observed['cycles']))
         assert comparison, 'No repeated workload for traffic comparison'
         summary['instructionCacheComparison'] = comparison
+    if args.prediction_baseline:
+        baseline = json.loads(args.prediction_baseline.read_text())
+        assert args.branch_predictor_entries and baseline['sourceHashes'] == summary['sourceHashes'], 'Prediction baseline uses different sources'
+        comparison = []
+        for current, previous in zip(summary['configurations'], baseline['configurations'], strict=True):
+            assert previous['branchPredictorEntries'] == 0 and previous['enableBranchPrediction']
+            assert current['parameters'] | dict(branchPredictorEntries=0) == previous['parameters'], 'Prediction window configuration differs'
+            for transport in ('axi', 'core'):
+                observed = current if transport == 'axi' else current['core']
+                expected = previous if transport == 'axi' else previous['core']
+                for new, old in zip(observed['cases'], expected['cases'], strict=True):
+                    assert (new['test'], new['seed'], new['events']) == (old['test'], old['seed'], old['events'])
+                    if new['test'] in ('branch_window', 'return_window'):
+                        assert new['pipeline']['workCycles'] < old['pipeline']['workCycles'], 'Prediction did not improve the fixed window'
+                        comparison.append(dict(test=new['test'], seed=new['seed'], transport=transport, before=old['pipeline']['workCycles'], after=new['pipeline']['workCycles']))
+        assert comparison, 'Missing prediction window'
+        summary['predictionComparison'] = comparison
     summary_path.write_text(json.dumps(summary, indent=2) + '\n')
     print('Scalar RTL verification passed', flush=True)
 

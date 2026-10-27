@@ -55,7 +55,10 @@ object DitDahA1Alu:
       (Referable[UInt], Referable[UInt], Referable[UInt]) =
     val (value, addImm, pcImm) = apply(in)
     val sequential = (in.decoded.instruction.pc + in.decoded.instruction.length).asBits.bits(63, 0).asUInt
-    out.instruction :<= in.decoded.instruction
+    for field <- Seq("pc", "tag", "instruction", "length", "cause", "tval") do
+      out.instruction.asRecord.field[UInt](field) := in.decoded.instruction.asRecord.field[UInt](field)
+    out.instruction.predictedTaken := in.decoded.instruction.predictedTaken
+    out.instruction.fault := in.decoded.instruction.fault
     out.rd := in.decoded.rd
     out.rdWrite := in.decoded.writesRd
     out.value := value

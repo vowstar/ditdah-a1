@@ -72,6 +72,23 @@ verify-signoff: verify-writeback verify-formal
 	$(MAKE) verify-data-line
 	$(MAKE) verify-read-capacity
 	$(MAKE) verify-memory-concurrency
+	$(MAKE) verify-prediction
+
+.PHONY: verify-prediction
+PREDICTION_OUTPUT ?= result/prediction
+FORMAL_JOBS ?= 1
+verify-prediction:
+	for mode in disabled 0 8 16; do \
+		prediction=""; comparison=""; \
+		if test $$mode != disabled; then prediction="--branch-prediction --branch-predictor-entries $$mode"; fi; \
+		if test $$mode = 8; then comparison="--prediction-baseline $(PREDICTION_OUTPUT)/0/summary.json"; fi; \
+		python3 test/verify.py --width 128 --issue-width 3 --pmp-entries 0 --icache-bytes 8192 --burst-refill $$prediction $$comparison --output $(PREDICTION_OUTPUT)/$$mode --case branch_window --case return_window --case return_switch --case pipeline_recovery --case pipeline_recovery_fault --case pipeline_redirect --case pipeline_older_fault --case pipeline_reuse || exit $$?; \
+	done
+	python3 test/verify.py --user-mode --interrupts --width 512 --issue-width 3 --load-queue-entries 2 --fabric-read-slots 3 --pmp-entries 16 --icache-bytes 8192 --burst-refill --dcache-bytes 8192 --dcache-refill-bytes 64 --dcache-writeback --branch-prediction --branch-predictor-entries 8 --output $(PREDICTION_OUTPUT)/protected --case user_mprv --case pmp_update --case pmp_permissions --case interrupt_read_pending --case synchronization --case fence_i_prefetch --case fence_ordering --case pipeline_recovery --case pipeline_recovery_fault --case pipeline_redirect --case pipeline_older_fault --case return_switch
+	python3 test/verify.py --sv39 --tlb-entries 4 --width 256 --issue-width 2 --load-queue-entries 2 --fabric-read-slots 3 --pmp-entries 16 --icache-bytes 8192 --burst-refill --dcache-bytes 8192 --dcache-refill-bytes 64 --dcache-writeback --branch-prediction --branch-predictor-entries 16 --output $(PREDICTION_OUTPUT)/translation --case sv39_context --case sv39_reuse --case sv39_accessed --case sv39_protection --case sv39_sum --case sv39_mxr
+	python3 test/verify.py --software-matrix --config $(SOFTWARE_CONFIG) --load-queue-entries 2 --branch-prediction --branch-predictor-entries 8 --icache-bytes 8192 --burst-refill --dcache-bytes 8192 --dcache-refill-bytes 64 --dcache-writeback --output $(PREDICTION_OUTPUT)/software --jobs $(SOFTWARE_JOBS)
+	python3 test/formal.py --rtl $(PREDICTION_OUTPUT)/8/axi128/rtl --output $(PREDICTION_OUTPUT)/formal --modules WfiFrontend PipelineBackend --jobs $(FORMAL_JOBS)
+	python3 test/formal.py --rtl $(PREDICTION_OUTPUT)/16/axi128/rtl --output $(PREDICTION_OUTPUT)/formal16 --modules WfiFrontend --jobs $(FORMAL_JOBS)
 
 .PHONY: verify-memory-concurrency
 verify-memory-concurrency:

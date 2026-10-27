@@ -37,6 +37,7 @@ object DitDahA1Config:
         "fabricReadSlots" -> parameter.resolvedFabricReadSlots,
         "loadQueueEntries" -> parameter.loadQueueEntries,
         "enableBranchPrediction" -> parameter.enableBranchPrediction,
+        "branchPredictorEntries" -> parameter.branchPredictorEntries,
         "dCacheRefillBytes" -> (if parameter.dCacheBytes != 0 then parameter.dCacheRefillBytes else 0),
         "enableBurstRefill" -> parameter.enableBurstRefill, "isaComplete" -> false
       ),

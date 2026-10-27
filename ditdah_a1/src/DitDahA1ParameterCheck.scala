@@ -146,9 +146,19 @@ object DitDahA1ParameterCheck:
       val predicted = cached.copy(enableBranchPrediction = true)
       predicted.validateRtl()
       assert(DitDahA1Config.parameter(DitDahA1Config.document(predicted)) == predicted)
+      for entries <- Seq(0, 8, 16) do
+        val dynamic = predicted.copy(branchPredictorEntries = entries)
+        dynamic.validateRtl()
+        dynamic.copy(iCacheBytes = 0).validateRtl()
+        assert(DitDahA1Config.parameter(DitDahA1Config.document(dynamic)) == dynamic)
+        assert(DitDahA1Config.document(dynamic)("implementation")("branchPredictorEntries").num == entries)
       assert(cached.fetchWords == Seq(1, 2, 4)(width - 1))
       assert((1 << cached.fetchCountBits) > cached.fetchWords)
       assert(cached.copy(iCacheBytes = 0).fetchWords == 1)
+    for entries <- Seq(-1, 1, 4, 32) do rejects { rtl.copy(enableBranchPrediction = true, branchPredictorEntries = entries); () }
+    rejects { rtl.copy(branchPredictorEntries = 8).validateFrontend() }
+    rejects { rtl.copy(branchPredictorEntries = 8).validateBackend() }
+    rtl.copy(branchPredictorEntries = 8).validateFabric()
     rejects { rtl.copy(issueWidth = 0); () }
     rejects { rtl.copy(issueWidth = 4); () }
     rejects { rtl.copy(resetVector = 2).validateFrontend() }

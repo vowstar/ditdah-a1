@@ -110,10 +110,11 @@ class PmpState(parameter: DitDahA1Parameter) extends Bundle:
 class FetchRequest extends Bundle:
   val pc = Aligned(UInt(64))
   val tag = Aligned(UInt(8))
-class FetchPacket(words: Int = 1) extends Bundle:
+class FetchPacket(words: Int = 1, predictionTarget: Boolean = true) extends Bundle:
   val pc = Aligned(UInt(64))
   val tag = Aligned(UInt(8))
   val predictedTaken = Aligned(Bool())
+  val predictedPc = Option.when(predictionTarget)(Aligned(UInt(64)))
   val instruction = Aligned(UInt(32))
   val length = Aligned(UInt(3))
   val fault = Aligned(Bool())
@@ -121,6 +122,13 @@ class FetchPacket(words: Int = 1) extends Bundle:
   val tval = Aligned(UInt(64))
   val count = Option.when(words > 1)(Aligned(UInt(32 - Integer.numberOfLeadingZeros(words))))
   val following = Option.when(words > 1)(Aligned(Vec(words - 1, UInt(32))))
+class BranchUpdate extends Bundle:
+  val clear = Aligned(Bool())
+  val valid = Aligned(Bool())
+  val pc = Aligned(UInt(64))
+  val nextPc = Aligned(UInt(64))
+  val conditional = Aligned(Bool())
+  val taken = Aligned(Bool())
 class InstructionGroup(width: Int) extends Bundle:
   val count = Aligned(UInt(32 - Integer.numberOfLeadingZeros(width)))
   val packets = Aligned(Vec(width, new FetchPacket))
@@ -140,7 +148,7 @@ class IssuedPacket extends Bundle:
   val operand1 = Aligned(UInt(64))
   val operand2 = Aligned(UInt(64))
 class ResultPacket extends Bundle:
-  val instruction = Aligned(new FetchPacket)
+  val instruction = Aligned(new FetchPacket(predictionTarget = false))
   val rd = Aligned(UInt(5))
   val rdWrite = Aligned(Bool())
   val value = Aligned(UInt(64))
@@ -205,6 +213,7 @@ class DitDahA1CoreIO(parameter: DitDahA1Parameter) extends HWBundle(parameter):
   val status = Aligned(new StatusBundle)
 
 class DitDahA1FrontendIO(parameter: DitDahA1Parameter) extends HWBundle(parameter):
+  val prediction = Option.when(parameter.branchPredictorEntries != 0)(Flipped(new BranchUpdate))
   val translation = Option.when(parameter.enableTranslation)(Aligned(new TranslationPort))
   val privilege = Flipped(UInt(2))
   val pmp = Option.when(parameter.pmpEntries != 0)(Flipped(new PmpState(parameter)))
@@ -228,6 +237,7 @@ class DitDahA1MemoryFabricIO(parameter: DitDahA1Parameter) extends HWBundle(para
   val axi = Aligned(new AxiBundle(parameter))
 
 class DitDahA1BackendIO(parameter: DitDahA1Parameter) extends HWBundle(parameter):
+  val prediction = Option.when(parameter.branchPredictorEntries != 0)(Aligned(new BranchUpdate))
   val translation = Option.when(parameter.enableTranslation)(Aligned(new TranslationPort))
   val translationState = Option.when(parameter.enableTranslation)(Aligned(new TranslationState))
   val invalidateTranslation = Option.when(parameter.enableTranslation && parameter.tlbEntries != 0)(Aligned(Bool()))

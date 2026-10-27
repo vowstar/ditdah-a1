@@ -3,6 +3,7 @@
 """Prove execution and transaction safety on generated RTL."""
 
 import argparse
+from concurrent.futures import ThreadPoolExecutor
 import hashlib
 import json
 import os
@@ -11,6 +12,7 @@ import re
 import subprocess
 
 import click
+from contracts import backend_control_signals, __file__ as binding_helper_file
 
 
 FETCH = r'''
@@ -149,6 +151,9 @@ MULTIPLY = r'''
 '''
 
 def backend_names(text, source):
+    late, early = backend_control_signals(source)
+    text = re.sub(r'\bearlyRedirect\b', early, text)
+    text = re.sub(r'\bredirect_0\b', late, text)
     text = re.sub(r'\b(instruction|decoded|issued|result|memory|commit)Packet_', r'\1Packets_0_', text)
     for name in ('instruction', 'decoded', 'issued', 'result', 'memory', 'commit'):
         text = re.sub(rf'\b{name}Valid\b', f'({name}Count != 0)', text)
@@ -167,18 +172,23 @@ def backend_names(text, source):
     return text
 
 
+def pipeline_identity_bits(parameters):
+    return 161 if parameters.get('branchPredictorEntries') else 97 if parameters.get('enableBranchPrediction') else 96
+
+
 def pipeline_case(source, parameters):
     dual = parameters.get('loadQueueEntries', 1) == 2
     width, capacity = parameters['issueWidth'], (5 + parameters.get('loadQueueEntries', 1)) * parameters['issueWidth']
     stages = ('commit', 'memory', *(('extra',) if dual else ()), 'result', 'issued', 'decoded', 'instruction')
     prediction = parameters.get('enableBranchPrediction', False)
-    identity_bits = 97 if prediction else 96
-    identity = lambda p, live=True: '{' + ((p + '_predictedTaken' if live else "1'b0") + ', ' if prediction else '') + p + '_pc, ' + p + '_instruction}'
+    dynamic = bool(parameters.get('branchPredictorEntries'))
+    identity_bits = pipeline_identity_bits(parameters)
+    identity = lambda p, live=True, target=True: '{' + ((p + '_predictedPc' if live and target else "64'd0") + ', ' if dynamic else '') + ((p + '_predictedTaken' if live else "1'b0") + ', ' if prediction else '') + p + '_pc, ' + p + '_instruction}'
     body = f'''
   reg pipeline_past = 0;
   reg [{capacity.bit_length()-1}:0] pipeline_owned;
   reg pipeline_fifo[{capacity}];
-  (* anyconst *) reg [6:0] pipeline_bit;
+  (* anyconst *) reg [{(identity_bits-1).bit_length()-1}:0] pipeline_bit;
   wire [{identity_bits-1}:0] pipeline_input[{width}];
   wire [{width.bit_length()-1}:0] pipeline_added = received ? instruction_bits_count : 0;
   wire [{capacity.bit_length()-1}:0] pipeline_discarded = {"memoryAdvance && memoryFault ? extraCount : 0" if dual else '0'};
@@ -193,8 +203,8 @@ def pipeline_case(source, parameters):
     for stage in stages:
         suffix = '_decoded_instruction' if stage == 'issued' else '' if stage == 'instruction' else '_instruction'
         for lane in range(width):
-            body += f'''  wire [{identity_bits-1}:0] pipeline_{stage}_{lane} = {identity(f'{stage}Packets_{lane}' + suffix, stage in ('instruction', 'decoded') or lane == 0)};
-  always @(posedge clock) if (!reset && {stage}Count > {lane}{" && pipeline_bit < 96" if prediction and lane > 0 and stage not in ("instruction", "decoded") else ""})
+            body += f'''  wire [{identity_bits-1}:0] pipeline_{stage}_{lane} = {identity(f'{stage}Packets_{lane}' + suffix, stage in ('instruction', 'decoded') or lane == 0, stage in ('instruction', 'decoded', 'issued'))};
+  always @(posedge clock) if (!reset && {stage}Count > {lane}{" && pipeline_bit < 96" if prediction and lane > 0 and stage not in ("instruction", "decoded") else " && pipeline_bit < 97" if dynamic and stage not in ('instruction', 'decoded', 'issued') else ""})
     assert(pipeline_{stage}_{lane}[pipeline_bit] == pipeline_fifo[{older} + {lane}]);
 '''
         older += f' + {stage}Count'
@@ -371,12 +381,25 @@ def pipeline_case(source, parameters):
     offset = 'issuedPackets_0_decoded_instruction_length'
     if parameters.get('enableBranchPrediction'):
         offset = 'issuedPackets_0_decoded_instruction_predictedTaken ? issuedPackets_0_decoded_immediate : ' + offset
+    expected_pc = ('issuedPackets_0_decoded_instruction_predictedTaken ? issuedPackets_0_decoded_instruction_predictedPc : '
+                   'issuedPackets_0_decoded_instruction_pc + issuedPackets_0_decoded_instruction_length') if dynamic else f'issuedPackets_0_decoded_instruction_pc + ({offset})'
     body += f"""  wire pipeline_control = issuedPackets_0_decoded_operation == 5 || issuedPackets_0_decoded_operation == 6 ||
     issuedPackets_0_decoded_operation == 7 || issuedPackets_0_decoded_operation == 25;
-  wire [63:0] pipeline_expected_pc = issuedPackets_0_decoded_instruction_pc + ({offset});
+  wire [63:0] pipeline_expected_pc = {expected_pc};
   always @(posedge clock) if (!reset) assert(earlyRedirect == (executed && pipeline_control &&
     !_execute_output_bits_instruction_fault && _execute_output_bits_nextPc != pipeline_expected_pc));
 """
+    if dynamic:
+        body += '''  always @(posedge clock) if (!reset) begin
+    assert(prediction_clear == redirect_0);
+    assert(prediction_valid == (executed && pipeline_control && issuedPackets_0_decoded_operation != 6 && !_execute_output_bits_instruction_fault));
+    if (prediction_valid) begin
+      assert(prediction_pc == issuedPackets_0_decoded_instruction_pc && prediction_nextPc == _execute_output_bits_nextPc);
+      assert(prediction_conditional == (issuedPackets_0_decoded_operation == 5 || issuedPackets_0_decoded_operation == 25));
+      assert(prediction_taken == (_execute_output_bits_nextPc != issuedPackets_0_decoded_instruction_pc + issuedPackets_0_decoded_instruction_length));
+    end
+  end
+'''
     before = re.search(r'commitPackets_0_instruction_pc <=\s*[^;]+;', source).group()
     translation = ' || translation_request_valid || translation_response_ready' if parameters.get('virtualAddressBits') == 39 else ''
     if dual:
@@ -1692,12 +1715,72 @@ def gpr_case(parameters):
     return ('Gpr', body + '    end\n  end\n', '', '')
 
 
+def predictor_state(parameters, abstract=False):
+    entries = parameters['branchPredictorEntries']
+    bits = (entries-1).bit_length()
+    if abstract:
+        body = f"  wire [{entries-1}:0] front_valid = valid;\n  wire [63:0] front_tag [0:{entries-1}], front_targets [0:{entries-1}];\n  wire [1:0] front_counters [0:{entries-1}];\n  wire front_conditional [0:{entries-1}];\n  always @* if (prediction_valid) assume(prediction_pc[1:0] == 0);\n"
+        for row in range(entries):
+            body += f"  assign front_tag[{row}] = {{tags_{row}, {bits+2}'d{row*4}}};\n  assign front_targets[{row}] = targets_{row};\n  assign front_counters[{row}] = counters_{row};\n  assign front_conditional[{row}] = conditional_{row};\n"
+        return body
+    body = f'''  reg [{entries-1}:0] front_valid = 0;
+  reg [63:0] front_tag [0:{entries-1}], front_targets [0:{entries-1}];
+  reg [1:0] front_counters [0:{entries-1}];
+  reg front_conditional [0:{entries-1}];
+  wire [{bits-1}:0] front_update_index = prediction_pc[{bits+1}:2];
+  wire front_update_hit = front_valid[front_update_index] && front_tag[front_update_index] == prediction_pc && front_conditional[front_update_index] == prediction_conditional;
+  always @* if (prediction_valid) assume(prediction_pc[1:0] == 0);
+  always @(posedge clock) begin
+    if (reset || prediction_clear) front_valid <= 0;
+    else if (prediction_valid) begin
+      front_valid[front_update_index] <= 1;
+      front_tag[front_update_index] <= prediction_pc;
+      front_targets[front_update_index] <= prediction_nextPc;
+      front_conditional[front_update_index] <= prediction_conditional;
+      front_counters[front_update_index] <= !front_update_hit ? (prediction_taken ? 2 : 1) :
+    prediction_taken ? (front_counters[front_update_index] == 3 ? 3 : front_counters[front_update_index] + 1) :
+    (front_counters[front_update_index] == 0 ? 0 : front_counters[front_update_index] - 1);
+    end
+    if (front_past && !reset) assert(valid == front_valid);
+    if (!reset) begin
+      cover(front_valid[0] && front_conditional[0] && front_counters[0] == 3);
+      cover(front_valid[0] && !front_conditional[0]);
+      cover(front_valid[0] && prediction_clear);
+    end
+  end
+'''
+    for row in range(entries):
+        body += f'''  always @(posedge clock) if (front_past && !reset && front_valid[{row}]) begin
+    assert(front_tag[{row}][{bits+1}:0] == {bits+2}'d{row*4});
+    assert(tags_{row} == front_tag[{row}][63:{bits+2}] && targets_{row} == front_targets[{row}]);
+    assert(counters_{row} == front_counters[{row}] && conditional_{row} == front_conditional[{row}]);
+  end
+'''
+    return body
+
+
+def frontend_queries(source, words):
+    request = instance_ports(source, 'DitDahA1Fetch')[0][1]['request_bits_pc']
+    expression = re.search(r'\bwire\s+\[63:0\]\s+' + re.escape(request) + r'\s*=([^;]+);', source).group(1)
+    pairs = re.findall(r'(\w+)\s*\?\s*(\w+)\s*:', expression)
+    assert len(pairs) == words, 'Unknown prediction priority connection'
+    result = []
+    for guard, target in pairs:
+        expression = re.search(r'\bwire\s+' + guard + r'\s*=([^;]+);', source).group(1)
+        taken = re.findall(r'\btaken(?:_\d+)?\b', expression)
+        assert len(taken) == 1, 'Unknown prediction direction connection'
+        result.append((guard, taken[0], target))
+    return result
+
+
 def frontend_case(parameters):
     width = parameters['issueWidth']
     words = 1 << (width - 1).bit_length() if parameters.get('iCacheBytes') else 1
     capacity = 2 * max(1, words - 1) if parameters.get('iCacheBytes') else width
     index_bits = (capacity + words).bit_length()
-    fields = ('pc', 'tag', 'predictedTaken', 'instruction', 'length', 'fault', 'cause', 'tval')
+    entries = parameters.get('branchPredictorEntries', 0)
+    fields = ('pc', 'tag', 'predictedTaken', *(('predictedPc',) if entries else ()), 'instruction', 'length', 'fault', 'cause', 'tval')
+    packet_bits = 301 if entries else 237
     packed = lambda prefix: '{' + ', '.join(prefix + field for field in fields) + '}'
     count = '_fetch_output_bits_count' if words > 1 else '1'
     reserved = 'reserved' if words > 1 else '1'
@@ -1706,8 +1789,8 @@ def frontend_case(parameters):
     pending_pc = 'pendingPc' if parameters.get('iCacheBytes') else 'front_pc'
     body = f'''
   reg front_past = 0;
-  (* anyconst *) reg [7:0] front_bit;
-  always @* assume(front_bit < 237);
+  (* anyconst *) reg [{(packet_bits-1).bit_length()-1}:0] front_bit;
+  always @* assume(front_bit < {packet_bits});
   reg [{index_bits-1}:0] front_owned = 0, front_reserved;
   reg [63:0] front_pc;
   wire formal_fetch_pending;
@@ -1727,8 +1810,11 @@ def frontend_case(parameters):
   wire [{index_bits-1}:0] front_buffered = front_owned - (formal_fetch_pending ? front_reserved : 0);
   reg front_reference [0:{capacity-1}];
   wire front_sequence [0:{capacity+words-1}];
-  wire [236:0] front_input [0:{words-1}], front_buffer [0:{capacity-1}], front_output [0:{width-1}];
+  wire [{packet_bits-1}:0] front_input [0:{words-1}], front_buffer [0:{capacity-1}], front_output [0:{width-1}];
 '''
+    if entries:
+        bits = (entries-1).bit_length()
+        body += predictor_state(parameters)
     for lane in range(words):
         instruction = '_fetch_output_bits_instruction' if lane == 0 else f'_fetch_output_bits_following_{lane-1}'
         body += f"""  wire [31:0] front_word_{lane} = {instruction};
@@ -1739,11 +1825,22 @@ def frontend_case(parameters):
     $signed({{{{front_word_{lane}[31], front_word_{lane}[19:12], front_word_{lane}[20], front_word_{lane}[30:21], 1'b0}}}}) :
     $signed({{{{front_word_{lane}[31], front_word_{lane}[7], front_word_{lane}[30:25], front_word_{lane}[11:8], 1'b0}}}});
 """
-        body += f"  assign front_input[{lane}] = {{_fetch_output_bits_pc + 64'd{4*lane}, _fetch_output_bits_tag + 8'd{lane}, front_predict_{lane}, {instruction}, 3'd4, " + (
+        if entries:
+            body = body.replace(f'(front_branch_{lane} && front_word_{lane}[31])',
+                f'(front_branch_{lane} && (front_hit_{lane} && front_conditional[front_index_{lane}] ? front_counters[front_index_{lane}][1] : front_word_{lane}[31])) || front_indirect_hit_{lane}')
+            body += f'''  wire [63:0] front_lookup_pc_{lane} = _fetch_output_bits_pc + 64'd{lane*4};
+  wire [{bits-1}:0] front_index_{lane} = front_lookup_pc_{lane}[{bits+1}:2];
+  wire front_hit_{lane} = front_valid[front_index_{lane}] && front_tag[front_index_{lane}][63:2] == front_lookup_pc_{lane}[63:2];
+  wire front_indirect_hit_{lane} = front_word_{lane}[6:0] == 7'h67 && front_word_{lane}[14:12] == 0 && front_hit_{lane} && !front_conditional[front_index_{lane}];
+  wire [63:0] front_prediction_pc_{lane} = front_indirect_hit_{lane} ? front_targets[front_index_{lane}] : front_lookup_pc_{lane} + front_offset_{lane};
+'''
+        target_field = f"front_predict_{lane} ? front_prediction_pc_{lane} : 64'd0, " if entries else ''
+        body += f"  assign front_input[{lane}] = {{_fetch_output_bits_pc + 64'd{4*lane}, _fetch_output_bits_tag + 8'd{lane}, front_predict_{lane}, {target_field}{instruction}, 3'd4, " + (
             "_fetch_output_bits_fault, _fetch_output_bits_cause, _fetch_output_bits_tval};\n" if lane == 0 else "1'b0, 64'd0, 64'd0};\n")
     body += "  always @* begin\n    front_count = front_raw_count; front_prediction = 0; front_target = 0;\n"
     for lane in range(words):
-        body += f"    if (!front_prediction && front_return && {lane} < front_raw_count && front_predict_{lane}) begin front_count = {lane+1}; front_prediction = 1; front_target = _fetch_output_bits_pc + 64'd{lane*4} + front_offset_{lane}; end\n"
+        target = f'front_prediction_pc_{lane}' if entries else f"_fetch_output_bits_pc + 64'd{lane*4} + front_offset_{lane}"
+        body += f"    if (!front_prediction && front_return && {lane} < front_raw_count && front_predict_{lane}) begin front_count = {lane+1}; front_prediction = 1; front_target = {target}; end\n"
     body += "  end\n"
     for lane in range(capacity):
         body += f'  assign front_buffer[{lane}] = {packed(f"buffer_{lane}_")};\n'
@@ -4424,7 +4521,8 @@ def read_queue_case(parameters):
     return ('ReadQueue', body, 'assign ar_bits_len =', "assign ar_bits_len = 8'h80 |")
 
 
-def verify(rtl, directory, modules=None, mutations=None):
+def verify(rtl, directory, modules=None, mutations=None, jobs=1):
+    assert jobs >= 1
     assert mutations is None or modules and all(mode.startswith('mutation') for mode in mutations), 'Select modules and negative controls'
     directory.mkdir(parents=True, exist_ok=True)
     summary = directory / 'summary.json'
@@ -4440,6 +4538,7 @@ def verify(rtl, directory, modules=None, mutations=None):
     license = '\n'.join(line.replace('#', '//', 1) for line in Path(__file__).read_text().splitlines()[:2]) + '\n'
     reports = []
     checker_hash = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
+    helper_hash = hashlib.sha256(Path(binding_helper_file).read_bytes()).hexdigest()
     regions = manifest['parameters']['memoryRegions']
     cache_routing_base = next((int(r['base']) & ~63 for r in regions if r.get('dataCacheable') and r['readable'] and not r['device'] and
         int(r['base']) % 64 and not any((p['device'] or p.get('dataCacheable') and p['readable']) and
@@ -4448,6 +4547,24 @@ def verify(rtl, directory, modules=None, mutations=None):
         ('yosys', ['yosys', '-V']), ('sby', ['sby', '--version']), ('z3', ['z3', '--version']))}
     proof_env = dict(os.environ, PYTHONPATH=str(Path(click.__file__).parent.parent)
                      + os.pathsep + os.environ.get('PYTHONPATH', ''))
+    executor = ThreadPoolExecutor(max_workers=jobs)
+    proof_futures = []
+
+    def run_check(work, timeout, name, mode, module, engine, counted):
+        mutating = mode.startswith('mutation')
+        with (work / 'run.log').open('w') as log:
+            result = subprocess.run(['sby', '-f', '-d', 'proof', 'check.sby'], cwd=work, env=proof_env, stdout=log, stderr=subprocess.STDOUT, timeout=timeout + 30)
+        assert 'multiple conflicting drivers' not in (work / 'run.log').read_text(), 'Conflicting proof drivers'
+        assert 'is implicitly declared' not in (work / 'run.log').read_text(), 'Undeclared proof signal'
+        status_file = work / 'proof/status'
+        assert status_file.exists(), (work / 'run.log').read_text()[-3000:]
+        status = status_file.read_text().split()[0]
+        assert status == ('FAIL' if mutating else 'PASS') and result.returncode == (2 if mutating else 0), (name, mode, status, work)
+        if mutating:
+            assert list((work / 'proof/engine_0').glob('trace*.vcd')), 'Missing mutation counterexample'
+        print(f'  {module} [{name}] {mode}: {status}', flush=True)
+        return dict(module=module, propertyGroup=name, mode=mode, status=status, engine=engine,
+                    assertions=len(re.findall(r'assert\((?!1\);)', counted)), covers=counted.count('cover('))
     enabled = manifest['parameters']['pmpEntries'] != 0
     cases = protection_cases(manifest['parameters']) if enabled else (
             ('Fetch', FETCH, '& ~killed & ~cancel', '& ~cancel'),
@@ -4741,6 +4858,21 @@ def verify(rtl, directory, modules=None, mutations=None):
         if name == 'WfiFrontend':
             fetch_pins = instance_ports(sources[module + '.sv'], 'DitDahA1Fetch')[0][1]
             body = body.replace('FORMAL_FRONT_REQUEST_PC', '(' + fetch_pins['request_bits_pc'] + ')')
+            if manifest['parameters'].get('branchPredictorEntries'):
+                words = 1 << (manifest['parameters']['issueWidth'] - 1).bit_length() if manifest['parameters'].get('iCacheBytes') else 1
+                queries = frontend_queries(sources[module + '.sv'], words)
+                query_body = ''
+                for lane, (_, taken, target) in enumerate(queries):
+                    query_body += f'''  wire query_direction_{lane} = ({taken} && !_fetch_output_bits_fault) == front_predict_{lane};
+  wire query_target_{lane} = !front_predict_{lane} || {target} == front_prediction_pc_{lane};
+  always @* begin assert(query_direction_{lane}); assert(query_target_{lane}); end
+'''
+                query_body += f'''  wire query_count = returnedCount == front_count;
+  wire query_selected = ({' || '.join(q[0] for q in queries)}) == front_prediction;
+  wire query_pc = ({fetch_pins['request_bits_pc']}) == front_request_pc;
+  always @* begin assert(query_count); assert(query_selected); assert(query_pc); end
+'''
+                body += query_body
             files['DitDahA1Fetch.sv'] = license + frontend_fetch_model(sources['DitDahA1Fetch.sv'], manifest['parameters'])
             files[module + '.sv'], count = re.subn(r'(DitDahA1Fetch\s+\w+\s*\()', r'\1\n.formal_pending(formal_fetch_pending), .formal_count(formal_fetch_count), .formal_pc(formal_fetch_pc),', files[module + '.sv'])
             assert count == 1
@@ -4919,6 +5051,8 @@ endmodule''', 1)
             tag_modes = [f'prove-tags-{bit}' for bit in range(8)] if read_slots > 2 else ['prove-tags']
             port_modes = [f'prove-ports-{port}' for port in range(0, 32, 8)] if read_slots > 2 and manifest['parameters']['hartCount'] == 16 else []
             checks[:1] = [(mode, before, after) for mode in ('prove-control', *port_modes, *tag_modes, *(f'prove-stability-{i}' for i in range(2 * manifest['parameters']['hartCount'])))]
+            if port_modes:
+                checks.insert(next(i for i, check in enumerate(checks) if check[0] == 'cover') + 1, ('cover-response', before, after))
             payload = re.search(r'assign\s+instruction_0_response_bits_data\s*=[^;]+;', original).group()
             checks += [('mutation-data', payload, payload.replace('=', '= axi_r_bits_data[63:0] ^ (', 1).replace(';', ');'))]
             if manifest['parameters'].get('dCacheWriteback') and cache_routing_base is not None:
@@ -5311,11 +5445,20 @@ endmodule''', 1)
                        ('mutation-acknowledgement', 'assign probe_0_response_ready =', "assign probe_0_response_ready = 1'h1 |"),
                        ('mutation-writeback-error', failure, "wire writebackFault = 1'h0;")]
         if name == 'PipelineBackend' and manifest['parameters']['issueWidth'] > 1:
-            checks[:1] = [(f'prove-bits-{bit}', before, after) for bit in range(0, 97 if manifest['parameters'].get('enableBranchPrediction') else 96, 4 if manifest['parameters']['issueWidth'] == 3 else 8)]
-        if name == 'PipelineBackend' and manifest['parameters'].get('loadQueueEntries', 1) == 2:
+            checks[:1] = [(f'prove-bits-{bit}', before, after) for bit in range(0, pipeline_identity_bits(manifest['parameters']), 4 if manifest['parameters']['issueWidth'] == 3 else 8)]
+        if name == 'PipelineBackend' and (manifest['parameters'].get('loadQueueEntries', 1) == 2 or manifest['parameters'].get('enableBranchPrediction')):
             checks[:0] = [('prove-control', before, after)]
             checks = [('prove-identity' if mode == 'prove' else mode, *rest) for mode, *rest in checks]
             checks.sort(key=lambda check: check[0].startswith('prove'))
+        if name == 'WfiFrontend' and manifest['parameters'].get('branchPredictorEntries'):
+            checks[:1] = [('prove-predictor', before, after), ('prove-query', before, after), ('prove-control', before, after),
+                          *((f'prove-bits-{bit}', before, after) for bit in range(0, 301, 8))]
+            for field in ('tags', 'targets', 'counters'):
+                updates = re.findall(r'\b' + field + r'_0 <=[^;]+;', original)
+                update = next(update for update in reversed(updates) if original.count(update) == 1)
+                checks.append(('mutation-predictor-' + field, update, field + "_0 <= 0;"))
+            update = re.search(r'valid <= prediction_clear \?[^;]+;', original).group()
+            checks.append(('mutation-predictor-clear', update, update.replace('prediction_clear', "1'b0", 1)))
         proof_top = top
         for check in checks:
             top = proof_top
@@ -5333,7 +5476,41 @@ endmodule''', 1)
             work = directory / f'{name.lower()}-{mode}'
             work.mkdir(exist_ok=True)
             for filename, text in files.items():
-                if name == 'PipelineBackend' and manifest['parameters'].get('loadQueueEntries', 1) == 2 and proving:
+                if name == 'WfiFrontend' and filename == module + '.sv' and manifest['parameters'].get('branchPredictorEntries'):
+                    if mode == 'prove-predictor':
+                        text = re.sub(r'\bassert\([^;]+;', lambda m: m[0] if re.search(r'front_(?:valid|tag|targets|counters|conditional)', m[0]) else 'assert(1);', text)
+                    elif mode in ('prove-query', 'prove-control') or mode.startswith('prove-bits-'):
+                        assert any(r['propertyGroup'] == name and r['mode'] == 'prove-predictor' and r['status'] == 'PASS' for r in reports), 'Missing predictor state prerequisite'
+                        model = predictor_state(manifest['parameters'])
+                        assert text.count(model) == 1
+                        text = text.replace(model, predictor_state(manifest['parameters'], abstract=True))
+                        if mode == 'prove-query':
+                            text = re.sub(r'\bassert\([^;]+;', lambda m: m[0] if 'query_' in m[0] else 'assert(1);', text)
+                        else:
+                            assert any(r['propertyGroup'] == name and r['mode'] == 'prove-query' and r['status'] == 'PASS' for r in reports), 'Missing frontend query prerequisite'
+                            words = 1 << (manifest['parameters']['issueWidth'] - 1).bit_length() if manifest['parameters'].get('iCacheBytes') else 1
+                            for lane, (_, taken, target) in enumerate(frontend_queries(sources[module + '.sv'], words)):
+                                for signal in (taken, target):
+                                    text, count = re.subn(r'\bwire\s+(\[[^]]+\]\s+)?' + signal + r'\s*=[^;]+;',
+                                        lambda m: '(* anyseq *) reg ' + (m[1] or '') + signal + ';', text)
+                                    assert count == 1, 'Unknown prediction cutpoint'
+                                text, count = re.subn(r'wire front_predict_' + str(lane) + r' =[^;]+;', f'wire front_predict_{lane} = {taken} && !_fetch_output_bits_fault;', text)
+                                assert count == 1
+                                text, count = re.subn(r'wire \[63:0\] front_prediction_pc_' + str(lane) + r' =[^;]+;', f'wire [63:0] front_prediction_pc_{lane} = {target};', text)
+                                assert count == 1
+                            text = re.sub(r'assert\(query_[^;]+;', 'assert(1);', text)
+                        if mode == 'prove-control':
+                            text = re.sub(r'\bassert\([^;]+;', lambda m: 'assert(1);' if '[front_bit]' in m[0] else m[0], text)
+                        elif mode.startswith('prove-bits-'):
+                            assert any(r['propertyGroup'] == name and r['mode'] == 'prove-control' and r['status'] == 'PASS' for r in reports), 'Missing frontend control prerequisite'
+                            text = re.sub(r'\bassert\([^;]+;', lambda m: m[0] if '[front_bit]' in m[0] else m[0].replace('assert(', 'assume(', 1), text)
+                            declaration = '(* anyconst *) reg [8:0] front_bit;'
+                            assert text.count(declaration) == 1
+                            bit = int(mode.rsplit('-', 1)[1])
+                            text = text.replace(declaration, f"(* anyconst *) reg [2:0] front_offset; wire [8:0] front_bit = 9'd{bit} + front_offset;")
+                if name == 'PipelineBackend' and (manifest['parameters'].get('loadQueueEntries', 1) == 2 or manifest['parameters'].get('enableBranchPrediction')) and proving:
+                    if mode != 'prove-control':
+                        assert any(r['propertyGroup'] == name and r['mode'] == 'prove-control' and r['status'] == 'PASS' for r in reports), 'Missing pipeline control prerequisite'
                     def partition_pipeline(match):
                         identity = '[pipeline_bit]' in match[0]
                         return ('assert(1);' if identity else match[0]) if mode == 'prove-control' else match[0] if identity else match[0].replace('assert(', 'assume(', 1)
@@ -5386,7 +5563,9 @@ endmodule''', 1)
                         i = int(mode.rsplit('-', 1)[1])
                         return expression if port[1] == f"{'instruction' if i % 2 == 0 else 'data'}_{i//2}" else 'assert(1);'
                     text = re.sub(r'\bassert\([^;]+;', partition_fabric, text)
-                if unit == 'MemoryFabric' and filename == module + '.sv' and mode in ('cover', 'mutation', 'mutation-drain', 'mutation-isolation', 'mutation-fairness') and manifest['parameters']['hartCount'] == 16:
+                if unit == 'MemoryFabric' and filename == module + '.sv' and port_modes and mode in ('cover', 'cover-response'):
+                    text = re.sub(r'\bcover\([^;]+;', lambda m: m[0] if ('fabric_single && |fabric_replied' in m[0]) == (mode == 'cover-response') else 'begin end', text)
+                if unit == 'MemoryFabric' and filename == module + '.sv' and mode in ('cover', 'cover-response', 'mutation', 'mutation-drain', 'mutation-isolation', 'mutation-fairness') and manifest['parameters']['hartCount'] == 16:
                     base = next((int(r['base']) + 7) & ~7 for r in manifest['parameters']['memoryRegions'] if r['executable'] and r['writable'] and not r['device'] and
                                 (mode != 'mutation' or r['atomic']) and
                                 ((int(r['base']) + 7) & ~7) + 8 <= int(r['base']) + int(r['size']))
@@ -5577,23 +5756,41 @@ endmodule''', 1)
                         for operand in (1, 2):
                             text += f'\n(* anyseq *) reg [63:0] arbitrary_{operand}_{lane};\nassign rdata{operand}_{lane} = raddr{operand}_{lane} == 0 ? 0 : arbitrary_{operand}_{lane};\n'
                     text += '\nendmodule\n'
-                if mode.startswith('prove-bits-') and filename == module + '.sv':
-                    declaration = '(* anyconst *) reg [6:0] pipeline_bit;'
+                if name == 'PipelineBackend' and mode.startswith('prove-bits-') and filename == module + '.sv':
+                    bits = pipeline_identity_bits(manifest['parameters'])
+                    size = (bits-1).bit_length()
+                    declaration = f'(* anyconst *) reg [{size-1}:0] pipeline_bit;'
                     assert text.count(declaration) == 1
                     bit = int(mode.rsplit('-', 1)[1])
-                    selector = "wire [6:0] pipeline_bit = 7'd96;" if bit == 96 else (
-                        f"(* anyconst *) reg [{1 if manifest['parameters']['issueWidth'] == 3 else 2}:0] pipeline_offset; wire [6:0] pipeline_bit = pipeline_offset + 7'd{bit};")
+                    selector = f"wire [{size-1}:0] pipeline_bit = {size}'d{bit};" if bit == bits-1 else (
+                        f"(* anyconst *) reg [{1 if manifest['parameters']['issueWidth'] == 3 else 2}:0] pipeline_offset; wire [{size-1}:0] pipeline_bit = pipeline_offset + {size}'d{bit};")
                     text = text.replace(declaration, selector)
                 if name == 'WfiFrontend' and mutating and filename == module + '.sv' and manifest['parameters'].get('enableBranchPrediction'):
                     first = "32'h0080006f" if mode.startswith('mutation-prediction') else "32'h13"
                     words = (1 << (manifest['parameters']['issueWidth'] - 1).bit_length()) if manifest['parameters'].get('iCacheBytes') else 1
                     guidance = f"  always @* assume(_fetch_output_bits_instruction == {first});\n"
+                    if manifest['parameters'].get('branchPredictorEntries') and not mode.startswith('mutation-predictor-'):
+                        guidance += f"  always @* assume(!prediction_valid && prediction_clear == {('invalidate' if manifest['parameters'].get('iCacheBytes') else '0')});\n"
+                    if mode == 'mutation-restart' and words > manifest['parameters']['issueWidth']:
+                        guidance += '''  always @* begin
+    assume(!halt && !redirect && output_ready);
+    assume(invalidate == (queued != 0 && pending));
+    assume(_fetch_output_valid == (formal_fetch_pending && !front_flush));
+    assume(!_fetch_output_bits_fault && _fetch_output_bits_count == formal_fetch_count);
+  end
+'''
                     for lane in range(1, words):
                         guidance += f"  always @* assume(_fetch_output_bits_following_{lane-1} == 32'h13);\n"
                     text = text.replace('endmodule', guidance + 'endmodule', 1)
+                if name == 'WfiFrontend' and mode.startswith('mutation-predictor-') and filename == module + '.sv':
+                    guidance = "  reg [3:0] predictor_cycle = 0;\n  always @(posedge clock) if (reset) predictor_cycle <= 0; else if (predictor_cycle != 15) predictor_cycle <= predictor_cycle + 1;\n"
+                    guidance += "  always @* begin assume(prediction_pc == 64'h100 && prediction_nextPc == 64'h108 && prediction_conditional && prediction_taken);\n"
+                    guidance += f"    assume(prediction_valid == (predictor_cycle == 0) && prediction_clear == ({('predictor_cycle == 1' if mode == 'mutation-predictor-clear' else '0')})); end\n"
+                    text = text.replace('endmodule', guidance + 'endmodule', 1)
                 if name == 'PipelineBackend' and mutating and filename == module + '.sv':
                     bit = 40 if mode in ('mutation', 'mutation-dual-owner') else 96 if mode == 'mutation-recovery-metadata' else 0
-                    text = text.replace('(* anyconst *) reg [6:0] pipeline_bit;', f"wire [6:0] pipeline_bit = 7'd{bit};")
+                    size = (pipeline_identity_bits(manifest['parameters'])-1).bit_length()
+                    text = text.replace(f'(* anyconst *) reg [{size-1}:0] pipeline_bit;', f"wire [{size-1}:0] pipeline_bit = {size}'d{bit};")
                 if name == 'PipelineBackend' and mode.startswith('cover') and filename == module + '.sv':
                     def cover_mode(expression):
                         return 'cover-dual' if expression.startswith('extraCount') else 'cover-drain' if expression.startswith('memoryFault') else 'cover-recovery' if expression.startswith(('earlyRedirect', 'commitResolved')) else 'cover-memory' if expression.startswith('memoryPending') else 'cover-dependency' if 'decodedCount ==' in expression else 'cover'
@@ -5961,6 +6158,8 @@ endmodule''', 1)
                 timeout = 180
             if name == 'WfiFrontend' and task == 'prove' and manifest['parameters']['issueWidth'] == 3:
                 timeout = 300
+            if name == 'WfiFrontend' and task == 'prove' and manifest['parameters'].get('branchPredictorEntries'):
+                engine = 'abc pdr'
             if unit == 'Backend' and task == 'prove' and (manifest['parameters']['issueWidth'] > 1 or manifest['parameters'].get('loadQueueEntries', 1) == 2):
                 timeout = 180
             if name == 'WideFetch' and task == 'cover' and manifest['parameters'].get('virtualAddressBits') == 39:
@@ -6009,23 +6208,20 @@ read -formal -sv {'-noautowire ' if name == 'PipelineBackend' else ''}{' '.join(
 [files]
 ''' + '\n'.join(files) + '\n'
             (work / 'check.sby').write_text(config)
-            with (work / 'run.log').open('w') as log:
-                result = subprocess.run(['sby', '-f', '-d', 'proof', 'check.sby'], cwd=work, env=proof_env, stdout=log, stderr=subprocess.STDOUT, timeout=timeout + 30)
-            assert 'multiple conflicting drivers' not in (work / 'run.log').read_text(), 'Conflicting proof drivers'
-            assert 'is implicitly declared' not in (work / 'run.log').read_text(), 'Undeclared proof signal'
-            status_file = work / 'proof/status'
-            assert status_file.exists(), (work / 'run.log').read_text()[-3000:]
-            status = status_file.read_text().split()[0]
-            expected = 'FAIL' if mutating else 'PASS'
-            assert status == expected and result.returncode == (2 if mutating else 0), (name, mode, status, work)
-            if mutating:
-                assert list((work / 'proof/engine_0').glob('trace*.vcd')), 'Missing mutation counterexample'
-            counted = (work / (module + '.sv')).read_text() if unit in ('ReadQueue', 'Axi', 'DataCache', 'MemoryFabric') or name == 'PipelineBackend' else body
-            reports.append(dict(module=module, propertyGroup=name, mode=mode, status=status, engine=engine,
-                                assertions=len(re.findall(r'assert\((?!1\);)', counted)), covers=counted.count('cover(')))
-            print(f'  {module} [{name}] {mode}: {status}', flush=True)
+            counted = (work / (module + '.sv')).read_text() if unit in ('ReadQueue', 'Axi', 'DataCache', 'MemoryFabric') or name in ('PipelineBackend', 'WfiFrontend') else body
+            arguments = (work, timeout, name, mode, module, engine, counted)
+            if jobs > 1 and mode.startswith('prove-bits-'):
+                proof_futures.append(executor.submit(run_check, *arguments))
+                if len(proof_futures) >= jobs:
+                    reports.append(proof_futures.pop(0).result())
+            else:
+                reports.append(run_check(*arguments))
+        reports.extend(future.result() for future in proof_futures)
+        proof_futures.clear()
+    executor.shutdown()
     assert all((rtl / p).read_text() == text for p, text in (sources | observation_sources).items()), 'RTL changed during proofs'
     assert checker_hash == hashlib.sha256(Path(__file__).read_bytes()).hexdigest(), 'Checker changed during proofs'
+    assert helper_hash == hashlib.sha256(Path(binding_helper_file).read_bytes()).hexdigest(), 'Binding helper changed during proofs'
     assert all(hashlib.sha256(Path(p).read_bytes()).hexdigest() == h for p, h in manifest['sourceHashes'].items())
     proved = {report['propertyGroup'] for report in reports if report['mode'].startswith('prove') and report['status'] == 'PASS'}
     if mutations is not None:
@@ -6034,13 +6230,17 @@ read -formal -sv {'-noautowire ' if name == 'PipelineBackend' else ''}{' '.join(
         assert {'prove', 'cover', 'mutation', 'mutation-store-missing', 'prove-storage-shape', 'prove-storage-bytes', 'prove-storage', 'cover-storage', 'mutation-storage-mask', 'mutation-storage-word'} <= {r['mode'] for r in reports if r['propertyGroup'] == 'DataCacheWriteback'}, 'Incomplete writeback authorization proof'
     if 'PipelineBackend' in proved:
         covers = {'cover', 'cover-memory', 'cover-recovery'} | ({'cover-dependency'} if manifest['parameters']['issueWidth'] > 1 else set())
+        if manifest['parameters'].get('enableBranchPrediction'):
+            covers.add('prove-control')
         if manifest['parameters'].get('loadQueueEntries', 1) == 2:
             covers |= {'prove-control', 'cover-dual', 'cover-drain', 'mutation-dual-owner', 'mutation-dual-drain'}
             if manifest['parameters']['issueWidth'] == 1:
                 covers |= {'prove-identity'}
         assert covers <= {report['mode'] for report in reports if report['propertyGroup'] == 'PipelineBackend'}, 'Incomplete pipeline covers'
+    if 'WfiFrontend' in proved and manifest['parameters'].get('branchPredictorEntries'):
+        assert {'prove-predictor', 'prove-query', 'prove-control', *(f'prove-bits-{bit}' for bit in range(0, 301, 8)), 'cover', 'mutation-prediction-target', 'mutation-prediction-metadata', 'mutation-predictor-tags', 'mutation-predictor-targets', 'mutation-predictor-counters', 'mutation-predictor-clear'} <= {r['mode'] for r in reports if r['propertyGroup'] == 'WfiFrontend'}, 'Incomplete predictor composition'
     if 'PipelineBackend' in proved and manifest['parameters']['issueWidth'] > 1:
-        assert {f'prove-bits-{bit}' for bit in range(0, 97 if manifest['parameters'].get('enableBranchPrediction') else 96, 4 if manifest['parameters']['issueWidth'] == 3 else 8)} <= {report['mode'] for report in reports}, 'Incomplete identity proof'
+        assert {f'prove-bits-{bit}' for bit in range(0, pipeline_identity_bits(manifest['parameters']), 4 if manifest['parameters']['issueWidth'] == 3 else 8)} <= {report['mode'] for report in reports}, 'Incomplete identity proof'
     if 'ReadQueue' in proved:
         payload_modes = {f'prove-payload-bits-{bit}' for bit in range(0, 64, read_bit_step)} if manifest['parameters']['hartCount'] > 2 or manifest['parameters']['axiDataBits'] > 64 else {'prove-payload'}
         expected = {'prove-permission', 'prove-permission-hold', 'prove-read-data', 'prove-control'} | {mode.replace('payload', 'storage') for mode in payload_modes}
@@ -6069,6 +6269,8 @@ read -formal -sv {'-noautowire ' if name == 'PipelineBackend' else ''}{' '.join(
     if any(r['propertyGroup'] == 'MemoryFabric' and r['mode'] == 'prove-control' for r in reports):
         tag_modes = {f'prove-tags-{bit}' for bit in range(8)} if read_slots > 2 else {'prove-tags'}
         port_modes = {f'prove-ports-{port}' for port in range(0, 32, 8)} if read_slots > 2 and manifest['parameters']['hartCount'] == 16 else set()
+        if port_modes:
+            assert {r['mode']: r['covers'] for r in reports if r['propertyGroup'] == 'MemoryFabric' and r['mode'] in ('cover', 'cover-response')} == {'cover': 3, 'cover-response': 1}, 'Incomplete fabric covers'
         assert {'prove-control', *port_modes, *tag_modes, 'cover', 'mutation-data', *(f'prove-stability-{i}' for i in range(2 * manifest['parameters']['hartCount']))} <= {r['mode'] for r in reports if r['propertyGroup'] == 'MemoryFabric'}, 'Incomplete fabric proof'
     if 'Axi' in proved and manifest['parameters']['axiDataBits'] == 512:
         assert {'prove-control', 'prove-payload', 'cover'} <= {r['mode'] for r in reports if r['propertyGroup'] == 'Axi'}, 'Incomplete AXI proof'
@@ -6089,7 +6291,8 @@ read -formal -sv {'-noautowire ' if name == 'PipelineBackend' else ''}{' '.join(
         resourceWitnessGuidance='cover/mutations only: faulting SD or configured PMP update followed by MUL and NOP, arbitrary response delay and quiescent interrupts' if 'Backend' in proved else None,
         pipelineMutationGuidance='mutations only: legal ADDI forwarding/dependency groups, SD/ALU/JAL or leading-JAL recovery sequences, faulted grouped LD and ALUs, or two loads with reverse returns or an older fault; observed PC/prediction bit selected for identity corruption; actual arithmetic and register storage' if 'PipelineBackend' in proved else None,
         pipelineCoverGuidance='cover only: independent ADDI groups, a leading SD with arbitrary response delay, lane-0-to-lane-1 RAW, recovery, or two loads with reverse returns or an older fault; translated witnesses use retained identity replies' if 'PipelineBackend' in proved else None,
-        pipelineComposition='dual-context control, ownership, metadata and architectural write/forwarding contracts proved first; accepted PC/encoding FIFO then consumes only those proved assertions; faulting head discards the younger memory group after draining' if 'PipelineBackend' in proved and manifest['parameters'].get('loadQueueEntries', 1) == 2 else None,
+        pipelineComposition='control, ownership, metadata and architectural write/forwarding contracts proved first; accepted identity FIFO then consumes only those proved assertions' if 'PipelineBackend' in proved and (manifest['parameters'].get('loadQueueEntries', 1) == 2 or manifest['parameters'].get('enableBranchPrediction')) else None,
+        predictorComposition='independent feedback state model first; per-word query and earliest target/count consume that state correspondence; frontend control and full FIFO metadata partitions use unrestricted query direction/target cutpoints after query proof; metadata consumes proved control; feedback PC word aligned; no progress theorem' if 'WfiFrontend' in proved and manifest['parameters'].get('branchPredictorEntries') else None,
         pipeline='independent FIFO of accepted PC/encoding/prediction bits checks every valid stage lane; multi-issue partitions all identity bits into four- or eight-bit proof domains; prediction provenance covers every pre-issue lane and each later head, whose control operations execute alone; greedy oldest prefix, youngest older writer, scalar effect ownership and every GPR write port; generated observation registers inlined; safety overapproximates nonzero GPR reads, with actual GPR retained for covers/mutations and separately proved' if 'PipelineBackend' in proved else None,
         synchronization='raw barrier encodings, independent accepted-data ownership until retirement, sequential instruction synchronization redirect and younger flush; no data response timing assumptions' if 'SynchronizationBackend' in proved else None,
         synchronizationWitnessGuidance='cover/mutations only: port-driven zero-address SD, FENCE/FENCE.I, one request and response stall, faulted FENCE.I and quiescent interrupts; unrestricted safety proof' if 'SynchronizationBackend' in proved else None,
@@ -6133,7 +6336,7 @@ read -formal -sv {'-noautowire ' if name == 'PipelineBackend' else ''}{' '.join(
         localInterrupts='independent request-driven MSIP, MTIME and MTIMECMP model; exact register widths, WARL bit, invalid-access isolation, read snapshots, write-once side effects, tag ownership and timer comparison; timeTick unrestricted' if 'LocalInterrupts' in proved else None,
         configurations=manifest['parameters'], sourceHashes=manifest['sourceHashes'],
         rtlHashes={p: hashlib.sha256(text.encode()).hexdigest() for p, text in (sources | observation_sources).items()},
-        checkerHash=checker_hash, tools=tools, reports=reports), indent=2) + '\n')
+        checkerHash=checker_hash, bindingHelperHash=helper_hash, tools=tools, reports=reports), indent=2) + '\n')
 
 
 if __name__ == '__main__':
@@ -6141,6 +6344,7 @@ if __name__ == '__main__':
     parser.add_argument('--rtl', type=Path, default=Path('result/production'))
     parser.add_argument('--output', type=Path, default=Path('result/formal'))
     parser.add_argument('--mutations', nargs='+')
+    parser.add_argument('--jobs', type=int, default=1)
     parser.add_argument('--modules', nargs='+', choices=('Fetch', 'WideFetch', 'Gpr', 'Multiply', 'Backend', 'PipelineBackend', 'Pmp', 'PmpDecode', 'PmpInterval', 'PmpSubset', 'Csr', 'UserCsr', 'UserExecute', 'SupervisorCsr', 'SupervisorExecute', 'SupervisorFetch', 'Lsu', 'LsuReads', 'InterruptCsr', 'InterruptBackend', 'SynchronizationBackend', 'InstructionCache', 'DataCache', 'DataCacheWriteback', 'Coherence', 'MemoryArbiter', 'ReadQueue', 'MemoryFabric', 'Memory', 'Axi', 'WordDecode', 'WordExecute', 'IntegerDecode', 'IntegerExecute', 'WfiBackend', 'WfiFrontend', 'LocalInterrupts', 'Translation'))
     args = parser.parse_args()
-    verify(args.rtl, args.output, args.modules, args.mutations)
+    verify(args.rtl, args.output, args.modules, args.mutations, args.jobs)

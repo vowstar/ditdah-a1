@@ -18,9 +18,9 @@ The executable RTL supports one to sixteen RV64 harts, M or optional M/U and M/S
 PMP is configurable to zero or sixteen entries per hart; the default uncached configuration omits it.
 MUL uses an iterative resource; accepted operations retain their instruction owner through completion or cancellation draining.
 Branches recover in EX while retaining older work; `enableBranchPrediction` enables static backward-branch and direct-jump prediction.
+`branchPredictorEntries` selects 0/8/16 direct-mapped entries with two-bit direction counters and last indirect targets; nonzero requires prediction enabled. This does not implement a return stack.
 The manifest lists implemented instructions; Sv48 and shared L2 remain design targets.
-Core composes Frontend and Backend; Frontend owns PC sequencing and Backend owns execution and retirement.
-Non-fault Backend packets contain four-byte instructions and word-aligned PCs; producers supply fetch faults.
+Core composes Frontend and Backend; Frontend owns PC sequencing and Backend owns execution and retirement. Non-fault Backend packets contain four-byte instructions and word-aligned PCs; producers supply fetch faults.
 Core exposes separate instruction/data memory ports; the physical fabric owns shared arbitration and AXI.
 Instruction permissions apply before cache lookup and to the complete refill request; region checks also protect external accesses.
 `loadQueueEntries` selects one or two ordinary data-read contexts per hart; replies retain their instruction owner and complete in order.
@@ -85,7 +85,7 @@ ELF checks build freestanding software with `RISCV_PREFIX` (default `riscv64-unk
 `make verify-width-software` checks identical loaded software across 1/2/3 issue for each of 1/2/16 harts; `make verify-zephyr-long SOFTWARE_JOBS=3` uses the pinned `ZEPHYR_BASE` checkout.
 Reachability and mutation checks exercise the properties; general multiply results are checked by simulation.
 This checks the implemented instruction subset, not full ISA compliance or physical signoff.
-`make verify-memory-concurrency` checks dual reads, fallback resources, fault/interrupt ordering and multicore console software.
+`make verify-memory-concurrency` checks dual reads, fallback resources, fault/interrupt ordering and multicore console software; `make verify-prediction` adds prediction modes, recovery, protection and fixed performance windows. `FORMAL_JOBS` controls independent proof partitions.
 
 ## Credits
 

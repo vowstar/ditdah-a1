@@ -50,6 +50,7 @@ def main():
         if args.top not in ("DitDahA1", "DitDahA1MemoryFabric", "DitDahA1ReadQueue"):
             manifest["implementation"]["fabricReadSlots"] = 0
         manifest["implementation"]["enableBranchPrediction"] = bool(manifest["parameters"]["enableBranchPrediction"] and args.top in ("DitDahA1", "DitDahA1Core", "DitDahA1Frontend"))
+        manifest["implementation"]["branchPredictorEntries"] = manifest["parameters"]["branchPredictorEntries"] if args.top in ("DitDahA1", "DitDahA1Core", "DitDahA1Frontend") else 0
         manifest["implementation"]["pmpEntries"] = 0 if scope in ("fabric", "localInterrupts", "gpr") else manifest["parameters"]["pmpEntries"]
         manifest["implementation"]["pmpState"] = bool(manifest["implementation"]["pmpEntries"] and args.top in ("DitDahA1", "DitDahA1Core", "DitDahA1Backend"))
         manifest["implementation"]["machineInterrupts"] = bool(manifest["parameters"]["enableInterrupts"] and args.top in ("DitDahA1", "DitDahA1Core", "DitDahA1Backend"))
