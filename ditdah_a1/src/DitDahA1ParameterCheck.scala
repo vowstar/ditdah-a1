@@ -207,7 +207,11 @@ object DitDahA1ParameterCheck:
     rtl.copy(dCacheWays = 2).validateFabric()
     rejects { MemoryRegion(device = true, executable = false, dataCacheable = true); () }
     assert(DitDahA1Config.parameter(DitDahA1Config.document(rtl.copy(memoryRegions = Seq(MemoryRegion(dataCacheable = true))))).memoryRegions.head.dataCacheable)
-    rejects { rtl.copy(l2CacheBytes = 131072).validateRtl() }
+    for bytes <- Seq(0, 131072) do rtl.copy(l2CacheBytes = bytes).validateRtl()
+    rejects { rtl.copy(l2CacheBytes = 262144).validateRtl() }
+    rtl.copy(l2CacheBytes = 262144).validateFrontend()
+    rtl.copy(l2CacheBytes = 262144).validateBackend()
+    rtl.copy(l2CacheBytes = 262144).validateFabric()
     rejects { rtl.copy(memoryRegions = Seq.empty).validateRtl() }
     rejects { rtl.copy(memoryRegions = Seq(MemoryRegion(executable = false))).validateRtl() }
     rejects { rtl.copy(memoryRegions = Seq(MemoryRegion(base = (BigInt(1) << 56) - 8, size = 16))); () }

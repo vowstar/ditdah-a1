@@ -86,13 +86,16 @@ case class DitDahA1Parameter(
     validateFabric()
     validateDataCache()
     require(!enableDataBurstRefill || dCacheBytes != 0, "Data burst refill requires a data cache")
-    require(l2CacheBytes == 0, "RTL does not support a shared cache")
+    validateSharedCache()
     require(memoryRegions.exists(r => r.executable && resetVector >= r.base && resetVector + 4 <= r.base + r.size), "Reset vector must be in executable memory")
 
   def resolvedFabricReadSlots: Int = fabricReadSlots.getOrElse(if hartCount > 1 then 2 else 0)
 
   def validateDataCache(): Unit =
     require(dCacheBytes != 0 || dCacheWays == 1, "Associativity requires a data cache")
+
+  def validateSharedCache(): Unit =
+    require(l2CacheBytes == 0 || l2CacheBytes == 131072, "RTL supports zero or 131072 shared cache bytes")
 
   def validateReadSlots(): Unit =
     require(resolvedFabricReadSlots >= (if hartCount == 1 then 0 else 1) &&

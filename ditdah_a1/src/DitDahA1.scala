@@ -40,7 +40,13 @@ object DitDahA1Module extends Generator[DitDahA1Parameter, DitDahA1Layers, DitDa
     fabric.io.clock := io.clock
     fabric.io.reset := io.reset
     if parameter.localInterruptBase.nonEmpty then fabric.io.timeTick.get := io.timeTick.get
-    io.axi :<>= fabric.io.axi
+    if parameter.l2CacheBytes == 0 then io.axi :<>= fabric.io.axi
+    else
+      val sharedCache = DitDahA1SharedCache.instantiate(parameter)
+      sharedCache.io.clock := io.clock
+      sharedCache.io.reset := io.reset
+      sharedCache.io.upstream :<>= fabric.io.axi
+      io.axi :<>= sharedCache.io.downstream
     io.status.trap := cores.map[Referable[Bool]](_.io.status.trap).reduce(_ | _)
     io.status.busy := cores.map[Referable[Bool]](_.io.status.busy).reduce(_ | _)
     io.status.sleep := cores.map[Referable[Bool]](_.io.status.sleep).reduce(_ & _)

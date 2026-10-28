@@ -54,6 +54,34 @@ module core_tb;
     $write("SOURCE %0d ", context_index % (2*HARTS));
     if (`LOAD_QUEUE_ENTRIES == 2) $write("TAG %02h ", accepted_request[context_index].tag);
   endtask
+  function automatic integer read_owner(input logic [IDW-1:0] identity);
+    integer owner;
+    owner = -1;
+    for (integer source = 0; source < CLIENT_CONTEXTS; source++)
+      if (active_source[source] >= 0 && transport_id[source] == integer'(identity)) begin
+        if (owner >= 0) $fatal(1, "Ambiguous live AXI ID");
+        owner = source;
+      end
+    if (owner < 0) $fatal(1, "AXI ID lacks accepted ownership");
+    return owner;
+  endfunction
+  task automatic emit_read(input integer source, input logic [63:0] address,
+      input logic [2:0] size, input bit line, fetch, input logic [DW-1:0] data,
+      input logic [1:0] response, input bit last);
+    if (HARTS > 1) $write("HART %0d ", (source % (2*HARTS)) / 2);
+    emit_source(source);
+    if (line) $display("LINE_BEAT %016h %01h %h %01h", address, response, data, last);
+    else $display("READ %016h %01h %016h", address, response,
+      64'(data >> (8 * (address % (DW/8)))) & access_mask(size));
+    if (fetch) begin
+      for (integer word_index = 0; word_index < (line ? DW/32 : 1); word_index++) begin
+        if (HARTS > 1) $write("HART %0d ", (source % (2*HARTS)) / 2);
+        emit_source(source);
+        $display("FETCH %016h %01h %08h", address + 4 * word_index, response,
+          32'(data >> (8 * (address % (DW/8)) + 32 * word_index)));
+      end
+    end
+  endtask
   `include "core_bindings.svh"
   logic clock = 0;
   logic reset = 1;
@@ -138,6 +166,8 @@ module core_tb;
   logic write_exclusive = 0, exclusive_success, write_success;
   integer reservation_max = 0;
   integer exclusive_failures;
+  integer writeback_failures = 0;
+  bit writeback_fault;
   logic [31:0] random_state;
   logic aw_held = 0, w_held = 0, write_pending = 0;
   logic [63:0] write_address;
@@ -156,6 +186,7 @@ module core_tb;
   logic [READ_CONTEXTS-1:0] read_live, read_lines, read_older;
   integer read_slot = 0, accept_read_slot, read_serial = 0, data_reads[HARTS];
   integer read_peak = 0, read_reordered = 0, reorder_reads = 0;
+  longint unsigned external_bytes = 0, external_data_reads = 0, external_data_bytes = 0;
   integer fixed_read_delay = -1;
   bit fixed_address_held = 0;
   integer line_peak = 0, line_overlap_cycles = 0;
@@ -209,6 +240,7 @@ module core_tb;
     if (!$value$plusargs("FAULT_WRITE=%h", fault_write)) fault_write = '1;
     if (!$value$plusargs("FAULT_EXCLUSIVE=%h", fault_exclusive)) fault_exclusive = '1;
     if (!$value$plusargs("EXCLUSIVE_FAILURES=%d", exclusive_failures)) exclusive_failures = 0;
+    if (!$value$plusargs("WRITEBACK_FAILURES=%d", writeback_failures)) writeback_failures = 0;
     if (!$value$plusargs("INTERFERENCE=%d", interference)) interference = 0;
     console_enabled = $value$plusargs("CONSOLE_BASE=%h", console_base);
     if (console_enabled) begin
@@ -279,16 +311,11 @@ module core_tb;
         if (read_context[slot].valid && read_context[slot].delay > 0) read_context[slot].delay <= read_context[slot].delay - 1;
       if (arvalid && arready) begin
         integer read_source, delay_index;
-        read_source = -1;
-        for (integer source = 0; source < CLIENT_CONTEXTS; source++)
-          if (active_source[source] >= 0 && transport_id[source] == integer'(arid)) begin
-            if (read_source >= 0) $fatal(1, "Ambiguous live AXI ID");
-            read_source = source;
-          end
-        if (read_source < 0) $fatal(1, "AXI ID lacks accepted ownership");
+        read_source = read_owner(arid);
         delay_index = `LOAD_QUEUE_ENTRIES == 2 ? (read_source % (2*HARTS)) / 2 : 0;
         if (!console_address(64'(araddr)) && (64'(araddr) < base_address || 64'(araddr) + (1 << arsize) * (1 + integer'(arlen)) > base_address + MB)) $fatal(1, "Truncated or unexpected read address");
-        if (arlen != (accepted_request[read_source].size == 6 ? 64 / (DW/8) - 1 : 0) || arburst != 1 || (arlock && arprot[2]) || arcache != 0 || arqos != 0) $fatal(1, "Read attributes");
+        if (arlen != (accepted_request[read_source].size == 6 ? 64 / (DW/8) - 1 : 0) || arburst != 1 || (arlock && arprot[2]) ||
+            arcache != expected_cache(64'(araddr), (1 << arsize) * (1 + integer'(arlen)), arprot[2], 0, arlock) || arqos != 0) $fatal(1, "Read attributes");
         if (arprot != {accepted_request[read_source].fetch, 1'b0, accepted_request[read_source].privileged}) $fatal(1, "Read privilege");
         if ((accepted_request[read_source].size == 6 ? arsize != $clog2(DW/8) : arprot[2] ? arsize != 2 : arsize > 3) ||
             (arlock && arsize != 3) || (araddr & ((1 << arsize) - 1)) != 0) $fatal(1, "Read alignment");
@@ -312,6 +339,11 @@ module core_tb;
         read_context[accept_read_slot].exclusive <= arlock;
         read_context[accept_read_slot].order <= read_serial;
         read_serial = read_serial + 1;
+        external_bytes += (1 + 64'(arlen)) << arsize;
+        if (!arprot[2]) begin
+          external_data_reads++;
+          external_data_bytes += (1 + 64'(arlen)) << arsize;
+        end
         read_context[accept_read_slot].delay <= arprot[2] ? integer'(random_state[5:4]) : 32 + integer'(random_state[7:4]);
         if (fixed_read_delay >= 0) read_context[accept_read_slot].delay <= arprot[2] ? 1 : fixed_read_delay;
         if (!arprot[2] && !arlock) begin
@@ -344,19 +376,7 @@ module core_tb;
           rvalid <= 1;
       end
       if (rvalid && rready) begin
-        if (HARTS > 1) $write("HART %0d ", (read_context[read_slot].source % (2*HARTS)) / 2);
-        emit_source(read_context[read_slot].source);
-        if (read_line) $display("LINE_BEAT %016h %01h %h %01h", read_address, rresp, rdata, rlast);
-        else $display("READ %016h %01h %016h", read_address, rresp,
-          64'(rdata >> (8 * (read_address % (DW/8)))) & access_mask(read_size));
-        if (read_fetch) begin
-          for (integer word_index = 0; word_index < (read_line ? DW/32 : 1); word_index++) begin
-            if (HARTS > 1) $write("HART %0d ", (read_context[read_slot].source % (2*HARTS)) / 2);
-            emit_source(read_context[read_slot].source);
-            $display("FETCH %016h %01h %08h", read_address + 4 * word_index, rresp,
-              32'(rdata >> (8 * (read_address % (DW/8)) + 32 * word_index)));
-          end
-        end
+        emit_read(read_context[read_slot].source, read_address, read_size, read_line, read_fetch, rdata, rresp, rlast);
         if (rlast) begin
           if (|read_older)
             read_reordered = read_reordered + 1;
@@ -372,7 +392,8 @@ module core_tb;
       if (awvalid && awready) begin
         if (!console_address(64'(awaddr)) && (64'(awaddr) < base_address || 64'(awaddr) + (1 << awsize) > base_address + MB)) $fatal(1, "Truncated or unexpected write address");
         if (awid >= HARTS || active_source[bus_owner] < 0 || awid != IDW'(bus_owner / 2) || awlen != 0 || awsize > 3 || (awlock && awsize != 3) ||
-            awburst != 1 || awcache != 0 || awprot != (writeback_pending ? 3'b001 : {2'b0, accepted_request[bus_owner].privileged}) || awqos != 0 ||
+            awburst != 1 || awcache != expected_cache(64'(awaddr), 1 << awsize, 0, 1, awlock) ||
+            awprot != (writeback_pending ? 3'b001 : {2'b0, accepted_request[bus_owner].privileged}) || awqos != 0 ||
             (awaddr & ((1 << awsize) - 1)) != 0) $fatal(1, "Write attributes");
         aw_held <= 1;
         write_address <= 64'(awaddr);
@@ -407,8 +428,10 @@ module core_tb;
           end else console_lines[bus_owner / 2] = {console_lines[bus_owner / 2], 8'(write_data >> (8 * (write_address % (DW/8))))};
         end
         exclusive_success = reservation_valid[write_id] && reservation_address[write_id] == write_address && reservation_size[write_id] == write_size;
-        write_success = write_address != fault_write && (!write_exclusive || exclusive_success);
-        bresp <= write_address == fault_write ? 2 : (write_exclusive ? (exclusive_success ? 1 : 0) : 0);
+        writeback_fault = writeback_pending && writeback_failures > 0;
+        if (writeback_fault) writeback_failures--;
+        write_success = write_address != fault_write && !writeback_fault && (!write_exclusive || exclusive_success);
+        bresp <= write_address == fault_write || writeback_fault ? 2 : (write_exclusive ? (exclusive_success ? 1 : 0) : 0);
         if (write_exclusive && exclusive_success && exclusive_failures > 0 && write_address != fault_write) begin
           interference_value = 0;
           for (integer i = 0; i < 8; i++) interference_value[i*8 +: 8] = memory[integer'(write_address - base_address) + i];
@@ -487,6 +510,7 @@ module core_tb;
         $display("THROUGHPUT %0d %0d", issue_max, retire_max);
         $display("CYCLES %0d", cycles);
         $display("READ_CONCURRENCY %0d %0d", read_peak, read_reordered);
+        $display("EXTERNAL_READS %0d %0d %0d %0d", read_serial, external_bytes, external_data_reads, external_data_bytes);
         $display("LINE_CONCURRENCY %0d %0d", line_peak, line_overlap_cycles);
         $display("PASS"); $finish;
       end

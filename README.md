@@ -19,7 +19,7 @@ PMP is configurable to zero or sixteen entries per hart; the default uncached co
 MUL uses an iterative resource; accepted operations retain their instruction owner through completion or cancellation draining.
 Branches recover in EX while retaining older work; `enableBranchPrediction` enables static backward-branch and direct-jump prediction.
 `branchPredictorEntries` selects 0/8/16 direct-mapped entries with two-bit direction counters and last indirect targets; nonzero requires prediction enabled. This does not implement a return stack.
-The manifest lists implemented instructions; Sv48 and shared L2 remain design targets.
+The manifest lists implemented instructions; Sv48 remains a design target.
 Core composes Frontend and Backend; Frontend owns PC sequencing and Backend owns execution and retirement. Non-fault Backend packets contain four-byte instructions and word-aligned PCs; producers supply fetch faults.
 Core exposes separate instruction/data memory ports; the physical fabric owns shared arbitration and AXI.
 Instruction permissions apply before cache lookup and to the complete refill request; region checks also protect external accesses.
@@ -44,10 +44,8 @@ make verify-signoff
 `make config` writes the uncached configuration to `result/ditdah_a1_config.json`; `make check` validates configuration, memory-region, and serialization contracts.
 `configure-ditdah-a1 --config input.json --output result/config.json` validates a supplied configuration.
 `build-ditdah-a1 --config input.json --output result/rtl` generates supported RTL configurations.
-Use `--top DitDahA1Core`, `DitDahA1Frontend`, `DitDahA1Backend`, or `DitDahA1MemoryFabric` for independent generation.
-Component builds validate their own domain; whole-system generation rejects unimplemented features.
-The manifest records the selected top and validation scope; unrelated parameters do not enable hardware features.
-Add `--trace` to retain the separate DV bind files.
+Use `--top DitDahA1Core`, `DitDahA1Frontend`, `DitDahA1Backend`, or `DitDahA1MemoryFabric` for independent generation; `--trace` retains the separate DV bind files.
+Component builds validate their domain; system builds reject unimplemented features, and the manifest records the selected top and scope.
 The default physical map is 64 KiB of RAM at zero; configure regions for the intended system.
 Set a region's `atomic` flag only for readable, writable, non-device memory with end-to-end exclusive monitoring of every competing writer.
 The flag defaults to false; unsupported exclusive reads and bus errors fault without rollback guarantees.
@@ -60,6 +58,8 @@ Ordinary loads use eight-byte sectors; narrow refills require full-word permissi
 `dCacheRefillBytes` defaults to 8; set it to 64 for protected whole-line refills independent of I-cache. Expanded-read errors drain and retry the original demand without installing a partial line.
 Set `dCacheWriteback` for dirty-byte tracking, ownership probes and masked writeback; errors retain dirty data and retry. Ordinary writes invalidate peer copies, and atomic operations invalidate all copies.
 Writeback cacheable service is serialized and uses privileged maintenance writes for previously authorized dirty bytes; new demands retain their protection checks. External writers require platform coordination; no DMA coherence is implemented.
+Set `l2CacheBytes` to zero for bypass or 131072 for a shared, direct-mapped 128 KiB cache with 64-byte lines and one read transaction at a time.
+The shared cache is non-inclusive and write-through without write allocation; private caches retain dirty ownership. Writes invalidate shared copies, while exclusive and device accesses bypass it; cache hits retain upstream protection checks.
 Set `pmpEntries` to 16 to enable protection; successful PMP writes restart younger execution while accepted fetches drain.
 Set `enableUserMode` for Bare M/U execution and effective data privilege via MPRV.
 Set `enableSupervisorMode` with user mode and interrupts for M/S/U, standard trap delegation and SRET.

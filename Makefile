@@ -74,6 +74,23 @@ verify-signoff: verify-writeback verify-formal
 	$(MAKE) verify-memory-concurrency
 	$(MAKE) verify-prediction
 	$(MAKE) verify-cache-configuration
+	$(MAKE) verify-shared-cache
+
+.PHONY: verify-shared-cache
+SHARED_OUTPUT ?= result/shared-cache-signoff
+SHARED_ARGS = --load-queue-entries 2 --fabric-read-slots 4 --pmp-entries 16 --icache-bytes 8192 --burst-refill --dcache-bytes 8192 --dcache-ways 2 --dcache-refill-bytes 64 --dcache-writeback
+verify-shared-cache:
+	python3 test/verify.py --shared-cache-arrays --output $(SHARED_OUTPUT)/arrays
+	for bus in 256 512; do python3 test/formal.py --rtl $(SHARED_OUTPUT)/arrays/axi$$bus/rtl --output $(SHARED_OUTPUT)/formal$$bus --modules SharedCache || exit $$?; done
+	for profile in 2:128:2 16:512:3; do \
+		count=$${profile%%:*}; rest=$${profile#*:}; bus=$${rest%%:*}; width=$${rest#*:}; \
+		python3 test/verify.py $(SHARED_ARGS) --l2-cache-bytes 131072 --multicore-only --harts $$count --width $$bus --issue-width $$width --output $(SHARED_OUTPUT)/harts$$count --case data_coherence --case writeback_retry --case synchronization --case cache_reservation --case atomic_lrsc_shared --case atomic_interrupt || exit $$?; \
+	done
+	python3 test/verify.py $(SHARED_ARGS) --fabric-read-slots 3 --l2-cache-bytes 131072 --user-mode --interrupts --width 512 --issue-width 3 --output $(SHARED_OUTPUT)/protected --case user_mprv --case pmp_update --case pmp_permissions --case interrupt_read_pending --case synchronization --case fence_i_prefetch --case fence_ordering
+	python3 test/verify.py $(SHARED_ARGS) --fabric-read-slots 3 --l2-cache-bytes 131072 --sv39 --tlb-entries 4 --width 256 --issue-width 3 --output $(SHARED_OUTPUT)/translation --case sv39_context --case sv39_reuse --case sv39_accessed --case sv39_protection --case sv39_sum --case sv39_mxr
+	python3 test/verify.py $(SHARED_ARGS) --dcache-ways 1 --multicore-only --harts 2 --width 128 --issue-width 2 --output $(SHARED_OUTPUT)/conflict0 --case cache_conflict
+	python3 test/verify.py $(SHARED_ARGS) --dcache-ways 1 --l2-cache-bytes 131072 --multicore-only --harts 2 --width 128 --issue-width 2 --output $(SHARED_OUTPUT)/conflict1 --case cache_conflict --shared-cache-baseline $(SHARED_OUTPUT)/conflict0/summary.json
+	python3 test/verify.py --software-matrix --config $(SOFTWARE_CONFIG) --l2-cache-bytes 131072 --load-queue-entries 2 --icache-bytes 8192 --burst-refill --dcache-bytes 8192 --dcache-ways 2 --dcache-refill-bytes 64 --dcache-writeback --output $(SHARED_OUTPUT)/software --jobs $(SOFTWARE_JOBS)
 
 .PHONY: verify-cache-configuration
 CACHE_OUTPUT ?= result/cache-configuration

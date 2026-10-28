@@ -24,6 +24,7 @@ def verify_storage(rtl, directory):
     manifest = json.loads((rtl / 'ditdah_a1_config.json').read_text())
     size = manifest['implementation']['iCacheBytes']
     data_size = manifest['implementation'].get('dCacheBytes', 0)
+    shared_size = manifest['implementation'].get('l2CacheBytes', 0)
     ways = manifest['parameters'].get('dCacheWays', 1)
     way_size = data_size // ways
     files = (rtl / 'filelist.f').read_text().splitlines()
@@ -37,7 +38,7 @@ def verify_storage(rtl, directory):
         assert len(re.findall(r'\breg\s+\[\d+:0\]\s+block\s*;', queue)) == int(bool(wide_line)), 'Shared beat storage'
         assert bool(re.search(r'\bbeat\b', queue)) == bool(parameter['enableBurstRefill'] or parameter['dCacheRefillBytes'] == 64)
     arrays = {file[:-3]: tuple(map(int, re.search(r'_(\d+)x(\d+)\.sv$', file).groups()))
-              for file in files if file.startswith(('instructions_', 'tags_', 'data_', 'dataTags_', 'dataDirty_', 'mem_'))}
+              for file in files if file.startswith(('instructions_', 'tags_', 'data_', 'dataTags_', 'dataDirty_', 'sharedData_', 'sharedTags_', 'mem_'))}
     assert ('DitDahA1InstructionCache.sv' in files) == bool(size)
     assert ('DitDahA1DataCache.sv' in files) == bool(data_size)
     banks = 1 << (manifest['parameters']['issueWidth'] - 1).bit_length() if size else 1
@@ -48,6 +49,10 @@ def verify_storage(rtl, directory):
                         dataTags=(way_size // 64, manifest['parameters']['physicalAddressBits'] - (way_size // 64).bit_length() - 5))
     if data_size and manifest['parameters'].get('dCacheWriteback'):
         expected['dataDirty'] = (way_size // 8, 8)
+    if shared_size:
+        expected.update(sharedData=(shared_size // (manifest['parameters']['axiDataBits'] // 8), manifest['parameters']['axiDataBits']),
+                        sharedTags=(shared_size // 64, manifest['parameters']['physicalAddressBits'] - (shared_size - 1).bit_length()))
+    assert ('DitDahA1SharedCache.sv' in files) == bool(shared_size)
     assert set(arrays.values()) == set(expected.values())
     if size:
         cache = (rtl / 'DitDahA1InstructionCache.sv').read_text()
@@ -75,6 +80,7 @@ def verify_storage(rtl, directory):
     visit(manifest['top'])
     expected_caches = manifest['parameters']['hartCount'] if manifest['top'] == 'DitDahA1' else 1
     assert instances.get('DitDahA1DataCache', 0) == (expected_caches if data_size else 0), 'Physical cache instance count'
+    assert instances.get('DitDahA1SharedCache', 0) == int(bool(shared_size)), 'Physical shared cache instance count'
     report = []
     directory.mkdir(parents=True, exist_ok=True)
     for module, (depth, width) in arrays.items():
@@ -739,6 +745,22 @@ def memory_contract(parameters):
     downstream_response_valid = 0;
 '''
     return body
+
+
+def axi_cache_attributes(parameters):
+    regions = ''
+    if parameters.get('l2CacheBytes'):
+        for r in parameters['memoryRegions']:
+            if r['device']:
+                continue
+            lower = f"address >= 64'd{int(r['base'])} && " if int(r['base']) else ''
+            regions += f'''    if ({lower}address + bytes <= 64'd{int(r['base']) + int(r['size'])})
+      expected_cache = !locked && (fetch ? {int(r['executable'])} : {int(r['readable'] and r.get('dataCacheable', False))}) ? (write_access ? 6 : 14) : 2;
+'''
+    return '''  function automatic logic [3:0] expected_cache(input logic [63:0] address,
+      input integer bytes, input bit fetch, write_access, locked);
+    expected_cache = 0;
+''' + regions + '  endfunction\n'
 
 
 def axi_contract(width, harts):
@@ -4210,9 +4232,142 @@ def local_interrupt_contract(parameters):
     return body
 
 
+def shared_cache_contract(parameters):
+    width = parameters['axiDataBits']
+    size, beat_bytes = (width // 8).bit_length() - 1, width // 8
+    beats = 64 // beat_bytes
+    region = next(r for r in parameters['memoryRegions'] if not r['device'] and
+                  (r['executable'] or r['readable'] and r.get('dataCacheable')) and int(r['size']) >= 128)
+    base = (int(region['base']) + 63) & ~63
+    prot = 0 if region['readable'] and region.get('dataCacheable') else 4
+    body = ''
+
+    def read(address, miss, count=1, access_size=size, lock=False, error=-1, wrong_id=-1, chunks=None, version=0, cache=14):
+        nonlocal body
+        body += f'''    upstream_ar_bits_addr = {parameters['physicalAddressBits']}'h{address:x}; upstream_ar_bits_id = 1;
+    upstream_ar_bits_len = {count-1}; upstream_ar_bits_size = {access_size}; upstream_ar_bits_burst = 1;
+    upstream_ar_bits_lock = {int(lock)}; upstream_ar_bits_prot = {prot}; upstream_ar_bits_cache = {cache}; upstream_ar_bits_qos = 2;
+    upstream_ar_valid = 1; upstream_r_ready = 0; downstream_ar_ready = 0;
+    #1; while (!upstream_ar_ready) tick(); tick(); upstream_ar_valid = 0;
+'''
+        if miss:
+            body += f'''    while (!downstream_ar_valid) begin check(!upstream_r_valid, "Cold read requires physical service"); tick(); end
+    repeat (3) begin
+      check(downstream_ar_valid && downstream_ar_bits_addr == {parameters['physicalAddressBits']}'h{address:x} &&
+        downstream_ar_bits_id == 1 && downstream_ar_bits_len == {count-1} && downstream_ar_bits_size == {access_size} &&
+        downstream_ar_bits_lock == {int(lock)} && downstream_ar_bits_prot == {prot} && downstream_ar_bits_cache == {cache} && downstream_ar_bits_qos == 2,
+        "Miss address and attributes retained under backpressure"); tick();
+    end
+    downstream_ar_ready = 1; tick(); downstream_ar_ready = 0;
+'''
+        actual = count if chunks is None else chunks
+        for beat in range(actual):
+            physical = (address & -beat_bytes) + beat * beat_bytes
+            value = sum(((physical + 8 * word + version + 19) * 0x0102030405060709 & MASK) << (64 * word) for word in range(width // 64))
+            last, response, identity = int(beat == actual - 1), 2 if beat == error else 0, 1 ^ int(beat == wrong_id)
+            if miss:
+                body += f'''    downstream_r_bits_data = {width}'h{value:x}; downstream_r_bits_id = {identity};
+    downstream_r_bits_resp = {response}; downstream_r_bits_last = {last}; downstream_r_valid = 1;
+'''
+            body += f'''    while (!upstream_r_valid) begin check(!downstream_ar_valid, "Hit issued an external read"); tick(); end
+    repeat (3) begin
+      check(upstream_r_valid && upstream_r_bits_data == {width}'h{value:x} && upstream_r_bits_id == {identity} &&
+        upstream_r_bits_resp == {response} && upstream_r_bits_last == {last} && !upstream_ar_ready && !downstream_ar_valid,
+        "Read bytes, identity and terminal framing held"); tick();
+    end
+    upstream_r_ready = 1; tick(); upstream_r_ready = 0;
+'''
+            if miss:
+                body += '    downstream_r_valid = 0;\n'
+
+    def write(address, order, response=0):
+        nonlocal body
+        body += f'''    upstream_aw_bits_addr = {parameters['physicalAddressBits']}'h{address:x}; upstream_aw_bits_id = 1;
+    upstream_aw_bits_len = 0; upstream_aw_bits_size = 0; upstream_aw_bits_burst = 1;
+    upstream_w_bits_data = 91; upstream_w_bits_strb = 1; upstream_w_bits_last = 1;
+    downstream_aw_ready = 1; downstream_w_ready = 1; upstream_b_ready = 0;
+'''
+        for channel in (('aw', 'w') if order == 0 else ('w', 'aw') if order == 1 else ('aw',)):
+            both = order == 2
+            body += f'    upstream_{channel}_valid = 1;\n'
+            if both:
+                body += '    upstream_w_valid = 1;\n'
+            body += f'''    #1; while (!upstream_{channel}_ready) tick();
+    check(downstream_{channel}_valid, "Write channel forwarded");
+    check(downstream_aw_bits_addr == {parameters['physicalAddressBits']}'h{address:x} && downstream_aw_bits_id == 1 &&
+      downstream_w_bits_data == 91 && downstream_w_bits_strb == 1 && downstream_w_bits_last, "Write payload retained");
+    tick(); upstream_{channel}_valid = 0;
+'''
+            if both:
+                body += '    upstream_w_valid = 0;\n'
+        body += f'''    downstream_aw_ready = 0; downstream_w_ready = 0;
+    downstream_b_bits_id = 1; downstream_b_bits_resp = {response}; downstream_b_valid = 1;
+    upstream_ar_valid = 1;
+    repeat (3) begin
+      check(upstream_b_valid && upstream_b_bits_id == 1 && upstream_b_bits_resp == {response} &&
+        !downstream_b_ready && !upstream_ar_ready && !downstream_ar_valid, "Write response and invalidation ordered before new reads"); tick();
+    end
+    upstream_b_ready = 1; tick(); upstream_b_ready = 0; downstream_b_valid = 0; upstream_ar_valid = 0;
+'''
+
+    read(base, True, beats)
+    for cache in (0, 1, 2, 3):
+        read(base, True, beats, cache=cache)
+    read(base, False, beats)
+    read(base + 64, True, beats, cache=10)
+    read(base + 64, True, beats, cache=10)
+    read(base, False, beats, cache=10)
+    if int(region['size']) < 2 * parameters['l2CacheBytes']:
+        read(base, False, beats)
+        for order in range(3):
+            write(base, order, 2 if order == 1 else 0)
+            read(base, True, beats, version=order + 1)
+            read(base, False, beats, version=order + 1)
+        read(base, True, beats, lock=True)
+        read(base, True, beats)
+        read(base, False, beats)
+        return body
+    write(base, 0)
+    for address in (base, base + parameters['l2CacheBytes'] - 64):
+        read(address, True, beats)
+        read(address, False, beats)
+        read(address + beat_bytes - 1, False, access_size=0)
+    other = base + parameters['l2CacheBytes']
+    read(other, True, beats)
+    read(base, True, beats)
+    for order in range(3):
+        write(base, order, 2 if order == 1 else 0)
+        read(base, True, beats, version=order + 1)
+        read(base, False, beats, version=order + 1)
+    read(base, True, beats, lock=True)
+    read(base, True, beats)
+    read(base, False, beats)
+    for options in (dict(error=beats-1), dict(wrong_id=0), dict(chunks=beats+1), *([dict(chunks=beats-1)] if beats > 1 else [])):
+        read(other, True, beats, **options)
+        read(other, True, beats)
+        read(base, True, beats)
+    narrow = base + 64
+    read(narrow, True, access_size=0)
+    read(narrow, True, access_size=0)
+    read(narrow, True)
+    read(narrow, False)
+    for bit in range((parameters['l2CacheBytes'] - 1).bit_length(), parameters['physicalAddressBits']):
+        alias = base + (1 << bit)
+        if alias + 64 <= int(region['base']) + int(region['size']):
+            read(alias, True, beats)
+            read(base, True, beats)
+    for r in parameters['memoryRegions']:
+        if r['device']:
+            read(int(r['base']), True)
+            read(int(r['base']), True)
+            break
+    return body
+
+
 def verify(rtl, directory, modules=None):
     directory.mkdir(parents=True, exist_ok=True)
-    parameters = json.loads((rtl / 'ditdah_a1_config.json').read_text())['parameters']
+    manifest = json.loads((rtl / 'ditdah_a1_config.json').read_text())
+    parameters = manifest['parameters']
     verified = []
     enabled = parameters['pmpEntries'] != 0
     cached = bool(parameters['iCacheBytes'])
@@ -4241,6 +4396,8 @@ def verify(rtl, directory, modules=None):
     if parameters.get('dCacheBytes'):
         suites += (('DitDahA1DataCache', data_cache_queue_contract(parameters) if parameters.get('loadQueueEntries', 1) == 2 else data_cache_contract(parameters)),
                    ('DitDahA1Coherence', coherence_contract(parameters)))
+    if manifest['implementation'].get('l2CacheBytes'):
+        suites += (('DitDahA1SharedCache', shared_cache_contract(parameters)),)
     if enabled:
         suites += (('DitDahA1Pmp', pmp_contract(parameters)),)
     identity = ''.join(f'''    hartId = {hart}; readAddress = 'hf14;
@@ -4283,7 +4440,19 @@ def verify(rtl, directory, modules=None):
                 body = re.sub(r'\bdut\.(instruction|decoded|issued|result|memory|commit)Valid\b',
                               r'(dut.\1Count != 0)', body)
                 body += backend_group_contract(parameters) + (backend_branch_contract() if parameters.get('loadQueueEntries', 1) == 1 else '') + backend_memory_group_contract(parameters)
-        test.write_text(bench(module, body))
+        source = bench(module, body)
+        if name in ('DitDahA1Axi', 'DitDahA1ReadQueue'):
+            prefix = 'axi_' if name == 'DitDahA1Axi' else ''
+            checks = axi_cache_attributes(parameters)
+            for channel in ('ar', 'aw') if name == 'DitDahA1Axi' else ('ar',):
+                signal = prefix + channel
+                checks += f'''  always @(posedge clock) if (!reset && {signal}_valid)
+    if ({signal}_bits_cache != expected_cache({signal}_bits_addr,
+      (1 << {signal}_bits_size) * (1 + integer'({signal}_bits_len)), {signal}_bits_prot[2],
+      {int(channel == 'aw')}, {signal}_bits_lock)) $fatal(1, "AXI memory type and allocation attributes");
+'''
+            source = source.replace('  initial begin', checks + '  initial begin', 1)
+        test.write_text(source)
         binary = directory / name
         dependencies = [rtl / 'DitDahA1Fetch.sv'] if name == 'DitDahA1Frontend' else []
         if cached and name in ('DitDahA1Fetch', 'DitDahA1Frontend'):
@@ -4302,6 +4471,9 @@ def verify(rtl, directory, modules=None):
         if name == 'DitDahA1DataCache':
             dependencies = [rtl / file for file in (rtl / 'filelist.f').read_text().splitlines()
                             if file.startswith(('data_', 'dataTags_', 'dataDirty_', 'mem_'))]
+        if name == 'DitDahA1SharedCache':
+            dependencies = [rtl / file for file in (rtl / 'filelist.f').read_text().splitlines()
+                            if file.startswith(('sharedData_', 'sharedTags_', 'mem_'))]
         if name == 'DitDahA1Backend':
             dependencies = [rtl / ('DitDahA1' + child + '.sv') for child in ('Decode', 'Issue', 'Execute', 'Multiply', 'Commit', 'Gpr', 'Csr', 'Lsu')]
         if enabled and name in ('DitDahA1Fetch', 'DitDahA1Lsu', 'DitDahA1Frontend', 'DitDahA1Backend'):

@@ -896,6 +896,8 @@ def interrupt_cases(base, protection):
 def multicore_cases(base, harts, protection=False, interrupts=False, user=False, writeback=False):
     yield 'load_window', load_window_program(base, harts)
     yield 'load_cancel', load_window_program(base, harts, cancel=True)
+    if writeback:
+        yield from ((name, program) for name, program in data_cache_access_cases(base, protection) if name == 'cache_conflict')
     p = Program(base)
     p.emit(csr(2, 0xf14, 0, True), alu(3, 2, 3, 1, immediate=True))
     p.address(10, 0x1800)
@@ -925,6 +927,9 @@ def multicore_cases(base, harts, protection=False, interrupts=False, user=False,
     yield 'synchronization', synchronization_program(base, harts, writeback)
     yield 'data_coherence', data_coherence_program(base, harts)
     if writeback:
+        retry = data_coherence_program(base, harts)
+        retry.writeback_failures = 2
+        yield 'writeback_retry', retry
         p = Program(base)
         p.emit(csr(2, 0xf14, 0, True), addi(14, 0, 1), addi(7, 0, 0x22), addi(15, 0, 0x33))
         for register, address in ((10, 0x1800), (11, 0x1880), (12, 0x18c0), (13, 0x2000)):
