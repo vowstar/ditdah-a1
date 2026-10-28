@@ -14,6 +14,7 @@ case class DitDahA1Parameter(
   tlbEntries: Int = 0,
   iCacheBytes: Int = 32768,
   dCacheBytes: Int = 32768,
+  dCacheWays: Int = 1,
   dCacheRefillBytes: Int = 8,
   dCacheWriteback: Boolean = false,
   l2CacheBytes: Int = 262144,
@@ -42,6 +43,7 @@ case class DitDahA1Parameter(
   require((resetVector & 1) == 0, "resetVector must be halfword aligned")
   require(iCacheBytes == 0 || (powerOfTwo(iCacheBytes) && iCacheBytes >= 8192 && iCacheBytes <= 65536), "iCacheBytes must be a power of two between 8192 and 65536")
   require(dCacheBytes == 0 || (powerOfTwo(dCacheBytes) && dCacheBytes >= 8192 && dCacheBytes <= 65536), "dCacheBytes must be a power of two between 8192 and 65536")
+  require(Set(1, 2).contains(dCacheWays), "dCacheWays must be one or two")
   require(Set(8, 64).contains(dCacheRefillBytes), "dCacheRefillBytes must be eight or sixty-four")
   require(l2CacheBytes == 0 || (powerOfTwo(l2CacheBytes) && l2CacheBytes >= 131072 && l2CacheBytes <= 8388608), "l2CacheBytes must be zero or a power of two between 131072 and 8388608")
   require(Set(64, 128, 256, 512).contains(axiDataBits), "axiDataBits must be 64, 128, 256, or 512")
@@ -82,12 +84,15 @@ case class DitDahA1Parameter(
   def validateRtl(): Unit =
     validateCore()
     validateFabric()
-    require(dCacheBytes == 0 || dCacheBytes == 8192, "RTL supports zero or 8192 data cache bytes")
+    validateDataCache()
     require(!enableDataBurstRefill || dCacheBytes != 0, "Data burst refill requires a data cache")
     require(l2CacheBytes == 0, "RTL does not support a shared cache")
     require(memoryRegions.exists(r => r.executable && resetVector >= r.base && resetVector + 4 <= r.base + r.size), "Reset vector must be in executable memory")
 
   def resolvedFabricReadSlots: Int = fabricReadSlots.getOrElse(if hartCount > 1 then 2 else 0)
+
+  def validateDataCache(): Unit =
+    require(dCacheBytes != 0 || dCacheWays == 1, "Associativity requires a data cache")
 
   def validateReadSlots(): Unit =
     require(resolvedFabricReadSlots >= (if hartCount == 1 then 0 else 1) &&
@@ -96,7 +101,7 @@ case class DitDahA1Parameter(
 
   def validateFabric(): Unit =
     validateReadSlots()
-    require(!dCacheWriteback || dCacheBytes == 8192, "Writeback requires an 8192-byte data cache")
+    require(!dCacheWriteback || dCacheBytes != 0, "Writeback requires a data cache")
     localInterruptBase.foreach { base =>
       require(enableInterrupts, "Local interrupt sources require machine interrupts")
       require(base >= 0 && (base & 65535) == 0 && base + 65536 <= (BigInt(1) << physicalAddressBits), "Local interrupt window must be aligned and fit the physical address space")

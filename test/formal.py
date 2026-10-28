@@ -2980,6 +2980,108 @@ def instruction_cache_case(parameters):
             ': ~filling | responseFault | bypass | ~complete')
 
 
+def associative_cache_case(parameters):
+    sets = parameters['dCacheBytes'] // 128
+    index = (sets - 1).bit_length()
+    words = sets * 8
+    wb = parameters.get('dCacheWriteback', False)
+    dual = parameters.get('loadQueueEntries', 1) == 2
+    waiting = '(state == 3 || state == 5)' if parameters.get('dCacheRefillBytes') == 64 else 'state == 3'
+    body = f'''
+  reg ways_past = 0;
+  reg [63:0] ways_victim, ways_parked_victim;
+  wire ways_restore = {('upstream_response_valid && upstream_response_ready && parkedValid' if dual else '0')};
+  wire ways_switch = {(waiting + ' && downstream_response_valid && parkedValid && downstream_response_bits_tag == parked_request_tag && downstream_response_bits_tag != request_tag' if dual else '0')};
+  wire ways_save = {(waiting + ' && upstream_request_valid && upstream_request_ready || ways_switch' if dual else '0')};
+  wire ways_swap = ways_restore || ways_switch;
+  wire [{index-1}:0] ways_set = request_address[{index+5}:6];
+  wire [7:0] ways_valid0 = valid >> (ways_set * 8);
+  wire [7:0] ways_valid1 = valid >> ({words} + ways_set * 8);
+  wire ways_match0 = |ways_valid0 && FORMAL_TAG0_R0_data == request_address[{parameters['physicalAddressBits']-1}:{index+6}];
+  wire ways_match1 = |ways_valid1 && FORMAL_TAG1_R0_data == request_address[{parameters['physicalAddressBits']-1}:{index+6}];
+  wire ways_expected = ways_match0 ? 0 : ways_match1 ? 1 : !ways_valid0 ? 0 : !ways_valid1 ? 1 : lru[ways_set];
+  wire ways_selected = WAYS_SELECTED;
+  wire ways_fill = FORMAL_DATA0_W0_en || FORMAL_DATA1_W0_en;
+  wire ways_install = FORMAL_TAG0_W0_en || FORMAL_TAG1_W0_en;
+  wire ways_reply = downstream_response_valid && downstream_response_ready;
+  wire ways_error = downstream_response_bits_fault || downstream_response_bits_tag != request_tag;
+  wire [{index+2}:0] ways_row = request_address[{index+5}:3];
+  wire ways_bus_write = state == 3 && ways_reply && !ways_error && !fault && !invalidated && !WAYS_COLLISION;
+  always @(posedge clock) begin
+    ways_past <= 1;
+    if (!ways_past) assume(reset); else assume(!reset);
+    if (!reset) begin
+      assert(!(FORMAL_DATA0_W0_en && FORMAL_DATA1_W0_en));
+      assert(!(FORMAL_TAG0_W0_en && FORMAL_TAG1_W0_en));
+      if (state == 1) assert(ways_selected == ways_expected);
+      if (state == 1) ways_victim <= {{(ways_expected ? FORMAL_TAG1_R0_data : FORMAL_TAG0_R0_data), ways_set, 6'b0}};
+      if (ways_save) ways_parked_victim <= ways_victim;
+      if (ways_swap) ways_victim <= ways_parked_victim;
+      if (state != 1) assert(ways_selected == way);
+      if (ways_fill) begin
+        assert(ways_bus_write && FORMAL_DATA1_W0_en == ways_selected);
+        assert(FORMAL_DATA0_W0_addr == FORMAL_DATA1_W0_addr);
+        assert(FORMAL_DATA0_W0_data == FORMAL_DATA1_W0_data);
+        if (!storeUpdating && {("(!line || (downstream_response_bits_last && beat == 7))" if parameters.get('dCacheRefillBytes') == 64 else "1")})
+          assert(ways_install);
+      end
+      if (ways_install) begin
+        assert(ways_fill && FORMAL_TAG1_W0_en == ways_selected);
+        assert(FORMAL_TAG0_W0_addr == ways_set && FORMAL_TAG1_W0_addr == ways_set);
+        assert(FORMAL_TAG0_W0_data == request_address[{parameters['physicalAddressBits']-1}:{index+6}]);
+        assert(FORMAL_TAG1_W0_data == FORMAL_TAG0_W0_data);
+      end
+      if (ways_past && $past(!reset)) begin
+        if ($past(state == 1 && !ways_swap)) assert(way == $past(ways_expected));
+        {('if ($past(ways_save)) assert(parked_way == $past(way)); if ($past(ways_swap)) assert(way == $past(parked_way));' if dual else '')}
+        if ({int(not dual)} && $past(downstream_request_valid && !downstream_request_ready)) begin
+          assert(downstream_request_valid);
+          assert($stable({{downstream_request_bits_address, downstream_request_bits_tag, downstream_request_bits_cacheOperation}}));
+        end
+      end
+      cover(ways_fill && ways_selected);
+      cover(state == 1 && ways_match0 && ways_valid1 != 0);
+      cover(state == 1 && ways_match1 && ways_valid0 != 0);
+    end
+  end
+  reg ways_probe_owned = 0;
+  always @(posedge clock) if (reset) ways_probe_owned <= 0; else begin
+    assert(ways_probe_owned == {('(probeState != 0)' if wb else 'probePending')});
+    assert(!probe_response_valid || ways_probe_owned);
+    if (probe_response_valid && probe_response_ready && probe_response_bits_last) ways_probe_owned <= 0;
+    if (probe_request_valid && probe_request_ready) ways_probe_owned <= 1;
+    if (ways_past && $past(!reset && probe_response_valid && !probe_response_ready))
+      assert(probe_response_valid && $stable({{probe_response_bits_data, probe_response_bits_mask, probe_response_bits_word, probe_response_bits_last}}));
+  end
+'''
+    if wb:
+        body += f'''
+  wire [{index-1}:0] ways_probe_set = probeRequest_address[{index+5}:6];
+  wire [7:0] ways_probe_valid0 = valid >> (ways_probe_set * 8);
+  wire [7:0] ways_probe_valid1 = valid >> ({words} + ways_probe_set * 8);
+  wire ways_probe_match0 = |ways_probe_valid0 && FORMAL_TAG0_R0_data == (probeRequest_address >> {index+6});
+  wire ways_probe_match1 = |ways_probe_valid1 && FORMAL_TAG1_R0_data == (probeRequest_address >> {index+6});
+  wire ways_probe_expected = !ways_probe_match0 && ways_probe_match1;
+  wire ways_probe_selected = WAYS_PROBE_SELECTED;
+  always @(posedge clock) if (!reset) begin
+    if (probeState == 1) assert(ways_probe_selected == ways_probe_expected);
+    else assert(ways_probe_selected == probeWay);
+    if (ways_past && $past(!reset && probeState == 1)) begin
+      assert(probeWay == $past(ways_probe_expected));
+      assert(probeMatch == $past(ways_probe_match0 || ways_probe_match1));
+    end
+    if (state >= 2 && releasing) assert(victim == ways_victim);
+    {('if (parkedValid && parked_releasing) assert(parked_victim == ways_parked_victim);' if dual else '')}
+    if (probe_response_valid && probe_response_ready && probe_response_bits_mask != 0) begin
+      assert(ways_probe_selected ? FORMAL_DIRTY1_W0_en : FORMAL_DIRTY0_W0_en);
+      assert((ways_probe_selected ? FORMAL_DIRTY1_W0_data : FORMAL_DIRTY0_W0_data) == 0);
+    end
+    cover(probe_response_valid && probeMatch && probeWay);
+  end
+'''
+    return ('DataCacheAssociativity', body, 'assign upstream_response_valid =', "assign upstream_response_valid = 1'h1 |")
+
+
 def writeback_cache_case(parameters):
     index = (parameters['dCacheBytes'] // 64 - 1).bit_length()
     lines = parameters['dCacheBytes'] // 64
@@ -4521,6 +4623,13 @@ def read_queue_case(parameters):
     return ('ReadQueue', body, 'assign ar_bits_len =', "assign ar_bits_len = 8'h80 |")
 
 
+def partition_covers(text, selected, count):
+    pattern = r'\bcover\([^;]+;'
+    assert len(re.findall(pattern, text)) == count, 'Unknown cover inventory'
+    positions = iter(range(count))
+    return re.sub(pattern, lambda match: match[0] if next(positions) == selected else 'begin end', text)
+
+
 def verify(rtl, directory, modules=None, mutations=None, jobs=1):
     assert jobs >= 1
     assert mutations is None or modules and all(mode.startswith('mutation') for mode in mutations), 'Select modules and negative controls'
@@ -4585,7 +4694,8 @@ def verify(rtl, directory, modules=None, mutations=None, jobs=1):
     if manifest['parameters'].get('iCacheBytes'):
         cases.append(instruction_cache_case(manifest['parameters']))
     if manifest['parameters'].get('dCacheBytes'):
-        cases += [writeback_cache_case(manifest['parameters']) if manifest['parameters'].get('dCacheWriteback') else data_cache_case(manifest['parameters']),
+        cases += [associative_cache_case(manifest['parameters']) if manifest['parameters'].get('dCacheWays', 1) == 2 else
+                  writeback_cache_case(manifest['parameters']) if manifest['parameters'].get('dCacheWriteback') else data_cache_case(manifest['parameters']),
                   coherence_case(manifest['parameters'])]
     if manifest['parameters'].get('enableInterrupts'):
         cases = [*cases, *(case for case in interrupt_cases(manifest['parameters'])
@@ -4605,7 +4715,7 @@ def verify(rtl, directory, modules=None, mutations=None, jobs=1):
         if modules and name not in modules and not (name.startswith('Pmp') and 'Pmp' in modules):
             continue
         unit = name.removeprefix('Interrupt').removeprefix('Synchronization').removeprefix('Pipeline').removeprefix('Word').removeprefix('Integer').removeprefix('Wfi').removeprefix('User').removeprefix('Supervisor').removeprefix('Wide')
-        if name == 'DataCacheWriteback':
+        if name in ('DataCacheWriteback', 'DataCacheAssociativity'):
             unit = 'DataCache'
         if name == 'LsuReads':
             unit = 'Lsu'
@@ -4706,7 +4816,22 @@ def verify(rtl, directory, modules=None, mutations=None, jobs=1):
                     body += '  always @(posedge clock) if (!reset && state != 0) assert(privileged == access_privileged);\n'
             else:
                 body += f'  always @(posedge clock) if (!reset && {output}_valid) assert({output}_bits_privileged);\n'
-        if unit == 'DataCache':
+        if name == 'DataCacheAssociativity':
+            capacity = manifest['parameters']['dCacheBytes'] // 2
+            tag_bits = manifest['parameters']['physicalAddressBits'] - (capacity - 1).bit_length()
+            original = sources['DitDahA1DataCache.sv']
+            cache_memories = tuple((rf'\w+_{capacity//divisor}x{width}', stem + ('_0' if way else ''), prefix + str(way))
+                for divisor, width, stem, prefix in ((8, 64, 'data_ext', 'DATA'), (64, tag_bits, 'dataTags_ext', 'TAG'),
+                    *(((8, 8, 'dataDirty_ext', 'DIRTY'),) if manifest['parameters'].get('dCacheWriteback') else ()))
+                for way in (0, 1))
+            way_ports = [instance_ports(original, memory, instance)[0][1] for memory, instance, _ in cache_memories]
+            selected = re.search(r'&\s*(\w+)\s*$', way_ports[1]['W0_en'])[1]
+            collision = re.search(r'wire\s+(\w+)\s*=\s*invalidating\s*&', original)[1]
+            body = body.replace('WAYS_SELECTED', selected).replace('WAYS_COLLISION', collision)
+            if manifest['parameters'].get('dCacheWriteback'):
+                probe_select = re.search(r'clearing\s*&\s*(\w+)\s*$', way_ports[-1]['W0_en'])[1]
+                body = body.replace('WAYS_PROBE_SELECTED', probe_select)
+        if unit == 'DataCache' and name != 'DataCacheAssociativity':
             capacity = manifest['parameters']['dCacheBytes']
             tag_bits = manifest['parameters']['physicalAddressBits'] - (capacity - 1).bit_length()
             cache_memories = ((rf'\w+_{capacity//8}x64', 'data_ext', 'DATA'),
@@ -5043,6 +5168,18 @@ endmodule''', 1)
             before = re.search(r': ~\w+ \| abort \| responseFault \| bypass \| ~complete', sources[module + '.sv']).group()
             after = before.replace(' | abort', '')
         checks = [('prove', before, after), ('cover', before, after), ('mutation', before, after)]
+        if name == 'DataCacheAssociativity':
+            route = re.search(r'\.W0_en\s*\([^\n]+\)', instance_ports(original, *cache_memories[0][:2])[0][0]).group()
+            checks[-1] = ('mutation', route, route.replace('~' + selected, "1'h1"))
+            tag_write = re.search(r'\.W0_en\s*\([^\n]+\)', instance_ports(original, *cache_memories[3][:2])[0][0]).group()
+            checks.append(('mutation-way-tag', tag_write, ".W0_en (1'h0)"))
+            tag_enable = '(' + way_ports[2]['W0_en'] + ') | (' + way_ports[3]['W0_en'] + ')'
+            checks.append(('mutation-way-duplicate', tag_write, '.W0_en (' + tag_enable + ')'))
+            if manifest['parameters']['dCacheBytes'] > 8192:
+                checks[1:2] = [(f'cover-{i}', before, after) for i in range(3 + int(manifest['parameters'].get('dCacheWriteback', False)))]
+            if manifest['parameters'].get('dCacheWriteback'):
+                victim_update = re.search(r'\bvictim <= \{[^;]+;', original).group()
+                checks.append(('mutation-way-victim', victim_update, "victim <= 0;"))
         if name == 'LsuReads':
             checks += [('mutation-value', 'assign output_bits_value =', "assign output_bits_value = 64'h1 ^"),
                        ('mutation-cancel', 'assign memory_request_valid =', 'assign memory_request_valid = ~cancel &')]
@@ -5352,6 +5489,8 @@ endmodule''', 1)
                        ('mutation-count', count, 'assign upstream_response_bits_count = 1;')]
         if name == 'DataCacheWriteback':
             original = sources[module + '.sv']
+            if manifest['parameters'].get('dCacheRefillBytes') == 64:
+                checks[1:2] = [(f'cover-{i}', before, after) for i in range(4)]
             store_update = re.search(r'wire\s+storeUpdating\s*=[^;]+;', original).group()
             checks += [('mutation-store-missing', store_update, store_update.replace('storeHit', "1'h0"))]
             dirty_ports = instance_ports(original, *cache_memories[-1][:2])[0][0]
@@ -5361,7 +5500,7 @@ endmodule''', 1)
                        ('prove-storage', before, after), ('cover-storage', before, after),
                        ('mutation-storage-mask', dirty_data, '.W0_data (8\'hff)'),
                        ('mutation-storage-word', word_output, word_output.replace('probeWord', "(probeWord ^ 3'h1)"))]
-        if unit == 'DataCache' and name != 'DataCacheWriteback':
+        if name == 'DataCache':
             original = sources[module + '.sv']
             store_update = re.search(r'wire\s+storeUpdating\s*=[^;]+;', original).group()
             store_data = re.search(r'\bdata & ~\(storeMask\[63:0\]\)[^\n]+', original).group()
@@ -5453,6 +5592,9 @@ endmodule''', 1)
         if name == 'WfiFrontend' and manifest['parameters'].get('branchPredictorEntries'):
             checks[:1] = [('prove-predictor', before, after), ('prove-query', before, after), ('prove-control', before, after),
                           *((f'prove-bits-{bit}', before, after) for bit in range(0, 301, 8))]
+            if manifest['parameters']['branchPredictorEntries'] == 16:
+                position = next(i for i, check in enumerate(checks) if check[0] == 'cover')
+                checks[position:position+1] = [(f'cover-{i}', before, after) for i in range(body.count('cover('))]
             for field in ('tags', 'targets', 'counters'):
                 updates = re.findall(r'\b' + field + r'_0 <=[^;]+;', original)
                 update = next(update for update in reversed(updates) if original.count(update) == 1)
@@ -5476,6 +5618,8 @@ endmodule''', 1)
             work = directory / f'{name.lower()}-{mode}'
             work.mkdir(exist_ok=True)
             for filename, text in files.items():
+                if name == 'WfiFrontend' and mode.startswith('cover-') and filename == module + '.sv':
+                    text = partition_covers(text, int(mode.rsplit('-', 1)[1]), body.count('cover('))
                 if name == 'WfiFrontend' and filename == module + '.sv' and manifest['parameters'].get('branchPredictorEntries'):
                     if mode == 'prove-predictor':
                         text = re.sub(r'\bassert\([^;]+;', lambda m: m[0] if re.search(r'front_(?:valid|tag|targets|counters|conditional)', m[0]) else 'assert(1);', text)
@@ -5985,7 +6129,55 @@ endmodule''', 1)
                     if mode == 'mutation-count':
                         guidance += f'  always @* assume(cache_scenario == 0 && upstream_request_bits_size == {banks.bit_length()+1} && upstream_request_bits_tag == 0);\n'
                     text = text.replace('endmodule', guidance + '\nendmodule', 1)
+                if name == 'DataCacheAssociativity' and not proving and filename == module + '.sv':
+                    base = min(int(r['base']) for r in manifest['parameters']['memoryRegions'] if r.get('dataCacheable'))
+                    span = manifest['parameters']['dCacheBytes'] // 2
+                    victim_witness = mode == 'mutation-way-victim'
+                    address = f"(ways_done[0] ? 64'd{base+span} : 64'd{base})"
+                    limit, probe_after, write, refill = 4, 4, '0', '0'
+                    tag0, tag1 = base // span, base // span + 1
+                    if victim_witness:
+                        tag0, tag1, write = tag1, tag0, '(ways_done == 1)'
+                        if manifest['parameters'].get('dCacheRefillBytes') == 64:
+                            limit, refill = 3, '(ways_done == 2 ? 6 : 0)'
+                            address = f"(ways_done == 2 ? 64'd{base+span+8} : 64'd{base+span})"
+                        else:
+                            address = f"(ways_done == 3 ? 64'd{base+2*span} : ways_done == 2 ? 64'd{base} : 64'd{base+span})"
+                    cover_index = int(mode.rsplit('-', 1)[1]) if mode.startswith('cover-') else None
+                    if cover_index is not None:
+                        limit = 2 if cover_index in (0, 3) else 3
+                        probe_after = 2 if cover_index == 3 else -1
+                        if cover_index == 2:
+                            address = f"(ways_done == 0 ? 64'd{base} : 64'd{base+span})"
+                        text = partition_covers(text, cover_index, 3 + int(manifest['parameters'].get('dCacheWriteback', False)))
+                    guide = f'''
+  reg [2:0] ways_done = 0;
+  reg ways_probed = 0;
+  always @(posedge clock) if (!reset) begin
+    if (upstream_response_valid && upstream_response_ready) ways_done <= ways_done + 1;
+    if (probe_request_valid && probe_request_ready) ways_probed <= 1;
+  end
+  always @* begin
+    assume(upstream_request_valid == (state == 0 && ways_done < {limit}));
+    assume(upstream_response_ready && downstream_request_ready && probe_response_ready);
+    assume(upstream_request_bits_address == {address});
+    assume(upstream_request_bits_size == 3 && upstream_request_bits_refillSize == {refill});
+    assume(upstream_request_bits_tag == 0 && upstream_request_bits_cacheOperation == 0);
+    assume(!upstream_request_bits_fetch && !upstream_request_bits_atomic && upstream_request_bits_privileged);
+    assume(upstream_request_bits_write == {write});
+    assume(upstream_request_bits_mask == 255 && upstream_request_bits_data == 91);
+    assume(downstream_response_valid == (state == 3 && {("probeState == 0 && !releasing" if manifest['parameters'].get('dCacheWriteback') else "1")}));
+    assume(!downstream_response_bits_fault && downstream_response_bits_last && downstream_response_bits_tag == 0);
+    assume(FORMAL_TAG0_R0_data == {tag0} && FORMAL_TAG1_R0_data == {tag1});
+    assume(probe_request_valid == {("0" if victim_witness or probe_after < 0 else f"(ways_done == {probe_after} && !ways_probed)")});
+    assume(probe_request_bits_address == {base+span} && probe_request_bits_invalidate);
+  end
+'''
+                    text = text.replace('endmodule', guide + '\nendmodule', 1)
                 if name == 'DataCacheWriteback' and not proving and filename == module + '.sv':
+                    cover_index = int(mode.rsplit('-', 1)[1]) if mode.startswith('cover-') and mode != 'cover-storage' else None
+                    if cover_index is not None:
+                        text = partition_covers(text, cover_index, 4)
                     base = min(int(r['base']) for r in manifest['parameters']['memoryRegions'] if r.get('dataCacheable') and r['writable'])
                     base = (base + 63) & ~63
                     guidance = f'''
@@ -6001,7 +6193,7 @@ endmodule''', 1)
   always @* begin
     assume(upstream_request_valid == (state == 0 && wb_witness_completed < 3));
     assume(upstream_response_ready && downstream_request_ready);
-    assume(upstream_request_bits_address == (wb_witness_completed == 2 ? 64'h{base+8192:x} : 64'h{base:x}));
+    assume(upstream_request_bits_address == (wb_witness_completed == 2 ? 64'h{base+manifest['parameters']['dCacheBytes']:x} : 64'h{base:x}));
     assume(upstream_request_bits_size == 3 && upstream_request_bits_tag == 0);
     assume(upstream_request_bits_write == (wb_witness_completed == 1));
     assume(!upstream_request_bits_fetch && !upstream_request_bits_atomic && upstream_request_bits_privileged);
@@ -6017,6 +6209,8 @@ endmodule''', 1)
   end
 '''
                     text = text.replace('endmodule', guidance + '\nendmodule', 1)
+                    if cover_index is not None:
+                        text = text.replace('(* anyconst *) reg wb_witness_error;', f'wire wb_witness_error = {int(cover_index == 2)};')
                     if 'storage' in mode:
                         sector = (manifest['parameters']['dCacheBytes'] // 8 - 1).bit_length()
                         watched = (base >> 3) % (1 << sector)
@@ -6092,6 +6286,17 @@ endmodule''', 1)
                         text = text.replace('endmodule', guidance + '\nendmodule', 1)
                 if unit == 'Coherence' and mode == 'mutation-acknowledgement' and filename == module + '.sv':
                     text = text.replace('endmodule', "  always @* assume(probe_0_response_bits_mask != 0);\nendmodule", 1)
+                if name in ('DataCacheWriteback', 'DataCacheAssociativity') and not proving and filename == module + '.sv':
+                    addresses = re.findall(r'assume\(upstream_request_bits_address == ([^\n]+)\);', text)
+                    assert len(addresses) == 1, 'Ambiguous cache witness address'
+                    text, count = re.subn(r'\binput(\s+\[63:0\]\s+)upstream_request_bits_address\b', r'input\1formal_unused_address', text)
+                    assert count == 1, 'Missing witness address input'
+                    text = text.replace('endmodule', f'wire [63:0] upstream_request_bits_address = {addresses[0]};\nendmodule', 1)
+                    if name == 'DataCacheWriteback' and 'storage' in mode:
+                        rows = re.findall(r'assume\(auth_watched == ([^;\n]+)\);', text)
+                        assert len(rows) == 1, 'Ambiguous storage witness row'
+                        text, count = re.subn(r'\(\* anyconst \*\) reg (\[[^]]+\]) auth_watched;', r'wire \1 auth_watched = ' + rows[0] + ';', text)
+                        assert count == 1, 'Missing storage witness row'
                 if mutating and filename == mutated_file:
                     assert text.count(before) == (2 if name == 'Csr' else 1), (name, before)
                     text = text.replace(before, after, 1)
@@ -6111,8 +6316,20 @@ endmodule''', 1)
                     assert 'FORMAL_CACHE_PIN_' not in text
                 if unit == 'DataCache' and filename == module + '.sv':
                     for memory, instance, prefix in cache_memories:
-                        for pin, expression in instance_ports(text, memory, instance)[0][1].items():
+                        pins = instance_ports(text, memory, instance)[0][1]
+                        for pin, expression in pins.items():
                             text = text.replace(f'FORMAL_{prefix}_{pin}', '(' + expression + ')')
+                        if not proving and 'storage' not in mode and prefix.startswith('TAG'):
+                            value = pins['R0_data']
+                            fixed = re.findall(r'assume\(\(?' + re.escape(value) + r"\)? == (\d+|\d+'[hdb][0-9a-fA-F]+)\);", text)
+                            if fixed:
+                                assert len(fixed) == 1
+                                primitive = re.search(r'(\w+)\s+' + instance + r'\s*\(', text)[1]
+                                assert 'assign R0_data = arbitrary_read;\nendmodule' in files[primitive + '.sv']
+                                connection = re.compile(r'\.R0_data\s*\(' + re.escape(value) + r'\)')
+                                text, count = connection.subn('.R0_data ()', text)
+                                assert count == 1
+                                text = text.replace('endmodule', f'assign {value} = {fixed[0]};\nendmodule', 1)
                     assert 'FORMAL_DATA_' not in text and 'FORMAL_TAG_' not in text
                 if unit == 'Backend' and filename == module + '.sv':
                     text = re.sub(r'\binstruction_bits_(pc|tag|instruction|length|fault|cause|tval)\b',
@@ -6168,6 +6385,10 @@ endmodule''', 1)
                 timeout = 180 if mode == 'cover-storage' and manifest['parameters'].get('dCacheRefillBytes', 8) == 64 else 90
             if unit == 'DataCache' and task == 'prove':
                 timeout = 180
+            if name == 'DataCacheAssociativity' and mode in ('cover-3', 'mutation-way-victim') and manifest['parameters']['dCacheBytes'] == 65536 and manifest['parameters'].get('loadQueueEntries', 1) == 2:
+                timeout = 120
+            if name == 'DataCacheWriteback' and mode == 'prove-storage-bytes' and manifest['parameters']['dCacheBytes'] > 8192:
+                engine = 'smtbmc --syn --unroll z3'
             if unit == 'ReadQueue' and mode.startswith(('prove-storage-bits-', 'prove-payload-bits-')):
                 timeout = 180
             if unit == 'ReadQueue' and mode == 'cover-global' and read_slots > 2:
@@ -6203,7 +6424,7 @@ timeout {timeout}
 {witness_option}[engines]
 {engine}
 [script]
-read -formal -sv {'-noautowire ' if name == 'PipelineBackend' else ''}{' '.join(files)}
+read -formal -sv {'-noautowire ' if name in ('PipelineBackend', 'DataCacheAssociativity') else ''}{' '.join(files)}
 {preparation}
 [files]
 ''' + '\n'.join(files) + '\n'
@@ -6227,7 +6448,14 @@ read -formal -sv {'-noautowire ' if name == 'PipelineBackend' else ''}{' '.join(
     if mutations is not None:
         assert set(mutations) == {report['mode'] for report in reports}, 'Incomplete negative-control selection'
     if 'DataCacheWriteback' in proved:
-        assert {'prove', 'cover', 'mutation', 'mutation-store-missing', 'prove-storage-shape', 'prove-storage-bytes', 'prove-storage', 'cover-storage', 'mutation-storage-mask', 'mutation-storage-word'} <= {r['mode'] for r in reports if r['propertyGroup'] == 'DataCacheWriteback'}, 'Incomplete writeback authorization proof'
+        covers = {f'cover-{i}' for i in range(4)} if manifest['parameters'].get('dCacheRefillBytes') == 64 else {'cover'}
+        assert {'prove', *covers, 'mutation', 'mutation-store-missing', 'prove-storage-shape', 'prove-storage-bytes', 'prove-storage', 'cover-storage', 'mutation-storage-mask', 'mutation-storage-word'} <= {r['mode'] for r in reports if r['propertyGroup'] == 'DataCacheWriteback'}, 'Incomplete writeback authorization proof'
+        assert sum(r['covers'] for r in reports if r['propertyGroup'] == 'DataCacheWriteback' and r['mode'] in covers) == 4, 'Incomplete writeback covers'
+    if 'DataCacheAssociativity' in proved:
+        covers = {f'cover-{i}' for i in range(3 + int(manifest['parameters'].get('dCacheWriteback', False)))} if manifest['parameters']['dCacheBytes'] > 8192 else {'cover'}
+        expected = {'prove', *covers, 'mutation', 'mutation-way-tag', 'mutation-way-duplicate'} | ({'mutation-way-victim'} if manifest['parameters'].get('dCacheWriteback') else set())
+        assert expected <= {r['mode'] for r in reports if r['propertyGroup'] == 'DataCacheAssociativity'}, 'Incomplete associativity proof'
+        assert sum(r['covers'] for r in reports if r['propertyGroup'] == 'DataCacheAssociativity' and r['mode'] in covers) == 3 + int(manifest['parameters'].get('dCacheWriteback', False)), 'Incomplete associativity covers'
     if 'PipelineBackend' in proved:
         covers = {'cover', 'cover-memory', 'cover-recovery'} | ({'cover-dependency'} if manifest['parameters']['issueWidth'] > 1 else set())
         if manifest['parameters'].get('enableBranchPrediction'):
@@ -6238,7 +6466,10 @@ read -formal -sv {'-noautowire ' if name == 'PipelineBackend' else ''}{' '.join(
                 covers |= {'prove-identity'}
         assert covers <= {report['mode'] for report in reports if report['propertyGroup'] == 'PipelineBackend'}, 'Incomplete pipeline covers'
     if 'WfiFrontend' in proved and manifest['parameters'].get('branchPredictorEntries'):
-        assert {'prove-predictor', 'prove-query', 'prove-control', *(f'prove-bits-{bit}' for bit in range(0, 301, 8)), 'cover', 'mutation-prediction-target', 'mutation-prediction-metadata', 'mutation-predictor-tags', 'mutation-predictor-targets', 'mutation-predictor-counters', 'mutation-predictor-clear'} <= {r['mode'] for r in reports if r['propertyGroup'] == 'WfiFrontend'}, 'Incomplete predictor composition'
+        covers = {f'cover-{i}' for i in range(frontend_case(manifest['parameters']).count('cover('))} if manifest['parameters']['branchPredictorEntries'] == 16 else {'cover'}
+        assert {'prove-predictor', 'prove-query', 'prove-control', *(f'prove-bits-{bit}' for bit in range(0, 301, 8)), *covers, 'mutation-prediction-target', 'mutation-prediction-metadata', 'mutation-predictor-tags', 'mutation-predictor-targets', 'mutation-predictor-counters', 'mutation-predictor-clear'} <= {r['mode'] for r in reports if r['propertyGroup'] == 'WfiFrontend'}, 'Incomplete predictor composition'
+        if manifest['parameters']['branchPredictorEntries'] == 16:
+            assert sum(r['covers'] for r in reports if r['propertyGroup'] == 'WfiFrontend' and r['mode'] in covers) == len(covers), 'Incomplete predictor covers'
     if 'PipelineBackend' in proved and manifest['parameters']['issueWidth'] > 1:
         assert {f'prove-bits-{bit}' for bit in range(0, pipeline_identity_bits(manifest['parameters']), 4 if manifest['parameters']['issueWidth'] == 3 else 8)} <= {report['mode'] for report in reports}, 'Incomplete identity proof'
     if 'ReadQueue' in proved:
@@ -6297,6 +6528,7 @@ read -formal -sv {'-noautowire ' if name == 'PipelineBackend' else ''}{' '.join(
         synchronization='raw barrier encodings, independent accepted-data ownership until retirement, sequential instruction synchronization redirect and younger flush; no data response timing assumptions' if 'SynchronizationBackend' in proved else None,
         synchronizationWitnessGuidance='cover/mutations only: port-driven zero-address SD, FENCE/FENCE.I, one request and response stall, faulted FENCE.I and quiescent interrupts; unrestricted safety proof' if 'SynchronizationBackend' in proved else None,
         instructionCache='control proof at configured geometry; arbitrary native SRAM read outputs; independent ownership, authorization, response fault/tag/last history, native write data, complete publication, invalidation and precise fallback; functional array contents require separate simulation' if 'InstructionCache' in proved else None,
+        associativeCache='independent tag/valid/empty/LRU selection, exclusive way writes, tag installation, captured victim and probe-way identity with arbitrary SRAM read values; finite cover and mutations use directed legal demands; does not prove stored-byte provenance, full cache contents or producer authorization' if 'DataCacheAssociativity' in proved else None,
         writebackCache='control safety with arbitrary data, tag and dirty-metadata SRAM outputs; captured request/probe ownership, stable native samples, terminal-only dirty release, required successful-acquire byte merge and dirty-mask union; upstream scalar size<=3 and internal operation zero, replies require owned requests, scalar/acquire replies terminate and held replies/probes persist; no full-cache contents, global coherence, privilege or progress theorem' if 'DataCacheWriteback' in proved else None,
         writebackCacheWitnessGuidance='cover/mutations only: legal refill, store grant or fault, dirty-victim replacement and held probe frames; safety has no witness restrictions' if 'DataCacheWriteback' in proved else None,
         writebackStorage='storage safety consumes the earlier unrestricted control assertions, then proves request/tag shape, stored-byte provenance and frame output in dependency order; arbitrary watched native dirty-metadata word and its line tag preserve emitted registered-address/current-array-value timing; independent accepted store shape/PMA and byte authorization history prove dirty masks and emitted physical-word identity; other rows and data SRAM remain arbitrary; upstream PMP authorization is a producer composition prerequisite, not proved at this cache boundary; storage mutations disable earlier control assertions only to target the authorization properties' if 'DataCacheWriteback' in proved else None,
@@ -6345,6 +6577,6 @@ if __name__ == '__main__':
     parser.add_argument('--output', type=Path, default=Path('result/formal'))
     parser.add_argument('--mutations', nargs='+')
     parser.add_argument('--jobs', type=int, default=1)
-    parser.add_argument('--modules', nargs='+', choices=('Fetch', 'WideFetch', 'Gpr', 'Multiply', 'Backend', 'PipelineBackend', 'Pmp', 'PmpDecode', 'PmpInterval', 'PmpSubset', 'Csr', 'UserCsr', 'UserExecute', 'SupervisorCsr', 'SupervisorExecute', 'SupervisorFetch', 'Lsu', 'LsuReads', 'InterruptCsr', 'InterruptBackend', 'SynchronizationBackend', 'InstructionCache', 'DataCache', 'DataCacheWriteback', 'Coherence', 'MemoryArbiter', 'ReadQueue', 'MemoryFabric', 'Memory', 'Axi', 'WordDecode', 'WordExecute', 'IntegerDecode', 'IntegerExecute', 'WfiBackend', 'WfiFrontend', 'LocalInterrupts', 'Translation'))
+    parser.add_argument('--modules', nargs='+', choices=('Fetch', 'WideFetch', 'Gpr', 'Multiply', 'Backend', 'PipelineBackend', 'Pmp', 'PmpDecode', 'PmpInterval', 'PmpSubset', 'Csr', 'UserCsr', 'UserExecute', 'SupervisorCsr', 'SupervisorExecute', 'SupervisorFetch', 'Lsu', 'LsuReads', 'InterruptCsr', 'InterruptBackend', 'SynchronizationBackend', 'InstructionCache', 'DataCache', 'DataCacheWriteback', 'DataCacheAssociativity', 'Coherence', 'MemoryArbiter', 'ReadQueue', 'MemoryFabric', 'Memory', 'Axi', 'WordDecode', 'WordExecute', 'IntegerDecode', 'IntegerExecute', 'WfiBackend', 'WfiFrontend', 'LocalInterrupts', 'Translation'))
     args = parser.parse_args()
     verify(args.rtl, args.output, args.modules, args.mutations, args.jobs)

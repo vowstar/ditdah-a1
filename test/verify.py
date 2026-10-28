@@ -378,24 +378,31 @@ def compile_tb(rtl, directory, width, pa, top='core_tb', source=None, extra_file
     end
   endtask''')
     result_sources = []
+    ways = parameters.get('dCacheWays', 1)
+    index_bits = ((parameters['dCacheBytes'] or 8192) // (64 * ways) - 1).bit_length()
+    way_sectors, way_lines = 1 << (index_bits + 3), 1 << index_bits
     if top == 'core_tb' and software and writeback:
         for hart in range(harts):
             cache = f'dut.data_cache_{hart}'
-            result_sources.append(f'''
-    if ({cache}.dirtyLines[index] && 64'({cache}.dataTags_ext.Memory[index]) == (address >> 13)) begin
+            for way in range(ways):
+                suffix = '_0' if way else ''
+                for stem in ('data', 'dataTags', 'dataDirty'):
+                    assert re.search(r'\b' + stem + '_ext' + suffix + r'\s*\(', (rtl / 'DitDahA1DataCache.sv').read_text()), 'Missing result storage connection'
+                result_sources.append(f'''
+    if ({cache}.dirtyLines[{way * way_lines} + index] && 64'({cache}.dataTags_ext{suffix}.Memory[index]) == (address >> {index_bits+6})) begin
       if (dirty_owner) $fatal(1, "Duplicate dirty result line owner");
       dirty_owner = 1;
-      if ({cache}.valid[sector])
+      if ({cache}.valid[{way * way_sectors} + sector])
         for (integer byte_index = 0; byte_index < 8; byte_index++)
-          if ({cache}.dataDirty_ext.Memory[sector][byte_index])
-            coherent_result[byte_index*8 +: 8] = {cache}.data_ext.Memory[sector][byte_index*8 +: 8];
+          if ({cache}.dataDirty_ext{suffix}.Memory[sector][byte_index])
+            coherent_result[byte_index*8 +: 8] = {cache}.data_ext{suffix}.Memory[sector][byte_index*8 +: 8];
     end''')
     bindings.append(f'''  localparam bit WRITEBACK_RESULTS = {int(bool(result_sources))};
   function automatic logic [63:0] coherent_result(input logic [63:0] address, physical_data);
-    logic [9:0] sector;
-    logic [6:0] index;
+    logic [{index_bits+2}:0] sector;
+    logic [{index_bits-1}:0] index;
     bit dirty_owner;
-    sector = address[12:3]; index = address[12:6]; dirty_owner = 0;
+    sector = address[{index_bits+5}:3]; index = address[{index_bits+5}:6]; dirty_owner = 0;
     coherent_result = physical_data;
 {''.join(result_sources)}
   endfunction''')
@@ -1254,6 +1261,7 @@ def compare(binary, directory, config, transport='axi', selected=()):
                 assert min(issue_streak, retire_streak) >= 64, f'{name}: native cached pipeline did not sustain the configured issue and retirement width'
             metric_config = config if transport == 'axi' else dict(config, fabricReadSlots=0)
             reports.append(dict(test=name, seed=seed, events=len(actual), cycles=elapsed, performance=performance_metrics(lines, metric_config),
+                                loadedMemoryHash=hashlib.sha256(image.read_bytes()).hexdigest(),
                                 busTransactions=len(bus), axiReadBeats=sum(line.startswith(('READ ', 'LINE_BEAT ')) for line in lines), fetches=fetches,
                                 issueStreak=issue_streak, retireStreak=retire_streak,
                                 **(dict(pipeline=pipeline_events) if pipeline_events is not None else {}),
@@ -1506,7 +1514,7 @@ def check_multicore(lines, config, program, name, atomic_metadata=False, softwar
             recipients.add(recipient)
             for access in (lsu_slots[recipient].values() if dual else (architectural[recipient],)):
                 if access and 'event' in access and access['event'][0] == 'read' and 'lineValue' not in access and (
-                        address // 64) % (config['dCacheBytes'] // 64) == (access['event'][1] // 64) % (config['dCacheBytes'] // 64):
+                        address // 64) % (config['dCacheBytes'] // (64 * config.get('dCacheWays', 1))) == (access['event'][1] // 64) % (config['dCacheBytes'] // (64 * config.get('dCacheWays', 1))):
                     access['invalidated'] = True
             continue
         if fields[:1] == ['RESULT']:
@@ -2212,7 +2220,7 @@ def check_multicore(lines, config, program, name, atomic_metadata=False, softwar
                 count['workCycles'] = end - begin
                 for key in ('axiReadAddresses', 'axiReadBytes', 'hits'):
                     count['work' + key[0].upper() + key[1:]] = after.get(key, 0) - before.get(key, 0)
-                wanted = job['work']['reads'][config.get('dCacheRefillBytes', 8)]
+                wanted = (16 if config['dCacheBytes'] == 8192 and config.get('dCacheWays', 1) == 1 else 2) if job.get('conflict') else job['work']['reads'][config.get('dCacheRefillBytes', 8)]
                 assert count['workAxiReadAddresses'] == wanted, 'Fixed-work data address count differs from expected refill behavior'
                 assert count['workAxiReadBytes'] == wanted * config.get('dCacheRefillBytes', 8), 'Fixed-work overfetch byte count'
         for hart, registers in enumerate(job.get('finalRegisters', [job.get('expectedRegisters', {})] * harts)):
@@ -2715,7 +2723,7 @@ def verify_software_matrix(args):
             config_path = directory / 'input.json'
             config_path.write_text(json.dumps(dict(template, hartCount=harts, issueWidth=width, enableBranchPrediction=args.branch_prediction, branchPredictorEntries=args.branch_predictor_entries,
                 axiDataBits=512 if harts == 16 else 64, iCacheBytes=args.icache_bytes,
-                dCacheBytes=args.dcache_bytes, dCacheRefillBytes=refill, dCacheWriteback=args.dcache_writeback, enableBurstRefill=args.burst_refill, loadQueueEntries=args.load_queue_entries,
+                dCacheBytes=args.dcache_bytes, dCacheWays=args.dcache_ways, dCacheRefillBytes=refill, dCacheWriteback=args.dcache_writeback, enableBurstRefill=args.burst_refill, loadQueueEntries=args.load_queue_entries,
                 **(dict(fabricReadSlots=selection) if args.software_read_matrix else {})), indent=2) + '\n')
             software = directory / 'software'
             run(['python3', 'scripts/build_software.py', '--config', config_path,
@@ -2753,6 +2761,46 @@ def verify_software_matrix(args):
     print(f'Software matrix passed {len(profiles)} configurations and {len(profiles) * len(args.seeds)} schedules', flush=True)
 
 
+def verify_cache_matrix(args):
+    args.output.mkdir(parents=True, exist_ok=True)
+    summary_path = args.output / 'summary.json'
+    summary_path.unlink(missing_ok=True)
+    reports, sources = [], None
+    test_hashes = test_source_hashes()
+    for capacity in ((args.dcache_bytes,) if args.dcache_bytes else (8192, 16384, 32768, 65536)):
+        for refill in (8, 64):
+            for writeback in (False, True):
+                directory = args.output / f'c{capacity}-r{refill}-w{int(writeback)}'
+                directory.mkdir(parents=True, exist_ok=True)
+                config = dict(configuration(64 if capacity == 8192 else 128),
+                    dCacheBytes=capacity, dCacheWays=args.dcache_ways, dCacheRefillBytes=refill, dCacheWriteback=writeback,
+                    loadQueueEntries=args.load_queue_entries,
+                    memoryRegions=[dict(base='0', size=str(1 << 48), dataCacheable=True),
+                                   dict(base=str(1 << 48), size='65536')])
+                config['physicalAddressBits'] = 56
+                config_path = directory / 'input.json'
+                config_path.write_text(json.dumps(config, indent=2) + '\n')
+                rtl = directory / 'rtl'
+                if not args.use_generated:
+                    run(['build-ditdah-a1', '--top', 'DitDahA1DataCache', '--config', config_path,
+                         '--output', rtl], directory / 'build.log')
+                manifest = json.loads((rtl / 'ditdah_a1_config.json').read_text())
+                assert all(manifest['parameters'][key] == value for key, value in config.items() if key != 'memoryRegions'), 'Stale cache matrix configuration'
+                assert len(manifest['parameters']['memoryRegions']) == len(config['memoryRegions'])
+                assert all(all(actual[key] == value for key, value in expected.items())
+                           for actual, expected in zip(manifest['parameters']['memoryRegions'], config['memoryRegions'])), 'Stale cache matrix regions'
+                assert all(hashlib.sha256(Path(key).read_bytes()).hexdigest() == value for key, value in manifest['sourceHashes'].items()), 'Stale cache matrix sources'
+                sources = sources or manifest['sourceHashes']
+                assert manifest['sourceHashes'] == sources, 'Mixed cache matrix sources'
+                arrays = verify_storage(rtl, directory / 'storage')
+                contracts = verify_contracts(rtl, directory / 'contracts', ['DitDahA1DataCache'])
+                reports.append(dict(parameters=manifest['parameters'], arrays=arrays, contracts=contracts))
+    assert test_source_hashes() == test_hashes, 'Cache checker inputs changed'
+    summary_path.write_text(json.dumps(dict(sourceHashes=sources, testSourceHashes=test_hashes,
+        configurations=reports), indent=2) + '\n')
+    print(f'Cache array matrix passed {len(reports)} configurations', flush=True)
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--width', type=int, choices=(64, 128, 256, 512), action='append')
@@ -2764,6 +2812,7 @@ def main():
     parser.add_argument('--software-matrix', action='store_true')
     parser.add_argument('--software-refill-matrix', action='store_true')
     parser.add_argument('--software-read-matrix', action='store_true')
+    parser.add_argument('--cache-matrix', action='store_true')
     parser.add_argument('--config', type=Path)
     parser.add_argument('--poison-bss', action='store_true')
     parser.add_argument('--software-transactions', type=int)
@@ -2784,13 +2833,18 @@ def main():
     parser.add_argument('--interrupts', action='store_true', help='Run only enabled interrupt profiles')
     parser.add_argument('--pmp-entries', type=int, choices=(0, 16))
     parser.add_argument('--icache-bytes', type=int, choices=(0, 8192, 16384, 32768, 65536), default=0)
-    parser.add_argument('--dcache-bytes', type=int, choices=(0, 8192), default=0)
+    parser.add_argument('--dcache-bytes', type=int, choices=(0, 8192, 16384, 32768, 65536), default=0)
     parser.add_argument('--dcache-writeback', action='store_true')
+    parser.add_argument('--dcache-ways', type=int, choices=(1, 2), default=1)
     parser.add_argument('--dcache-refill-bytes', type=int, choices=(8, 64), default=8)
     parser.add_argument('--case', dest='selected', action='append', default=[])
     parser.add_argument('--traffic-baseline', type=Path)
     parser.add_argument('--prediction-baseline', type=Path)
+    parser.add_argument('--cache-baseline', type=Path)
     args = parser.parse_args()
+    if args.cache_matrix:
+        verify_cache_matrix(args)
+        return
     if args.fabric_read_slots is not None and args.elf:
         parser.error('Software read slots use their configuration')
     if args.burst_refill and not args.icache_bytes and not args.elf:
@@ -2857,7 +2911,7 @@ def main():
         directory = args.output / f'{"irq-" if interrupts else ""}{"pmp16-" if entries else ""}axi{width}'
         directory.mkdir(parents=True, exist_ok=True)
         config = configuration(width)
-        config.update(issueWidth=args.issue_width, loadQueueEntries=args.load_queue_entries, pmpEntries=entries, enableInterrupts=interrupts, iCacheBytes=args.icache_bytes, dCacheBytes=args.dcache_bytes, dCacheRefillBytes=args.dcache_refill_bytes, dCacheWriteback=args.dcache_writeback, tlbEntries=args.tlb_entries, enableBurstRefill=args.burst_refill, enableBranchPrediction=args.branch_prediction, branchPredictorEntries=args.branch_predictor_entries)
+        config.update(issueWidth=args.issue_width, loadQueueEntries=args.load_queue_entries, pmpEntries=entries, enableInterrupts=interrupts, iCacheBytes=args.icache_bytes, dCacheBytes=args.dcache_bytes, dCacheWays=args.dcache_ways, dCacheRefillBytes=args.dcache_refill_bytes, dCacheWriteback=args.dcache_writeback, tlbEntries=args.tlb_entries, enableBurstRefill=args.burst_refill, enableBranchPrediction=args.branch_prediction, branchPredictorEntries=args.branch_predictor_entries)
         if args.fabric_read_slots is not None:
             config['fabricReadSlots'] = args.fabric_read_slots
         config['memoryRegions'][0]['dataCacheable'] = bool(args.dcache_bytes)
@@ -2888,7 +2942,7 @@ def main():
         report = compare(binary, directory, manifest['parameters'], selected=args.selected)
         report['interfaceContracts'] = interface_contracts
         report['instructionStorage'] = storage
-        report.update(issueWidth=args.issue_width, loadQueueEntries=args.load_queue_entries, axiDataBits=width, physicalAddressBits=config['physicalAddressBits'], pmpEntries=entries, enableInterrupts=interrupts, iCacheBytes=args.icache_bytes, dCacheBytes=args.dcache_bytes, dCacheRefillBytes=args.dcache_refill_bytes, dCacheWriteback=args.dcache_writeback,
+        report.update(issueWidth=args.issue_width, loadQueueEntries=args.load_queue_entries, axiDataBits=width, physicalAddressBits=config['physicalAddressBits'], pmpEntries=entries, enableInterrupts=interrupts, iCacheBytes=args.icache_bytes, dCacheBytes=args.dcache_bytes, dCacheWays=args.dcache_ways, dCacheRefillBytes=args.dcache_refill_bytes, dCacheWriteback=args.dcache_writeback,
                       branchPredictorEntries=args.branch_predictor_entries, enableBranchPrediction=args.branch_prediction, parameters=manifest['parameters'])
         summary['configurations'].append(report)
         core = directory / 'core'
@@ -2924,7 +2978,7 @@ def main():
                 continue
             directory = args.output / f'harts{harts}-axi{width}'
             directory.mkdir(parents=True, exist_ok=True)
-            config = dict(configuration(width), issueWidth=args.issue_width, loadQueueEntries=args.load_queue_entries, hartCount=harts, pmpEntries=entries, enableInterrupts=interrupts, iCacheBytes=args.icache_bytes, dCacheBytes=args.dcache_bytes, dCacheRefillBytes=args.dcache_refill_bytes, dCacheWriteback=args.dcache_writeback, tlbEntries=args.tlb_entries, enableBurstRefill=args.burst_refill, enableBranchPrediction=args.branch_prediction, branchPredictorEntries=args.branch_predictor_entries)
+            config = dict(configuration(width), issueWidth=args.issue_width, loadQueueEntries=args.load_queue_entries, hartCount=harts, pmpEntries=entries, enableInterrupts=interrupts, iCacheBytes=args.icache_bytes, dCacheBytes=args.dcache_bytes, dCacheWays=args.dcache_ways, dCacheRefillBytes=args.dcache_refill_bytes, dCacheWriteback=args.dcache_writeback, tlbEntries=args.tlb_entries, enableBurstRefill=args.burst_refill, enableBranchPrediction=args.branch_prediction, branchPredictorEntries=args.branch_predictor_entries)
             if args.fabric_read_slots is not None:
                 config['fabricReadSlots'] = args.fabric_read_slots
             config['memoryRegions'][0]['dataCacheable'] = bool(args.dcache_bytes)
@@ -2956,7 +3010,7 @@ def main():
                                                       *(('DitDahA1DataCache', 'DitDahA1Coherence') if args.dcache_bytes else ()),
                                                       *(('DitDahA1LocalInterrupts',) if args.platform_only else ())))
             report['instructionStorage'] = verify_storage(rtl, directory / 'storage')
-            report.update(issueWidth=args.issue_width, loadQueueEntries=args.load_queue_entries, hartCount=harts, axiDataBits=width, pmpEntries=entries, enableInterrupts=interrupts, iCacheBytes=args.icache_bytes, dCacheBytes=args.dcache_bytes, dCacheRefillBytes=args.dcache_refill_bytes, dCacheWriteback=args.dcache_writeback)
+            report.update(issueWidth=args.issue_width, loadQueueEntries=args.load_queue_entries, hartCount=harts, axiDataBits=width, pmpEntries=entries, enableInterrupts=interrupts, iCacheBytes=args.icache_bytes, dCacheBytes=args.dcache_bytes, dCacheWays=args.dcache_ways, dCacheRefillBytes=args.dcache_refill_bytes, dCacheWriteback=args.dcache_writeback)
             if not args.icache_bytes and not args.dcache_bytes and not args.platform_only:
                 for count in ((15, 16) if harts == 16 else (harts,)):
                     Path(f'result/harts{count}-input.json').write_text(json.dumps(dict(config, hartCount=count), indent=2) + '\n')
@@ -2996,6 +3050,21 @@ def main():
                                        uncachedCycles=wanted['cycles'], cachedCycles=observed['cycles']))
         assert comparison, 'No repeated workload for traffic comparison'
         summary['instructionCacheComparison'] = comparison
+    if args.cache_baseline:
+        baseline = json.loads(args.cache_baseline.read_text())
+        assert baseline['sourceHashes'] == summary['sourceHashes'], 'Cache comparison sources differ'
+        comparison = []
+        for current, previous in zip(summary['configurations'], baseline['configurations'], strict=True):
+            assert current['parameters']['dCacheWays'] == 2 and previous['parameters']['dCacheWays'] == 1
+            assert current['parameters'] | dict(dCacheWays=1) == previous['parameters'], 'Cache comparison configurations differ'
+            for new, old in zip(current['cases'], previous['cases'], strict=True):
+                assert (new['test'], new['seed'], new['events'], new['loadedMemoryHash']) == (old['test'], old['seed'], old['events'], old['loadedMemoryHash']), 'Cache comparison workload differs'
+                if new['test'] == 'cache_conflict':
+                    after, before = new['dataCache'][0], old['dataCache'][0]
+                    assert after['workAxiReadAddresses'] < before['workAxiReadAddresses'] and after['workHits'] > before['workHits'], 'Associativity did not retain conflicting lines'
+                    comparison.append(dict(seed=new['seed'], before=before, after=after))
+        assert comparison, 'Missing conflicting cache workload'
+        summary['cacheComparison'] = comparison
     if args.prediction_baseline:
         baseline = json.loads(args.prediction_baseline.read_text())
         assert args.branch_predictor_entries and baseline['sourceHashes'] == summary['sourceHashes'], 'Prediction baseline uses different sources'

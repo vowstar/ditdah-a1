@@ -55,7 +55,7 @@ Failed AMO writes retry; SC returns a status without retry. AMO completion requi
 Set `iCacheBytes` to zero for bypass or a power of two from 8 to 64 KiB for a blocking, direct-mapped instruction cache with 64-byte lines.
 Instruction refills use individually authorized four-byte requests; non-demand refill faults fall back to the original demand.
 Set `enableBurstRefill` with an instruction cache for protected 64-byte INCR refills; denial or line errors retry the original scalar demand without installing a line.
-Set `dCacheBytes` to 8192 for private caches on `dataCacheable` non-device regions; zero bypasses them.
+Set `dCacheBytes` to 8192/16384/32768/65536 total data bytes per hart on `dataCacheable` non-device regions; zero bypasses them. `dCacheWays` selects one or two ways; two ways use one LRU bit per set.
 Ordinary loads use eight-byte sectors; narrow refills require full-word permission. Write-through stores update existing bytes after successful completion; store misses do not allocate.
 `dCacheRefillBytes` defaults to 8; set it to 64 for protected whole-line refills independent of I-cache. Expanded-read errors drain and retry the original demand without installing a partial line.
 Set `dCacheWriteback` for dirty-byte tracking, ownership probes and masked writeback; errors retain dirty data and retry. Ordinary writes invalidate peer copies, and atomic operations invalidate all copies.
@@ -85,7 +85,7 @@ ELF checks build freestanding software with `RISCV_PREFIX` (default `riscv64-unk
 `make verify-width-software` checks identical loaded software across 1/2/3 issue for each of 1/2/16 harts; `make verify-zephyr-long SOFTWARE_JOBS=3` uses the pinned `ZEPHYR_BASE` checkout.
 Reachability and mutation checks exercise the properties; general multiply results are checked by simulation.
 This checks the implemented instruction subset, not full ISA compliance or physical signoff.
-`make verify-memory-concurrency` checks dual reads, fallback resources, fault/interrupt ordering and multicore console software; `make verify-prediction` adds prediction modes, recovery, protection and fixed performance windows. `FORMAL_JOBS` controls independent proof partitions.
+`make verify-memory-concurrency`, `make verify-prediction` and `make verify-cache-configuration` cover overlapped reads, prediction and cache geometry/coherence. `FORMAL_JOBS` controls independent proof partitions.
 
 ## Credits
 

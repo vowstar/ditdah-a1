@@ -192,8 +192,19 @@ object DitDahA1ParameterCheck:
     rejects { rtl.copy(pmpEntries = 64).validateFrontend() }
     rejects { rtl.copy(pmpEntries = 64).validateBackend() }
     for bytes <- Seq(0, 8192, 16384, 32768, 65536) do rtl.copy(iCacheBytes = bytes).validateRtl()
-    rtl.copy(dCacheBytes = 8192).validateRtl()
-    rejects { rtl.copy(dCacheBytes = 16384).validateRtl() }
+    for bytes <- Seq(8192, 16384, 32768, 65536); ways <- Seq(1, 2); writeback <- Seq(false, true) do
+      val cached = rtl.copy(dCacheBytes = bytes, dCacheWays = ways, dCacheWriteback = writeback)
+      cached.validateRtl()
+      assert(DitDahA1Config.parameter(DitDahA1Config.document(cached)) == cached)
+    rejects { rtl.copy(dCacheBytes = 12288); () }
+    rejects { rtl.copy(dCacheBytes = 4096); () }
+    rejects { rtl.copy(dCacheBytes = 131072); () }
+    rejects { rtl.copy(dCacheWriteback = true).validateFabric() }
+    for ways <- Seq(0, 3, 4) do rejects { rtl.copy(dCacheWays = ways); () }
+    rejects { rtl.copy(dCacheWays = 2).validateRtl() }
+    rtl.copy(dCacheWays = 2).validateFrontend()
+    rtl.copy(dCacheWays = 2).validateBackend()
+    rtl.copy(dCacheWays = 2).validateFabric()
     rejects { MemoryRegion(device = true, executable = false, dataCacheable = true); () }
     assert(DitDahA1Config.parameter(DitDahA1Config.document(rtl.copy(memoryRegions = Seq(MemoryRegion(dataCacheable = true))))).memoryRegions.head.dataCacheable)
     rejects { rtl.copy(l2CacheBytes = 131072).validateRtl() }

@@ -73,6 +73,37 @@ verify-signoff: verify-writeback verify-formal
 	$(MAKE) verify-read-capacity
 	$(MAKE) verify-memory-concurrency
 	$(MAKE) verify-prediction
+	$(MAKE) verify-cache-configuration
+
+.PHONY: verify-cache-configuration
+CACHE_OUTPUT ?= result/cache-configuration
+verify-cache-configuration:
+	for ways in 1 2; do \
+		python3 test/verify.py --cache-matrix --dcache-ways $$ways --output $(CACHE_OUTPUT)/ways$$ways || exit $$?; \
+	done
+	for profile in 8192:8:0 8192:8:1 65536:64:1; do \
+		bytes=$${profile%%:*}; rest=$${profile#*:}; refill=$${rest%%:*}; writeback=$${rest#*:}; \
+		python3 test/formal.py --rtl $(CACHE_OUTPUT)/ways2/c$$bytes-r$$refill-w$$writeback/rtl --output $(CACHE_OUTPUT)/formal-c$$bytes-r$$refill-w$$writeback --modules DataCacheAssociativity || exit $$?; \
+	done
+	for bytes in 8192 65536; do \
+		python3 test/verify.py --cache-matrix --dcache-bytes $$bytes --dcache-ways 2 --load-queue-entries 2 --output $(CACHE_OUTPUT)/dual$$bytes || exit $$?; \
+	done
+	for profile in 8192:8 65536:64; do \
+		bytes=$${profile%:*}; refill=$${profile#*:}; \
+		python3 test/formal.py --rtl $(CACHE_OUTPUT)/dual$$bytes/c$$bytes-r$$refill-w1/rtl --output $(CACHE_OUTPUT)/formal-dual$$bytes --modules DataCacheAssociativity --jobs $(FORMAL_JOBS) || exit $$?; \
+	done
+	for profile in 2:8192:64:1:8 2:16384:128:2:64 16:65536:512:3:64; do \
+		count=$${profile%%:*}; rest=$${profile#*:}; bytes=$${rest%%:*}; rest=$${rest#*:}; bus=$${rest%%:*}; rest=$${rest#*:}; width=$${rest%%:*}; refill=$${rest#*:}; \
+		python3 test/verify.py --multicore-only --harts $$count --width $$bus --issue-width $$width --load-queue-entries 2 --fabric-read-slots 4 --pmp-entries 16 --icache-bytes 8192 --burst-refill --dcache-bytes $$bytes --dcache-ways 2 --dcache-refill-bytes $$refill --dcache-writeback --output $(CACHE_OUTPUT)/harts$$count-c$$bytes --case data_coherence --case synchronization --case cache_reservation --case atomic_lrsc_shared --case atomic_interrupt || exit $$?; \
+	done
+	python3 test/verify.py --user-mode --interrupts --width 512 --issue-width 3 --load-queue-entries 2 --fabric-read-slots 3 --pmp-entries 16 --icache-bytes 8192 --burst-refill --dcache-bytes 65536 --dcache-ways 2 --dcache-refill-bytes 64 --dcache-writeback --output $(CACHE_OUTPUT)/protected --case user_mprv --case pmp_update --case pmp_permissions --case interrupt_read_pending --case synchronization --case fence_i_prefetch --case fence_ordering
+	python3 test/verify.py --sv39 --tlb-entries 4 --width 256 --issue-width 3 --load-queue-entries 2 --fabric-read-slots 3 --pmp-entries 16 --icache-bytes 8192 --burst-refill --dcache-bytes 65536 --dcache-ways 2 --dcache-refill-bytes 64 --dcache-writeback --output $(CACHE_OUTPUT)/translation --case sv39_context --case sv39_reuse --case sv39_accessed --case sv39_protection --case sv39_sum --case sv39_mxr
+	for ways in 1 2; do \
+		comparison=""; if test $$ways = 2; then comparison="--cache-baseline $(CACHE_OUTPUT)/conflict1/summary.json"; fi; \
+		python3 test/verify.py --width 128 --pmp-entries 0 --dcache-bytes 8192 --dcache-ways $$ways $$comparison --output $(CACHE_OUTPUT)/conflict$$ways --case cache_conflict || exit $$?; \
+	done
+	python3 test/verify.py --software-matrix --config $(SOFTWARE_CONFIG) --load-queue-entries 2 --branch-prediction --branch-predictor-entries 8 --icache-bytes 8192 --burst-refill --dcache-bytes 65536 --dcache-ways 2 --dcache-refill-bytes 64 --dcache-writeback --output $(CACHE_OUTPUT)/software --jobs $(SOFTWARE_JOBS)
+	$(MAKE) verify-translation-software SOFTWARE_CONFIG=$(CACHE_OUTPUT)/software/w3-h16/input.json SOFTWARE_OUTPUT=$(CACHE_OUTPUT)/software SOFTWARE_TLB_ENTRIES=4 SOFTWARE_CACHE_SIZES=65536 SOFTWARE_BURST_REFILL=--burst-refill TRANSLATION_SOFTWARE_DIR=translation
 
 .PHONY: verify-prediction
 PREDICTION_OUTPUT ?= result/prediction

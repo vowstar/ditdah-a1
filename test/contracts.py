@@ -24,6 +24,8 @@ def verify_storage(rtl, directory):
     manifest = json.loads((rtl / 'ditdah_a1_config.json').read_text())
     size = manifest['implementation']['iCacheBytes']
     data_size = manifest['implementation'].get('dCacheBytes', 0)
+    ways = manifest['parameters'].get('dCacheWays', 1)
+    way_size = data_size // ways
     files = (rtl / 'filelist.f').read_text().splitlines()
     slots = manifest['implementation']['fabricReadSlots']
     assert ('DitDahA1ReadQueue.sv' in files) == bool(slots)
@@ -42,14 +44,37 @@ def verify_storage(rtl, directory):
     expected = {} if not size else {'instructions': (size // (4 * banks), 32),
         'tags': (size // 64, manifest['parameters']['physicalAddressBits'] - (size // 64).bit_length() - 5)}
     if data_size:
-        expected.update(data=(data_size // 8, 64),
-                        dataTags=(data_size // 64, manifest['parameters']['physicalAddressBits'] - (data_size // 64).bit_length() - 5))
+        expected.update(data=(way_size // 8, 64),
+                        dataTags=(way_size // 64, manifest['parameters']['physicalAddressBits'] - (way_size // 64).bit_length() - 5))
     if data_size and manifest['parameters'].get('dCacheWriteback'):
-        expected['dataDirty'] = (data_size // 8, 8)
+        expected['dataDirty'] = (way_size // 8, 8)
     assert set(arrays.values()) == set(expected.values())
     if size:
         cache = (rtl / 'DitDahA1InstructionCache.sv').read_text()
         assert len(re.findall(r'^\s*instructions_\d+x32\s+\w+\s*\(', cache, re.M)) == banks
+    if data_size:
+        cache = (rtl / 'DitDahA1DataCache.sv').read_text()
+        sets = data_size // (64 * ways)
+        lru = re.search(r'\breg\s+\[(\d+):0\]\s+lru\s*;', cache)
+        assert bool(lru) == (ways == 2) and (not lru or int(lru[1]) + 1 == sets), 'Replacement state geometry'
+        assert bool(re.search(r'\breg\s+way\s*;', cache)) == (ways == 2), 'Redundant or missing way state'
+        for name, width in (('data', 64), ('dataTags', expected['dataTags'][1]), ('dataDirty', 8)):
+            expected_count = ways if name != 'dataDirty' or manifest['parameters']['dCacheWriteback'] else 0
+            depth = way_size // (64 if name == 'dataTags' else 8)
+            assert len(re.findall(rf'^\s*\w+_{depth}x{width}\s+{name}_ext(?:_\d+)?\s*\(', cache, re.M)) == expected_count, 'Physical cache way count'
+    modules = {Path(file).stem: (rtl / file).read_text() for file in files if file.endswith('.sv')}
+    instances = {}
+
+    def visit(name, ancestors=()):
+        assert name not in ancestors, 'Recursive storage hierarchy'
+        instances[name] = instances.get(name, 0) + 1
+        for child in re.findall(r'^\s*(\w+)\s+\w+\s*\(', modules[name], re.M):
+            if child in modules:
+                visit(child, (*ancestors, name))
+
+    visit(manifest['top'])
+    expected_caches = manifest['parameters']['hartCount'] if manifest['top'] == 'DitDahA1' else 1
+    assert instances.get('DitDahA1DataCache', 0) == (expected_caches if data_size else 0), 'Physical cache instance count'
     report = []
     directory.mkdir(parents=True, exist_ok=True)
     for module, (depth, width) in arrays.items():
@@ -62,10 +87,11 @@ def verify_storage(rtl, directory):
         cells = json.loads(netlist.read_text())['modules'][module]['cells'].values()
         memories = [cell for cell in cells if cell['type'] == '$mem_v2']
         assert len(memories) == 1 and all(int(memories[0]['parameters'][key], 2) == value
-                                        for key, value in (('SIZE', depth), ('WIDTH', width))), 'Storage geometry mismatch'
+                                        for key, value in (('SIZE', depth), ('WIDTH', width), ('RD_PORTS', 1), ('WR_PORTS', 1))), 'Storage geometry mismatch'
         state = sum(len(cell['connections']['Q']) for cell in cells if cell['type'].startswith('$dff'))
         assert state <= 3 * width + 4 * depth.bit_length(), 'Storage expanded into word registers'
-        report.append(dict(array=name, depth=depth, width=width, registerBits=state))
+        report.append(dict(array=name, depth=depth, width=width, registerBits=state,
+                           instances=instances[module], storageBits=instances[module] * depth * width))
     (directory / 'summary.json').write_text(json.dumps(report, indent=2) + '\n')
     return report
 
@@ -1512,8 +1538,11 @@ def lsu_refill_contract(parameters):
 
 
 def data_cache_queue_contract(parameters):
-    base = int(next(r for r in parameters['memoryRegions'] if r.get('dataCacheable'))['base']) + 0x1000
+    region = next(r for r in parameters['memoryRegions'] if r.get('dataCacheable'))
+    base = int(region['base']) + 0x1000
     addresses, tags = (base + 24, base + 104), (17, 34)
+    seed = addresses[0] + parameters['dCacheBytes'] // 2
+    seeded = parameters.get('dCacheWays', 1) == 2 and seed + 8 <= int(region['base']) + int(region['size'])
     line = parameters['dCacheRefillBytes'] == 64
     chunks = 8 if line else 1
 
@@ -1546,7 +1575,37 @@ def data_cache_queue_contract(parameters):
     seen = 0; holding = 0;
     upstream_response_ready = 0; downstream_request_ready = 0;
     reset = 1; tick(); reset = 0; tick(); upstream_response_ready = 1;
-    fork
+'''
+        if seeded:
+            body += f'''    upstream_response_ready = 0;
+    upstream_request_bits_address = 64'h{seed:x}; upstream_request_bits_size = 3;
+    upstream_request_bits_refillSize = 0; upstream_request_bits_tag = 119;
+    upstream_request_bits_write = 0; upstream_request_valid = 1;
+    while (!upstream_request_ready) tick(); tick(); upstream_request_valid = 0;
+    while (!downstream_request_valid) tick();
+    downstream_request_ready = 1; tick(); downstream_request_ready = 0;
+    downstream_response_bits_tag = 119; downstream_response_bits_data = 4660;
+    downstream_response_bits_fault = 0; downstream_response_bits_last = 1; downstream_response_valid = 1;
+    while (!downstream_response_ready) tick(); tick(); downstream_response_valid = 0;
+    while (!upstream_response_valid) tick();
+    check(upstream_response_bits_data == 4660 && !upstream_response_bits_fault, "Seed occupies the other way");
+    upstream_response_ready = 1; tick(); upstream_response_ready = 0;
+'''
+            if parameters.get('dCacheWriteback'):
+                body += f'''    upstream_request_bits_write = 1; upstream_request_bits_data = 91;
+    upstream_request_bits_mask = 255; upstream_request_valid = 1;
+    while (!upstream_request_ready) tick(); tick(); upstream_request_valid = 0;
+    while (!downstream_request_valid) tick();
+    check(downstream_request_bits_cacheOperation == 1 && downstream_request_bits_address == 64'h{seed:x}, "Seed obtains dirty ownership");
+    downstream_request_ready = 1; tick(); downstream_request_ready = 0;
+    downstream_response_valid = 1; while (!downstream_response_ready) tick(); tick(); downstream_response_valid = 0;
+    while (!upstream_response_valid) tick();
+    check(!upstream_response_bits_fault, "Seed store completes");
+    upstream_response_ready = 1; tick(); upstream_response_ready = 0;
+    upstream_request_bits_write = 0; upstream_request_bits_mask = 0;
+'''
+            body += '    upstream_response_ready = 1;\n'
+        body += '''    fork
       forever begin
         @(posedge clock);
         if (upstream_response_valid && upstream_response_ready) begin
@@ -1591,15 +1650,23 @@ def data_cache_queue_contract(parameters):
             "Concurrent refill hit and held completion"); tick();
     end
     upstream_response_ready = 1; tick(); upstream_response_ready = 0;
-    end
 '''
+        if seeded:
+            body += f'''    upstream_request_bits_address = 64'h{seed:x}; upstream_request_bits_tag = 85;
+    upstream_request_bits_refillSize = 0; upstream_request_valid = 1;
+    while (!upstream_request_ready) tick(); tick(); upstream_request_valid = 0;
+    while (!upstream_response_valid) begin check(!downstream_request_valid, "Restored read overwrote another cache way"); tick(); end
+    check(!upstream_response_bits_fault && upstream_response_bits_tag == 85 &&
+          upstream_response_bits_data == {91 if parameters.get('dCacheWriteback') else 4660}, "Parked read retains its selected way and peer dirty bytes");
+    upstream_response_ready = 1; tick(); upstream_response_ready = 0;
+'''
+        body += '    end\n'
     return body
 
 
 def data_cache_contract(parameters):
     region = next(r for r in parameters['memoryRegions'] if r.get('dataCacheable'))
     base, size = int(region['base']), parameters['dCacheBytes']
-    assert int(region['size']) >= 2 * size
     fields = dict(cacheOperation=2, address=64, data=64, size=3, mask=8, tag=8, write=1, fetch=1,
                   privileged=1, atomic=1, atomicOperation=5, scEligible=1, refillSize=3)
     current = {}
@@ -1668,7 +1735,8 @@ def data_cache_contract(parameters):
 
     values = tuple(0xfedcba9876543210 ^ (0x0101010101010101 * word) for word in range(8))
 
-    def line(fault=-1, wrong_tag=-1, chunks=8, invalidation=None):
+    def line(fault=-1, wrong_tag=-1, chunks=8, invalidation=None, payload=None):
+        payload = values if payload is None else payload
         physical = dict(current, address=current['address'] & ~63, size=6)
         body = '''    while (!downstream_request_valid) begin check(!upstream_response_valid, "Line miss completed before service"); tick(); end
 repeat (3) begin
@@ -1681,7 +1749,7 @@ repeat (3) begin
             body += invalidate(current['address'])
         for chunk in range(chunks):
             body += f'''    repeat (2) begin check(!upstream_response_valid && !downstream_request_valid && !upstream_request_ready, "Partial line cannot complete or release ownership"); tick(); end
-downstream_response_bits_data = 64'h{values[chunk % 8]:x}; downstream_response_bits_tag = {current['tag'] ^ int(chunk == wrong_tag)};
+downstream_response_bits_data = 64'h{payload[chunk % 8]:x}; downstream_response_bits_tag = {current['tag'] ^ int(chunk == wrong_tag)};
 downstream_response_bits_fault = {int(chunk == fault)}; downstream_response_bits_last = {int(chunk == chunks - 1)};
 downstream_response_valid = 1; check(downstream_response_ready, "Line response ownership");
 '''
@@ -1690,24 +1758,117 @@ downstream_response_valid = 1; check(downstream_response_ready, "Line response o
         return body
 
 
-    if parameters.get('dCacheWriteback'):
-        def probe_line(address, invalidate_line, dirty=None):
-            dirty = dirty or {}
-            body = f'''    probe_request_bits_address = 64'h{address:x}; probe_request_bits_invalidate = {int(invalidate_line)};
-    probe_request_valid = 1; probe_response_ready = 0;
-    #1; while (!probe_request_ready) tick(); tick(); probe_request_valid = 0;
-'''
-            for word in range(8) if dirty else (0,):
-                value, mask = dirty.get(word, (0, 0))
-                data = f" && probe_response_bits_data == 64'h{value:x}" if mask else ''
-                body += f'''    while (!probe_response_valid) tick();
-    repeat (4) begin
-      check(probe_response_valid && probe_response_bits_mask == {mask} && probe_response_bits_word == {word} && probe_response_bits_last == {int(not dirty or word == 7)}{data} && !upstream_request_ready, "Probe frame data, dirty bytes and ownership retained under backpressure"); tick();
-    end
-    probe_response_ready = 1; tick(); probe_response_ready = 0;
-'''
-            return body + '    check(!probe_response_valid, "Probe completes once");\n'
+    geometry = ''
+    limit = min(size, int(region['size']))
+    for offset in (limit - 16, limit - 8):
+        geometry += request(base + offset) + bus(offset ^ 0x71) + reply(offset ^ 0x71)
+    for offset in (limit - 16, limit - 8):
+        geometry += request(base + offset) + reply(offset ^ 0x71)
 
+    def probe_line(address, invalidate_line, dirty=None):
+        dirty = dirty or {}
+        body = f'''    probe_request_bits_address = 64'h{address:x}; probe_request_bits_invalidate = {int(invalidate_line)};
+probe_request_valid = 1; probe_response_ready = 0;
+#1; while (!probe_request_ready) tick(); tick(); probe_request_valid = 0;
+'''
+        for word in range(8) if dirty else (0,):
+            value, mask = dirty.get(word, (0, 0))
+            data = f" && probe_response_bits_data == 64'h{value:x}" if mask else ''
+            body += f'''    while (!probe_response_valid) tick();
+repeat (4) begin
+  check(probe_response_valid && probe_response_bits_mask == {mask} && probe_response_bits_word == {word} && probe_response_bits_last == {int(not dirty or word == 7)}{data} && !upstream_request_ready, "Probe frame data, dirty bytes and ownership retained under backpressure"); tick();
+end
+probe_response_ready = 1; tick(); probe_response_ready = 0;
+'''
+        return body + '    check(!probe_response_valid, "Probe completes once");\n'
+
+    if parameters.get('dCacheWriteback') and int(region['size']) >= 2 * size:
+        high = base + size - 8
+        targets = [(high, (size - 8) ^ 0x71)]
+        if parameters.get('dCacheWays', 1) == 2:
+            other = high - size // 2
+            geometry += request(other) + bus(0x1234) + reply(0x1234)
+            targets.append((other, 0x1234))
+        for address, value in targets:
+            updated = (value & ((1 << 56) - 1)) | (0x5a << 56)
+            geometry += request(address + 7, write=1, size=0, mask=1, data=0x5a) + bus(0, operation=1) + reply(0)
+            geometry += request(address) + reply(updated)
+        for address, value in targets:
+            updated = (value & ((1 << 56) - 1)) | (0x5a << 56)
+            geometry += probe_line(address, True, {7: (updated, 128)})
+
+    if int(region['size']) < 2 * size:
+        writeback = parameters.get('dCacheWriteback', False)
+        body = '    probe_response_ready = 0;\n' if writeback else '    probe_request_bits_invalidate = 1; probe_response_ready = 1;\n'
+        body += request(base) + bus(19) + reply(19)
+        body += request(base, write=1, mask=255, data=23) + bus(0, operation=int(writeback)) + reply(0)
+        body += request(base) + reply(23)
+        body += probe_line(base, True, {0: (23, 255)}) if writeback else invalidate(base)
+        body += request(base) + bus(23) + reply(23)
+        if parameters.get('dCacheRefillBytes') == 64:
+            body += probe_line(base, True) if writeback else invalidate(base)
+            body += request(base + 8, refillSize=6) + line() + reply(values[1])
+            for word in (0, 7):
+                body += request(base + 8 * word) + reply(values[word])
+        return geometry + body
+
+    def associative():
+        x, y, z = base, base + size // 2, base + size
+        body = '    probe_response_ready = 0;\n' if parameters.get('dCacheWriteback') else '    probe_request_bits_invalidate = 1; probe_response_ready = 1;\n'
+        for address, value in ((x, 11), (y, 22), (x + 8, 13), (y + 8, 23)):
+            body += request(address) + bus(value) + reply(value)
+        for address, value in ((x, 11), (y, 22), (x + 8, 13), (y + 8, 23)):
+            body += request(address) + reply(value)
+        body += request(z) + bus(33) + reply(33) + request(y) + reply(22)
+        body += request(z) + reply(33) + request(x) + bus(11) + reply(11)
+        body += request(z) + reply(33) + request(y) + bus(22) + reply(22)
+        body += request(z) + reply(33)
+        body += request(y, write=1, mask=255, data=71) + bus(0, operation=int(parameters.get('dCacheWriteback', False))) + reply(0)
+        body += request(y) + reply(71) + request(z) + reply(33)
+        if parameters.get('dCacheWriteback'):
+            body += probe_line(y, True, {0: (71, 255)}) + request(z) + reply(33)
+            body += probe_line(z, True) + probe_line(x, True)
+            body += request(x) + bus(11) + reply(11) + request(y) + bus(22) + reply(22)
+            for address, value in ((x, 91), (y, 92)):
+                body += request(address, write=1, mask=255, data=value) + bus(0, operation=1) + reply(0)
+            body += request(z)
+            body += bus(0, operation=2, physical_address=x, before_response=probe_line(x, True, {0: (91, 255)}))
+            body += bus(33) + reply(33) + request(y) + reply(92)
+            body += request(x) + bus(91) + reply(91) + request(x) + reply(91)
+            body += request(z)
+            body += bus(0, operation=2, physical_address=y, before_response=probe_line(y, True, {0: (92, 255)}))
+            body += bus(33) + reply(33) + request(x) + reply(91)
+            body += probe_line(x, True) + probe_line(y, True) + probe_line(z, True)
+        else:
+            body += invalidate(y) + request(z) + bus(33) + reply(33)
+            body += request(x) + bus(11) + reply(11)
+            body += invalidate(x)
+        body += request(x) + bus(11) + reply(11) + request(y) + bus(22) + reply(22)
+        body += request(z) + bus(0, fault=1) + reply(0, fault=1)
+        body += request(x) + reply(11) + request(y) + reply(22)
+        body += request(y + (1 << parameters['physicalAddressBits'])) + bus(0, fault=1) + reply(0, fault=1)
+        body += request(y) + reply(22)
+        body += probe_line(x, True) + probe_line(y, True) if parameters.get('dCacheWriteback') else invalidate(x)
+        if parameters.get('dCacheRefillBytes') == 64:
+            first = values
+            body += request(x, refillSize=6) + line() + reply(first[0])
+            second = tuple(v ^ 0x5a5a5a5a5a5a5a5a for v in first)
+            body += request(y, refillSize=6)
+            body += line(payload=second) + reply(second[0])
+            for word in (0, 3, 7):
+                body += request(x + 8 * word) + reply(first[word])
+                body += request(y + 8 * word) + reply(second[word])
+            for target, retained, value in ((z, y + 56, second[7]), (x, z + 8, 89)):
+                body += request(target, refillSize=6) + line(wrong_tag=3) + bus(67, fallback=True) + reply(67)
+                body += request(retained) + reply(value)
+                body += request(target + 8) + bus(89) + reply(89)
+                body += request(target) + bus(67) + reply(67)
+        return body
+
+    if parameters.get('dCacheWays', 1) == 2:
+        return geometry + associative()
+
+    if parameters.get('dCacheWriteback'):
         initial = 0x123456789abcdef0
         value = initial
         body = request(base) + bus(value) + reply(value)
@@ -1769,7 +1930,7 @@ downstream_response_valid = 1; check(downstream_response_ready, "Line response o
             body += probe_line(base + size, True) + request(base + size, refillSize=6) + line(wrong_tag=3)
             body += bus(low, fallback=True) + reply(low)
             body += request(base + size + 8) + bus(values[1]) + reply(values[1])
-        return body
+        return geometry + body
 
     body = '    probe_request_bits_invalidate = 1; probe_response_ready = 1;\n'
     body += request(base) + bus(0x123456789abcdef0) + reply(0x123456789abcdef0)
@@ -1893,7 +2054,7 @@ downstream_response_valid = 1; check(downstream_response_ready, "Line response o
             for _ in range(2):
                 body += request(int(region['base']), refillSize=6, **options) + bus(14) + reply(14)
             break
-    return body
+    return geometry + body
 
 
 def coherence_contract(parameters):
@@ -3293,11 +3454,11 @@ def verify_cache_coherence(cache_rtl, fabric_rtl, directory, mutations=False):
                 ('mask-accumulation', 'storedDirty | accessMask[7:0]', 'accessMask[7:0]'),
                 ('probe-mask', mask, 'assign probe_response_bits_mask = 0;'),
                 ('probe-word', word, 'assign probe_response_bits_word = 0;')):
-            assert original.count(before) == 1
+            assert original.count(before) == (parameters.get('dCacheWays', 1) if name == 'mask-accumulation' else 1)
             work = directory / ('mutation-' + name)
             work.mkdir(exist_ok=True)
             changed = work / 'DitDahA1DataCache.sv'
-            changed.write_text(original.replace(before, after, 1))
+            changed.write_text(original.replace(before, after))
             binary = work / 'CacheCoherence'
             subprocess.run(['iverilog', '-g2012', '-s', 'contract_tb', '-o', str(binary),
                             *map(str, [changed, *files[1:]])], check=True)

@@ -847,8 +847,7 @@ def pmp_cases(base, writeback=False):
             p.emit(csr(11, 0x3b0, 0, True), csr(12, 0x3b1, 0, True), csr(13, 0x3a0, 0, True))
             p.emit(csr(14, 0x3a1, 0, True), csr(15, 0x3a4, 0, True), csr(16, 0x3ef, 0, True))
         if hasattr(p, 'dirty_permission'):
-            p.address(17, 0x3000)
-            p.emit(ld(17, 17), ld(18, 10))
+            p.emit(amo(2, 17, 10), ld(18, 10))
         yield 'pmp_' + name, p.finish(fixed_return=name in ('fetch', 'update'))
 
 
@@ -1027,6 +1026,21 @@ def data_cache_program(base):
 
 
 def data_cache_access_cases(base, protection):
+    p = Program(base)
+    p.address(10, 0x1000)
+    p.address(11, 0x3000)
+    p.memory.update({base + 0x1000: 11, base + 0x3000: 17})
+    p.emit(addi(3, 0, 0))
+    begin = base + p.offset
+    p.emit(fence())
+    for _ in range(8):
+        p.emit(ld(2, 10), add(3, 3, 2), ld(2, 11), add(3, 3, 2))
+    end = base + p.offset
+    p.emit(fence())
+    p.data_cache = dict(minHits=0, conflict=True, expectedRegisters={'3': 224},
+                        work=dict(begin=begin, end=end))
+    yield 'cache_conflict', p.finish()
+
     for name, repeats, stride in (('cold', 1, 8), ('warm', 4, 8), ('sparse', 1, 64)):
         p = Program(base)
         p.address(10, 0x1000)

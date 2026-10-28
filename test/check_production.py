@@ -158,7 +158,7 @@ directory = Path('result/component-checks')
 directory.mkdir(exist_ok=True)
 parameters = json.loads(Path('result/production/ditdah_a1_config.json').read_text())['parameters']
 for index, (top, overrides, diagnostic) in enumerate((
-        ('DitDahA1', {'dCacheBytes': 16384}, 'RTL supports zero or 8192 data cache bytes'),
+        ('DitDahA1', {'dCacheBytes': 12288}, 'dCacheBytes must be a power of two'),
         ('DitDahA1', {'hartCount': 0}, 'hartCount must be between 1 and 16'),
         ('DitDahA1', {'hartCount': 17}, 'hartCount must be between 1 and 16'),
         ('DitDahA1Core', {'pmpEntries': 64}, 'RTL supports zero or sixteen PMP entries'),

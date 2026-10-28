@@ -17,6 +17,7 @@ class DitDahA1DataCacheIO(parameter: DitDahA1Parameter) extends HWBundle(paramet
   val probe = Flipped(new CacheProbePort)
 
 class DataCacheContext(parameter: DitDahA1Parameter) extends Bundle:
+  val way = Option.when(parameter.dCacheWays == 2)(Aligned(UInt(1)))
   val request = Aligned(new MemoryRequest)
   val fault = Aligned(Bool())
   val invalidated = Aligned(Bool())
@@ -41,13 +42,23 @@ class DitDahA1DataCacheProbe(parameter: DitDahA1Parameter) extends DVBundle[DitD
 object DitDahA1DataCache extends Generator[DitDahA1Parameter, DitDahA1Layers, DitDahA1DataCacheIO, DitDahA1DataCacheProbe]:
   override def moduleName(parameter: DitDahA1Parameter): String = "DitDahA1DataCache"
   def architecture(parameter: DitDahA1Parameter) =
-    require(parameter.dCacheBytes == 8192, "Data cache requires 8192 bytes")
+    parameter.validateDataCache()
+    require(parameter.dCacheBytes != 0, "Data cache requires nonzero capacity")
     val io = summon[Interface[DitDahA1DataCacheIO]]
     val probe = summon[ProbeInterface[DitDahA1DataCacheProbe]]
     given ClockScope = ClockScope.posedge(io.clock)
     given ResetScope = ResetScope.syncActiveHigh(io.reset)
-    val indexBits = Integer.numberOfTrailingZeros(parameter.dCacheBytes) - 6
+    val ways = parameter.dCacheWays
+    val indexBits = Integer.numberOfTrailingZeros(parameter.dCacheBytes / ways) - 6
     val words = parameter.dCacheBytes / 8
+    val wayWords = words / ways
+    val way = Option.when(ways == 2)(Reg(UInt(1)))
+    val selectedWay = Wire(UInt(1))
+    selectedWay := way.getOrElse(0.U(1))
+    val lru = Option.when(ways == 2)(RegInit(0.B(wayWords / 8)))
+    val probeWay = Option.when(ways == 2 && parameter.dCacheWriteback)(Reg(UInt(1)))
+    val probeSelection = Wire(UInt(1))
+    probeSelection := probeWay.getOrElse(0.U(1))
     val tagBits = parameter.physicalAddressBits - indexBits - 6
     val state = RegInit(0.U(3))
     val request = Reg(new MemoryRequest)
@@ -89,9 +100,11 @@ object DitDahA1DataCache extends Generator[DitDahA1Parameter, DitDahA1Layers, Di
     val capture = if concurrent then (state === 2.U(3)) & !offered.get & !poisoned.get else
       down.request.valid & down.request.ready
     val index = request.address.asBits.bits(indexBits + 5, 6).asUInt
-    val word = request.address.asBits.bits(indexBits + 5, 3).asUInt
+    val arrayWord = request.address.asBits.bits(indexBits + 5, 3).asUInt
+    val word = if ways == 1 then arrayWord else (selectedWay.asBits ## arrayWord.asBits).asUInt
+    val lineIndex = if ways == 1 then index else (selectedWay.asBits ## index.asBits).asUInt
     val mask = (1.U(words) << word).asBits.bits(words - 1, 0)
-    val lineShift = (index.asBits ## 0.B(3)).asUInt
+    val lineShift = (lineIndex.asBits ## 0.B(3)).asUInt
     val lineMask = (255.U(words) << lineShift).asBits.bits(words - 1, 0)
     val probeAccepted = io.probe.request.valid & io.probe.request.ready
     val probeCompleted = io.probe.response.valid & io.probe.response.ready
@@ -100,8 +113,11 @@ object DitDahA1DataCache extends Generator[DitDahA1Parameter, DitDahA1Layers, Di
     if parameter.dCacheWriteback then invalidating := probeCompleted & io.probe.response.bits.last & probeMatch.get & probeRequest.get.invalidate
     val probeAddress = probeRequest.map(_.address).getOrElse(io.probe.request.bits.address)
     val invalidateIndex = probeAddress.asBits.bits(indexBits + 5, 6).asUInt
-    val invalidateShift = (invalidateIndex.asBits ## 0.B(3)).asUInt
-    val invalidateMask = (255.U(words) << invalidateShift).asBits.bits(words - 1, 0)
+    val probeLineIndex = if ways == 1 then invalidateIndex else (probeSelection.asBits ## invalidateIndex.asBits).asUInt
+    val invalidateShift = (probeLineIndex.asBits ## 0.B(3)).asUInt
+    val probeLineMask = (255.U(words) << invalidateShift).asBits.bits(words - 1, 0)
+    val invalidateMask = if ways == 2 && !parameter.dCacheWriteback then
+      probeLineMask | (probeLineMask.asUInt << wayWords).asBits.bits(words - 1, 0) else probeLineMask
     val collision = invalidating & (invalidateIndex === index)
     val refill = Wire(new MemoryRequest)
     refill :<= request
@@ -135,27 +151,53 @@ object DitDahA1DataCache extends Generator[DitDahA1Parameter, DitDahA1Layers, Di
     val filling = wordFilling | lineFilling | storeUpdating
     val reading = up.request.valid & up.request.ready
     val tag = request.address.asBits.bits(parameter.physicalAddressBits - 1, indexBits + 6).asUInt
-    val writeWord = beat.map(b => lineActive.?((index.asBits ## b.asBits).asUInt, word)).getOrElse(word)
+    val writeWord = beat.map(b => lineActive.?((index.asBits ## b.asBits).asUInt, arrayWord)).getOrElse(arrayWord)
     val shift = (request.address.asBits.bits(2, 0) ## 0.B(3)).asUInt
     val byteMask = (0 until 8).reverse.map(byte => request.mask.asBits.bit(byte).?(255.B(8), 0.B(8))).reduce(_ ## _)
     val storeMask = (byteMask.asUInt << shift).asBits.bits(63, 0)
     val storeData = ((data.asBits & ~storeMask) | ((request.data << shift).asBits.bits(63, 0) & storeMask)).asUInt
     val probeReading = probeState.map(_ === 2.U(3)).getOrElse(false.B)
-    val probeSector = probeWord.map(w => (invalidateIndex.asBits ## w.asBits).asUInt).getOrElse(word)
-    val readWord = probeReading.?(probeSector, up.request.bits.address.asBits.bits(indexBits + 5, 3).asUInt)
-    val wordRead = StorageArray("data", words, 64,
-      readWord, writeWord, storeUpdating.?(storeData, down.response.bits.data), filling, reading | probeReading, io.clock)
+    val probeArraySector = probeWord.map(w => (invalidateIndex.asBits ## w.asBits).asUInt).getOrElse(arrayWord)
+    val probeSector = if ways == 1 then probeArraySector else (probeSelection.asBits ## probeArraySector.asBits).asUInt
+    val readWord = probeReading.?(probeArraySector, up.request.bits.address.asBits.bits(indexBits + 5, 3).asUInt)
+    val wordReads = (0 until ways).map { w =>
+      StorageArray("data", wayWords, 64, readWord, writeWord, storeUpdating.?(storeData, down.response.bits.data),
+        filling & (if ways == 1 then true.B else selectedWay === w.U(1)), reading | probeReading, io.clock)
+    }
     val probeIndex = io.probe.request.bits.address.asBits.bits(indexBits + 5, 6).asUInt
     val probeTagReading = if parameter.dCacheWriteback then probeAccepted else false.B
-    val tagRead = StorageArray("dataTags", words / 8, tagBits,
-      probeTagReading.?(probeIndex, up.request.bits.address.asBits.bits(indexBits + 5, 6).asUInt), index,
-      tag, wordFilling | publish, reading | probeTagReading, io.clock)
+    val tagReads = (0 until ways).map { w =>
+      StorageArray("dataTags", wayWords / 8, tagBits,
+        probeTagReading.?(probeIndex, up.request.bits.address.asBits.bits(indexBits + 5, 6).asUInt), index,
+        tag, (wordFilling | publish) & (if ways == 1 then true.B else selectedWay === w.U(1)),
+        reading | probeTagReading, io.clock)
+    }
+    if ways == 2 then
+      val present = (0 until ways).map(w => (valid.asUInt >> (index.asBits ## 0.B(3)).asUInt).asBits.bits(w * wayWords + 7, w * wayWords) =/= 0.B(8))
+      val matches = (0 until ways).map(w => present(w) & (tagReads(w) === tag))
+      when(state === 1.U(3)) {
+        selectedWay := matches(0).?(0.U(1), matches(1).?(1.U(1),
+          (!present(0)).?(0.U(1), (!present(1)).?(1.U(1), (lru.get.asUInt >> index).asBits.bit(0).?(1.U(1), 0.U(1))))))
+        way.get := selectedWay
+      }
+      if parameter.dCacheWriteback then
+        val matching = (0 until ways).map(w => (tagReads(w) === probeAddress.asBits.bits(63, indexBits + 6).asUInt) &
+          ((valid.asUInt >> (invalidateIndex.asBits ## 0.B(3)).asUInt).asBits.bits(w * wayWords + 7, w * wayWords) =/= 0.B(8)))
+        when(probeState.get === 1.U(3)) { probeSelection := (!matching(0) & matching(1)).?(1.U(1), 0.U(1)); probeWay.get := probeSelection }
+    val tagRead = if ways == 1 then tagReads.head else (selectedWay === 0.U(1)).?(tagReads.head, tagReads(1))
+    val arraySelection = probeActive.?(probeSelection, selectedWay)
+    val wordRead = if ways == 1 then wordReads.head else (arraySelection === 0.U(1)).?(wordReads.head, wordReads(1))
     val dirtyRead = Option.when(parameter.dCacheWriteback) {
       val clearing = probeCompleted & (io.probe.response.bits.mask =/= 0.U(8))
       val accessMask = (request.mask << request.address.asBits.bits(2, 0).asUInt).asBits.bits(7, 0).asUInt
-      StorageArray("dataDirty", words, 8, readWord, clearing.?(probeSector, writeWord),
-        (storeUpdating & acquireActive).?((storedDirty.get.asBits | accessMask.asBits).asUInt, 0.U(8)),
-        filling | clearing, reading | probeReading, io.clock)
+      val reads = (0 until ways).map { w =>
+        StorageArray("dataDirty", wayWords, 8, readWord, clearing.?(probeArraySector, writeWord),
+          (storeUpdating & acquireActive).?((storedDirty.get.asBits | accessMask.asBits).asUInt, 0.U(8)),
+          (filling & (if ways == 1 then true.B else selectedWay === w.U(1))) |
+            (clearing & (if ways == 1 then true.B else probeSelection === w.U(1))),
+          reading | probeReading, io.clock)
+      }
+      if ways == 1 then reads.head else (arraySelection === 0.U(1)).?(reads.head, reads(1))
     }
     val hit = (valid.asUInt >> word).asBits.bit(0) & (tagRead === tag) & !collision & !invalidated
     val readMask = Wire(UInt(64))
@@ -165,14 +207,18 @@ object DitDahA1DataCache extends Generator[DitDahA1Parameter, DitDahA1Layers, Di
     val hitData = ((wordRead >> shift).asBits & readMask.asBits).asUInt
     val refillData = ((down.response.bits.data >> shift).asBits & readMask.asBits).asUInt
     val hitResponse = (state === 1.U(3)) & eligible & hit
-    val needsRelease = dirtyLines.map(d => eligible & !hit & (d.asUInt >> index).asBits.bit(0) &
+    if ways == 2 then
+      val bit = (1.U(wayWords / 8) << index).asBits.bits(wayWords / 8 - 1, 0)
+      when(hitResponse | wordFilling | publish | storeUpdating) {
+        lru.get := (lru.get & ~bit) | (selectedWay === 0.U(1)).?(bit, 0.B(wayWords / 8))
+      }
+    val needsRelease = dirtyLines.map(d => eligible & !hit & (d.asUInt >> lineIndex).asBits.bit(0) &
       (lineCandidate | (tagRead =/= tag))).getOrElse(false.B)
     val startLine = (state === 1.U(3)) & !hitResponse & lineCandidate & !needsRelease
     if parameter.dCacheWriteback then
       val ps = probeState.get
       val pw = probeWord.get
-      val probeLineMask = (255.U(words) << invalidateShift).asBits.bits(words - 1, 0)
-      val dirtyLine = (dirtyLines.get.asUInt >> invalidateIndex).asBits.bit(0)
+      val dirtyLine = (dirtyLines.get.asUInt >> probeLineIndex).asBits.bit(0)
       io.probe.request.ready := (ps === 0.U(3)) & !down.response.valid
       io.probe.response.valid := ps === 4.U(3)
       io.probe.response.bits.data := probeData.get
@@ -181,7 +227,8 @@ object DitDahA1DataCache extends Generator[DitDahA1Parameter, DitDahA1Layers, Di
       io.probe.response.bits.last := !probeMatch.get | !dirtyLine | (pw === 7.U(3))
       when(probeAccepted) { probeRequest.get :<= io.probe.request.bits; ps := 1.U(3) }
       when(ps === 1.U(3)) {
-        val matching = (tagRead === probeAddress.asBits.bits(63, indexBits + 6).asUInt) & ((valid & probeLineMask) =/= 0.B(words))
+        val probeTag = if ways == 1 then tagReads.head else (probeSelection === 0.U(1)).?(tagReads.head, tagReads(1))
+        val matching = (probeTag === probeAddress.asBits.bits(63, indexBits + 6).asUInt) & ((valid & probeLineMask) =/= 0.B(words))
         probeMatch.get := matching
         pw := 0.U(3)
         probeData.get := 0.U(64)
@@ -198,8 +245,8 @@ object DitDahA1DataCache extends Generator[DitDahA1Parameter, DitDahA1Layers, Di
         when(io.probe.response.bits.last) { ps := 0.U(3) }
           .otherwise { pw := (pw + 1.U(3)).asBits.bits(2, 0).asUInt; ps := 2.U(3) }
       }
-      val bit = (1.U(words / 8) << index).asBits.bits(words / 8 - 1, 0)
-      val probeBit = (1.U(words / 8) << invalidateIndex).asBits.bits(words / 8 - 1, 0)
+      val bit = (1.U(words / 8) << lineIndex).asBits.bits(words / 8 - 1, 0)
+      val probeBit = (1.U(words / 8) << probeLineIndex).asBits.bits(words / 8 - 1, 0)
       when(storeUpdating & acquireActive) { dirtyLines.get := dirtyLines.get | bit }
       when(probeCompleted & io.probe.response.bits.last & probeMatch.get) { dirtyLines.get := dirtyLines.get & ~probeBit }
     else
@@ -279,7 +326,7 @@ object DitDahA1DataCache extends Generator[DitDahA1Parameter, DitDahA1Layers, Di
           fault := fault | responseFault | !down.response.bits.last
           when(down.response.bits.last) {
             state := 2.U(3)
-            when(!fault & !responseFault & !(dirtyLines.get.asUInt >> index).asBits.bit(0)) {
+            when(!fault & !responseFault & !(dirtyLines.get.asUInt >> lineIndex).asBits.bit(0)) {
               releasing.get := false.B; invalidated := false.B; sameTag := false.B; fault := false.B
             }
           }
@@ -349,12 +396,14 @@ object DitDahA1DataCache extends Generator[DitDahA1Parameter, DitDahA1Layers, Di
         extra.request.write := false.B; extra.request.atomic := false.B; extra.request.fetch := false.B
         extra.request.atomicOperation := 0.U(5); extra.request.cacheOperation := 0.U(2); extra.request.scEligible := false.B
         extra.fault := fault; extra.invalidated := invalidated | collision; extra.sameTag := sameTag; extra.expanded := expanded
+        extra.way.foreach(_ := way.get)
         extra.data.foreach(_ := data); extra.line.foreach(_ := line.get); extra.beat.foreach(_ := beat.get)
         extra.draining.foreach(_ := state === 5.U(3))
         extra.releasing.foreach(_ := releasing.get); extra.victim.foreach(_ := victim.get)
       def restoreContext()(using Arena, Context, Block, InstanceContext): Unit =
         request :<= extra.request
         fault := extra.fault; invalidated := extra.invalidated | extraCollision; sameTag := extra.sameTag; expanded := extra.expanded
+        extra.way.foreach(value => way.get := value)
         extra.data.foreach(value => data := value); extra.line.foreach(value => line.get := value); extra.beat.foreach(value => beat.get := value)
         state := extra.draining.map(_.?(5.U(3), 3.U(3))).getOrElse(3.U(3))
         storeHit := false.B; acquiring.foreach(_ := false.B)
