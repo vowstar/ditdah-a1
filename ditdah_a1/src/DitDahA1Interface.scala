@@ -90,6 +90,13 @@ class TranslationState extends Bundle:
   val satp = Aligned(UInt(64))
   val sum = Aligned(Bool())
   val mxr = Aligned(Bool())
+class TranslationMaintenance(parameter: DitDahA1Parameter) extends Bundle:
+  val valid = Aligned(Bool())
+  val fence = Aligned(Bool())
+  val addressValid = Aligned(Bool())
+  val address = Aligned(UInt(64))
+  val asidValid = Aligned(Bool())
+  val asid = Aligned(UInt(parameter.asidBits.max(1)))
 class TranslationRequest extends Bundle:
   val address = Aligned(UInt(64))
   val privilege = Aligned(UInt(2))
@@ -240,7 +247,8 @@ class DitDahA1BackendIO(parameter: DitDahA1Parameter) extends HWBundle(parameter
   val prediction = Option.when(parameter.branchPredictorEntries != 0)(Aligned(new BranchUpdate))
   val translation = Option.when(parameter.enableTranslation)(Aligned(new TranslationPort))
   val translationState = Option.when(parameter.enableTranslation)(Aligned(new TranslationState))
-  val invalidateTranslation = Option.when(parameter.enableTranslation && parameter.tlbEntries != 0)(Aligned(Bool()))
+  val translationMaintenance = Option.when(parameter.enableTranslation && parameter.preciseTranslationMaintenance)(Aligned(new TranslationMaintenance(parameter)))
+  val invalidateTranslation = Option.when(parameter.enableTranslation && parameter.hasTranslationCache)(Aligned(Bool()))
   val privilege = Aligned(UInt(2))
   val hartId = Flipped(UInt(4))
   val interrupts = Option.when(parameter.enableInterrupts)(Flipped(new InterruptBundle))

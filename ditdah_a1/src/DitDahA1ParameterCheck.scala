@@ -107,6 +107,19 @@ object DitDahA1ParameterCheck:
       cached.validateCore()
       assert(DitDahA1Config.parameter(DitDahA1Config.document(cached)) == cached)
       assert(DitDahA1Config.document(cached)("implementation")("tlbEntries").num == entries)
+    for instruction <- Seq(0, 2, 4); data <- Seq(0, 2, 4); shared <- Seq(0, 2, 4); asid <- Seq(0, 4) do
+      val cached = paged.copy(iTlbEntries = instruction, dTlbEntries = data, tlbEntries = shared, asidBits = asid)
+      cached.validateCore()
+      assert(DitDahA1Config.parameter(DitDahA1Config.document(cached)) == cached)
+    rejects { paged.copy(iTlbEntries = 1); () }
+    rejects { paged.copy(dTlbEntries = 8); () }
+    rejects { supervisor.copy(iTlbEntries = 2).validateCore() }
+    rejects { supervisor.copy(dTlbEntries = 2).validateCore() }
+    rejects { paged.copy(asidBits = 2); () }
+    rejects { supervisor.copy(asidBits = 4).validateCore() }
+    rejects { supervisor.copy(asidBits = 4).validateBackend() }
+    supervisor.copy(asidBits = 4).validateFrontend()
+    supervisor.copy(asidBits = 4).validateFabric()
     rejects { paged.copy(tlbEntries = 1); () }
     rejects { paged.copy(tlbEntries = 8); () }
     rejects { supervisor.copy(tlbEntries = 2).validateCore() }

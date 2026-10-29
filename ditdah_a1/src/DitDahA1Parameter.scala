@@ -12,6 +12,9 @@ case class DitDahA1Parameter(
   physicalAddressBits: Int = 56,
   virtualAddressBits: Int = 39,
   tlbEntries: Int = 0,
+  iTlbEntries: Int = 0,
+  dTlbEntries: Int = 0,
+  asidBits: Int = 0,
   iCacheBytes: Int = 32768,
   dCacheBytes: Int = 32768,
   dCacheWays: Int = 1,
@@ -39,6 +42,9 @@ case class DitDahA1Parameter(
   require(physicalAddressBits >= 32 && physicalAddressBits <= 56, "physicalAddressBits must be between 32 and 56")
   require(Set(0, 39, 48).contains(virtualAddressBits), "virtualAddressBits must select Bare, Sv39 or Sv48")
   require(Set(0, 2, 4).contains(tlbEntries), "tlbEntries must be zero, two or four")
+  require(Set(0, 2, 4).contains(iTlbEntries), "iTlbEntries must be zero, two or four")
+  require(Set(0, 2, 4).contains(dTlbEntries), "dTlbEntries must be zero, two or four")
+  require(Set(0, 4).contains(asidBits), "asidBits must be zero or four")
   require(resetVector >= 0 && resetVector < (BigInt(1) << physicalAddressBits), "resetVector must fit the physical address space")
   require((resetVector & 1) == 0, "resetVector must be halfword aligned")
   require(iCacheBytes == 0 || (powerOfTwo(iCacheBytes) && iCacheBytes >= 8192 && iCacheBytes <= 65536), "iCacheBytes must be a power of two between 8192 and 65536")
@@ -64,6 +70,7 @@ case class DitDahA1Parameter(
     require((resetVector & 3) == 0, "Frontend requires a word-aligned resetVector")
 
   def validateBackend(): Unit =
+    require(asidBits == 0 || enableTranslation, "ASID requires Sv39")
     validateProtection()
     validatePrediction()
 
@@ -72,7 +79,7 @@ case class DitDahA1Parameter(
 
   def validateCore(): Unit =
     require(Set(0, 39).contains(virtualAddressBits), "RTL supports Bare or Sv39 addressing")
-    require(tlbEntries == 0 || enableTranslation, "Translation cache requires Sv39")
+    require(!hasTranslationCache || enableTranslation, "Translation cache requires Sv39")
     validateFrontend()
     validateBackend()
 
@@ -113,6 +120,8 @@ case class DitDahA1Parameter(
     }
 
   def enableTranslation: Boolean = virtualAddressBits == 39 && enableSupervisorMode
+  def preciseTranslationMaintenance: Boolean = hasTranslationCache && (asidBits != 0 || iTlbEntries != 0 || dTlbEntries != 0)
+  def hasTranslationCache: Boolean = tlbEntries != 0 || iTlbEntries != 0 || dTlbEntries != 0
   def enableDataBurstRefill: Boolean = dCacheRefillBytes == 64
   def enableLineRefill: Boolean = enableBurstRefill || enableDataBurstRefill
 

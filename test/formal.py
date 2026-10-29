@@ -1090,7 +1090,7 @@ def supervisor_cases(parameters):
   always @* if (supervisor_past) begin
     assert(sfenceLegal == (privilege == 3 || privilege == 1 && !status[20]));
     assert(translationState_sum == status[18] && translationState_mxr == status[19]);
-    assert(translationState_satp[59:44] == 0);
+    assert(translationState_satp[59:{44 + parameters.get("asidBits", 0)}] == 0);
     assert(translationState_satp[63:60] == 0 || translationState_satp[63:60] == 8);
   end
   always @(posedge clock) if (supervisor_past) begin
@@ -1098,7 +1098,7 @@ def supervisor_cases(parameters):
     else begin
       if ($past(write && writeAddress == 12'h180 && writeData[63:60] == 0)) assert(translationState_satp == 0);
       else if ($past(write && writeAddress == 12'h180 && writeData[63:60] == 8 && ({root_fits})))
-        assert(translationState_satp == (64'h8000000000000000 | ($past(writeData) & 64'hfffffffffff)));
+        assert(translationState_satp == (64'h8000000000000000 | ($past(writeData) & 64'h{(1 << (44 + parameters.get('asidBits', 0))) - 1:x})));
       else assert($stable(translationState_satp));
       if ($past(write && (writeAddress == 12'h100 || writeAddress == 12'h300)))
         assert(status[19:18] == $past(writeData[19:18]));
@@ -1140,6 +1140,8 @@ def supervisor_cases(parameters):
     cover(input_valid && s_sfence && !s_prior_fault && !sfenceLegal);
   end
 '''
+    if any(parameters.get(key) for key in ('tlbEntries', 'iTlbEntries', 'dTlbEntries')) and any(parameters.get(key) for key in ('asidBits', 'iTlbEntries', 'dTlbEntries')):
+        execute += "  always @* if (s_sfence) assert(output_bits_address == input_bits_operand1 && output_bits_storeData == input_bits_operand2);\n"
     fetch = r'''
   reg context_past = 0, context_owned = 0, context_cancelled = 0;
   reg [1:0] retained_fetch_mode;
@@ -1189,7 +1191,15 @@ def supervisor_cases(parameters):
 
 def translation_case(parameters):
     count = parameters.get('tlbEntries', 0)
-    invalidating = 'invalidate' if count else "1'b0"
+    banks = [(prefix, valid, position, parameters.get(key, 0), owner) for prefix, valid, position, key, owner in
+             (('tlb', 'tlbValid', 'replacement', 'tlbEntries', None),
+              ('instructionTlb', 'instructionValid', 'instructionReplacement', 'iTlbEntries', 0),
+              ('dataTlb', 'dataValid', 'dataReplacement', 'dTlbEntries', 1)) if parameters.get(key)]
+    precise = bool(banks) and any(parameters.get(key) for key in ('asidBits', 'iTlbEntries', 'dTlbEntries'))
+    asid_bits = parameters.get('asidBits', 0)
+    invalidating = ('invalidate' + (' || maintenance_valid' if precise else '')) if banks else "1'b0"
+    current_asid = f'state_satp[{43+asid_bits}:44]' if asid_bits else "1'b0"
+
     ordinary = ' || '.join(f"(walk_address >= 64'h{int(region['base']):x} && walk_address <= 64'h{int(region['base']) + int(region['size']) - 8:x})"
                           for region in parameters['memoryRegions'] if region['readable'] and not region['device'] and int(region['size']) >= 8) or "1'b0"
     permit = '_pmp_allowed' if parameters['pmpEntries'] else "1'b1"
@@ -1223,9 +1233,14 @@ def translation_case(parameters):
 '''
     for port in range(2):
         q = f'ports_{port}_request_bits'
-        hit = [f"(tlbValid[{i}] && ({q}_address[38:12] >> (9 * tlb_{i}_level)) == (tlb_{i}_vpn >> (9 * tlb_{i}_level)))" for i in range(count)]
-        cached_pte = ''.join(f'{hit[i]} ? tlb_{i}_pte : ' for i in range(count)) + "64'd0"
-        cached_level = ''.join(f'{hit[i]} ? tlb_{i}_level : ' for i in range(count)) + "2'd0"
+        choices = [(f'{prefix}_{i}', f'{valid}[{i}]') for prefix, valid, position, size, owner in sorted(banks, key=lambda b: b[4] != port)
+                   if owner in (None, port) for i in range(size)]
+        hit = [f"({valid} && ({q}_address[38:12] >> (9 * {entry}_level)) == ({entry}_vpn >> (9 * {entry}_level))" +
+               (f" && ({entry}_asid == {current_asid} || {entry}_pte[5])" if entry.startswith('tlb_') and asid_bits else '') + ')'
+               for entry, valid in choices]
+        local_count = parameters.get('iTlbEntries' if port == 0 else 'dTlbEntries', 0)
+        cached_pte = ''.join(f'{h} ? {entry}_pte : ' for h, (entry, _) in zip(hit, choices)) + "64'd0"
+        cached_level = ''.join(f'{h} ? {entry}_level : ' for h, (entry, _) in zip(hit, choices)) + "2'd0"
         p = f'formal_lookup_{port}'
         body += f'''
   reg formal_held_{port};
@@ -1235,6 +1250,7 @@ def translation_case(parameters):
   wire {p}_paged = {q}_privilege != 3 && state_satp[63:60] != 0;
   wire {p}_invalid = {p}_paged && (state_satp[63:60] != 8 || {q}_address[63:39] != {{25{{{q}_address[38]}}}});
   wire {p}_hit = {' || '.join(hit) or "1'b0"};
+  wire {p}_local = {' || '.join(hit[:local_count]) or "1'b0"};
   wire [63:0] {p}_pte = {cached_pte};
   wire [1:0] {p}_level = {cached_level};
   wire [63:0] {p}_mask = {p}_level == 2 ? 64'h3fffffff : {p}_level == 1 ? 64'h1fffff : 64'hfff;
@@ -1328,7 +1344,7 @@ def translation_case(parameters):
       cover(bus_owned && !client && formal_lookup_1_response && formal_lookup_1_hit);
     end
 '''
-    if not count:
+    if not banks:
         body = body.replace(' && formal_lookup_0_hit', '').replace(' && formal_lookup_1_hit', '')
     for port in range(2):
         p, q, response = f'formal_lookup_{port}', f'ports_{port}_request_bits', f'ports_{port}_response_bits'
@@ -1375,50 +1391,80 @@ def translation_case(parameters):
     end
 '''
     body += '  end\n'
-    if count:
-        body += '''
-  reg cache_refill_allowed = 0;
+    if banks:
+        body += f'''
+  reg cache_refill_allowed = 0, cache_global;
+  reg [{max(asid_bits, 1)-1}:0] cache_asid;
   wire cache_leaf = bus_owned && memory_response_valid && memory_response_ready && !cancel_now &&
     !memory_response_bits_fault && memory_response_bits_tag == 0 && !bad_pte && leaf_pte;
-  wire cache_fill = cache_leaf && cache_refill_allowed && !invalidate;
+  wire cache_fill = cache_leaf && cache_refill_allowed && !formal_invalidate;
+  wire [63:0] cache_pte = formal_pte | {("(cache_global ? 64'd32 : 64'd0)" if precise else "64'd0")};
   always @(posedge clock) begin
-    if (reset) cache_refill_allowed <= 0;
-    else if (invalidate) cache_refill_allowed <= 0;
+    if (reset || formal_invalidate) cache_refill_allowed <= 0;
     else if (ports_0_request_valid && ports_0_request_ready && !formal_lookup_0_fast ||
              ports_1_request_valid && ports_1_request_ready && !formal_lookup_1_fast) cache_refill_allowed <= 1;
-    if (translation_past) begin
+    if (ports_0_request_valid && ports_0_request_ready && !formal_lookup_0_fast ||
+        ports_1_request_valid && ports_1_request_ready && !formal_lookup_1_fast) begin
+      cache_asid <= {current_asid}; cache_global <= 0;
+    end
+    if (bus_owned && memory_response_valid && memory_response_ready && !cancel_now &&
+        !memory_response_bits_fault && memory_response_bits_tag == 0 && !bad_pte && !leaf_pte)
+      cache_global <= cache_global || formal_pte[5];
+    if (translation_past && !reset) begin
       assert(refillAllowed == cache_refill_allowed);
-      if ($past(reset || invalidate)) assert(tlbValid == 0 && replacement == 0);
-      else begin
-        if ($past(cache_fill)) assert(replacement == ($past(replacement) + 1) % CACHE_COUNT);
-        else assert($stable({tlbValid, replacement}));
-'''.replace('CACHE_COUNT', str(count))
-        for i in range(count):
-            overlap = f'((tlb_{i}_vpn >> (9 * (tlb_{i}_level > walk_level ? tlb_{i}_level : walk_level))) == (virtual_address[38:12] >> (9 * (tlb_{i}_level > walk_level ? tlb_{i}_level : walk_level))))'
-            body += f'''
-        if ($past(cache_fill)) begin
-          assert(tlbValid[{i}] == ($past(replacement) == {i} || $past(tlbValid[{i}] && !{overlap})));
-          if ($past(replacement) == {i}) begin
-            assert(tlb_{i}_vpn == $past(virtual_address[38:12]) && tlb_{i}_pte == $past(memory_response_bits_data));
-            assert(tlb_{i}_level == $past(walk_level));
-          end else assert($stable({{tlb_{i}_vpn, tlb_{i}_pte, tlb_{i}_level}}));
-        end else assert($stable({{tlb_{i}_vpn, tlb_{i}_pte, tlb_{i}_level}}));
-'''
-        body += '''      end
-      cover(formal_lookup_0_response && formal_lookup_0_hit && !formal_lookup_0_denied);
-      cover(formal_lookup_1_response && formal_lookup_1_hit && formal_lookup_1_denied && ports_1_request_bits_write);
-      cover(cache_leaf && cache_refill_allowed && invalidate);
+      {('if (active) assert(walkAsid == cache_asid);' if count and asid_bits else '')}
+      {('if (active) assert(globalMapping == cache_global);' if precise else '')}
+      cover(cache_leaf && cache_refill_allowed && formal_invalidate);
       cover(walk_response && !cache_refill_allowed && !fault);
     end
   end
 '''
-        for i in range(count):
+        for prefix, valid, position, size, owner in banks:
+            name = 'cache_' + prefix
+            promote = (f'ports_{owner}_request_valid && ports_{owner}_request_ready && formal_lookup_{owner}_hit && '
+                       f'!formal_lookup_{owner}_local && formal_lookup_{owner}_paged && !formal_lookup_{owner}_fault && '
+                       '!(memory_response_valid && memory_response_ready)') if owner is not None else "1'b0"
+            allocate = 'cache_fill' + (f' && client == {owner}' if owner is not None else '')
             body += f'''
-  always @* if (translation_past && tlbValid[{i}]) begin
-    assert(tlb_{i}_level <= 2 && tlb_{i}_pte[63:54] == 0 && tlb_{i}_pte[0] && tlb_{i}_pte[6]);
-    assert((tlb_{i}_pte[1] || tlb_{i}_pte[3]) && (tlb_{i}_pte[1] || !tlb_{i}_pte[2]));
-    assert(tlb_{i}_level != 2 || tlb_{i}_pte[27:10] == 0);
-    assert(tlb_{i}_level != 1 || tlb_{i}_pte[18:10] == 0);
+  wire {name}_promote = {promote};
+  wire {name}_allocate = ({allocate}) || {name}_promote;
+  wire {name}_update = cache_fill || {name}_promote;
+  wire [26:0] {name}_vpn = {name}_promote ? ports_{owner or 0}_request_bits_address[38:12] : virtual_address[38:12];
+  wire [63:0] {name}_pte = {name}_promote ? formal_lookup_{owner or 0}_pte : cache_pte;
+  wire [1:0] {name}_level = {name}_promote ? formal_lookup_{owner or 0}_level : walk_level;
+  always @(posedge clock) if (translation_past) begin
+    if ($past(reset || invalidate)) assert({valid} == 0 && {position} == 0);
+    else begin
+      if ($past({name}_allocate)) assert({position} == ($past({position}) + 1) % {size});
+      else assert($stable({position}));
+'''
+            for i in range(size):
+                entry = f'{prefix}_{i}'
+                space = f'({entry}_asid == cache_asid || {entry}_pte[5] || {name}_pte[5]) && ' if owner is None and asid_bits else ''
+                overlap = f'({space}(({entry}_vpn >> (9 * ({entry}_level > {name}_level ? {entry}_level : {name}_level))) == ({name}_vpn >> (9 * ({entry}_level > {name}_level ? {entry}_level : {name}_level)))))'
+                selected = f'({name}_allocate && {position} == {i})'
+                discard = "1'b0"
+                if precise:
+                    identity = f'{entry}_asid' if owner is None and asid_bits else current_asid
+                    scope = f'(!maintenance_addressValid || maintenance_address[63:39] == {{25{{maintenance_address[38]}}}} && (maintenance_address[38:12] >> (9 * {entry}_level)) == ({entry}_vpn >> (9 * {entry}_level))) && (!maintenance_asidValid || !{entry}_pte[5] && {identity} == maintenance_asid)'
+                    discard = f'maintenance_valid && (maintenance_fence ? ({scope}) : {int(owner is not None)})'
+                body += f'''
+      if ($past({discard})) assert(!{valid}[{i}]);
+      else assert({valid}[{i}] == $past({name}_update ? ({selected} || {valid}[{i}] && !{overlap}) : {valid}[{i}]));
+      if ($past({selected})) begin
+        assert({entry}_vpn == $past({name}_vpn) && {entry}_pte == $past({name}_pte) && {entry}_level == $past({name}_level));
+        {('assert(' + entry + '_asid == $past(cache_asid));' if owner is None and asid_bits else '')}
+      end else assert($stable({{{entry}_vpn, {entry}_pte, {entry}_level{(', ' + entry + '_asid') if owner is None and asid_bits else ''}}}));
+'''
+            body += '    end\n  end\n'
+            for i in range(size):
+                entry = f'{prefix}_{i}'
+                body += f'''
+  always @* if (translation_past && {valid}[{i}]) begin
+    assert({entry}_level <= 2 && {entry}_pte[63:54] == 0 && {entry}_pte[0] && {entry}_pte[6]);
+    assert(({entry}_pte[1] || {entry}_pte[3]) && ({entry}_pte[1] || !{entry}_pte[2]));
+    assert({entry}_level != 2 || {entry}_pte[27:10] == 0);
+    assert({entry}_level != 1 || {entry}_pte[18:10] == 0);
   end
 '''
     return ('Translation', body, 'assign memory_request_bits_size = 3\'h3;', "assign memory_request_bits_size = 3'h2;")
@@ -2495,6 +2541,9 @@ def integer_cases(parameters):
     if parameters.get('virtualAddressBits') == 39:
         decode = decode.replace("i_word == 32'h10200073 ? 31 : 0", "i_word == 32'h10200073 ? 31 : (i_word & 32'hfe007fff) == 32'h12000073 ? 16 : 0")
         decode = decode.replace("i_word == 32'h10200073)", "i_word == 32'h10200073 || (i_word & 32'hfe007fff) == 32'h12000073)")
+        if any(parameters.get(key) for key in ('tlbEntries', 'iTlbEntries', 'dTlbEntries')) and any(parameters.get(key) for key in ('asidBits', 'iTlbEntries', 'dTlbEntries')):
+            decode = decode.replace('assert(!output_bits_usesRs1 && !output_bits_usesRs2 && !output_bits_writesRd);',
+                "assert(output_bits_usesRs1 == (!input_bits_fault && (i_word & 32'hfe007fff) == 32'h12000073) && output_bits_usesRs2 == output_bits_usesRs1 && !output_bits_writesRd);")
     execute = r'''
   wire [4:0] i_op = input_bits_decoded_operation;
   wire [31:0] i_word = input_bits_decoded_instruction_instruction;
@@ -5429,7 +5478,7 @@ endmodule''', 1)
                            ('mutation-sum', 'assign translationState_sum = status[18];', 'assign translationState_sum = status[19];'),
                            ('mutation-tvm', 'assign sfenceLegal =', "assign sfenceLegal = 1'h1 |"),
                            ('mutation-satp-mode', "writeData[63:60] == 4'h8", "writeData[63:60] != 4'h0"),
-                           ('mutation-satp-asid', "satp <= {20'h80000, writeData[43:0]};", "satp <= {4'h8, writeData[59:0]};")]
+                           ('mutation-satp-asid', re.search(r"satp <= \{[^;]+;", sources[module + '.sv']).group(), "satp <= {4'h8, writeData[59:0]};")]
                 if manifest['parameters']['physicalAddressBits'] != 56:
                     root = re.search(r"writeData\[43:\d+\] == \d+'h0", sources[module + '.sv']).group()
                     checks += [('mutation-satp-root', root, "1'h1")]
@@ -5453,10 +5502,19 @@ endmodule''', 1)
                 denied_name = re.search(r':\s*(\w+)\s*$', fault_output)[1]
                 denied = re.search(rf'wire\s+{denied_name}\s*=\s*(\w+)\s*\|[^;]+;', original)
                 checks += [('mutation-tlb-flush', invalidate.group(), invalidate[1] + 'tlbValid <= tlbValid;'),
-                           ('mutation-tlb-refill', 'refillAllowed & ~invalidate', "1'h1"),
+                           ('mutation-tlb-refill', 'refillAllowed & ~' + ('maintaining' if any(manifest['parameters'].get(key) for key in ('asidBits', 'iTlbEntries', 'dTlbEntries')) else 'invalidate'), "1'h1"),
                            ('mutation-tlb-permission', denied.group(), f"wire {denied_name} = {denied[1]};"),
-                           ('mutation-tlb-ppn', 'tlb_0_pte <= memory_response_bits_data;', "tlb_0_pte <= memory_response_bits_data & 64'hffffffff;"),
+                           ('mutation-tlb-ppn', re.search(r"tlb_0_pte <= [^;]+;", original).group(), "tlb_0_pte <= memory_response_bits_data & 64'hffffffff;"),
                            ('mutation-tlb-page', 'tlb_0_level <= level;', "tlb_0_level <= 2'h0;")]
+                if manifest['parameters'].get('asidBits'):
+                    comparison = re.search(r"wire\s+\w+\s*=\s*tlb_0_asid == state_satp\[\d+:44\];", original).group()
+                    scope = re.search(r'if \(maintenance_valid\) begin\s+(tlbValid <=[^;]+;)', original)[1]
+                    inherited = re.search(r'wire\s+\[63:0\]\s+(\w+)\s*=\s*memory_response_bits_data\s*\|[^;]+;', original)
+                    assert inherited and 'globalMapping' in inherited[0] and f'tlb_0_pte <= {inherited[1]};' in original
+                    checks += [('mutation-tlb-asid', comparison, comparison.split('=')[0] + "= 1'h1;"),
+                               ('mutation-tlb-global', inherited[0], f'wire [63:0] {inherited[1]} = memory_response_bits_data;'),
+                               ('mutation-tlb-asid-select', scope, scope.replace('~maintenance_asidValid', "1'h1")),
+                               ('mutation-tlb-address-select', scope, scope.replace('~maintenance_addressValid', "1'h1"))]
         if name == 'UserExecute':
             checks += [('mutation-return', 'assign output_bits_instruction_fault =', 'assign output_bits_instruction_fault = 0 &')]
         if name == 'SupervisorExecute':
@@ -6073,8 +6131,56 @@ endmodule''', 1)
       walk_level == 1 ? 64'h{(((base + 8192) >> 12) << 10) | 1:x} : 64'h400000cf));
   end
 '''
-                    if manifest['parameters'].get('tlbEntries'):
+                    if any(manifest['parameters'].get(key) for key in ('tlbEntries', 'iTlbEntries', 'dTlbEntries')):
                         guidance += '  always @* assume(!invalidate);\n'
+                    if 'maintenance_valid' in sources[module + '.sv']:
+                        guidance += '  always @* assume(!maintenance_valid);\n'
+                    text = text.replace('endmodule', guidance + 'endmodule', 1)
+                if unit == 'Translation' and mode == 'mutation-tlb-flush' and filename == module + '.sv' and 'maintenance_valid' in sources[module + '.sv']:
+                    base = int(manifest['parameters']['resetVector'])
+                    guidance = f'''
+  always @* begin
+    assume(!ports_0_request_valid && ports_1_request_valid && ports_1_response_ready);
+    assume(ports_1_request_bits_address == 64'h100 && ports_1_request_bits_privilege == 1);
+    assume(!ports_1_request_bits_fetch && !ports_1_request_bits_write && !cancelInstruction);
+    assume(state_satp == 64'h{(8 << 60) | (base >> 12):x} && !state_sum && !state_mxr);
+    assume(!maintenance_valid && invalidate == (|tlbValid) && formal_permit && memory_request_ready);
+    assume(memory_response_valid == memory_response_ready && !memory_response_bits_fault && memory_response_bits_tag == 0);
+    assume(memory_response_bits_data == 64'h{((base >> 12) << 10) | 0xcf:x});
+  end
+'''
+                    text = text.replace('endmodule', guidance + 'endmodule', 1)
+                if unit == 'Translation' and mode == 'mutation-tlb-global' and filename == module + '.sv':
+                    base = int(manifest['parameters']['resetVector'])
+                    guidance = f'''
+  always @* begin
+    assume(!ports_0_request_valid && ports_1_request_valid && ports_1_response_ready);
+    assume(ports_1_request_bits_address == 64'h100 && ports_1_request_bits_privilege == 1);
+    assume(!ports_1_request_bits_fetch && !ports_1_request_bits_write && !cancelInstruction);
+    assume(state_satp == 64'h{(8 << 60) | (base >> 12):x} && !state_sum && !state_mxr);
+    assume(!invalidate && !maintenance_valid && formal_permit && memory_request_ready);
+    assume(memory_response_valid == memory_response_ready && !memory_response_bits_fault && memory_response_bits_tag == 0);
+    assume(memory_response_bits_data == (walk_level == 2 ? 64'h{(((base + 4096) >> 12) << 10) | 33:x} : 64'h{((base >> 12) << 10) | 0xcf:x}));
+  end
+'''
+                    text = text.replace('endmodule', guidance + 'endmodule', 1)
+                if unit == 'Translation' and mode in ('mutation-tlb-asid-select', 'mutation-tlb-address-select') and filename == module + '.sv':
+                    base = int(manifest['parameters']['resetVector'])
+                    address_select = mode == 'mutation-tlb-address-select'
+                    guidance = f'''
+  always @* begin
+    assume(!ports_0_request_valid && ports_1_request_valid && ports_1_response_ready);
+    assume(ports_1_request_bits_address == 64'h100 && ports_1_request_bits_privilege == 1);
+    assume(!ports_1_request_bits_fetch && !ports_1_request_bits_write && !cancelInstruction);
+    assume(state_satp == 64'h{(8 << 60) | (1 << 44) | (base >> 12):x} && !state_sum && !state_mxr);
+    assume(!invalidate && formal_permit && memory_request_ready);
+    assume(memory_response_valid == memory_response_ready && !memory_response_bits_fault && memory_response_bits_tag == 0);
+    assume(memory_response_bits_data == 64'h{((base >> 12) << 10) | 0xcf:x});
+    assume(maintenance_valid == (|tlbValid) && maintenance_fence);
+    assume(maintenance_addressValid == {int(address_select)} && maintenance_address == 64'h40000100);
+    assume(maintenance_asidValid == {int(not address_select)} && maintenance_asid == 2);
+  end
+'''
                     text = text.replace('endmodule', guidance + 'endmodule', 1)
                 if name == 'WideFetch' and mode == 'cover':
                     base = (min(int(r['base']) for r in manifest['parameters']['memoryRegions'] if r['executable'] and not r['device'] and int(r['size']) >= 64) + 63) & ~63
@@ -6535,6 +6641,8 @@ endmodule''', 1)
                 depth = 4
             if unit == 'Translation' and task == 'prove':
                 depth = 6
+                if any(manifest['parameters'].get(key) for key in ('asidBits', 'iTlbEntries', 'dTlbEntries')):
+                    timeout = 180
             if name in ('WideFetch', 'WfiFrontend', 'PipelineBackend') and task == 'prove':
                 depth = 6 if name == 'WideFetch' else 4
             if name in ('WfiBackend', 'InterruptBackend') and mutating:

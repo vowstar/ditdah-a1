@@ -75,6 +75,7 @@ verify-signoff: verify-writeback verify-formal
 	$(MAKE) verify-prediction
 	$(MAKE) verify-cache-configuration
 	$(MAKE) verify-shared-cache
+	$(MAKE) verify-translation-context SOFTWARE_CONFIG=$(SHARED_OUTPUT)/software/w3-h16/input.json
 
 .PHONY: verify-shared-cache
 SHARED_OUTPUT ?= result/shared-cache-signoff
@@ -304,6 +305,24 @@ verify-burst-formal: verify-burst
 	python3 test/formal.py --rtl result/burst/pmp16-axi64/rtl --output result/formal/burst --modules Pmp Fetch InstructionCache Memory MemoryArbiter Axi WfiFrontend
 	python3 test/formal.py --rtl result/burst-translation/irq-pmp16-axi512/rtl --output result/formal/burst-wide --modules Pmp SupervisorFetch InstructionCache Memory MemoryArbiter Axi Coherence WfiFrontend
 
+.PHONY: verify-translation-context
+TRANSLATION_OUTPUT ?= result/translation-context-signoff
+TRANSLATION_ARGS = --sv39 --i-tlb-entries 2 --d-tlb-entries 2 --pmp-entries 16 --issue-width 3
+verify-translation-context:
+	for entries in 0 4; do \
+		comparison=""; if test $$entries = 4; then comparison="--translation-baseline $(TRANSLATION_OUTPUT)/shared0/summary.json"; fi; \
+		python3 test/verify.py $(TRANSLATION_ARGS) --tlb-entries $$entries --width 64 --output $(TRANSLATION_OUTPUT)/shared$$entries --case sv39_working_set --case sv39_asid $$comparison || exit $$?; \
+	done
+	python3 test/verify.py $(TRANSLATION_ARGS) --asid-bits 4 --tlb-entries 4 --width 256 --load-queue-entries 2 --fabric-read-slots 3 --icache-bytes 8192 --burst-refill --dcache-bytes 8192 --dcache-refill-bytes 64 --dcache-writeback --l2-cache-bytes 131072 --output $(TRANSLATION_OUTPUT)/coherent --case sv39_asid --case sv39_context --case sv39_protection --case sv39_accessed --case sv39_sum --case sv39_mxr
+	for profile in shared0:64 shared4:64 coherent:256; do \
+		name=$${profile%:*}; bus=$${profile#*:}; \
+		python3 test/formal.py --rtl $(TRANSLATION_OUTPUT)/$$name/irq-pmp16-axi$$bus/rtl --output $(TRANSLATION_OUTPUT)/formal-$$name --modules Translation --jobs $(FORMAL_JOBS) || exit $$?; \
+	done
+	python3 test/formal.py --rtl $(TRANSLATION_OUTPUT)/coherent/irq-pmp16-axi256/rtl --output $(TRANSLATION_OUTPUT)/formal-scalar --modules SupervisorCsr SupervisorExecute IntegerDecode --jobs $(FORMAL_JOBS)
+	$(MAKE) verify-translation-software SOFTWARE_OUTPUT=$(TRANSLATION_OUTPUT)/software SOFTWARE_TLB_ENTRIES=4 SOFTWARE_CACHE_SIZES=8192 SOFTWARE_BURST_REFILL=--burst-refill SOFTWARE_TRANSLATION_ARGS="--asid-bits 4 --i-tlb-entries 2 --d-tlb-entries 2 --dcache-refill-bytes 64" TRANSLATION_SOFTWARE_DIR=context
+	build-ditdah-a1 --no-trace --config $(TRANSLATION_OUTPUT)/software/context/harts16-cache8192/input.json --output $(TRANSLATION_OUTPUT)/production-context
+	python3 test/check_production.py --root $(TRANSLATION_OUTPUT) --translation-context --sv39 --tlb-entries 4 --i-tlb-entries 2 --d-tlb-entries 2 --asid-bits 4 --burst-refill --dcache-refill-bytes 64
+
 verify-translation-cache: verify-translation-formal
 	python3 test/verify.py --sv39 --tlb-entries 2 --width 64 --pmp-entries 16 --output result/translation-cache-small $(foreach name,$(TRANSLATION_CASES),--case $(name))
 	python3 test/verify.py --sv39 --tlb-entries 2 --width 64 --pmp-entries 0 --output result/translation-cache-pmp0 --case sv39_reuse --case sv39_context
@@ -321,6 +340,7 @@ verify-translation-cache-software:
 	$(MAKE) verify-translation-software SOFTWARE_TLB_ENTRIES=4 TRANSLATION_SOFTWARE_DIR=translation-cache
 
 SOFTWARE_TLB_ENTRIES ?= 0
+SOFTWARE_TRANSLATION_ARGS ?=
 TRANSLATION_SOFTWARE_DIR ?= translation
 SOFTWARE_CACHE_SIZES ?= 0 8192
 SOFTWARE_BURST_REFILL ?=
@@ -331,7 +351,7 @@ verify-burst-software:
 verify-translation-software:
 	for count in 1 2 16; do for cache in $(SOFTWARE_CACHE_SIZES); do \
 		image=$(SOFTWARE_OUTPUT)/$(TRANSLATION_SOFTWARE_DIR)/harts$$count-cache$$cache; \
-		python3 scripts/build_software.py --config $(SOFTWARE_CONFIG) --sv39 --tlb-entries $(SOFTWARE_TLB_ENTRIES) $(SOFTWARE_BURST_REFILL) --expected-interrupt 3 --harts $$count --icache-bytes $$cache --dcache-bytes $$cache --console-base 0x10000000 --program software/tests/virtual_memory.S --stack-bytes 512 --output $$image && \
+		python3 scripts/build_software.py --config $(SOFTWARE_CONFIG) --sv39 --tlb-entries $(SOFTWARE_TLB_ENTRIES) $(SOFTWARE_TRANSLATION_ARGS) $(SOFTWARE_BURST_REFILL) --expected-interrupt 3 --harts $$count --icache-bytes $$cache --dcache-bytes $$cache --console-base 0x10000000 --program software/tests/virtual_memory.S --stack-bytes 512 --output $$image && \
 		python3 test/verify.py --elf $$image/software.elf --config $$image/input.json --output $$image/verification --software-transactions $$((4096 * count)) --jobs $(SOFTWARE_JOBS) || exit $$?; \
 	done; done
 

@@ -40,7 +40,8 @@ object DitDahA1Core extends Generator[DitDahA1Parameter, DitDahA1Layers, DitDahA
       translation.io.reset := io.reset
       translation.io.state :<= backend.io.translationState.get
       translation.io.cancelInstruction := backend.io.redirect
-      if parameter.tlbEntries != 0 then translation.io.invalidate.get := backend.io.invalidateTranslation.get
+      if parameter.hasTranslationCache then translation.io.invalidate.get := backend.io.invalidateTranslation.get
+      if parameter.preciseTranslationMaintenance then translation.io.maintenance.get :<= backend.io.translationMaintenance.get
       if parameter.pmpEntries != 0 then translation.io.pmp.get :<= backend.io.pmp.get
       translation.io.ports(0) :<>= frontend.io.translation.get
       translation.io.ports(1) :<>= backend.io.translation.get
@@ -175,7 +176,17 @@ object DitDahA1Backend extends Generator[DitDahA1Parameter, DitDahA1Layers, DitD
         ((retire.bits.csrAddress >= 0x3b0.U(12)) & (retire.bits.csrAddress <= 0x3ef.U(12))))
     val translationUpdate = if parameter.enableTranslation then
       retire.bits.sfenceVma | (retire.bits.csrWrite & (retire.bits.csrAddress === 0x180.U(12))) else false.B
-    io.invalidateTranslation.foreach(_ := retired & (translationUpdate | pmpUpdate))
+    val satpUpdate = retire.bits.csrWrite & (retire.bits.csrAddress === 0x180.U(12))
+    io.invalidateTranslation.foreach(_ := retired & (pmpUpdate | (if parameter.preciseTranslationMaintenance then
+      (if parameter.asidBits == 0 then satpUpdate else false.B) else translationUpdate)))
+    io.translationMaintenance.foreach { maintenance =>
+      maintenance.valid := retired & !retire.bits.instruction.fault & (retire.bits.sfenceVma | (parameter.asidBits != 0).B & satpUpdate)
+      maintenance.fence := retire.bits.sfenceVma
+      maintenance.addressValid := retire.bits.instruction.instruction.asBits.bits(19, 15) =/= 0.B(5)
+      maintenance.address := retire.bits.address
+      maintenance.asidValid := retire.bits.instruction.instruction.asBits.bits(24, 20) =/= 0.B(5)
+      maintenance.asid := (if parameter.asidBits == 0 then 0.U(1) else retire.bits.storeData.asBits.bits(parameter.asidBits - 1, 0).asUInt)
+    }
     val redirect = takeInterrupt | (retired & (retire.bits.instruction.fault | retire.bits.mret | retire.bits.sret |
       pmpUpdate | translationUpdate | retire.bits.fenceI | (!commitResolved & (retire.bits.nextPc =/= sequentialPc)))) | enterWfi
     if parameter.iCacheBytes != 0 then io.invalidate.get := retired & (retire.bits.fenceI | pmpUpdate | translationUpdate)

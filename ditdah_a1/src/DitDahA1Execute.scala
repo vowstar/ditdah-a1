@@ -127,6 +127,7 @@ object DitDahA1Execute extends Generator[DitDahA1Parameter, DitDahA1UnitLayers, 
     out.fenceI := op === FenceI.U(operationBits)
     out.sfenceVma := parameter.enableTranslation.B & (op === Fence.U(operationBits)) &
       ((encoding & BigInt("fe007fff", 16).B(32)) === 0x12000073.B(32))
+    if parameter.preciseTranslationMaintenance then when(out.sfenceVma) { out.address := a }
     out.wfi := op === Wfi.U(operationBits)
     when(csr) { out.value := io.csrValue }
     val jump = (op === Jal.U(operationBits)) | (op === Jalr.U(operationBits))

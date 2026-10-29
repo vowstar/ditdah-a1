@@ -88,6 +88,11 @@ object DitDahA1Decode extends Generator[DitDahA1Parameter, DitDahA1UnitLayers, D
       out.usesRs2 := !in.fault & !lr
     }
     if parameter.enableTranslation then
-      when((in.instruction.asBits & BigInt("fe007fff", 16).B(32)) === 0x12000073.B(32)) { out.operation := Fence.U(operationBits) }
+      when((in.instruction.asBits & BigInt("fe007fff", 16).B(32)) === 0x12000073.B(32)) {
+        out.operation := Fence.U(operationBits)
+        if parameter.preciseTranslationMaintenance then
+          out.usesRs1 := !in.fault
+          out.usesRs2 := !in.fault
+      }
     out.writesRd := !in.fault & (operation =/= Illegal.U(operationBits)) & !branch & !store & (operation =/= Ecall.U(operationBits)) & (operation =/= Mret.U(operationBits)) & (operation =/= Sret.U(operationBits)) & (operation =/= Fence.U(operationBits)) & (operation =/= FenceI.U(operationBits)) & (operation =/= Wfi.U(operationBits))
     out.serializing := !in.fault & (csr | (operation === Mret.U(operationBits)) | (operation === Sret.U(operationBits)) | (operation === Fence.U(operationBits)) | (operation === FenceI.U(operationBits)) | (operation === Wfi.U(operationBits)))

@@ -472,6 +472,60 @@ def sv39_cases(base, protection, writeback=False):
         p.emit(sd(3, 11), csr(0, 0x300, 0))
         yield 'sv39_' + name, p.finish()
     p = Program(base)
+    root, middle, leaf, virtual = base + 0x1000, base + 0x2000, base + 0x3000, 0x40000000
+    def word(physical, value):
+        p.memory.update((physical + byte, (value >> (byte * 8)) & 255) for byte in range(8))
+    word(root + 8, (middle >> 2) | 1)
+    word(middle, (leaf >> 2) | 1)
+    for page in range(4):
+        word(leaf + page * 8, ((base + page * 4096) >> 2) | 0xcf)
+    for page, value in ((1, 0x1111), (2, 0x2222), (3, 0x3333)):
+        word(base + page * 4096 + 0x100, value)
+        word(base + 0x610 + page * 8, virtual + page * 4096 + 0x100)
+    word(base + 0x600, (8 << 60) | root >> 12)
+    word(base + 0x610, 0x800)
+    if protection:
+        p.emit(addi(2, 0, -1), csr(0, 0x3b0, 2), addi(2, 0, 0x1f), csr(0, 0x3a0, 2))
+    p.address(10, 0x600)
+    p.emit(ld(11, 10, 24), ld(12, 10, 32), ld(13, 10, 40), ld(2, 10), csr(0, 0x180, 2), 0x12000073,
+           ld(2, 10, 16), csr(0, 0x300, 2), ld(2, 10, 8), csr(0, 0x341, 2), 0x30200073)
+    word(base + 0x608, virtual + p.offset)
+    p.emit(addi(6, 0, 32))
+    loop = p.offset
+    p.emit(ld(3, 11), ld(4, 12), ld(5, 13), addi(6, 6, -1), beq(6, 0, loop - p.offset - 16) ^ (1 << 12))
+    stop = virtual + p.offset
+    p.finish()
+    p.stop = stop
+    p.expected_registers = {3: 0x1111, 4: 0x2222, 5: 0x3333, 6: 0}
+    yield 'sv39_working_set', p
+    p = Program(base)
+    root, other, middle, alternate, leaf = (base + offset for offset in (0x1000, 0, 0x2000, 0x3000, 0x7000))
+    def word(physical, value):
+        p.memory.update((physical + byte, (value >> (byte * 8)) & 255) for byte in range(8))
+    for physical, value in ((root + 255 * 8, middle >> 2 | 1), (other + 255 * 8, alternate >> 2 | 1),
+            (middle + 8, leaf >> 2 | 1), (alternate + 8, middle >> 2 | 1),
+            (leaf, root >> 2 | 0xcf), (middle, middle >> 2 | 0xcf),
+            (root + 0x100, 0x11), (middle + 0x100, 0x22),
+            (base + 0x600, 8 << 60 | 1 << 44 | root >> 12), (base + 0x608, 8 << 60 | 2 << 44 | other >> 12),
+            (base + 0x610, 255 << 30 | 1 << 21 | 0x100), (base + 0x618, 0x20800),
+            (base + 0x620, 1 << 63 | 2)):
+        word(physical, value)
+    if protection:
+        p.emit(addi(2, 0, -1), csr(0, 0x3b0, 2), addi(2, 0, 0x1f), csr(0, 0x3a0, 2))
+    p.address(10, 0x600)
+    p.emit(ld(2, 10), ld(3, 10, 8), ld(11, 10, 16), ld(12, 10, 24), ld(14, 10, 32), addi(15, 0, 0), 0x12000073)
+    def access(context):
+        p.emit(csr(0, 0x180, context), csr(0, 0x300, 12), ld(14 + context, 11), csr(0, 0x300, 0))
+    for context in (2, 3, 2, 2):
+        access(context)
+    for selectors in ((15, 0), (0, 15), (0, 14), (0, 0)):
+        p.emit(0x12000073 | selectors[0] << 15 | selectors[1] << 20)
+        for context in ((2, 3, 2) if selectors == (0, 14) else (2, 3)):
+            access(context)
+    p.translation = {16: 0x11, 17: 0x22}
+    p.translation_accesses = 13
+    yield 'sv39_asid', p.finish()
+    p = Program(base)
     root, other, middle, alternate, leaf, changed = (base + offset for offset in (0x1000, 0, 0x2000, 0x3000, 0x4000, 0x7000))
     if writeback:
         changed = root

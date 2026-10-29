@@ -63,8 +63,8 @@ The shared cache is non-inclusive and write-through without write allocation; pr
 Set `pmpEntries` to 16 to enable protection; successful PMP writes restart younger execution while accepted fetches drain.
 Set `enableUserMode` for Bare M/U execution and effective data privilege via MPRV.
 Set `enableSupervisorMode` with user mode and interrupts for M/S/U, standard trap delegation and SRET.
-Set `virtualAddressBits` to 39 for Sv39/Svade with 4 KiB/2 MiB/1 GiB pages and ASIDLEN=0; zero selects Bare. PTE reads share the data path under S-mode PMP/PMA.
-Set `tlbEntries` to 0/2/4 for a shared per-hart TLB with independent I/D hit service and one walker; SFENCE.VMA, satp and PMP maintenance exclude stale refills while accepted reads drain.
+Set `virtualAddressBits` to 39 for Sv39/Svade with 4 KiB/2 MiB/1 GiB pages; zero selects Bare. `asidBits` selects zero or four implemented ASID bits. PTE reads share the data path under S-mode PMP/PMA.
+`iTlbEntries`, `dTlbEntries` and shared `tlbEntries` independently select 0/2/4 entries per hart with one walker. Local entries clear on satp writes; ASID-tagged shared entries survive context changes. With local banks or ASIDs, SFENCE.VMA selects VA/ASID ranges and handles global mappings; PMP maintenance clears all layers, and maintenance excludes stale refills while accepted reads drain.
 Set `enableInterrupts` for precise entry and return from synchronous machine software/timer/external interrupt levels; platform logic owns the sources.
 System interrupt inputs are indexed by hart; each hart has independent CSR and PMP state.
 An optional `localInterruptBase` maps protected software-interrupt and 64-bit timer registers; `timeTick` supplies the synchronous timebase.

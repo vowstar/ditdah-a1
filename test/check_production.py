@@ -17,9 +17,13 @@ parser.add_argument('--data-cache', action='store_true')
 parser.add_argument('--dcache-refill-bytes', type=int, choices=(8, 64), default=8)
 parser.add_argument('--supervisor', action='store_true')
 parser.add_argument('--sv39', action='store_true')
+parser.add_argument('--translation-context', action='store_true')
 parser.add_argument('--burst-refill', action='store_true')
 parser.add_argument('--pipeline', action='store_true')
 parser.add_argument('--tlb-entries', type=int, choices=(0, 2, 4), default=0)
+parser.add_argument('--root', type=Path, default=Path('result'))
+for name in ('i-tlb-entries', 'd-tlb-entries', 'asid-bits'):
+    parser.add_argument('--' + name, type=int, choices=(0, 4) if name == 'asid-bits' else (0, 2, 4), default=0)
 args = parser.parse_args()
 
 load_configuration = runpy.run_path('scripts/build_software.py')['load_configuration']
@@ -27,7 +31,7 @@ source = Path('software/platform.json')
 original = source.read_bytes()
 baseline = json.loads(original)
 directory = Path('result/software-config-checks') / ('pipeline' if args.pipeline else 'sv39' if args.sv39 else 'supervisor' if args.supervisor else 'data-cache' if args.data_cache else 'base')
-for name, overrides in (('unchanged', {}), ('derived', dict(harts=2)), ('supervisor', dict(harts=2, supervisor_mode=True)), ('sv39', dict(harts=2, sv39=True)), ('cache', dict(tlb_entries=2)), ('burst', dict(burst_refill=True)), ('data-line', dict(dcache_bytes=8192, dcache_refill_bytes=64))):
+for name, overrides in (('unchanged', {}), ('derived', dict(harts=2)), ('supervisor', dict(harts=2, supervisor_mode=True)), ('sv39', dict(harts=2, sv39=True)), ('cache', dict(tlb_entries=2)), ('context', dict(sv39=True, i_tlb_entries=2, d_tlb_entries=4, asid_bits=4)), ('burst', dict(burst_refill=True)), ('data-line', dict(dcache_bytes=8192, dcache_refill_bytes=64))):
     output = directory / name
     output.mkdir(parents=True, exist_ok=True)
     selection = SimpleNamespace(config=source, output=output, harts=None, icache_bytes=None, dcache_bytes=None)
@@ -38,6 +42,8 @@ for name, overrides in (('unchanged', {}), ('derived', dict(harts=2)), ('supervi
     assert selected['virtualAddressBits'] == (39 if overrides.get('sv39') else baseline['virtualAddressBits'])
     assert bool(selected.get('enableBurstRefill')) == bool(overrides.get('burst_refill'))
     assert selected.get('tlbEntries', 0) == overrides.get('tlb_entries', 0)
+    for field, option in (('iTlbEntries', 'i_tlb_entries'), ('dTlbEntries', 'd_tlb_entries'), ('asidBits', 'asid_bits')):
+        assert selected.get(field, 0) == overrides.get(option, 0)
     assert selected.get('dCacheRefillBytes', 8) == overrides.get('dcache_refill_bytes', 8)
     if overrides.get('supervisor_mode') or overrides.get('sv39'):
         assert selected['enableUserMode'] and selected['enableInterrupts']
@@ -62,9 +68,12 @@ if args.pipeline:
     profiles = (('production-width2', 'DitDahA1'), ('production-prediction', 'DitDahA1'))
 if args.dcache_refill_bytes == 64:
     profiles = (('production-data-line', 'DitDahA1'), ('production-data-line-burst', 'DitDahA1'))
+if args.translation_context:
+    assert args.sv39
+    profiles = (('production-context', 'DitDahA1'),)
 for directory, top in profiles:
     burst = args.burst_refill or directory == 'production-data-line-burst'
-    rtl = Path("result") / directory
+    rtl = args.root / directory
     manifest = json.loads((rtl / 'ditdah_a1_config.json').read_text())
     assert manifest['implementation']['issueWidth'] == manifest['parameters']['issueWidth']
     count = manifest['parameters']['hartCount'] if args.supervisor or args.sv39 or burst or args.dcache_refill_bytes == 64 else int(directory.split('-harts')[1]) if '-harts' in directory else 1
@@ -102,6 +111,8 @@ for directory, top in profiles:
         assert manifest['implementation']['privilege'] == 'MSU' and 'sret' in manifest['implementation']['instructions']
     assert ('DitDahA1Translation.sv' in files) == args.sv39
     assert manifest['implementation']['tlbEntries'] == args.tlb_entries
+    for field, option in (('iTlbEntries', 'i_tlb_entries'), ('dTlbEntries', 'd_tlb_entries'), ('asidBits', 'asid_bits')):
+        assert manifest['implementation'][field] == getattr(args, option)
     assert manifest['parameters']['enableBurstRefill'] == burst
     assert manifest['implementation']['enableBurstRefill'] == burst
     if top in ('DitDahA1', 'DitDahA1MemoryFabric'):
@@ -114,6 +125,8 @@ for directory, top in profiles:
             assert bool(re.search(r'\bblock\b', queue)) == (line and manifest['parameters']['axiDataBits'] > 64)
     if args.sv39:
         assert ('tlbValid' in (rtl / 'DitDahA1Translation.sv').read_text()) == bool(args.tlb_entries)
+        for register, entries in (('instructionValid', args.i_tlb_entries), ('dataValid', args.d_tlb_entries)):
+            assert bool(re.search(r'\breg\s+\[[^]]+\]\s+' + register + ';', (rtl / 'DitDahA1Translation.sv').read_text())) == bool(entries)
     if args.sv39:
         assert manifest['parameters']['virtualAddressBits'] == 39
         assert manifest['implementation']['translation'] == 'Sv39/Svade'

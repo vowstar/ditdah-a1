@@ -31,7 +31,11 @@ main:
     slli t1, s0, 12
     add t0, t0, t1
     add s1, s1, t0
+#if DITDAH_ASID_BITS
+    li t0, 0x200000ef
+#else
     li t0, 0x200000cf
+#endif
     sd t0, 16(s1)
     li t0, 0xc7
     sd t0, 0(s1)
@@ -77,6 +81,17 @@ main:
     li t1, 0x00200513
     sw t1, 0(t0)
     fence.i
+#if DITDAH_ASID_BITS
+    la t0, .Lcontexts
+    slli t1, s0, 12
+    add t0, t0, t1
+    li t1, 0x200000cf
+    sd t1, 8(t0)
+    ori t1, t1, 32
+    sd t1, 16(t0)
+    li t1, 0xc7
+    sd t1, 0(t0)
+#endif
     la t0, __ram_base
     srli t0, t0, 2
     csrw pmpaddr0, t0
@@ -112,6 +127,27 @@ main:
     jalr ra, t0, 0
     li t0, 1
     bne a0, t0, .Lfail_supervisor
+#if DITDAH_ASID_BITS
+    csrr t5, satp
+    la t0, .Lcontexts
+    slli t1, s0, 12
+    add t0, t0, t1
+    srli t0, t0, 12
+    li t1, 0x8000100000000000
+    or t0, t0, t1
+    li t1, 1
+    sfence.vma zero, t1
+    csrw satp, t0
+    li t0, 0x40000200
+    ld t1, 0(t0)
+    li t2, 0x80000200
+    ld t2, 0(t2)
+    bne t1, t2, .Lfail_supervisor
+    csrw satp, t5
+    ld t1, 0(t0)
+    addi t2, s0, 65
+    bne t1, t2, .Lfail_supervisor
+#endif
     la t0, .Lready
     slli t1, s0, 3
     add t0, t0, t1
@@ -308,3 +344,7 @@ main:
 .balign 4096
 .Lspaces:
     .zero 16 * 20480
+#if DITDAH_ASID_BITS
+.Lcontexts:
+    .zero 16 * 4096
+#endif

@@ -138,7 +138,9 @@ object DitDahA1Csr extends Generator[DitDahA1Parameter, DitDahA1UnitLayers, DitD
             io.writeData.asBits.bits(43, parameter.physicalAddressBits - 12) === 0.B(56 - parameter.physicalAddressBits)
           when(mode === 0.B(4)) { satp.get := 0.U(64) }
           when((mode === 8.B(4)) & rootFits) {
-            satp.get := (8.B(4) ## 0.B(16) ## io.writeData.asBits.bits(43, 0)).asUInt
+            val asid = if parameter.asidBits == 0 then 0.B(16) else
+              0.B(16 - parameter.asidBits) ## io.writeData.asBits.bits(43 + parameter.asidBits, 44)
+            satp.get := (8.B(4) ## asid ## io.writeData.asBits.bits(43, 0)).asUInt
           }
         }
       when(io.sret) {

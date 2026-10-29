@@ -1011,6 +1011,30 @@ def translation_maintenance(trace):
         (address == 0x180 or 0x3a0 <= address <= 0x3ae or 0x3b0 <= address <= 0x3ef))
 
 
+
+def maintain_translation_history(trace, config, model, history):
+    if not translation_maintenance(trace):
+        return False
+    instruction = trace[2]
+    cached = any(config.get(key) for key in ('tlbEntries', 'iTlbEntries', 'dTlbEntries'))
+    precise = cached and any(config.get(key) for key in ('asidBits', 'iTlbEntries', 'dTlbEntries'))
+    if instruction & 0xfe007fff == 0x12000073 and precise:
+        rs1, rs2 = instruction >> 15 & 31, instruction >> 20 & 31
+        address, asid = model.registers[rs1], model.registers[rs2] & ((1 << config.get('asidBits', 0)) - 1)
+        canonical = address >> 39 == ((1 << 25) - 1 if address >> 38 & 1 else 0)
+        def discard(entry):
+            satp, vpn, bits, reads, port = entry
+            global_page = any(data & 32 for _, data, _ in reads)
+            return (not rs1 or canonical and address >> bits == vpn) and (not rs2 or
+                not global_page and satp >> 44 & ((1 << config.get('asidBits', 0)) - 1) == asid)
+        history[:] = [entry for entry in history if not discard(entry)]
+    elif instruction >> 20 == 0x180 and config.get('asidBits') and config.get('tlbEntries'):
+        pass
+    else:
+        history.clear()
+    return True
+
+
 def permitted_table_read(config, model, address):
     return address % 8 == 0 and 0 <= address <= (1 << config['physicalAddressBits']) - 8 and any(
         int(region['base']) <= address and address + 8 <= int(region['base']) + int(region['size']) and
@@ -1032,22 +1056,26 @@ def check_translation_result(walk, result, config, model, history):
             raise Fault(5, address)
         return entry[1]
     paged = walk['privilege'] != 3 and walk['satp'] >> 60 == 8
-    cached = [reads for satp, vpn, bits, reads in walk.get('acceptedHistory', history) if satp == walk['satp'] and walk['address'] >> bits == vpn]
-    candidates = [walk['reads']] if walk['reads'] or not paged else cached or [[]]
+    asid_mask = (1 << config.get('asidBits', 0)) - 1
+    cached = [(satp, reads) for satp, vpn, bits, reads, port in walk.get('acceptedHistory', history)
+              if walk['address'] >> bits == vpn and (config.get('tlbEntries') or port == walk['port']) and
+              ((satp >> 44 & asid_mask == walk['satp'] >> 44 & asid_mask or any(data & 32 for _, data, _ in reads))
+               if asid_mask else satp == walk['satp'])]
+    candidates = [(walk['satp'], walk['reads'])] if walk['reads'] or not paged else cached or [(walk['satp'], [])]
     matches = bool(walk.get('cancelled'))
-    for candidate in candidates:
+    for origin_satp, candidate in candidates:
         reads = iter(candidate)
         expected, fault, cause = walk['address'], False, 0
         try:
-            expected = sv39_walk(walk['address'], walk['kind'], walk['privilege'], walk['satp'], walk['status'], lambda address: read_pte(address, reads))
+            expected = sv39_walk(walk['address'], walk['kind'], walk['privilege'], origin_satp, walk['status'], lambda address: read_pte(address, reads))
         except StopIteration:
             continue
         except Fault as error:
             fault, cause = True, error.cause
         matches |= result == (expected, fault, cause) and next(reads, None) is None
-        if config.get('tlbEntries') and paged and walk['reads'] and not fault and not (walk.get('stale') or walk.get('cancelled')):
+        if any(config.get(key) for key in ('tlbEntries', 'iTlbEntries', 'dTlbEntries')) and paged and walk['reads'] and not fault and not (walk.get('stale') or walk.get('cancelled')):
             bits = 12 + 9 * (3 - len(walk['reads']))
-            entry = walk['satp'], walk['address'] >> bits, bits, tuple(walk['reads'])
+            entry = walk['satp'], walk['address'] >> bits, bits, tuple(walk['reads']), walk['port']
             if entry not in history:
                 history.append(entry)
     assert result is None or matches, 'Translation result lacks a matching walk or authorized cached leaf'
@@ -1094,8 +1122,7 @@ def check_core_translations(lines, config, program, expected_requests):
         elif fields[:1] == ['IRQ']:
             model.set_interrupts(int(fields[1], 16))
         elif fields[:1] == ['TRACE']:
-            if translation_maintenance(tuple(int(v, 16) for v in fields[1:])):
-                history.clear()
+            if maintain_translation_history(tuple(int(v, 16) for v in fields[1:]), config, model, history):
                 for walk in walks:
                     if walk:
                         walk['stale'] = True
@@ -1277,6 +1304,9 @@ def compare(binary, directory, config, transport='axi', selected=()):
                 shared_report = checked.get('sharedCache')
                 if name == 'sv39_reuse':
                     assert translation_report['pteReads'] == (3 if config.get('tlbEntries') else 99), 'Repeated page walk count'
+                if hasattr(program, 'translation_accesses') and (not config.get('asidBits') or config.get('tlbEntries', 0) in (0, 4)):
+                    expected_reads = 15 if config.get('asidBits') and config.get('tlbEntries') == 4 else 3 * program.translation_accesses
+                    assert translation_report['pteReads'] == expected_reads, 'ASID retention, zero-register selectors and ignored high bits'
             else:
                 assert data_bus == expected_bus, f'{name}: unexpected data accesses\nactual {data_bus}\nexpected {expected_bus}'
             if transport == 'memory':
@@ -1314,7 +1344,7 @@ def compare(binary, directory, config, transport='axi', selected=()):
             if transport == 'axi' and config.get('l2CacheBytes') and shared_report is None:
                 shared_report = check_shared_cache(raw_lines, config)
             reports.append(dict(test=name, seed=seed, events=len(actual), cycles=elapsed, performance=performance_metrics(lines, metric_config),
-                                loadedMemoryHash=hashlib.sha256(image.read_bytes()).hexdigest(),
+                                loadedMemoryHash=hashlib.sha256(image.read_bytes()).hexdigest(), retirementHash=hashlib.sha256(json.dumps(actual).encode()).hexdigest(),
                                 busTransactions=len(bus), axiReadBeats=sum(line.startswith(('READ ', 'LINE_BEAT ')) for line in lines), fetches=fetches,
                                 issueStreak=issue_streak, retireStreak=retire_streak,
                                 **(dict(pipeline=pipeline_events) if pipeline_events is not None else {}),
@@ -2203,8 +2233,7 @@ def check_multicore(lines, config, program, name, atomic_metadata=False, softwar
                     assert pending[hart][7], 'LSU-local rejection differs from instruction model'
                 lsu_order[hart].popleft()
                 del lsu_slots[hart][access['tag']]
-            if translated and translation_maintenance(observed):
-                translation_history[hart].clear()
+            if translated and maintain_translation_history(observed, config, models[hart], translation_history[hart]):
                 for walk in walks[hart]:
                     if walk:
                         walk['stale'] = True
@@ -2942,20 +2971,36 @@ def verify_shared_arrays(args):
     (args.output / 'summary.json').write_text(json.dumps(dict(sourceHashes=sources | inputs, configurations=reports), indent=2) + '\n')
 
 
-def shared_cache_comparison(current, baseline):
-    assert current['sourceHashes'] == baseline['sourceHashes'], 'Shared-cache comparison sources differ'
-    reports = []
+def comparison_cases(current, baseline, parameter, value):
+    assert current['sourceHashes'] == baseline['sourceHashes'], 'Comparison sources differ'
     for new, old in zip(current['configurations'], baseline['configurations'], strict=True):
-        assert new['parameters']['l2CacheBytes'] == 131072 and old['parameters']['l2CacheBytes'] == 0
-        assert new['parameters'] | dict(l2CacheBytes=0) == old['parameters'], 'Shared-cache comparison configurations differ'
+        assert new['parameters'][parameter] == value and old['parameters'][parameter] == 0
+        assert new['parameters'] | {parameter: 0} == old['parameters'], 'Comparison configurations differ'
         for after, before in zip(new['cases'], old['cases'], strict=True):
-            assert tuple(after[k] for k in ('test', 'seed', 'loadedMemoryHash')) == tuple(before[k] for k in ('test', 'seed', 'loadedMemoryHash')), 'Shared-cache comparison workload differs'
-            if after['test'] == 'cache_conflict':
-                assert [(c['workRetiredInstructions'], c['workRetirementHash']) for c in after['dataCache']] == [(c['workRetiredInstructions'], c['workRetirementHash']) for c in before['dataCache']], 'Shared-cache fixed-work retirements differ'
-                assert after['sharedCache']['dataHits'] > 0
-                assert all(after['externalMemory'][k] < before['externalMemory'][k] for k in ('dataReads', 'dataReadBytes')), 'Shared cache did not reduce physical shared reads'
-                reports.append(dict(seed=after['seed'], before=before['externalMemory'], after=after['externalMemory']))
+            assert tuple(after[k] for k in ('test', 'seed', 'loadedMemoryHash')) == tuple(before[k] for k in ('test', 'seed', 'loadedMemoryHash')), 'Comparison workload differs'
+            yield after, before
+
+
+def shared_cache_comparison(current, baseline):
+    reports = []
+    for after, before in comparison_cases(current, baseline, 'l2CacheBytes', 131072):
+        if after['test'] == 'cache_conflict':
+            assert [(c['workRetiredInstructions'], c['workRetirementHash']) for c in after['dataCache']] == [(c['workRetiredInstructions'], c['workRetirementHash']) for c in before['dataCache']], 'Shared-cache fixed-work retirements differ'
+            assert after['sharedCache']['dataHits'] > 0
+            assert all(after['externalMemory'][k] < before['externalMemory'][k] for k in ('dataReads', 'dataReadBytes')), 'Shared cache did not reduce physical shared reads'
+            reports.append(dict(seed=after['seed'], before=before['externalMemory'], after=after['externalMemory']))
     assert reports, 'Missing fixed shared-cache workload'
+    return reports
+
+
+def translation_cache_comparison(current, baseline):
+    reports = []
+    for after, before in comparison_cases(current, baseline, 'tlbEntries', 4):
+        if after['test'] == 'sv39_working_set':
+            assert (after['events'], after['retirementHash']) == (before['events'], before['retirementHash']), 'Translation fixed-work retirements differ'
+            assert after['translation']['pteReads'] < before['translation']['pteReads'], 'Shared translation did not reduce page walks'
+            reports.append(dict(seed=after['seed'], before=before['translation']['pteReads'], after=after['translation']['pteReads']))
+    assert reports, 'Missing fixed translation workload'
     return reports
 
 
@@ -3025,6 +3070,8 @@ def main():
     parser.add_argument('--branch-prediction', action='store_true')
     parser.add_argument('--branch-predictor-entries', type=int, choices=(0, 8, 16), default=0)
     parser.add_argument('--tlb-entries', type=int, choices=(0, 2, 4), default=0)
+    for name in ('i-tlb-entries', 'd-tlb-entries', 'asid-bits'):
+        parser.add_argument('--' + name, type=int, choices=(0, 4) if name == 'asid-bits' else (0, 2, 4), default=0)
     parser.add_argument('--multicore-only', action='store_true')
     parser.add_argument('--platform-only', action='store_true')
     parser.add_argument('--harts', type=int, choices=(1, 2, 3, 16), action='append')
@@ -3042,6 +3089,7 @@ def main():
     parser.add_argument('--prediction-baseline', type=Path)
     parser.add_argument('--cache-baseline', type=Path)
     parser.add_argument('--shared-cache-baseline', type=Path)
+    parser.add_argument('--translation-baseline', type=Path)
     args = parser.parse_args()
     if args.shared_cache_arrays:
         verify_shared_arrays(args)
@@ -3064,8 +3112,8 @@ def main():
         parser.error('Select one software matrix dimension')
     if args.software_read_matrix and args.harts != [16]:
         parser.error('Read capacity software requires --harts 16')
-    if args.tlb_entries and not args.sv39:
-        parser.error('--tlb-entries requires --sv39')
+    if any((args.tlb_entries, args.i_tlb_entries, args.d_tlb_entries, args.asid_bits)) and not args.sv39:
+        parser.error('Translation cache and ASID options require --sv39')
     if args.sv39:
         args.supervisor_mode = True
     if args.supervisor_mode:
@@ -3117,7 +3165,7 @@ def main():
         directory = args.output / f'{"irq-" if interrupts else ""}{"pmp16-" if entries else ""}axi{width}'
         directory.mkdir(parents=True, exist_ok=True)
         config = configuration(width)
-        config.update(l2CacheBytes=args.l2_cache_bytes or 0, issueWidth=args.issue_width, loadQueueEntries=args.load_queue_entries, pmpEntries=entries, enableInterrupts=interrupts, iCacheBytes=args.icache_bytes, dCacheBytes=args.dcache_bytes, dCacheWays=args.dcache_ways, dCacheRefillBytes=args.dcache_refill_bytes, dCacheWriteback=args.dcache_writeback, tlbEntries=args.tlb_entries, enableBurstRefill=args.burst_refill, enableBranchPrediction=args.branch_prediction, branchPredictorEntries=args.branch_predictor_entries)
+        config.update(l2CacheBytes=args.l2_cache_bytes or 0, issueWidth=args.issue_width, loadQueueEntries=args.load_queue_entries, pmpEntries=entries, enableInterrupts=interrupts, iCacheBytes=args.icache_bytes, dCacheBytes=args.dcache_bytes, dCacheWays=args.dcache_ways, dCacheRefillBytes=args.dcache_refill_bytes, dCacheWriteback=args.dcache_writeback, tlbEntries=args.tlb_entries, iTlbEntries=args.i_tlb_entries, dTlbEntries=args.d_tlb_entries, asidBits=args.asid_bits, enableBurstRefill=args.burst_refill, enableBranchPrediction=args.branch_prediction, branchPredictorEntries=args.branch_predictor_entries)
         if args.fabric_read_slots is not None:
             config['fabricReadSlots'] = args.fabric_read_slots
         config['memoryRegions'][0]['dataCacheable'] = bool(args.dcache_bytes)
@@ -3184,7 +3232,7 @@ def main():
                 continue
             directory = args.output / f'harts{harts}-axi{width}'
             directory.mkdir(parents=True, exist_ok=True)
-            config = dict(configuration(width), l2CacheBytes=args.l2_cache_bytes or 0, issueWidth=args.issue_width, loadQueueEntries=args.load_queue_entries, hartCount=harts, pmpEntries=entries, enableInterrupts=interrupts, iCacheBytes=args.icache_bytes, dCacheBytes=args.dcache_bytes, dCacheWays=args.dcache_ways, dCacheRefillBytes=args.dcache_refill_bytes, dCacheWriteback=args.dcache_writeback, tlbEntries=args.tlb_entries, enableBurstRefill=args.burst_refill, enableBranchPrediction=args.branch_prediction, branchPredictorEntries=args.branch_predictor_entries)
+            config = dict(configuration(width), l2CacheBytes=args.l2_cache_bytes or 0, issueWidth=args.issue_width, loadQueueEntries=args.load_queue_entries, hartCount=harts, pmpEntries=entries, enableInterrupts=interrupts, iCacheBytes=args.icache_bytes, dCacheBytes=args.dcache_bytes, dCacheWays=args.dcache_ways, dCacheRefillBytes=args.dcache_refill_bytes, dCacheWriteback=args.dcache_writeback, tlbEntries=args.tlb_entries, iTlbEntries=args.i_tlb_entries, dTlbEntries=args.d_tlb_entries, asidBits=args.asid_bits, enableBurstRefill=args.burst_refill, enableBranchPrediction=args.branch_prediction, branchPredictorEntries=args.branch_predictor_entries)
             if args.fabric_read_slots is not None:
                 config['fabricReadSlots'] = args.fabric_read_slots
             config['memoryRegions'][0]['dataCacheable'] = bool(args.dcache_bytes)
@@ -3236,6 +3284,8 @@ def main():
     for name, digest in test_hashes.items():
         assert hashlib.sha256(Path(name).read_bytes()).hexdigest() == digest, f'Test changed during verification: {name}'
     summary['sourceHashes'].update(test_hashes)
+    if args.translation_baseline:
+        summary['translationComparison'] = translation_cache_comparison(summary, json.loads(args.translation_baseline.read_text()))
     if args.shared_cache_baseline:
         summary['sharedCacheComparison'] = shared_cache_comparison(summary, json.loads(args.shared_cache_baseline.read_text()))
     if args.traffic_baseline:

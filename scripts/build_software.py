@@ -14,13 +14,16 @@ def load_configuration(args):
     sv39 = getattr(args, 'sv39', False)
     supervisor_mode = getattr(args, 'supervisor_mode', False) or sv39
     tlb_entries = getattr(args, 'tlb_entries', None)
+    translation = {key: getattr(args, option, None) for key, option in
+                   (('iTlbEntries', 'i_tlb_entries'), ('dTlbEntries', 'd_tlb_entries'), ('asidBits', 'asid_bits'))}
+    translation = {key: value for key, value in translation.items() if value is not None}
     burst_refill = getattr(args, 'burst_refill', None)
     data_refill = getattr(args, 'dcache_refill_bytes', None)
     original = args.config
     content = original.read_bytes()
     document = json.loads(content)
     config = document.get('parameters', document)
-    if args.harts is None and args.icache_bytes is None and args.dcache_bytes is None and not supervisor_mode and tlb_entries is None and burst_refill is None and data_refill is None:
+    if args.harts is None and args.icache_bytes is None and args.dcache_bytes is None and not supervisor_mode and tlb_entries is None and burst_refill is None and data_refill is None and not translation:
         return config, {}
     if args.harts is not None:
         config['hartCount'] = args.harts
@@ -34,6 +37,7 @@ def load_configuration(args):
         config.update(enableSupervisorMode=True, enableUserMode=True, enableInterrupts=True)
     if sv39:
         config['virtualAddressBits'] = 39
+    config.update(translation)
     if tlb_entries is not None:
         config['tlbEntries'] = tlb_entries
     if burst_refill is not None:
@@ -59,6 +63,8 @@ def main():
     parser.add_argument('--supervisor-mode', action='store_true')
     parser.add_argument('--sv39', action='store_true')
     parser.add_argument('--tlb-entries', type=int, choices=(0, 2, 4))
+    for name in ('i-tlb-entries', 'd-tlb-entries', 'asid-bits'):
+        parser.add_argument('--' + name, type=int, choices=(0, 4) if name == 'asid-bits' else (0, 2, 4))
     parser.add_argument('--burst-refill', action=argparse.BooleanOptionalAction, default=None)
     parser.add_argument('--expected-interrupt', type=int, choices=(1, 3, 5, 7, 9, 11), action='append', default=[])
     args = parser.parse_args()
@@ -86,6 +92,7 @@ def main():
         definitions['__local_interrupt_base'] = int(config['localInterruptBase'])
     command = [args.tool_prefix + 'gcc', '-march=rv64i_zicsr_zifencei',
                f'-DDITDAH_RAM_BASE={base}', f'-DDITDAH_RAM_BYTES={int(ram["size"])}',
+               f'-DDITDAH_ASID_BITS={config.get("asidBits", 0)}',
                f'-DDITDAH_CONSOLE_BASE={console}', '-mabi=lp64', '-mcmodel=medany',
                '-Os', '-ffreestanding', '-fno-builtin', '-fno-stack-protector', '-msmall-data-limit=0',
                '-nostdlib', '-nostartfiles', '-Wl,--no-relax', '-T', str(runtime / 'link.ld'),

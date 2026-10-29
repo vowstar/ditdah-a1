@@ -347,7 +347,7 @@ class Model:
             if value >> 60 == 0:
                 self.csrs[address] = 0
             elif value >> 60 == 8 and value & ((1 << 44) - 1) < 1 << (self.config['physicalAddressBits'] - 12):
-                self.csrs[address] = (8 << 60) | (value & ((1 << 44) - 1))
+                self.csrs[address] = (8 << 60) | (value & ((1 << (44 + self.config.get('asidBits', 0))) - 1))
         elif address == 0x304 and self.config.get('enableInterrupts', False):
             self.csrs[address] = value & (0xaaa if self.config.get('enableSupervisorMode') else 0x888)
         elif address == 0x104:

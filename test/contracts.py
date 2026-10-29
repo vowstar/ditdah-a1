@@ -592,10 +592,11 @@ def decode_contract(parameters):
         if word in extra or word in invalid:
             body += f'    check(output_bits_operation == {extra.get(word, 0)}, "Scalar operation class {word:08x}");\n'
     if parameters.get('virtualAddressBits') == 39:
+        precise = any(parameters.get(key) for key in ('tlbEntries', 'iTlbEntries', 'dTlbEntries')) and any(parameters.get(key) for key in ('asidBits', 'iTlbEntries', 'dTlbEntries'))
         for rs1, rs2 in ((0, 0), (1, 0), (0, 31), (31, 31)):
             word = 0x12000073 | (rs1 << 15) | (rs2 << 20)
             body += f'''    input_bits_instruction = 32'h{word:x};
-    check(output_bits_operation == 16 && output_bits_serializing && !output_bits_usesRs1 && !output_bits_usesRs2 && !output_bits_writesRd, "Full local SFENCE accepts standard selectors");
+    check(output_bits_operation == 16 && output_bits_serializing && output_bits_usesRs1 == {int(precise)} && output_bits_usesRs2 == output_bits_usesRs1 && !output_bits_writesRd, "SFENCE selector dependencies");
 '''
         for word in (0x120000f3, 0x12001073, 0x14000073):
             body += f"    input_bits_instruction = 32'h{word:x}; check(output_bits_operation != 16, \"SFENCE requires its complete standard encoding\");\n"
@@ -3793,7 +3794,8 @@ def translation_contract(parameters):
     base, pa = int(parameters['resetVector']), parameters['physicalAddressBits']
     root, middle, bottom = base + 0x1000, base + 0x2000, base + 0x3000
     body = '    reset = 1; tick(); reset = 0; tick();\n'
-    flush = '    invalidate = 1; tick(); invalidate = 0; tick();\n' if parameters.get('tlbEntries') else ''
+    cached = [bool(parameters.get('tlbEntries') or parameters.get(key)) for key in ('iTlbEntries', 'dTlbEntries')]
+    flush = '    invalidate = 1; tick(); invalidate = 0; tick();\n' if any(cached) else ''
     if parameters['pmpEntries']:
         body += f"    pmp_config = 'h1f; pmp_address = 'h{(1 << (pa - 2)) - 1:x};\n"
     vectors = []
@@ -3848,7 +3850,7 @@ def translation_contract(parameters):
     end
     ports_{port}_response_ready = 1; tick(); ports_{port}_response_ready = 0;
 '''
-        if parameters.get('tlbEntries') and reads and not fault:
+        if cached[port] and reads and not fault:
             hit_address = address + (8 if address <= MASK - 15 and address % 4096 < 4088 else 0)
             for hit_kind, hit_privilege, hit_status in ((kind, privilege, status), ('write', privilege, status),
                     ('read', privilege, status ^ (1 << 19)), (kind, 1 - privilege, status ^ (1 << 18))):
@@ -3900,9 +3902,11 @@ def translation_contract(parameters):
     check(ports_1_response_bits_fault && ports_1_response_bits_cause == 5 && ports_1_response_bits_address == 'h100, "PTE physical authorization uses S privilege");
     ports_1_response_ready = 1; tick(); ports_1_response_ready = 0;
 '''
-    if parameters.get('tlbEntries'):
+    if any(cached):
         for walking in range(2):
             hit = 1 - walking
+            if not cached[hit]:
+                continue
             body += '    reset = 1; tick(); reset = 0; tick();\n'
             if parameters['pmpEntries']:
                 body += f"    pmp_config = 'h1f; pmp_address = 'h{(1 << (pa - 2)) - 1:x};\n"
@@ -3938,6 +3942,40 @@ def translation_contract(parameters):
     memory_response_valid = 1; tick(); memory_response_valid = 0; ports_{walking}_response_ready = 1;
     while (!ports_{walking}_response_valid) tick(); tick(); ports_{walking}_response_ready = 0;
 '''
+    if parameters.get('tlbEntries'):
+        for target, key in enumerate(('iTlbEntries', 'dTlbEntries')):
+            if not parameters.get(key):
+                continue
+            body += '''    reset = 1; tick(); reset = 0; tick();
+    ports_0_request_valid = 0; ports_1_request_valid = 0; cancelInstruction = 0; invalidate = 0;
+    ports_0_response_ready = 0; ports_1_response_ready = 0;
+    memory_request_ready = 0; memory_response_valid = 0; memory_response_bits_fault = 0; memory_response_bits_tag = 0;
+'''
+            if parameters['pmpEntries']:
+                body += f"    pmp_config = 'h1f; pmp_address = 'h{(1 << (pa - 2)) - 1:x};\n"
+            body += f"    state_satp = 64'h{(8 << 60) | root >> 12:x}; state_sum = 0; state_mxr = 0;\n"
+            def demand(port, virtual, miss):
+                nonlocal body
+                body += f'''    ports_{port}_request_bits_address = 64'h{virtual:x}; ports_{port}_request_bits_privilege = 1;
+    ports_{port}_request_bits_fetch = {int(port == 0)}; ports_{port}_request_bits_write = 0; ports_{port}_request_valid = 1;
+    #1; while (!ports_{port}_request_ready) tick(); tick(); ports_{port}_request_valid = 0;
+'''
+                if miss:
+                    body += f'''    while (!memory_request_valid) begin check(!ports_{port}_response_valid, "Cold translation needs its walk"); tick(); end
+    check(memory_request_bits_address == 'h{root + (virtual >> 30) * 8:x}, "Replacement walk uses independent root index");
+    memory_request_ready = 1; tick(); memory_request_ready = 0;
+    memory_response_bits_data = 64'h{((base >> 12) << 10) | 0xcf:x}; memory_response_valid = 1;
+    tick(); memory_response_valid = 0;
+'''
+                body += f'''    while (!ports_{port}_response_valid) begin check(!memory_request_valid, "Promoted translation survives shared replacement"); tick(); end
+    check(!memory_request_valid && !ports_{port}_response_bits_fault && ports_{port}_response_bits_address == 'h{base + (virtual & ((1 << 30) - 1)):x}, "Local translation retains its leaf bytes");
+    ports_{port}_response_ready = 1; tick(); ports_{port}_response_ready = 0;
+'''
+            demand(1 - target, 0x100, True)
+            demand(target, 0x100, False)
+            for page in range(1, parameters['tlbEntries'] + 1):
+                demand(1 - target, (page << 30) | 0x100, True)
+            demand(target, 0x100, False)
     body += '''    state_satp = 0; ports_0_request_bits_address = 'h40; ports_0_request_bits_fetch = 1;
     ports_1_request_bits_address = 'h80; ports_0_request_valid = 1; ports_1_request_valid = 1;
     ports_0_response_ready = 1; ports_1_response_ready = 1;
@@ -3947,7 +3985,7 @@ def translation_contract(parameters):
     tick(); ports_0_response_ready = 0; ports_1_response_ready = 0;
     tick(); ports_0_request_valid = 0; ports_1_request_valid = 0; state_satp = '1; cancelInstruction = 1;
 '''
-    body += '    invalidate = 1;\n' if parameters.get('tlbEntries') else ''
+    body += '    invalidate = 1;\n' if any(cached) else ''
     body += '''    repeat (3) begin
       check(ports_0_response_valid && ports_1_response_valid && ports_0_response_bits_address == 'h40 &&
         ports_1_response_bits_address == 'h80 && !ports_0_response_bits_fault && !ports_1_response_bits_fault &&
@@ -3955,8 +3993,92 @@ def translation_contract(parameters):
     end
     ports_0_response_ready = 1; ports_1_response_ready = 1; tick(); cancelInstruction = 0;
 '''
-    body += '    invalidate = 0;\n' if parameters.get('tlbEntries') else ''
+    body += '    invalidate = 0;\n' if any(cached) else ''
     return body
+
+
+def translation_context_contract(parameters):
+    if parameters.get('asidBits') != 4 or parameters.get('tlbEntries') != 4:
+        return ''
+    base, root = int(parameters['resetVector']), int(parameters['resetVector']) + 0x1000
+    body = ['    reset = 1; tick(); reset = 0; ports_0_request_valid = 0; ports_1_request_valid = 0;\n',
+            '    ports_0_response_ready = 0; ports_1_response_ready = 0; cancelInstruction = 0;\n',
+            '    invalidate = 0; maintenance_valid = 0; memory_request_ready = 0; memory_response_valid = 0;\n',
+            '    memory_response_bits_fault = 0; memory_response_bits_tag = 0; state_sum = 0; state_mxr = 0;\n']
+    if parameters['pmpEntries']:
+        body += [f"    pmp_config = 'h1f; pmp_address = 'h{(1 << (parameters['physicalAddressBits'] - 2)) - 1:x};\n"]
+    def context(asid, page_root=root):
+        body.append(f"    state_satp = 64'h{8 << 60 | asid << 44 | page_root >> 12:x}; maintenance_valid = 1; maintenance_fence = 0; tick(); maintenance_valid = 0;\n")
+    def fence(address=None, asid=None):
+        body.append(f'''    maintenance_valid = 1; maintenance_fence = 1; maintenance_addressValid = {int(address is not None)};
+    maintenance_address = 64'h{(address or 0):x}; maintenance_asidValid = {int(asid is not None)}; maintenance_asid = {asid or 0};
+    #1; check(!ports_0_request_ready && !ports_1_request_ready, "Maintenance blocks new ownership"); tick(); maintenance_valid = 0;
+''')
+    def demand(asid, page, miss, global_page=False, port=1, page_root=root, switch=True):
+        if switch:
+            context(asid, page_root)
+        virtual, physical = (page << 30) | 0x100, base + (asid if not global_page else 0) * 0x1000 + 0x100
+        body.append(f'''    ports_{port}_request_bits_address = 64'h{virtual:x}; ports_{port}_request_bits_privilege = 1;
+    ports_{port}_request_bits_fetch = {int(port == 0)}; ports_{port}_request_bits_write = 0;
+    ports_{port}_request_valid = 1; #1; while (!ports_{port}_request_ready) tick(); tick(); ports_{port}_request_valid = 0;
+''')
+        if miss:
+            tables = [(page_root + page * 8, ((root + 0x1000) >> 12) << 10 | 1 | (32 if global_page else 0)),
+                      (root + 0x1000, ((root + 0x2000) >> 12) << 10 | 1),
+                      (root + 0x2000, ((physical >> 12) << 10) | 0xcf)]
+            for address, pte in tables:
+                body.append(f'''    while (!memory_request_valid) begin check(!ports_{port}_response_valid, "Context miss requires PTE service"); tick(); end
+    check(memory_request_bits_address == 64'h{address:x}, "ASID walk root and page ownership");
+    memory_request_ready = 1; tick(); memory_request_ready = 0; memory_response_bits_data = 64'h{pte:x};
+    memory_response_valid = 1; tick(); memory_response_valid = 0;
+''')
+        body.append(f'''    while (!ports_{port}_response_valid) begin check(!memory_request_valid, "Selective fence retained an eligible translation"); tick(); end
+    check(!memory_request_valid && !ports_{port}_response_bits_fault && ports_{port}_response_bits_address == 64'h{physical:x}, "ASID and inherited global leaf identity");
+    ports_{port}_response_ready = 1; tick(); ports_{port}_response_ready = 0;
+''')
+    entries = ((1, 0, False), (2, 0, False), (2, 1, False), (1, 2, True))
+    for address_valid, asid_valid in ((False, False), (True, False), (False, True), (True, True)):
+        body.append('    invalidate = 1; tick(); invalidate = 0;\n')
+        for asid, page, global_page in entries:
+            demand(asid, page, True, global_page)
+        fence(0 if address_valid else None, 1 if asid_valid else None)
+        for index, (asid, page, global_page) in enumerate(entries):
+            invalidated = (not address_valid or page == 0) and (not asid_valid or asid == 1 and not global_page)
+            if not invalidated:
+                demand(2 if global_page else asid, page, False, global_page, index % 2)
+        for asid, page, global_page in entries:
+            if (not address_valid or page == 0) and (not asid_valid or asid == 1 and not global_page):
+                demand(asid, page, True, global_page)
+    fence(1 << 39)
+    demand(1, 0, False)
+    fence(None, 0)
+    demand(1, 0, False)
+    fence(None, 1)
+    demand(1, 0, True, page_root=root + 0x3000)
+    body.append('    invalidate = 1; tick(); invalidate = 0;\n')
+    demand(1, 0, True, port=0)
+    demand(1, 0, False, port=1, switch=False)
+    fence(None, 2)
+    demand(1, 0, False, port=0, switch=False)
+    demand(1, 0, False, port=1, switch=False)
+    fence(0, 1)
+    demand(1, 0, True, port=0, switch=False)
+    demand(1, 0, False, port=1, switch=False)
+    for phase in ('waiting', 'leaf'):
+        body.append('    invalidate = 1; tick(); invalidate = 0;\n')
+        context(1)
+        body.append("    ports_1_request_bits_address = 'h100; ports_1_request_bits_privilege = 1; ports_1_request_bits_fetch = 0; ports_1_request_valid = 1; #1; while (!ports_1_request_ready) tick(); tick(); ports_1_request_valid = 0;\n")
+        for n, (address, pte) in enumerate(((root, (root + 0x1000) >> 2 | 1),
+                (root + 0x1000, (root + 0x2000) >> 2 | 1), (root + 0x2000, (base + 0x1000) >> 2 | 0xcf))):
+            body.append(f"    while (!memory_request_valid) tick(); check(memory_request_bits_address == 'h{address:x}, \"In-flight walk context\"); memory_request_ready = 1; tick(); memory_request_ready = 0;\n")
+            if n == 0 and phase == 'waiting':
+                fence(None, 1)
+            if n == 2 and phase == 'leaf':
+                body.append('    maintenance_valid = 1; maintenance_fence = 1; maintenance_addressValid = 0; maintenance_asidValid = 0;\n')
+            body.append(f"    memory_response_bits_data = 'h{pte:x}; memory_response_valid = 1; tick(); memory_response_valid = 0; maintenance_valid = 0;\n")
+        body.append(f"    while (!ports_1_response_valid) tick(); check(!ports_1_response_bits_fault && ports_1_response_bits_address == 'h{base + 0x1100:x}, \"Old response retains accepted context\"); ports_1_response_ready = 1; tick(); ports_1_response_ready = 0;\n")
+        demand(1, 0, True, switch=False)
+    return ''.join(body)
 
 
 def translated_consumer_contract(parameters, fetch):
@@ -4417,7 +4539,7 @@ def verify(rtl, directory, modules=None):
     if parameters.get('virtualAddressBits') == 39:
         suites = tuple((name, body) for name, body in suites if name not in
                        ('DitDahA1Fetch', 'DitDahA1Frontend', 'DitDahA1Lsu', 'DitDahA1Backend'))
-        suites += (('DitDahA1Translation', translation_contract(parameters)),)
+        suites += (('DitDahA1Translation', translation_contract(parameters) + translation_context_contract(parameters)),)
         suites += (('DitDahA1Fetch', translated_consumer_contract(parameters, True)),
                    ('DitDahA1Lsu', lsu_queue_contract(parameters) if parameters.get('loadQueueEntries', 1) == 2 else
                     translated_consumer_contract(parameters, False) + lsu_refill_contract(parameters)))
