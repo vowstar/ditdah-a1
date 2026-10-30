@@ -56,6 +56,7 @@ def main():
     parser.add_argument('--config', type=Path, required=True)
     parser.add_argument('--issue-width', type=int, choices=(1, 2, 3))
     parser.add_argument('--isa', choices=tuple('rv64i' + suffix for suffix in ('', 'm', 'a', 'ma', 'c', 'mc', 'ac', 'mac')), default='rv64i')
+    parser.add_argument('--bitmanip', nargs='+', choices=('Zba', 'Zbb', 'Zbs'), default=[])
     parser.add_argument('--program', type=Path, default=Path('software/tests/console.S'))
     parser.add_argument('--output', type=Path, default=Path('result/software/console'))
     parser.add_argument('--tool-prefix', default=os.environ.get('RISCV_PREFIX', 'riscv64-unknown-elf-'))
@@ -95,9 +96,9 @@ def main():
                        __stack_bytes=args.stack_bytes, __console_base=console)
     if config.get('localInterruptBase') is not None:
         definitions['__local_interrupt_base'] = int(config['localInterruptBase'])
-    required_extensions = [name for name in ('M', 'A', 'C') if name.lower() in args.isa[5:]]
-    assert all(config.get('enable' + name, name != 'C') for name in required_extensions), 'Software requires a disabled extension'
-    command = [args.tool_prefix + 'gcc', '-march=' + args.isa + '_zicsr_zifencei',
+    required_extensions = [name for name in ('M', 'A', 'C') if name.lower() in args.isa[5:]] + sorted(set(args.bitmanip))
+    assert all(config.get('enable' + name, name in ('M', 'A')) for name in required_extensions), 'Software requires a disabled extension'
+    command = [args.tool_prefix + 'gcc', '-march=' + args.isa + '_zicsr_zifencei' + ''.join('_' + name.lower() for name in sorted(set(args.bitmanip))),
                f'-DDITDAH_HART_COUNT={harts}',
                f'-DDITDAH_RAM_BASE={base}', f'-DDITDAH_RAM_BYTES={int(ram["size"])}',
                f'-DDITDAH_ASID_BITS={config.get("asidBits", 0)}',

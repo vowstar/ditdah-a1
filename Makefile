@@ -4,10 +4,11 @@
 .PHONY: config check rtl software verify-software verify-data-software verify-supervisor-software zephyr verify-zephyr verify-zephyr-long verify-signoff verify-simulation verify-production verify-cache verify-platform verify-user verify-data-cache verify-supervisor verify-formal verify-scalar-formal verify-user-formal verify-data-formal verify-supervisor-formal verify-translation verify-translation-formal verify-translation-software verify-translation-cache verify-translation-cache-formal verify-translation-cache-software clean
 .PHONY: verify-burst verify-burst-formal verify-burst-software verify-widths verify-width-software
 .PHONY: verify-data-line verify-data-line-software verify-read-capacity verify-read-software
-.PHONY: verify-writeback verify-writeback-software verify-scalar-isa verify-compressed-isa
+.PHONY: verify-writeback verify-writeback-software verify-scalar-isa verify-compressed-isa verify-bitmanip-isa
 
 HART_COUNTS ?= 2 3 15 16
 SCALAR_OUTPUT ?= result/scalar-isa/gate
+BITMANIP_OUTPUT ?= result/bitmanip-isa
 COMPRESSED_OUTPUT ?= result/compressed-isa
 COMPRESSED_CASES := $(addprefix compressed_,integer boundary illegal breakpoint groups control)
 COMPRESSED_ARGS = $(foreach name,$(COMPRESSED_CASES),--case $(name))
@@ -78,6 +79,7 @@ verify-zephyr-long:
 verify-signoff: verify-writeback verify-formal
 	$(MAKE) verify-scalar-isa
 	$(MAKE) verify-compressed-isa
+	$(MAKE) verify-bitmanip-isa
 	$(MAKE) verify-widths
 	$(MAKE) verify-data-line
 	$(MAKE) verify-read-capacity
@@ -437,5 +439,17 @@ verify-compressed-isa:
 	for count in 1 2 16; do \
 		image=$(COMPRESSED_OUTPUT)/software/harts$$count; \
 		python3 scripts/build_software.py --config $(COMPRESSED_OUTPUT)/software.json --isa rv64imac --program software/tests/atomic.c --harts $$count --issue-width $$((count < 3 ? count : 3)) --icache-bytes 8192 --dcache-bytes 8192 --stack-bytes 512 --console-base 0x10000000 --output $$image && \
+		python3 test/verify.py --elf $$image/software.elf --config $$image/input.json --output $$image/verification --jobs $(SOFTWARE_JOBS) || exit $$?; \
+	done
+
+verify-bitmanip-isa:
+	python3 test/verify.py --bitmanip Zba Zbb Zbs --width 64 --pmp-entries 0 --issue-width 3 $(foreach name,zba zbb zbs,--case bitmanip_$(name)) --output $(BITMANIP_OUTPUT)/enabled
+	python3 test/formal.py --rtl $(BITMANIP_OUTPUT)/enabled/axi64/rtl --output $(BITMANIP_OUTPUT)/formal --modules BitManipDecode BitManipExecute --jobs 2
+	python3 test/verify.py --width 512 --pmp-entries 0 --issue-width 2 $(foreach name,zba zbb zbs,--case bitmanip_$(name)) --output $(BITMANIP_OUTPUT)/disabled
+	python3 test/formal.py --rtl $(BITMANIP_OUTPUT)/disabled/axi512/rtl --output $(BITMANIP_OUTPUT)/disabled-formal --modules BitManipDecode
+	python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); d=d.get("parameters",d); d.update({"enable"+n:True for n in ("Zba","Zbb","Zbs")}); json.dump(d,open(sys.argv[2],"w"))' "$(SOFTWARE_CONFIG)" "$(BITMANIP_OUTPUT)/software.json"
+	for count in 1 2 16; do \
+		image=$(BITMANIP_OUTPUT)/software/harts$$count; \
+		python3 scripts/build_software.py --config $(BITMANIP_OUTPUT)/software.json --isa rv64ima --bitmanip Zba Zbb Zbs --program software/tests/atomic.c --harts $$count --issue-width $$((count < 3 ? count : 3)) --icache-bytes 8192 --dcache-bytes 8192 --stack-bytes 512 --console-base 0x10000000 --output $$image && \
 		python3 test/verify.py --elf $$image/software.elf --config $$image/input.json --output $$image/verification --jobs $(SOFTWARE_JOBS) || exit $$?; \
 	done

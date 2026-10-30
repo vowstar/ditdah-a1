@@ -10,7 +10,7 @@ import java.lang.foreign.Arena
 import org.llvm.mlir.scalalib.capi.ir.{Block, Context}
 
 object DitDahA1Alu:
-  def apply(in: Referable[IssuedPacket])(using Arena, Context, Block, InstanceContext): (Referable[UInt], Referable[UInt], Referable[UInt]) =
+  def apply(parameter: DitDahA1Parameter, in: Referable[IssuedPacket])(using Arena, Context, Block, InstanceContext): (Referable[UInt], Referable[UInt], Referable[UInt]) =
     import DitDahA1Isa.*
     val d = in.decoded
     val insn = d.instruction
@@ -50,11 +50,12 @@ object DitDahA1Alu:
     when((op === AluImmediate.U(operationBits)) | (op === AluRegister.U(operationBits)) | word) {
       value := word.?((alu.asBits.bit(31).?(BigInt("ffffffff", 16).B(32), 0.B(32)) ## alu.asBits.bits(31, 0)).asUInt, alu)
     }
-    (value, addImm, pcImm)
+    val computed = if DitDahA1BitManip.encodings(parameter).nonEmpty then DitDahA1BitManip.result(parameter, in, value) else value
+    (computed, addImm, pcImm)
 
-  def result(in: Referable[IssuedPacket], out: Referable[ResultPacket])(using Arena, Context, Block, InstanceContext):
+  def result(parameter: DitDahA1Parameter, in: Referable[IssuedPacket], out: Referable[ResultPacket])(using Arena, Context, Block, InstanceContext):
       (Referable[UInt], Referable[UInt], Referable[UInt]) =
-    val (value, addImm, pcImm) = apply(in)
+    val (value, addImm, pcImm) = apply(parameter, in)
     val sequential = (in.decoded.instruction.pc + in.decoded.instruction.length).asBits.bits(63, 0).asUInt
     for field <- Seq("pc", "tag", "instruction", "length", "cause", "tval") do
       out.instruction.asRecord.field[UInt](field) := in.decoded.instruction.asRecord.field[UInt](field)
@@ -99,7 +100,7 @@ object DitDahA1Execute extends Generator[DitDahA1Parameter, DitDahA1UnitLayers, 
     val encoding = insn.instruction.asBits
     val function = d.functionCode.map(_.asBits).getOrElse(encoding.bits(30, 30) ## encoding.bits(14, 12))
     val funct3 = function.bits(2, 0)
-    val (addImm, pcImm, sequential) = DitDahA1Alu.result(in, out)
+    val (addImm, pcImm, sequential) = DitDahA1Alu.result(parameter, in, out)
     io.input.ready := io.output.ready
     io.output.valid := io.input.valid
     io.csrAddress := insn.instruction.asBits.bits(31, 20).asUInt

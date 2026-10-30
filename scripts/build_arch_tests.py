@@ -17,6 +17,7 @@ ARCHITECTURE = 'rv64i2p1_zicsr2p0_zifencei2p0'
 M_ARCHITECTURE = 'rv64i2p1_m2p0_zicsr2p0_zifencei2p0_zmmul1p0'
 A_ARCHITECTURES = {name: ARCHITECTURE + '_' + name.lower() + '1p0' for name in ('Zaamo', 'Zalrsc')}
 C_ARCHITECTURE = ARCHITECTURE + '_zca1p0'
+B_ARCHITECTURES = {name: ARCHITECTURE + '_' + name.lower() + '1p0' for name in ('Zba', 'Zbb', 'Zbs')}
 
 
 def digest(path):
@@ -68,7 +69,7 @@ def main():
     from ruamel.yaml import YAML
 
     parser = argparse.ArgumentParser()
-    parser.add_argument('--extensions', nargs='+', choices=('I', 'M', 'Zaamo', 'Zalrsc', 'Zca'), default=['I'])
+    parser.add_argument('--extensions', nargs='+', choices=('I', 'M', 'Zaamo', 'Zalrsc', 'Zca', *B_ARCHITECTURES), default=['I'])
     parser.add_argument('--config', type=Path, required=True)
     parser.add_argument('--output', type=Path, default=Path('result/arch-test'))
     parser.add_argument('--arch-test-dir', type=Path, default=os.environ.get('ARCH_TEST_DIR'))
@@ -99,6 +100,7 @@ def main():
     atomic = bool(set(extensions) & A_ARCHITECTURES.keys())
     assert not atomic or config.get('enableA', True), 'Atomic tests require enabled A'
     assert 'Zca' not in extensions or config.get('enableC'), 'Compressed tests require enabled C'
+    assert all(config.get('enable' + name) for name in set(extensions) & B_ARCHITECTURES.keys()), 'Bit manipulation tests require enabled extensions'
     assert config['hartCount'] == 1 and config['pmpEntries'] == 0 and not config['virtualAddressBits']
     ram = next(r for r in config['memoryRegions'] if int(r['base']) == base and r['readable'] and r['writable'] and r['executable'] and not r['device'])
     assert int(ram['size']) >= 0x80000 and not base <= console < base + int(ram['size'])
@@ -123,6 +125,7 @@ def main():
     if 'Zca' in extensions:
         udb['implemented_extensions'] += [dict(name='C', version='= 2.0'), dict(name='Zca', version='= 1.0')]
         udb['params']['MUTABLE_MISA_C'] = False
+    udb['implemented_extensions'] += [dict(name=name, version='= 1.0') for name in extensions if name in B_ARCHITECTURES]
     (platform / 'udb.json').write_text(json.dumps(udb, indent=2) + '\n')
     sail = pyjson5.loads(subprocess.check_output([args.sail, '--print-default-config'], text=True))
     def disable(node):
@@ -142,6 +145,7 @@ def main():
         sail['platform']['reservation'].update(require_exact_reservation_addr=True, invalidate_on_same_hart_store=True)
     if 'Zca' in extensions:
         sail['extensions']['Zca']['supported'] = True
+    for name in set(extensions) & B_ARCHITECTURES.keys(): sail['extensions'][name]['supported'] = True
     sail['base']['writable_misa'] = False
     sail['base']['mtvec']['vectored']['supported'] = False
     sail['base']['privileged_isa_version'] = 'Privileged_ISA_1_12'
@@ -168,7 +172,7 @@ def main():
     generated = {str(p.relative_to(output)): digest(p) for p in [*platform.iterdir(), *(output / 'act/ditdah-a1-integer').glob('*.h')] if p.is_file()}
     reports, manifests = [], []
     for image in sorted(p for extension in extensions for p in (output / 'act/ditdah-a1-integer/elfs/rv64i' / extension).glob('*.elf')):
-        architecture = C_ARCHITECTURE if image.parent.name == 'Zca' else M_ARCHITECTURE if image.parent.name == 'M' else A_ARCHITECTURES.get(image.parent.name, ARCHITECTURE)
+        architecture = C_ARCHITECTURE if image.parent.name == 'Zca' else M_ARCHITECTURE if image.parent.name == 'M' else (A_ARCHITECTURES | B_ARCHITECTURES).get(image.parent.name, ARCHITECTURE)
         target = output / image.stem
         target.mkdir(exist_ok=True)
         shutil.copyfile(image, target / 'software.elf')
@@ -185,7 +189,7 @@ def main():
             reference_symbols = {s.name: s['st_value'] for s in ELFFile(stream).get_section_by_name('.symtab').iter_symbols()}
         assert all(all_symbols.get(name) == reference_symbols.get(name) for name in
                    ('rvtest_code_begin', 'rvtest_code_end', 'scratch', 'begin_signature', 'end_signature', 'signature_base')), 'Reference test addresses differ'
-        manifest = dict(profile='arch-test', requiredExtensions=['C'] if image.parent.name == 'Zca' else [], instructionArchitecture=architecture, sourceHashes=hashes, configurationHash=hashlib.sha256(configuration).hexdigest(),
+        manifest = dict(profile='arch-test', requiredExtensions=['C'] if image.parent.name == 'Zca' else [image.parent.name] if image.parent.name in B_ARCHITECTURES else [], instructionArchitecture=architecture, sourceHashes=hashes, configurationHash=hashlib.sha256(configuration).hexdigest(),
             imageHash=digest(image), symbols=symbols, codeSpans=spans, symbolTableHash=table_hash, commands=[command],
             upstreamRevision=REVISION, generatedHashes=generated, referenceHashes={suffix: digest(Path(str(reference) + suffix)) for suffix in ('.sig.elf', '.sig', '.results', '.sig.log')},
             toolVersions={tool: subprocess.check_output([tool, '--version'], text=True).splitlines()[0] for tool in (args.sail, args.tool_prefix + 'gcc', args.tool_prefix + 'ld', args.tool_prefix + 'objdump')},
@@ -193,7 +197,7 @@ def main():
             layout=dict(kind='arch-test', entrySymbol='rvtest_entry_point', entryAlias='_start', bssStart=symbols['__bss_start'], bssEnd=symbols['__bss_end'],
                         stacks=[dict(symbol='__stack_bottom', address=symbols['__stack_bottom'], size=symbols['__stack_bytes'], count=1, stride=symbols['__stack_bytes'])]))
         manifests.append((target, manifest))
-    assert len(manifests) == sum({'I': 51, 'M': 13, 'Zaamo': 18, 'Zalrsc': 4, 'Zca': 32}[extension] for extension in extensions), 'Unexpected architecture test selection'
+    assert len(manifests) == sum({'I': 51, 'M': 13, 'Zaamo': 18, 'Zalrsc': 4, 'Zca': 32, 'Zba': 8, 'Zbb': 24, 'Zbs': 8}[extension] for extension in extensions), 'Unexpected architecture test selection'
     assert args.config.read_bytes() == configuration and all(digest(Path(p)) == h for p, h in hashes.items()), 'Build inputs changed'
     clean_revision()
     for target, manifest in manifests:

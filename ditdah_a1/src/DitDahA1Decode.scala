@@ -82,6 +82,11 @@ object DitDahA1Decode extends Generator[DitDahA1Parameter, DitDahA1UnitLayers, D
     when(insn === 0x10500073L.B(32)) { out.operation := Wfi.U(operationBits) }
     when((opcode === 0x0f.B(7)) & (funct3 === 0.B(3))) { out.operation := Fence.U(operationBits) }
     when((opcode === 0x0f.B(7)) & (funct3 === 1.B(3))) { out.operation := FenceI.U(operationBits) }
+    for (_, mask, encoding) <- DitDahA1BitManip.encodings(parameter) do
+      when((insn & BigInt(mask).B(32)) === BigInt(encoding).B(32)) {
+        val unary = (encoding & 0x7f) == 0x13 || (encoding & 0x7f) == 0x1b || mask == 0xfff0707fL
+        out.operation := (if unary then AluImmediate else AluRegister).U(operationBits)
+      }
     val operation = out.operation
     val csr = (operation === Csrrw.U(operationBits)) | (operation === Csrrs.U(operationBits)) | (operation === Csr.U(operationBits))
     val branch = (operation === Beq.U(operationBits)) | (operation === Branch.U(operationBits))

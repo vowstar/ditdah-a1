@@ -123,7 +123,67 @@ def muldiv_value(insn, a, b):
     return signed(value, 32) if word else value & MASK
 
 
-def integer_value(insn, a, b):
+
+BITMANIP_ENCODINGS = {
+    name: (extension, ((upper << 25) | (function << 12) | opcode), 0xfe00707f)
+    for extension, name, opcode, function, upper in
+    [('Zba', f'sh{n}add{suffix}', op, n * 2, 16) for op, suffix in ((0x33, ''), (0x3b, '.uw')) for n in (1, 2, 3)] +
+    [('Zba', 'add.uw', 0x3b, 0, 4)] +
+    [('Zbb', name, 0x33, function, upper) for name, function, upper in
+     (('andn', 7, 32), ('orn', 6, 32), ('xnor', 4, 32), ('min', 4, 5), ('minu', 5, 5), ('max', 6, 5), ('maxu', 7, 5))] +
+    [('Zbb', name + suffix, opcode, function, 48) for opcode, suffix in ((0x33, ''), (0x3b, 'w')) for name, function in (('rol', 1), ('ror', 5))] +
+    [('Zbb', 'roriw', 0x1b, 5, 48)] +
+    [('Zbs', name, 0x33, function, upper) for name, function, upper in (('bclr', 1, 36), ('bext', 5, 36), ('binv', 1, 52), ('bset', 1, 20))]
+}
+BITMANIP_ENCODINGS.update({name + suffix: ('Zbb', (imm << 20) | 0x1013 | opcode, 0xfff0707f)
+    for opcode, suffix in ((0, ''), (8, 'w')) for name, imm in (('clz', 0x600), ('ctz', 0x601), ('cpop', 0x602))})
+BITMANIP_ENCODINGS.update({name: ('Zbb', (imm << 20) | function | opcode, 0xfff0707f)
+    for name, imm, function, opcode in (('sext.b', 0x604, 0x1000, 0x13), ('sext.h', 0x605, 0x1000, 0x13),
+    ('zext.h', 0x080, 0x4000, 0x3b), ('orc.b', 0x287, 0x5000, 0x13), ('rev8', 0x6b8, 0x5000, 0x13))})
+BITMANIP_ENCODINGS.update({name: (ext, (upper << 26) | (function << 12) | opcode, 0xfc00707f)
+    for name, ext, upper, function, opcode in (('slli.uw', 'Zba', 2, 1, 0x1b), ('rori', 'Zbb', 24, 5, 0x13),
+    ('bclri', 'Zbs', 18, 1, 0x13), ('bexti', 'Zbs', 18, 5, 0x13), ('binvi', 'Zbs', 26, 1, 0x13), ('bseti', 'Zbs', 10, 1, 0x13))})
+
+
+def bitmanip_value(insn, a, b, config):
+    for name, (extension, encoding, mask) in BITMANIP_ENCODINGS.items():
+        if insn & mask != encoding:
+            continue
+        if not config.get('enable' + extension):
+            raise Fault(2, insn)
+        width = 32 if name.endswith('w') and not name.endswith('.uw') else 64
+        x = a & ((1 << width) - 1)
+        shift = ((insn >> 20) if insn & 127 in (0x13, 0x1b) else b) & (width - 1)
+        if name.startswith('sh'):
+            value = ((a & 0xffffffff if name.endswith('.uw') else a) << int(name[2])) + b
+        elif name in ('add.uw', 'slli.uw'):
+            value = (a & 0xffffffff) + b if name == 'add.uw' else (a & 0xffffffff) << shift
+        elif name in ('andn', 'orn', 'xnor'):
+            value = a & ~b if name == 'andn' else a | ~b if name == 'orn' else ~(a ^ b)
+        elif name.startswith(('clz', 'ctz', 'cpop')):
+            return width - x.bit_length() if name.startswith('clz') else ((x & -x).bit_length() - 1 if x else width) if name.startswith('ctz') else x.bit_count()
+        elif name in ('min', 'minu', 'max', 'maxu'):
+            key = (lambda n: n) if name.endswith('u') else (lambda n: signed(n, 64))
+            value = (min if name.startswith('min') else max)((a, b), key=key)
+        elif name in ('sext.b', 'sext.h', 'zext.h'):
+            value = a & 65535 if name == 'zext.h' else signed(a, 8 if name == 'sext.b' else 16)
+        elif name in ('orc.b', 'rev8'):
+            octets = a.to_bytes(8, 'little')
+            value = int.from_bytes(bytes(255 if n else 0 for n in octets), 'little') if name == 'orc.b' else int.from_bytes(octets, 'big')
+        elif name.startswith('ro'):
+            value = (x << shift) | (x >> ((width - shift) % width)) if name.startswith('rol') else (x >> shift) | (x << ((width - shift) % width))
+        else:
+            bit = 1 << shift
+            value = a & ~bit if name.startswith('bclr') else a ^ bit if name.startswith('binv') else a | bit if name.startswith('bset') else (a >> shift) & 1
+        return (signed(value, 32) if width == 32 else value) & MASK
+    return None
+
+
+def integer_value(insn, a, b, config=None):
+    bitmanip = bitmanip_value(insn, a, b, config or {})
+    if bitmanip is not None:
+        return bitmanip
+
     opcode, function, upper = insn & 127, (insn >> 12) & 7, insn >> 25
     word, immediate = opcode in (0x1b, 0x3b), opcode in (0x13, 0x1b)
     width = 32 if word else 64
@@ -495,7 +555,7 @@ class Model:
             elif opcode in (0x13, 0x1b, 0x33, 0x3b):
                 if opcode in (0x33, 0x3b) and insn >> 25 == 1 and not self.config.get('enableM', True):
                     raise Fault(2, insn)
-                value, write = integer_value(insn, a, b), True
+                value, write = integer_value(insn, a, b, self.config), True
             elif opcode == 0x63 and funct3 in (0, 1, 4, 5, 6, 7):
                 displacement = signed(((insn >> 31) << 12) | (((insn >> 7) & 1) << 11)
                                       | (((insn >> 25) & 63) << 5) | (((insn >> 8) & 15) << 1), 13)

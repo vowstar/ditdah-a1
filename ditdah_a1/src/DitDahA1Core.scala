@@ -218,7 +218,7 @@ object DitDahA1Backend extends Generator[DitDahA1Parameter, DitDahA1Layers, DitD
     val execution = Wire(Vec(width, new ResultPacket))
     execution(0) :<= execute.io.output.bits
     mulDiv.foreach { resource => when(isMulDiv) { execution(0).value := resource.io.output.bits } }
-    for lane <- 1 until width do DitDahA1Alu.result(issuedPackets(lane), execution(lane))
+    for lane <- 1 until width do DitDahA1Alu.result(parameter, issuedPackets(lane), execution(lane))
     val control = Seq(DitDahA1Isa.Beq, DitDahA1Isa.Branch, DitDahA1Isa.Jal, DitDahA1Isa.Jalr)
       .map(op => issuedPacket.decoded.operation === op.U(DitDahA1Isa.operationBits)).reduce(_ | _)
     val resolved = control & !execution(0).instruction.fault

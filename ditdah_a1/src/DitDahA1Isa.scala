@@ -13,7 +13,7 @@ object DitDahA1Isa:
     "ld", "sd", "csrrw", "csrrs", "ecall", "ebreak", "mret", "fence", "fence.i", "lw", "lwu", "sw",
     "slli", "slti", "sltiu", "xori", "srli", "srai", "ori", "andi", "sub", "sll", "slt", "sltu", "xor", "srl", "sra", "or", "and",
     "addiw", "slliw", "srliw", "sraiw", "addw", "subw", "sllw", "srlw", "sraw", "bne", "blt", "bge", "bltu", "bgeu",
-    "lb", "lh", "lbu", "lhu", "sb", "sh", "csrrc", "csrrwi", "csrrsi", "csrrci", "wfi") ++ (if parameter.enableA then atomicInstructions else Seq.empty) ++ (if parameter.enableM then mulDivInstructions else Seq.empty) ++ (if parameter.enableC then compressedInstructions else Seq.empty)
+    "lb", "lh", "lbu", "lhu", "sb", "sh", "csrrc", "csrrwi", "csrrsi", "csrrci", "wfi") ++ (if parameter.enableA then atomicInstructions else Seq.empty) ++ (if parameter.enableM then mulDivInstructions else Seq.empty) ++ (if parameter.enableC then compressedInstructions else Seq.empty) ++ DitDahA1BitManip.encodings(parameter).map(_._1)
   val supervisorInstructions = Seq("sret")
   val Illegal = 0
   val Lui = 1

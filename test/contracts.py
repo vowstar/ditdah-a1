@@ -10,7 +10,7 @@ import random
 import subprocess
 
 from programs import addi, alu, amo, beq, csr, sd, mul, muldiv, ld, lw, sw, load, store, fence
-from model import ATOMIC_OPERATIONS, Fault, LocalInterrupts, Model, MASK, atomic_value, compressed_instruction, muldiv_value, pmp_allowed, signed, sv39_walk
+from model import BITMANIP_ENCODINGS, ATOMIC_OPERATIONS, Fault, LocalInterrupts, Model, MASK, atomic_value, compressed_instruction, muldiv_value, pmp_allowed, signed, sv39_walk
 
 
 def backend_control_signals(source):
@@ -718,6 +718,16 @@ def decode_contract(parameters, directory):
     cases += tuple((fence(instruction, reserved), 0, 0, 0) for instruction in (False, True)
                    for reserved in (0, 0x83328880, 0xffff8f80))
     cases += ((0x200f, 0, 0, 0), (0x700f, 0, 0, 0))
+    for name, (extension, encoding, mask) in BITMANIP_ENCODINGS.items():
+        for amount in ((0, 1, 31, 32, 63) if mask == 0xfc00707f else (0, 1, 31)):
+            operand = amount if mask != 0xfff0707f else 0
+            word = encoding | (5 << 15) | (6 << 7) | (operand << 20)
+            enabled = parameters.get('enable' + extension, False)
+            register = word & 127 in (0x33, 0x3b) and mask != 0xfff0707f
+            extra[word] = (22 if register else 21) if enabled else 0
+            cases += ((word, int(enabled), int(enabled and register), int(enabled)),)
+    invalid.update((0x69805013, 0x6200501b, 0x08004033, 0x60801013, 0x2a001033))
+    cases += tuple((word, 0, 0, 0) for word in (0x69805013, 0x6200501b, 0x08004033, 0x60801013, 0x2a001033))
     body = '    input_valid = 1; output_ready = 1;\n'
     for word, rs1, rs2, rd in cases:
         if word & 127 in (0x33, 0x3b) and word >> 25 == 1 and not parameters.get('enableM', True):
@@ -752,7 +762,7 @@ def decode_contract(parameters, directory):
 
 
 def execute_contract(parameters):
-    config = dict(resetVector='0', physicalAddressBits=56, pmpEntries=0, enableInterrupts=True, enableC=parameters.get('enableC', False),
+    config = dict(resetVector='0', physicalAddressBits=56, pmpEntries=0, enableInterrupts=True, enableC=parameters.get('enableC', False), **{key: parameters.get(key, False) for key in ('enableZba', 'enableZbb', 'enableZbs')},
                   memoryRegions=[dict(base='0', size=str(1 << 56), readable=True, writable=True, executable=True, device=False, atomic=True)])
     body = ''
 
@@ -800,6 +810,16 @@ def execute_contract(parameters):
             for function, upper in ((1, 0), (5, 0), (5, 0x400)):
                 for amount in ((0, 1, 31) if word else (0, 1, 32, 63)):
                     check_instruction(alu(6, 1, amount | upper, function, word, True), 23 if word else 21, a)
+    random = __import__('random').Random(0x624)
+    for name, (extension, encoding, mask) in BITMANIP_ENCODINGS.items():
+        if not parameters.get('enable' + extension):
+            continue
+        operation = 22 if encoding & 127 in (0x33, 0x3b) and mask != 0xfff0707f else 21
+        for a, b in (*pairs, *((random.getrandbits(64), random.getrandbits(64)) for _ in range(12))):
+            for amount in ((0, 1, 31, 32, 63) if mask == 0xfc00707f else (0, 1, 31) if name == 'roriw' else (0,)):
+                rs2 = amount if mask == 0xfc00707f or name == 'roriw' else 0 if mask == 0xfff0707f else 2
+                instruction = encoding | (1 << 15) | (6 << 7) | (rs2 << 20)
+                check_instruction(instruction, operation, a, b)
     for function in (1, 4, 5, 6, 7):
         for a, b in pairs:
             for offset in (2, 8):

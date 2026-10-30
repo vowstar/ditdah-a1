@@ -25,6 +25,10 @@ object DitDahA1ParameterCheck:
       assert(DitDahA1Isa.compressedInstructions.forall(name => DitDahA1Isa.instructions(selected).contains(name) == enabled))
       assert(!enabled || selected.fetchWords == 1 && selected.frontendCapacity >= width)
       if enabled then selected.copy(resetVector = 2, virtualAddressBits = 0).validateFrontend()
+    for mask <- 0 until 8 do
+      val selected = baseline.copy(enableZba = (mask & 1) != 0, enableZbb = (mask & 2) != 0, enableZbs = (mask & 4) != 0)
+      assert(DitDahA1Config.parameter(DitDahA1Config.document(selected)) == selected)
+      assert(DitDahA1BitManip.encodings(selected).size == (if selected.enableZba then 8 else 0) + (if selected.enableZbb then 24 else 0) + (if selected.enableZbs then 8 else 0))
     val highAddress = baseline.copy(resetVector = (BigInt(1) << 40) + 2)
     val encoded = upickle.default.write(highAddress)
     assert(upickle.default.read[DitDahA1Parameter](encoded) == highAddress)

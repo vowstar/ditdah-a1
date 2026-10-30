@@ -24,6 +24,14 @@ int main(void)
     volatile uint64_t product = (hart + 3) * (hart + 5);
     if (product != products[hart] || product / (hart + 3) != hart + 5 || product % (hart + 3))
         return 1;
+#if defined(__riscv_zba) && defined(__riscv_zbb) && defined(__riscv_zbs)
+    uint64_t address, rotated, toggled;
+    __asm__ volatile ("sh3add %0, %1, %2" : "=r"(address) : "r"(hart), "r"(0x8000000000000001UL));
+    __asm__ volatile ("rori %0, %1, 63" : "=r"(rotated) : "r"(address));
+    __asm__ volatile ("binvi %0, %1, 63" : "=r"(toggled) : "r"(rotated));
+    if (address != 0x8000000000000001UL + 8 * hart ||
+        rotated != 3 + 16 * hart || toggled != (0x8000000000000003UL + 16 * hart)) return 5;
+#endif
     uint32_t old = __atomic_fetch_add(&state.counter, 1, __ATOMIC_ACQ_REL);
     if (old >= DITDAH_HART_COUNT) return 2;
     uint32_t expected = 0;

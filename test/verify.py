@@ -16,7 +16,7 @@ import subprocess
 from types import SimpleNamespace
 
 from contracts import verify as verify_contracts, verify_storage, backend_control_signals, axi_cache_attributes
-from model import ATOMIC_OPERATIONS, ExclusiveMonitor, Fault, LocalInterrupts, Model, MASK, atomic_value, compressed_instruction, integer_value, pmp_allowed, sv39_walk
+from model import BITMANIP_ENCODINGS, ATOMIC_OPERATIONS, ExclusiveMonitor, Fault, LocalInterrupts, Model, MASK, atomic_value, compressed_instruction, integer_value, pmp_allowed, sv39_walk
 from programs import cases, multicore_cases, platform_program
 
 
@@ -2703,7 +2703,7 @@ def load_software(image, config_path):
     assert hashlib.sha256(image.read_bytes()).hexdigest() == manifest['imageHash'], 'Software image changed'
     assert all(hashlib.sha256(Path(name).read_bytes()).hexdigest() == digest for name, digest in manifest['sourceHashes'].items()), 'Stale software sources'
     required = manifest.get('requiredExtensions', [])
-    assert set(required) <= {'M', 'A', 'C'} and all(config.get('enable' + name, name != 'C') for name in required), 'Software requires disabled extensions'
+    assert set(required) <= {'M', 'A', 'C', 'Zba', 'Zbb', 'Zbs'} and all(config.get('enable' + name, name in ('M', 'A')) for name in required), 'Software requires disabled extensions'
     base, harts, memory, spans, payloads = int(config['resetVector']), config['hartCount'], {}, [], []
     ram = next(r for r in config['memoryRegions'] if int(r['base']) == base and r['readable'] and r['writable'] and r['executable'] and not r['device'])
     memory_bytes = max(65536, int(ram['size']))
@@ -2743,10 +2743,11 @@ def load_software(image, config_path):
             spec.loader.exec_module(builder)
             integer = 'rv64i2p1_zicsr2p0_zifencei2p0'
             architecture = 'rv64i2p1_a2p1_zicsr2p0_zifencei2p0_zaamo1p0_zalrsc1p0' if kind == 'zephyr' else manifest.get('instructionArchitecture', integer)
-            assert kind != 'arch-test' or architecture in (integer, builder.M_ARCHITECTURE, builder.C_ARCHITECTURE, *builder.A_ARCHITECTURES.values()), 'Unsupported software architecture profile'
+            assert kind != 'arch-test' or architecture in (integer, builder.M_ARCHITECTURE, builder.C_ARCHITECTURE, *builder.A_ARCHITECTURES.values(), *builder.B_ARCHITECTURES.values()), 'Unsupported software architecture profile'
             assert architecture != builder.M_ARCHITECTURE or config.get('enableM', True), 'Software requires disabled arithmetic'
             assert architecture not in builder.A_ARCHITECTURES.values() or config.get('enableA', True), 'Software requires disabled atomics'
             assert architecture != builder.C_ARCHITECTURE or config.get('enableC'), 'Software requires disabled compressed instructions'
+            assert all(architecture != value or config.get('enable' + name) for name, value in builder.B_ARCHITECTURES.items()), 'Software requires disabled bit manipulation'
             code = builder.code_spans(elf, architecture, (integer,) if kind == 'zephyr' else ())
             if kind == 'arch-test':
                 assert code == manifest['codeSpans'] and hashlib.sha256(table.data()).hexdigest() == manifest['symbolTableHash'], 'Executable mappings changed'
@@ -2763,7 +2764,7 @@ def load_software(image, config_path):
                     assert not (opcode in (51, 59) and funct7 == 1) or config.get('enableM', True), 'Software requires disabled arithmetic'
                     if opcode in (19, 27, 51, 59):
                         try:
-                            integer_value(word, 0, 0)
+                            integer_value(word, 0, 0, config)
                         except Fault as error:
                             raise AssertionError('Unsupported software integer encoding') from error
                     elif opcode in (3, 15, 35, 99, 103):
@@ -2838,15 +2839,21 @@ def test_source_hashes():
 def check_software_output(lines, config, program, console):
     report = check_multicore(lines, config, program, 'software', atomic_metadata=True, software_output=True)
     assert Counter(console.read_text().splitlines()) == Counter(f'[hart {hart}] {line}' for hart, text in enumerate(program.software['expectedConsole']) for line in text.splitlines()), 'Console log differs from software bytes'
-    if 'C' in program.software.get('requiredExtensions', []):
-        observed = set()
-        for line in log_lines(lines):
-            fields = line.split()
-            hart = int(fields[1]) if fields[:1] == ['HART'] else 0
-            fields = fields[2:] if fields[:1] == ['HART'] else fields
-            if fields[:1] == ['TRACE'] and not int(fields[8], 16) and int(fields[3], 16) & 3 != 3:
-                observed.add(hart)
-        assert observed == set(range(config['hartCount'])), 'Software profile lacks compressed retirement on every hart'
+    required = set(program.software.get('requiredExtensions', [])) & {'C', 'Zba', 'Zbb', 'Zbs'}
+    observed = set()
+    for line in log_lines(lines):
+        fields = line.split()
+        hart = int(fields[1]) if fields[:1] == ['HART'] else 0
+        fields = fields[2:] if fields[:1] == ['HART'] else fields
+        if fields[:1] != ['TRACE'] or int(fields[8], 16):
+            continue
+        instruction = int(fields[3], 16)
+        if instruction & 3 != 3:
+            observed.add((hart, 'C'))
+        for extension, encoding, mask in BITMANIP_ENCODINGS.values():
+            if instruction & mask == encoding:
+                observed.add((hart, extension))
+    assert {(hart, name) for hart in range(config['hartCount']) for name in required} <= observed, 'Software profile lacks extension retirement on every hart'
     return report
 
 
@@ -3154,6 +3161,7 @@ def main():
     parser.add_argument('--supervisor-mode', action='store_true')
     parser.add_argument('--sv39', action='store_true')
     parser.add_argument('--compressed', action='store_true')
+    parser.add_argument('--bitmanip', nargs='+', choices=('Zba', 'Zbb', 'Zbs'), default=[])
     parser.add_argument('--burst-refill', action='store_true')
     parser.add_argument('--branch-prediction', action='store_true')
     parser.add_argument('--branch-predictor-entries', type=int, choices=(0, 8, 16), default=0)
@@ -3253,6 +3261,7 @@ def main():
         directory = args.output / f'{"irq-" if interrupts else ""}{"pmp16-" if entries else ""}axi{width}'
         directory.mkdir(parents=True, exist_ok=True)
         config = configuration(width)
+        config.update({'enable' + name: name in args.bitmanip for name in ('Zba', 'Zbb', 'Zbs')})
         config.update(enableM=not args.no_m, enableA=not args.no_a, enableC=args.compressed, l2CacheBytes=args.l2_cache_bytes or 0, issueWidth=args.issue_width, loadQueueEntries=args.load_queue_entries, pmpEntries=entries, enableInterrupts=interrupts, iCacheBytes=args.icache_bytes, dCacheBytes=args.dcache_bytes, dCacheWays=args.dcache_ways, dCacheRefillBytes=args.dcache_refill_bytes, dCacheWriteback=args.dcache_writeback, tlbEntries=args.tlb_entries, iTlbEntries=args.i_tlb_entries, dTlbEntries=args.d_tlb_entries, asidBits=args.asid_bits, enableBurstRefill=args.burst_refill, enableBranchPrediction=args.branch_prediction, branchPredictorEntries=args.branch_predictor_entries)
         if args.fabric_read_slots is not None:
             config['fabricReadSlots'] = args.fabric_read_slots
@@ -3321,6 +3330,7 @@ def main():
             directory = args.output / f'harts{harts}-axi{width}'
             directory.mkdir(parents=True, exist_ok=True)
             config = dict(configuration(width), enableM=not args.no_m, enableA=not args.no_a, l2CacheBytes=args.l2_cache_bytes or 0, issueWidth=args.issue_width, loadQueueEntries=args.load_queue_entries, hartCount=harts, pmpEntries=entries, enableInterrupts=interrupts, iCacheBytes=args.icache_bytes, dCacheBytes=args.dcache_bytes, dCacheWays=args.dcache_ways, dCacheRefillBytes=args.dcache_refill_bytes, dCacheWriteback=args.dcache_writeback, tlbEntries=args.tlb_entries, iTlbEntries=args.i_tlb_entries, dTlbEntries=args.d_tlb_entries, asidBits=args.asid_bits, enableBurstRefill=args.burst_refill, enableBranchPrediction=args.branch_prediction, branchPredictorEntries=args.branch_predictor_entries)
+            config.update(enableC=args.compressed, **{'enable' + name: name in args.bitmanip for name in ('Zba', 'Zbb', 'Zbs')})
             if args.fabric_read_slots is not None:
                 config['fabricReadSlots'] = args.fabric_read_slots
             config['memoryRegions'][0]['dataCacheable'] = bool(args.dcache_bytes)

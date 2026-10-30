@@ -407,6 +407,7 @@ def cases(base, protection=False, interrupts=False, user=False, local_interrupt_
            mul(7, 2, 3) | (1 << 12), mul(7, 2, 3) | (4 << 12), mul(7, 2, 3) | 8)
     yield 'multiply', p.finish()
     yield from integer_cases(base)
+    yield from bitmanip_cases(base)
     if compressed:
         yield from compressed_cases(base, protection, sv39)
 
@@ -781,6 +782,27 @@ def compressed_cases(base, protection=False, sv39=False):
                                     21: 0 if kind=='success' else virtual+0x1000, 25: virtual+(0x1004 if kind=='success' else 0xffe), 23: 1}
             p.required_fetch = (virtual+0xffc, 0x4485)
             yield 'compressed_page_' + kind, p
+
+
+
+def bitmanip_cases(base):
+    from model import BITMANIP_ENCODINGS
+    for extension in ('Zba', 'Zbb', 'Zbs'):
+        p = Program(base)
+        p.address(10, 0x3000)
+        for index, value in enumerate((0, -1, 0x8000000080000000, 0x0123456789abcdef)):
+            for byte in range(8):
+                p.memory[base + 0x3000 + 8 * index + byte] = (value >> (8 * byte)) & 255
+            p.emit(ld(1, 10, index * 8), addi(2, 0, (0, 31, 32, 63)[index]))
+            for name, (owner, encoding, mask) in BITMANIP_ENCODINGS.items():
+                if owner != extension:
+                    continue
+                for amount in ((0, 31, 32, 63) if mask == 0xfc00707f else (0, 31) if name == 'roriw' else (0,)):
+                    rs2 = amount if mask == 0xfc00707f or name == 'roriw' else 0 if mask == 0xfff0707f else 2
+                    p.emit(encoding | (1 << 15) | (6 << 7) | (rs2 << 20), add(7, 6, 6))
+            p.emit(addi(0, 0, 1))
+        assert p.offset < 0x800
+        yield 'bitmanip_' + extension.lower(), p.finish()
 
 
 def integer_cases(base):

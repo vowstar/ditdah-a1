@@ -2749,6 +2749,79 @@ def integer_cases(parameters):
             ('IntegerExecute', execute, 'assign output_bits_csrData =', "assign output_bits_csrData = 64'h0 &")]
 
 
+
+def bitmanip_cases(parameters):
+    from model import BITMANIP_ENCODINGS
+    decode, execute = '', r"""
+  wire [31:0] bm_instruction = input_bits_decoded_instruction_instruction;
+  wire [63:0] bm_a = input_bits_operand1, bm_b = input_bits_operand2;
+  wire [5:0] bm_shift = bm_instruction[6:0] == 7'h13 || bm_instruction[6:0] == 7'h1b ? bm_instruction[25:20] : bm_b[5:0];
+  function automatic [63:0] bm_count(input [63:0] x, input integer width, kind);
+    integer i;
+    begin
+      bm_count = kind == 2 ? 0 : width;
+      for (i=0; i<width; i=i+1) begin
+        if (kind == 2) bm_count = bm_count + x[i];
+        else if (kind == 0 && (x >> i) != 0) bm_count = width - i - 1;
+        else if (kind == 1 && ((x << (63-i)) != 0) && bm_count == width) bm_count = i;
+      end
+    end
+  endfunction
+"""
+    for index, (name, (extension, encoding, mask)) in enumerate(BITMANIP_ENCODINGS.items()):
+        enabled = parameters.get('enable' + extension, False)
+        register = encoding & 127 in (0x33, 0x3b) and mask != 0xfff0707f
+        operation = 22 if register else 21
+        predicate = f"(input_bits_instruction & 32'h{mask:x}) == 32'h{encoding:x}"
+        decode += f"  always @* if ({predicate}) begin\n"
+        decode += f"    assert(output_bits_operation == {operation if enabled else 0});\n"
+        decode += f"    assert(output_bits_usesRs1 == ({int(enabled)} && !input_bits_fault));\n"
+        decode += f"    assert(output_bits_usesRs2 == ({int(enabled and register)} && !input_bits_fault));\n"
+        decode += f"    assert(output_bits_writesRd == ({int(enabled)} && !input_bits_fault) && !output_bits_serializing);\n"
+        decode += "  end\n" + f"  always @* cover(input_valid && !input_bits_fault && ({predicate}));\n"
+        if not enabled:
+            continue
+        word = name.endswith('w') and not name.endswith('.uw')
+        width = 32 if word else 64
+        a = "{32'd0, bm_a[31:0]}" if word else 'bm_a'
+        shift = 'bm_shift[4:0]' if word else 'bm_shift'
+        if name.startswith('sh'):
+            left = "{32'd0, bm_a[31:0]}" if name.endswith('.uw') else a
+            expression = f'({left} << {name[2]}) + bm_b'
+        elif name in ('add.uw', 'slli.uw'):
+            expression = "{32'd0, bm_a[31:0]} " + ('+ bm_b' if name == 'add.uw' else '<< bm_shift')
+        elif name in ('andn', 'orn', 'xnor'):
+            expression = {'andn': 'bm_a & ~bm_b', 'orn': 'bm_a | ~bm_b', 'xnor': '~(bm_a ^ bm_b)'}[name]
+        elif name.startswith(('clz', 'ctz', 'cpop')):
+            expression = f"bm_count({a}, {width}, {0 if name.startswith('clz') else 1 if name.startswith('ctz') else 2})"
+        elif name in ('min', 'minu', 'max', 'maxu'):
+            cast = (lambda x: x) if name.endswith('u') else (lambda x: '$signed(' + x + ')')
+            expression = f"{cast(a)} {'<' if name.startswith('min') else '>'} {cast('bm_b')} ? {a} : bm_b"
+        elif name in ('sext.b', 'sext.h', 'zext.h'):
+            bits = 8 if name == 'sext.b' else 16
+            extension = f'{{{64-bits}{{bm_a[{bits-1}]}}}}' if name.startswith('sext') else f"{64-bits}'d0"
+            expression = '{' + extension + f', bm_a[{bits-1}:0]' + '}'
+        elif name == 'orc.b':
+            expression = '{' + ','.join(f'{{8{{|bm_a[{i*8}+:8]}}}}' for i in reversed(range(8))) + '}'
+        elif name == 'rev8':
+            expression = '{' + ','.join(f'bm_a[{i*8}+:8]' for i in range(8)) + '}'
+        elif name.startswith('ro'):
+            complement = f"(({width} - {shift}) % {width})"
+            expression = f'({a} << {shift}) | ({a} >> {complement})' if name.startswith('rol') else f'({a} >> {shift}) | ({a} << {complement})'
+        else:
+            expression = f"(bm_a >> bm_shift) & 64'd1" if name.startswith('bext') else f"bm_a {'& ~' if name.startswith('bclr') else '^' if name.startswith('binv') else '|'} (64'd1 << bm_shift)"
+        execute += f'  wire [63:0] bm_expected_{index} = {expression};\n'
+        expected = f"{{{{32{{bm_expected_{index}[31]}}}}, bm_expected_{index}[31:0]}}" if word else f'bm_expected_{index}'
+        condition = f"(bm_instruction & 32'h{mask:x}) == 32'h{encoding:x} && input_bits_decoded_operation == {operation}"
+        execute += f'  always @* if ({condition}) assert(output_bits_value == {expected});\n'
+        witness = 'bm_a[63]' if mask == 0xfff0707f else f'bm_a[63] && bm_shift == {31 if name == "roriw" else 63}'
+        execute += f'  always @* cover(input_valid && ({condition}) && {witness});\n'
+    mutation = ('assign output_bits_writesRd =', "assign output_bits_writesRd = 1'h0 &") if any(parameters.get('enable' + name) for name in ('Zba', 'Zbb', 'Zbs')) else (
+        'assign output_bits_operation =', "assign output_bits_operation = input_bits_instruction == 32'h0800003b ? 5'd21 :")
+    return [('BitManipDecode', decode, *mutation)] + (
+        [('BitManipExecute', execute, 'assign output_bits_value =', "assign output_bits_value = 64'h1 ^")] if any(parameters.get('enable' + name) for name in ('Zba', 'Zbb', 'Zbs')) else [])
+
+
 def local_interrupt_case(parameters):
     base = int(parameters['localInterruptBase'])
     count = parameters['hartCount']
@@ -4963,7 +5036,7 @@ def verify(rtl, directory, modules=None, mutations=None, jobs=1):
             ('Fetch', FETCH, '& ~killed & ~cancel', '& ~cancel'),
             ('MulDiv', MULDIV, '~busy & ~valid', '~valid'),
             ('Backend', BACKEND, '(~issuedValid | executed) & ~executePending & ~redirect_0', '(~issuedValid | executed) & ~redirect_0'))
-    cases = [*cases, gpr_case(manifest['parameters']), *word_cases(manifest['parameters']), *integer_cases(manifest['parameters']), *wfi_cases(manifest['parameters']), synchronization_case(manifest['parameters']),
+    cases = [*cases, gpr_case(manifest['parameters']), *word_cases(manifest['parameters']), *integer_cases(manifest['parameters']), *bitmanip_cases(manifest['parameters']), *wfi_cases(manifest['parameters']), synchronization_case(manifest['parameters']),
              arbiter_case(manifest['parameters']), memory_case(manifest['parameters']), axi_case(manifest['parameters'])]
     if manifest['parameters'].get('loadQueueEntries', 1) == 2 and not enabled and manifest['parameters'].get('virtualAddressBits') == 0:
         cases.append(lsu_reads_case(manifest['parameters']))
@@ -5002,7 +5075,7 @@ def verify(rtl, directory, modules=None, mutations=None, jobs=1):
             continue
         if modules and name not in modules and not (name.startswith('Pmp') and 'Pmp' in modules):
             continue
-        unit = name.removeprefix('Compressed').removeprefix('Interrupt').removeprefix('Synchronization').removeprefix('Pipeline').removeprefix('Word').removeprefix('Integer').removeprefix('Wfi').removeprefix('User').removeprefix('Supervisor').removeprefix('Wide')
+        unit = name.removeprefix('BitManip').removeprefix('Compressed').removeprefix('Interrupt').removeprefix('Synchronization').removeprefix('Pipeline').removeprefix('Word').removeprefix('Integer').removeprefix('Wfi').removeprefix('User').removeprefix('Supervisor').removeprefix('Wide')
         if name in ('DataCacheWriteback', 'DataCacheAssociativity'):
             unit = 'DataCache'
         if name == 'LsuReads':
@@ -7029,6 +7102,6 @@ if __name__ == '__main__':
     parser.add_argument('--output', type=Path, default=Path('result/formal'))
     parser.add_argument('--mutations', nargs='+')
     parser.add_argument('--jobs', type=int, default=1)
-    parser.add_argument('--modules', nargs='+', choices=('Fetch', 'CompressedFetch', 'WideFetch', 'Gpr', 'MulDiv', 'Backend', 'PipelineBackend', 'Pmp', 'PmpDecode', 'PmpInterval', 'PmpSubset', 'Csr', 'UserCsr', 'UserExecute', 'SupervisorCsr', 'SupervisorExecute', 'SupervisorFetch', 'Lsu', 'LsuReads', 'InterruptCsr', 'InterruptBackend', 'SynchronizationBackend', 'SharedCache', 'InstructionCache', 'DataCache', 'DataCacheWriteback', 'DataCacheAssociativity', 'Coherence', 'MemoryArbiter', 'ReadQueue', 'MemoryFabric', 'Memory', 'Axi', 'WordDecode', 'WordExecute', 'IntegerDecode', 'IntegerExecute', 'WfiBackend', 'WfiFrontend', 'LocalInterrupts', 'Translation'))
+    parser.add_argument('--modules', nargs='+', choices=('Fetch', 'CompressedFetch', 'WideFetch', 'Gpr', 'MulDiv', 'Backend', 'PipelineBackend', 'Pmp', 'PmpDecode', 'PmpInterval', 'PmpSubset', 'Csr', 'UserCsr', 'UserExecute', 'SupervisorCsr', 'SupervisorExecute', 'SupervisorFetch', 'Lsu', 'LsuReads', 'InterruptCsr', 'InterruptBackend', 'SynchronizationBackend', 'SharedCache', 'InstructionCache', 'DataCache', 'DataCacheWriteback', 'DataCacheAssociativity', 'Coherence', 'MemoryArbiter', 'ReadQueue', 'MemoryFabric', 'Memory', 'Axi', 'WordDecode', 'WordExecute', 'BitManipDecode', 'BitManipExecute', 'IntegerDecode', 'IntegerExecute', 'WfiBackend', 'WfiFrontend', 'LocalInterrupts', 'Translation'))
     args = parser.parse_args()
     verify(args.rtl, args.output, args.modules, args.mutations, args.jobs)
