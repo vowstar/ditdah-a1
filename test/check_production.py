@@ -178,7 +178,7 @@ for index, (top, overrides, diagnostic) in enumerate((
         ('DitDahA1Frontend', {'pmpEntries': 64}, 'RTL supports zero or sixteen PMP entries'),
         ('DitDahA1Core', {'issueWidth': 0}, 'issueWidth must be between 1 and 3'),
         ('DitDahA1Backend', {'issueWidth': 4}, 'issueWidth must be between 1 and 3'),
-        ('DitDahA1Frontend', {'resetVector': '2'}, 'Frontend requires a word-aligned resetVector'),
+        ('DitDahA1Frontend', {'resetVector': '2'}, 'Frontend resetVector must satisfy IALIGN'),
         ('DitDahA1MemoryFabric', {'axiDataBits': 96}, 'axiDataBits must be'),
         ('DitDahA1MemoryFabric', {'memoryRegions': [{'base': '0', 'size': '16'}, {'base': '8', 'size': '8'}]}, 'Memory regions must not overlap'),
         ('DitDahA1Core', {'virtualAddressBits': 48}, 'RTL supports Bare or Sv39 addressing'),

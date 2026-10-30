@@ -10,7 +10,7 @@ import me.jiuyang.zaozi.valuetpe.*
 class DitDahA1MulDivIO(parameter: DitDahA1Parameter) extends HWBundle(parameter):
   val clock = Flipped(Clock())
   val reset = Flipped(Reset())
-  val input = Flipped(new Decoupled(new IssuedPacket))
+  val input = Flipped(new Decoupled(new IssuedPacket(parameter)))
   val output = Aligned(new Decoupled(UInt(64)))
 
 @generator

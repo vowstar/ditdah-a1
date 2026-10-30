@@ -16,7 +16,7 @@ import subprocess
 from types import SimpleNamespace
 
 from contracts import verify as verify_contracts, verify_storage, backend_control_signals, axi_cache_attributes
-from model import ATOMIC_OPERATIONS, ExclusiveMonitor, Fault, LocalInterrupts, Model, MASK, atomic_value, integer_value, pmp_allowed, sv39_walk
+from model import ATOMIC_OPERATIONS, ExclusiveMonitor, Fault, LocalInterrupts, Model, MASK, atomic_value, compressed_instruction, integer_value, pmp_allowed, sv39_walk
 from programs import cases, multicore_cases, platform_program
 
 
@@ -215,16 +215,22 @@ def compile_tb(rtl, directory, width, pa, top='core_tb', source=None, extra_file
                 retirement.append(f'  assign {target}.trace{name[0].upper() + name[1:]} = {backend}.{probes[name]}{select};')
             for name in ('pipelineOccupancy', 'pipelineStall'):
                 retirement.append(f'  assign {target}.{name} = {backend}.{probes[name]};')
-        fetch_words = (1 if issue_width == 1 else 2 if issue_width == 2 else 4) if parameters['iCacheBytes'] else 1
+        fetch_words = (1 if issue_width == 1 else 2 if issue_width == 2 else 4) if parameters['iCacheBytes'] and not parameters.get('enableC') else 1
         suffix_format = ' %01h' + ' %08h' * (fetch_words - 1) if fetch_words > 1 else ''
         suffix_values = ', ' + ', '.join([f'{fetch}.output_bits_count',
             *(f'{fetch}.output_bits_following_{lane - 1}' for lane in range(1, fetch_words))]) if fetch_words > 1 else ''
+        if parameters.get('enableC'):
+            suffix_format += ' LEN %01h'
+            suffix_values += ', ' + fetch + '.output_bits_length'
         early = f'{backend}.{recovery}'
         prediction = ''
         if parameters.get('branchPredictorEntries'):
             frontend = fetch.removesuffix('.fetch')
             word = f'{issued}_instruction'
             control = f"({word}[6:0] == 7'h6f || ({word}[6:0] == 7'h67 && {word}[14:12] == 0) || ({word}[6:0] == 7'h63 && ({word}[14:12] == 0 || {word}[14:12] == 1 || {word}[14])))"
+            if parameters.get('enableC'):
+                operation = issued.removesuffix('_instruction') + '_operation'
+                control = '(' + ' || '.join(operation + ' == 5\'d' + str(op) for op in (5, 6, 7, 25)) + ')'
             prediction = f'''    if ({backend}.execute.output_valid && {backend}.execute.output_ready &&
         !{backend}.execute.output_bits_instruction_fault && {control}) begin
       {prefix}$display("BRANCH_RESOLVE %016h %02h %08h %01h %016h %016h", {issued}_pc, {issued}_tag,
@@ -464,7 +470,7 @@ def compile_tb(rtl, directory, width, pa, top='core_tb', source=None, extra_file
          '-Wno-TIMESCALEMOD', '-Wno-WIDTHTRUNC', '-Wno-WIDTHEXPAND',
          f'-DAXI_BITS={width}', f'-DPA_BITS={pa}', f'-DHARTS={harts}',
          f'-DFABRIC_READ_SLOTS={parameters.get("fabricReadSlots") or (2 if harts > 1 else 0)}',
-         f'-DLOAD_QUEUE_ENTRIES={parameters.get("loadQueueEntries", 1)}',
+         f'-DLOAD_QUEUE_ENTRIES={parameters.get("loadQueueEntries", 1)}', f'-DCOMPRESSED={int(parameters.get("enableC", False))}',
          '-I' + str(directory.resolve()), *(['-DENABLE_M'] if parameters.get('enableM', True) else []), *(['-DENABLE_INTERRUPTS'] if interrupts else []), '-I' + str(rtl.resolve()),
          *(['-DICACHE'] if parameters['iCacheBytes'] else []),
          *(['-DLOCAL_INTERRUPTS'] if local_base is not None else []),
@@ -583,9 +589,12 @@ def control_offset(instruction):
 def prediction_target(config, table, pc, instruction):
     if not config.get('enableBranchPrediction'):
         return None
+    if config.get('enableC') and instruction & 3 != 3:
+        instruction = compressed_instruction(instruction)
     entries = config.get('branchPredictorEntries', 0)
-    row = table.get((pc >> 2) % entries) if entries else None
-    hit = row is not None and row[0] == pc >> 2
+    shift = 1 if config.get('enableC') else 2
+    row = table.get((pc >> shift) % entries) if entries else None
+    hit = row is not None and row[0] == pc >> shift
     offset = control_offset(instruction)
     if offset is not None:
         taken = instruction & 127 == 0x6f or (row[3] >= 2 if hit and row[1] else offset < 0)
@@ -632,7 +641,13 @@ def fetch_checker(config, faults, local_faults, architectural=None, buffered=())
             int(region['base']) <= address and address + size <= int(region['base']) + int(region['size'])
             and region['executable'] and (size != 64 or not region['device']) for region in config['memoryRegions'])
 
-    pending, requests, demand, physical_demand = None, {}, None, None
+    compressed = config.get('enableC', False)
+    align = 2 if compressed else 4
+    shift = 1 if compressed else 2
+    length = lambda word: 2 if compressed and word & 3 != 3 else 4
+    expand = lambda word: compressed_instruction(word) if compressed and word & 3 != 3 else word
+    lengths = {}
+    pending, requests, demand, physical_demand, parcel_va = None, {}, None, None, None
     arch_accepted, arch_completed, arch_wraps = 0, 0, 0
     previous_tag = None
     fetched, failed = Counter(), Counter()
@@ -678,17 +693,17 @@ def fetch_checker(config, faults, local_faults, architectural=None, buffered=())
         elif fields[:1] == ['PREDICT_UPDATE']:
             assert dynamic and len(fields) == 5, 'Unexpected prediction feedback'
             pc, target, conditional, taken = (int(value, 16) for value in fields[1:])
-            assert pc % 4 == target % 4 == 0 and conditional in (0, 1) and taken == (target != (pc + 4) & MASK), 'Invalid prediction feedback'
-            index = (pc >> 2) % dynamic
+            assert pc % align == target % align == 0 and conditional in (0, 1) and taken == (target != (pc + lengths.get(pc, 4)) & MASK), 'Invalid prediction feedback'
+            index = (pc >> shift) % dynamic
             row = prediction_table.get(index)
-            count = max(0, min(3, row[3] + (1 if taken else -1))) if row and row[:2] == (pc >> 2, conditional) else 1 + taken
-            prediction_table[index] = (pc >> 2, conditional, target, count)
+            count = max(0, min(3, row[3] + (1 if taken else -1))) if row and row[:2] == (pc >> shift, conditional) else 1 + taken
+            prediction_table[index] = (pc >> shift, conditional, target, count)
             prediction_updates += 1
         elif fields[:1] == ['BRANCH_RESOLVE']:
             assert dynamic and len(fields) == 7, 'Unexpected branch resolution'
             pc, tag, instruction, taken, target, actual = (int(value, 16) for value in fields[1:])
             word, predicted = prediction_packets.pop((pc, tag), (None, None))
-            assert word == instruction and predicted == (target if taken else (pc + 4) & MASK), 'Resolved branch lost its predicted PC or instruction owner'
+            assert word == instruction and predicted == (target if taken else (pc + length(instruction)) & MASK), 'Resolved branch lost its predicted PC or instruction owner'
             resolved_predictions[pc, tag, instruction, actual] += 1
             if actual != predicted:
                 expected_recoveries[pc, tag, actual] += 1
@@ -701,11 +716,15 @@ def fetch_checker(config, faults, local_faults, architectural=None, buffered=())
             assert not requests and pending is None and address in reachable, 'Unexpected architectural fetch identity or control flow'
             requests[tag] = address
             demand = address
+            parcel_va = address
             physical_demand = address
             arch_wraps += int(previous_tag is not None and tag < previous_tag)
             previous_tag = tag
             arch_accepted += 1
-            reachable.add(address + 4)
+            if not compressed:
+                reachable.add(address + 4)
+        elif fields[:2] == ['TRANSLATE_REQUEST', '0']:
+            parcel_va = int(fields[2], 16)
         elif fields[:2] == ['TRANSLATE_RESPONSE', '0']:
             physical_demand = int(fields[2], 16)
         elif fields[:1] == ['ARCH_CANCEL']:
@@ -718,11 +737,12 @@ def fetch_checker(config, faults, local_faults, architectural=None, buffered=())
                 pc, tag, target = (int(value, 16) for value in fields[3:])
                 candidates = [key for key, count in fetched.items() if count and key[0] == pc and key[-1] == tag]
                 assert len(candidates) == 1, 'Early recovery lacks its accepted instruction occurrence'
-                instruction = candidates[0][1]
+                raw = candidates[0][1]
+                instruction = expand(raw)
                 offset = control_offset(instruction)
                 valid = target == (pc + offset) & MASK if offset is not None else instruction & 0x707f == 0x67
-                valid |= offset is not None and instruction & 127 == 0x63 and target == pc + 4
-                assert valid and target % 4 == 0, 'Early recovery target differs from the standard instruction'
+                valid |= offset is not None and instruction & 127 == 0x63 and target == pc + length(raw)
+                assert valid and target % align == 0, 'Early recovery target differs from the standard instruction'
                 epochs.append(((pc, tag), (fetched.copy(), failed.copy(), bus_failed.copy())))
                 fetched.clear(); failed.clear(); bus_failed.clear()
                 reachable.add(target)
@@ -732,18 +752,26 @@ def fetch_checker(config, faults, local_faults, architectural=None, buffered=())
                     discard_outputs()
                     cancel_order = None
         elif fields[:1] == ['ARCH_FETCH']:
+            if compressed:
+                assert fields[-2] == 'LEN' and int(fields[-1], 16) in (2, 4), 'Missing actual instruction length'
+                actual_length, fields = int(fields[-1], 16), fields[:-2]
             address, fault, instruction, tag = (int(value, 16) for value in fields[1:5])
+            if compressed and not fault:
+                assert actual_length == length(instruction) and (actual_length == 4 or instruction < 65536), 'Instruction length or raw encoding mismatch'
+            lengths[address] = length(instruction)
             count = int(fields[5], 16) if len(fields) > 5 else 1
             words = [instruction, *(int(value, 16) for value in fields[6:])]
             width = config.get('issueWidth', 1)
-            banks = (1 if width == 1 else 2 if width == 2 else 4) if config['iCacheBytes'] else 1
+            banks = (1 if width == 1 else 2 if width == 2 else 4) if config['iCacheBytes'] and not compressed else 1
             assert len(words) == banks and 1 <= count <= banks - (address // 4) % banks, 'Invalid architectural fetch suffix'
             assert not fault or count == 1, 'Fetch fault returned younger instructions'
             assert requests.pop(tag, None) == address, 'Unrequested, repeated or cancelled architectural fetch'
             if not config['iCacheBytes']:
                 if not fault:
-                    assert physical_fetched[address, instruction], 'Architectural fetch without matching physical response'
-                    physical_fetched[address, instruction] -= 1
+                    for offset in range(0, length(instruction), align):
+                        key = (address + offset, (instruction >> (8 * offset)) & ((1 << (8 * align)) - 1))
+                        assert physical_fetched[key], 'Architectural fetch without matching physical response'
+                        physical_fetched[key] -= 1
                 elif physical_failed[address]:
                     physical_failed[address] -= 1
                     bus_failed[address, tag] += 1
@@ -763,21 +791,24 @@ def fetch_checker(config, faults, local_faults, architectural=None, buffered=())
                     if dynamic:
                         pc = address + 4 * lane
                         target = prediction_target(config, prediction_table, pc, words[lane])
-                        prediction_packets[pc, (tag + lane) & 255] = (words[lane], (pc + 4) & MASK if target is None else target)
-            reachable.update(address + 4 * lane for lane in range(1, count + 1))
+                        prediction_packets[pc, (tag + lane) & 255] = (words[lane], (pc + length(words[lane])) & MASK if target is None else target)
+            reachable.update(address + (length(instruction) if compressed else 4 * lane) for lane in range(1, count + 1))
         elif fields[:2] == ['BUS', 'fetch']:
             address, size, data = int(fields[2], 16), int(fields[3]), int(fields[4], 16)
             assert pending is None, 'Overlapping instruction transactions'
-            assert size in ((4, 64) if config.get('enableBurstRefill') else (4,)) and data == 0 and allowed(address, size), f'Forbidden fetch: {line}'
-            expected = demand is not None and (address & ~63 == physical_demand & ~63 if config['iCacheBytes'] else address == physical_demand)
+            sizes = (2, 4, 64) if compressed and config.get('enableBurstRefill') else (2, 4) if compressed else (4, 64) if config.get('enableBurstRefill') else (4,)
+            assert size in sizes and data == 0 and allowed(address, size), f'Forbidden fetch: {line}'
+            parcels = (physical_demand, physical_demand + 2) if compressed and config.get('virtualAddressBits') != 39 else (physical_demand,)
+            expected = demand is not None and any(address & ~63 == parcel & ~63 if config['iCacheBytes'] else address == parcel for parcel in parcels)
             assert (expected if architectural else address in reachable), f'Fetch outside current instruction demand: {line}'
             reachable.add(address + 4)
-            pending = [address, architectural and not requests, demand, size // 4, size]
+            virtual = parcel_va if config.get('virtualAddressBits') == 39 else address
+            pending = [address, architectural and not requests, virtual if compressed else demand, max(1, size // 4), size]
             accepted += 1
         elif fields[:1] == ['FETCH']:
             address, response, instruction = (int(value, 16) for value in fields[1:])
             assert pending is not None and pending[0] == address, f'Unrequested fetch response: {line}'
-            beat_bytes = (config.get('fetchBeatBytes', config['axiDataBits'] // 8) if pending[4] == 64 else 4)
+            beat_bytes = (config.get('fetchBeatBytes', config['axiDataBits'] // 8) if pending[4] == 64 else min(4, pending[4]))
             beat_base = address & -beat_bytes
             expected_fault = beat_base <= faults.get('fetch', -1) < beat_base + beat_bytes
             assert response == (2 if expected_fault else 0), f'Fetch response: {line}'
@@ -785,7 +816,10 @@ def fetch_checker(config, faults, local_faults, architectural=None, buffered=())
                 (failed if response else fetched)[(address, None) if response else (address, instruction, None)] += 1
             elif not pending[1]:
                 virtual = pending[2] if config.get('virtualAddressBits') == 39 else address
-                (physical_failed if response else physical_fetched)[virtual if response else (virtual, instruction)] += 1
+                if compressed and response:
+                    physical_failed[demand] += 1
+                else:
+                    (physical_failed if response else physical_fetched)[virtual if response else (virtual, instruction & 65535 if pending[4] == 2 else instruction)] += 1
             pending[3] -= 1
             pending[0] += 4
             if not pending[3]:
@@ -815,7 +849,7 @@ def fetch_checker(config, faults, local_faults, architectural=None, buffered=())
                     consume(2, (pc,), tag)
             else:
                 tag = consume(0, (pc, instruction), tag)
-            if dynamic and not trap and instruction & 127 in (0x63, 0x67, 0x6f):
+            if dynamic and not trap and expand(instruction) & 127 in (0x63, 0x67, 0x6f):
                 assert resolved_predictions[pc, tag, instruction, trace[3]], 'Retired control lacks its matching resolution'
                 resolved_predictions[pc, tag, instruction, trace[3]] -= 1
             if epochs and epochs[0][0] == (pc, tag):
@@ -915,7 +949,30 @@ def check_fetch_oracle():
         assert str(error) == 'Recovery counts differ from the configured prediction policy'
     else:
         raise AssertionError('Pipeline oracle accepted disabled prediction')
-    return [*rejected, 'disabledPrediction']
+    c = dict(config, enableC=True)
+    parcels = ['ARCH_REQUEST 0 0', 'BUS fetch 0 2 0', 'FETCH 0 0 93',
+               'BUS fetch 2 2 0', 'FETCH 2 0 10', 'ARCH_FETCH 0 0 100093 0 LEN 4',
+               'TRACE 0 0 100093 4 1 1 1 0 0 0']
+    check_fetches(parcels, c, {})
+    half = ['ARCH_REQUEST 0 0', 'BUS fetch 0 2 0', 'FETCH 0 0 1',
+            'ARCH_FETCH 0 0 1 0 LEN 2', 'TRACE 0 0 1 2 0 0 0 0 0 0']
+    check_fetches(half, c, {})
+    second_fault = [*parcels[:4], 'FETCH 2 2 0', 'ARCH_FETCH 0 1 0 0 LEN 4',
+                    'TRACE 0 0 0 0 0 0 0 1 1 2']
+    check_fetches(second_fault, c, {'fetch': 2})
+    changes = {'missingSecondParcel': parcels[:3] + parcels[5:],
+               'wrongParcel': [line.replace('FETCH 2 0 10', 'FETCH 2 0 11') for line in parcels],
+               'wrongLength': [line.replace('LEN 4', 'LEN 2') for line in parcels],
+               'unrelatedParcel': [*parcels[:3], 'BUS fetch 4 2 0'],
+               'wideCompressedEncoding': [line.replace('ARCH_FETCH 0 0 1 0', 'ARCH_FETCH 0 0 10001 0') for line in half],
+               'missingSecondFault': [*second_fault[:3], *second_fault[5:]]}
+    for name, lines in changes.items():
+        try:
+            check_fetches(lines, c, {'fetch': 2} if name == 'missingSecondFault' else {})
+        except AssertionError:
+            continue
+        raise AssertionError(f'Fetch oracle accepted {name}')
+    return [*rejected, 'disabledPrediction', *changes]
 
 
 def check_burst_guards(lines, config, program, name):
@@ -1138,7 +1195,7 @@ def check_pipeline_events(lines, config, program):
         if fields[:1] == ['ISSUE_GROUP']:
             hart, cycle, pc, instruction, count = (int(value, 16 if column in (2, 3) else 10) for column, value in enumerate(fields[1:]))
             assert hart == 0 and 0 < count <= config['issueWidth']
-            assert instruction == sum(program.memory.get(pc + byte, 0) << (8 * byte) for byte in range(4)), 'Issue group head differs from instruction memory'
+            assert instruction == sum(program.memory.get(pc + byte, 0) << (8 * byte) for byte in range(2 if config.get('enableC') and program.memory.get(pc, 0) & 3 != 3 else 4)), 'Issue group head differs from instruction memory'
             groups.setdefault(pc, []).append(count)
         elif fields[:1] == ['RECOVERY']:
             hart, cycle, pc, tag, target = (int(value, 16 if column >= 2 else 10) for column, value in enumerate(fields[1:]))
@@ -1179,7 +1236,7 @@ def compare(binary, directory, config, transport='axi', selected=()):
     count = 0
     reports, burst_guards = [], []
     pipeline_max, dependency_stalls = 0, 0
-    for name, program in cases(base, config['pmpEntries'] != 0, config['enableInterrupts'], config.get('enableUserMode', False), local_interrupt_base(config), config.get('enableSupervisorMode', False), config.get('virtualAddressBits') == 39, config.get('dCacheWriteback', False)):
+    for name, program in cases(base, config['pmpEntries'] != 0, config['enableInterrupts'], config.get('enableUserMode', False), local_interrupt_base(config), config.get('enableSupervisorMode', False), config.get('virtualAddressBits') == 39, config.get('dCacheWriteback', False), config.get('enableC', False)):
         if selected and name not in selected:
             continue
         image = directory / (name + '.hex')
@@ -1311,6 +1368,9 @@ def compare(binary, directory, config, transport='axi', selected=()):
                 assert data_bus == expected_bus, f'{name}: unexpected data accesses\nactual {data_bus}\nexpected {expected_bus}'
             if hasattr(program, 'required_atomics'):
                 assert sum(line.startswith('REQUEST atomic ') for line in lines) == program.required_atomics, 'Required translated atomic requests were not exercised'
+            if hasattr(program, 'required_fetch'):
+                pc, instruction = program.required_fetch
+                assert any(line.startswith(f'ARCH_FETCH {pc:016x} 0 {instruction:08x} ') for line in lines), 'Required translated compressed instruction was not fetched'
             if transport == 'memory':
                 assert [tuple(int(value, 16) for value in line.split()[1:]) for line in lines if line.startswith('ATOMIC ')] == expected_atomics, 'Memory atomic metadata differs from independent instructions'
                 requests = [(v[1], int(v[2], 16), int(v[3]), int(v[4], 16)) for line in lines
@@ -2643,7 +2703,7 @@ def load_software(image, config_path):
     assert hashlib.sha256(image.read_bytes()).hexdigest() == manifest['imageHash'], 'Software image changed'
     assert all(hashlib.sha256(Path(name).read_bytes()).hexdigest() == digest for name, digest in manifest['sourceHashes'].items()), 'Stale software sources'
     required = manifest.get('requiredExtensions', [])
-    assert set(required) <= {'M', 'A'} and all(config.get('enable' + name, True) for name in required), 'Software requires disabled extensions'
+    assert set(required) <= {'M', 'A', 'C'} and all(config.get('enable' + name, name != 'C') for name in required), 'Software requires disabled extensions'
     base, harts, memory, spans, payloads = int(config['resetVector']), config['hartCount'], {}, [], []
     ram = next(r for r in config['memoryRegions'] if int(r['base']) == base and r['readable'] and r['writable'] and r['executable'] and not r['device'])
     memory_bytes = max(65536, int(ram['size']))
@@ -2654,7 +2714,7 @@ def load_software(image, config_path):
     with image.open('rb') as stream:
         elf = ELFFile(stream)
         assert elf.elfclass == 64 and elf.little_endian and elf['e_machine'] == 'EM_RISCV' and elf['e_type'] == 'ET_EXEC', 'Unsupported executable format'
-        assert not elf['e_flags'] & 6 and (kind == 'arch-test' or not elf['e_flags'] & 1), 'Unsupported compressed or floating-point ABI'
+        assert not elf['e_flags'] & 6 and (kind == 'arch-test' or config.get('enableC') or not elf['e_flags'] & 1), 'Unsupported compressed or floating-point ABI'
         table = elf.get_section_by_name('.symtab')
         assert table is not None, 'Software symbols are missing'
         all_symbols = {symbol.name: symbol for symbol in table.iter_symbols() if symbol['st_shndx'] != 'SHN_UNDEF'}
@@ -2683,9 +2743,10 @@ def load_software(image, config_path):
             spec.loader.exec_module(builder)
             integer = 'rv64i2p1_zicsr2p0_zifencei2p0'
             architecture = 'rv64i2p1_a2p1_zicsr2p0_zifencei2p0_zaamo1p0_zalrsc1p0' if kind == 'zephyr' else manifest.get('instructionArchitecture', integer)
-            assert kind != 'arch-test' or architecture in (integer, builder.M_ARCHITECTURE, *builder.A_ARCHITECTURES.values()), 'Unsupported software architecture profile'
+            assert kind != 'arch-test' or architecture in (integer, builder.M_ARCHITECTURE, builder.C_ARCHITECTURE, *builder.A_ARCHITECTURES.values()), 'Unsupported software architecture profile'
             assert architecture != builder.M_ARCHITECTURE or config.get('enableM', True), 'Software requires disabled arithmetic'
             assert architecture not in builder.A_ARCHITECTURES.values() or config.get('enableA', True), 'Software requires disabled atomics'
+            assert architecture != builder.C_ARCHITECTURE or config.get('enableC'), 'Software requires disabled compressed instructions'
             code = builder.code_spans(elf, architecture, (integer,) if kind == 'zephyr' else ())
             if kind == 'arch-test':
                 assert code == manifest['codeSpans'] and hashlib.sha256(table.data()).hexdigest() == manifest['symbolTableHash'], 'Executable mappings changed'
@@ -2693,8 +2754,10 @@ def load_software(image, config_path):
             for span in code:
                 section = elf.get_section_by_name(span['section'])
                 data = section.data()
-                for address in range(span['start'], span['end'], 4):
-                    word = int.from_bytes(data[address - section['sh_addr']:address - section['sh_addr'] + 4], 'little')
+                for address, word in builder.instructions(data, span['start'] - section['sh_addr'], span['end'] - section['sh_addr'], config.get('enableC', False)):
+                    if word & 3 != 3:
+                        word = compressed_instruction(word)
+                        assert word, 'Unsupported compressed software instruction'
                     opcode, funct3, funct7 = word & 127, (word >> 12) & 7, word >> 25
                     assert opcode in (3, 15, 19, 23, 27, 35, 47, 51, 55, 59, 99, 103, 111, 115), 'Unsupported software instruction family'
                     assert not (opcode in (51, 59) and funct7 == 1) or config.get('enableM', True), 'Software requires disabled arithmetic'
@@ -2732,7 +2795,7 @@ def load_software(image, config_path):
                 assert all(high <= start or end <= low for start, end in payloads), 'Loaded bytes overlap reserved stack'
                 assert all(high <= span['start'] or span['end'] <= low for span in code), 'Code overlaps reserved stack'
     assert any(low <= base < high and flags & 1 for low, high, flags in spans), 'Entry is not executable'
-    assert symbols['__test_halt'] % 4 == 0 and any(low <= symbols['__test_halt'] < high and flags & 1 for low, high, flags in spans)
+    assert symbols['__test_halt'] % (2 if config.get('enableC') else 4) == 0 and any(low <= symbols['__test_halt'] < high and flags & 1 for low, high, flags in spans)
     bss = symbols['__bss_start'], symbols['__bss_end']
     assert base <= bss[0] <= symbols['__test_results'] <= symbols['__test_results'] + 8 * harts <= bss[1] <= base + memory_bytes
     assert symbols['__test_results'] % 8 == 0 and all(memory.get(address) == 0 for address in range(*bss)), 'ELF BSS was not zero-filled'
@@ -2761,7 +2824,7 @@ def load_software(image, config_path):
         assert frequency == 10000000 and local_interrupt_base(config) is not None and config['enableInterrupts']
         assert all(hashlib.sha256(image.with_name(name).read_bytes()).hexdigest() == digest for name, digest in manifest['generatedHashes'].items()), 'Generated software configuration changed'
     return config, SimpleNamespace(memory=memory, faults={}, stop=symbols['__test_halt'],
-        software=dict(kind=kind, console=console, results=symbols['__test_results'], bss=bss, expectedConsole=expected, expectedInterruptCauses=interrupt_causes,
+        software=dict(kind=kind, console=console, results=symbols['__test_results'], bss=bss, expectedConsole=expected, expectedInterruptCauses=interrupt_causes, requiredExtensions=required,
                       memoryBytes=memory_bytes, timebaseHz=frequency, timeTickCycles=100000000 // frequency,
                       idleCycles=4 * 100000000 // 100 if kind == 'zephyr' else 0)), manifest
 
@@ -2775,6 +2838,15 @@ def test_source_hashes():
 def check_software_output(lines, config, program, console):
     report = check_multicore(lines, config, program, 'software', atomic_metadata=True, software_output=True)
     assert Counter(console.read_text().splitlines()) == Counter(f'[hart {hart}] {line}' for hart, text in enumerate(program.software['expectedConsole']) for line in text.splitlines()), 'Console log differs from software bytes'
+    if 'C' in program.software.get('requiredExtensions', []):
+        observed = set()
+        for line in log_lines(lines):
+            fields = line.split()
+            hart = int(fields[1]) if fields[:1] == ['HART'] else 0
+            fields = fields[2:] if fields[:1] == ['HART'] else fields
+            if fields[:1] == ['TRACE'] and not int(fields[8], 16) and int(fields[3], 16) & 3 != 3:
+                observed.add(hart)
+        assert observed == set(range(config['hartCount'])), 'Software profile lacks compressed retirement on every hart'
     return report
 
 
@@ -3081,6 +3153,7 @@ def main():
     parser.add_argument('--user-mode', action='store_true')
     parser.add_argument('--supervisor-mode', action='store_true')
     parser.add_argument('--sv39', action='store_true')
+    parser.add_argument('--compressed', action='store_true')
     parser.add_argument('--burst-refill', action='store_true')
     parser.add_argument('--branch-prediction', action='store_true')
     parser.add_argument('--branch-predictor-entries', type=int, choices=(0, 8, 16), default=0)
@@ -3180,7 +3253,7 @@ def main():
         directory = args.output / f'{"irq-" if interrupts else ""}{"pmp16-" if entries else ""}axi{width}'
         directory.mkdir(parents=True, exist_ok=True)
         config = configuration(width)
-        config.update(enableM=not args.no_m, enableA=not args.no_a, l2CacheBytes=args.l2_cache_bytes or 0, issueWidth=args.issue_width, loadQueueEntries=args.load_queue_entries, pmpEntries=entries, enableInterrupts=interrupts, iCacheBytes=args.icache_bytes, dCacheBytes=args.dcache_bytes, dCacheWays=args.dcache_ways, dCacheRefillBytes=args.dcache_refill_bytes, dCacheWriteback=args.dcache_writeback, tlbEntries=args.tlb_entries, iTlbEntries=args.i_tlb_entries, dTlbEntries=args.d_tlb_entries, asidBits=args.asid_bits, enableBurstRefill=args.burst_refill, enableBranchPrediction=args.branch_prediction, branchPredictorEntries=args.branch_predictor_entries)
+        config.update(enableM=not args.no_m, enableA=not args.no_a, enableC=args.compressed, l2CacheBytes=args.l2_cache_bytes or 0, issueWidth=args.issue_width, loadQueueEntries=args.load_queue_entries, pmpEntries=entries, enableInterrupts=interrupts, iCacheBytes=args.icache_bytes, dCacheBytes=args.dcache_bytes, dCacheWays=args.dcache_ways, dCacheRefillBytes=args.dcache_refill_bytes, dCacheWriteback=args.dcache_writeback, tlbEntries=args.tlb_entries, iTlbEntries=args.i_tlb_entries, dTlbEntries=args.d_tlb_entries, asidBits=args.asid_bits, enableBurstRefill=args.burst_refill, enableBranchPrediction=args.branch_prediction, branchPredictorEntries=args.branch_predictor_entries)
         if args.fabric_read_slots is not None:
             config['fabricReadSlots'] = args.fabric_read_slots
         config['memoryRegions'][0]['dataCacheable'] = bool(args.dcache_bytes)

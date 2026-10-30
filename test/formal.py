@@ -85,6 +85,77 @@ FETCH = r'''
   end
 '''
 
+def compressed_fetch_case(source, parameters):
+    assert parameters.get('enableC') and not parameters['iCacheBytes'] and not parameters['pmpEntries'] and not parameters.get('enableUserMode') and parameters.get('virtualAddressBits') != 39
+    assignment = re.search(r'assign output_valid\s*=\s*[^;]+;', source).group()
+    assert '& ~cancel' in assignment
+    body = r'''
+  reg past_valid=0, active, owned, killed, second, seen;
+  reg [63:0] pc, expected_tval;
+  reg [7:0] tag;
+  reg [15:0] first;
+  reg [31:0] expected_instruction;
+  reg expected_fault;
+  always @(posedge clock) begin
+    past_valid<=1;
+    if (!past_valid) assume(reset); else assume(!reset);
+    if (reset) begin active<=0; owned<=0; killed<=0; second<=0; seen<=0; end
+    else begin
+      assume(!memory_response_valid || owned);
+      assume(!memory_response_valid || memory_response_bits_last);
+      if ($past(!reset && memory_response_valid && !memory_response_ready)) begin
+        assume(memory_response_valid);
+        assume($stable({memory_response_bits_data,memory_response_bits_fault,memory_response_bits_tag}));
+      end
+      if (memory_request_valid && memory_request_ready) begin assert(!owned); owned<=1; end
+      if (memory_response_valid && memory_response_ready) begin
+        assert(owned); owned<=0; seen<=1;
+        expected_fault<=memory_response_bits_fault || memory_response_bits_tag!=tag;
+        expected_tval<=(memory_response_bits_fault || memory_response_bits_tag!=tag) ? pc+(second ? 2 : 0) : 0;
+        expected_instruction<=(memory_response_bits_fault || memory_response_bits_tag!=tag) ? 0 : second ? {memory_response_bits_data[15:0],first} : {16'b0,memory_response_bits_data[15:0]};
+        if (!second && !memory_response_bits_fault && memory_response_bits_tag==tag && memory_response_bits_data[1:0]==3) begin first<=memory_response_bits_data[15:0]; second<=1; end
+      end
+      if (output_valid && output_ready) active<=0;
+      if (cancel) killed<=1;
+      if (request_valid && request_ready) begin
+        assert(!active || killed || output_valid && output_ready);
+        active<=1; killed<=0; second<=0; seen<=0; pc<=request_bits_pc; tag<=request_bits_tag;
+      end
+      assert(!memory_response_ready || owned);
+      if (memory_request_valid) begin
+        assert(active && memory_request_bits_address==pc+(second ? 2 : 0));
+        assert(memory_request_bits_size==1 && memory_request_bits_tag==tag && memory_request_bits_fetch && memory_request_bits_privileged);
+        assert(!memory_request_bits_write && !memory_request_bits_atomic && !memory_request_bits_mask && !memory_request_bits_data);
+        if (second) assert(seen && first[1:0]==3);
+      end
+      if (output_valid) begin
+        assert(active && !killed && !cancel && output_bits_pc==pc && output_bits_tag==tag);
+        assert(output_bits_length==(second ? 4 : 2));
+        if (pc[0]) assert(output_bits_fault && output_bits_cause==0 && output_bits_tval==pc && output_bits_instruction==0);
+        else begin
+          assert(seen && output_bits_instruction==expected_instruction && output_bits_fault==expected_fault);
+          assert(output_bits_cause==(expected_fault ? 1 : 0) && output_bits_tval==expected_tval);
+        end
+      end
+      if (killed || cancel) assert(!output_valid);
+      if ($past(!reset && memory_request_valid && !memory_request_ready)) begin
+        assert(memory_request_valid);
+        assert($stable({memory_request_bits_address,memory_request_bits_size,memory_request_bits_tag,memory_request_bits_privileged}));
+      end
+      if ($past(!reset && output_valid && !output_ready) && !cancel) begin
+        assert(output_valid);
+        assert($stable({output_bits_pc,output_bits_tag,output_bits_instruction,output_bits_length,output_bits_fault,output_bits_cause,output_bits_tval}));
+      end
+      cover(output_valid && output_ready && !output_bits_fault && output_bits_length==2);
+      cover(output_valid && output_ready && !output_bits_fault && output_bits_length==4 && pc[5:0]==62);
+      cover(output_valid && output_bits_fault && second && output_bits_tval==pc+2);
+      cover(killed && owned && memory_response_valid && memory_response_ready);
+      cover(cancel && active && seen && !owned && !second);
+    end
+  end
+'''
+    return 'CompressedFetch', body, assignment, assignment.replace('& ~cancel', '')
+
 FETCH_PHYSICAL = r'''
   reg fetch_physical_owned = 0, fetch_physical_line;
   always @(posedge clock) if (reset) fetch_physical_owned <= 0;
@@ -4923,13 +4994,15 @@ def verify(rtl, directory, modules=None, mutations=None, jobs=1):
         cases.append(translation_case(manifest['parameters']))
     if manifest['parameters'].get('iCacheBytes') and manifest['parameters']['issueWidth'] > 1:
         cases = [wide_fetch_case(manifest['parameters']) if case[0] == 'Fetch' else case for case in cases]
+    if manifest['parameters'].get('enableC') and not manifest['parameters']['iCacheBytes'] and not enabled and not manifest['parameters'].get('enableUserMode') and manifest['parameters'].get('virtualAddressBits') != 39:
+        cases.append(compressed_fetch_case(sources['DitDahA1Fetch.sv'], manifest['parameters']))
     assert not modules or set(modules) <= {case[0] for case in cases}, 'Unsupported proof selection'
     for name, body, before, after in cases:
         if name == 'MemoryArbiter' and not modules and (enabled or manifest['parameters']['enableInterrupts']):
             continue
         if modules and name not in modules and not (name.startswith('Pmp') and 'Pmp' in modules):
             continue
-        unit = name.removeprefix('Interrupt').removeprefix('Synchronization').removeprefix('Pipeline').removeprefix('Word').removeprefix('Integer').removeprefix('Wfi').removeprefix('User').removeprefix('Supervisor').removeprefix('Wide')
+        unit = name.removeprefix('Compressed').removeprefix('Interrupt').removeprefix('Synchronization').removeprefix('Pipeline').removeprefix('Word').removeprefix('Integer').removeprefix('Wfi').removeprefix('User').removeprefix('Supervisor').removeprefix('Wide')
         if name in ('DataCacheWriteback', 'DataCacheAssociativity'):
             unit = 'DataCache'
         if name == 'LsuReads':
@@ -4977,7 +5050,7 @@ def verify(rtl, directory, modules=None, mutations=None, jobs=1):
             body += '\n  wire sc_tag_write = ' + ports[0][1]['W0_en'] + ';\n'
         if unit == 'InstructionCache':
             arrays, ports = zip(*instance_ports(sources['DitDahA1InstructionCache.sv']))
-            banks = 1 << (manifest['parameters']['issueWidth'] - 1).bit_length()
+            banks = manifest['implementation']['fetchWords']
             assert len(arrays) == banks
             address_bits = (manifest['parameters']['iCacheBytes'] // (4 * banks) - 1).bit_length()
             for bank, port in enumerate(ports):
@@ -4985,6 +5058,43 @@ def verify(rtl, directory, modules=None, mutations=None, jobs=1):
                     alias = f'formal_cache_pin_{bank}_{pin}'
                     body += f'\n  wire [{width-1}:0] {alias} = FORMAL_CACHE_PIN_{bank}_{pin};\n'
                     port[pin] = alias
+            if manifest['parameters'].get('enableC'):
+                body = body.replace('upstream_request_bits_address[1:0] == 0', '(upstream_request_bits_size == 1 ? !upstream_request_bits_address[0] : upstream_request_bits_size == 2 && upstream_request_bits_address[1:0] == 0)')
+                body = body.replace('cache_address[1:0] == 0', '(cache_half ? !cache_address[0] : cache_address[1:0] == 0)')
+                body = body.replace('(bypass ? 2 : 6)', '(bypass ? (cache_half ? 1 : 2) : 6)')
+                body = body.replace('assert(checkSize == (bypass ? (cache_half ? 1 : 2) : 6))', 'assert(checkSize == (bypass ? (halfword ? 1 : 2) : 6))')
+                body = body.replace('downstream_request_bits_size == 2', 'downstream_request_bits_size == (bypass && cache_half ? 1 : 2)')
+                body = body.replace('cache_error && cache_beat == cache_address', 'cache_error && (bypass || !cache_half && cache_beat == cache_address)')
+                body = body.replace('!allowed && !cache_abort && checkAddress == cache_address', '!allowed && !cache_abort && (bypass || !cache_half && checkAddress == cache_address)')
+                body = body.replace('cache_error && cache_beat != cache_address', 'cache_error && !bypass && (cache_half || cache_beat != cache_address)')
+                body = body.replace('!allowed && checkAddress != cache_address', '!allowed && !bypass && (cache_half || checkAddress != cache_address)')
+                body += f'\n  wire [31:0] formal_parcel_word = {ports[0]["R0_data"]};\n'
+                body += r'''
+  reg cache_half, parcel_valid;
+  reg [31:0] parcel_value;
+  function [31:0] halfword_value(input [31:0] value);
+    halfword_value = cache_half && cache_address[1] ? {16'b0,value[31:16]} : value;
+  endfunction
+  always @(posedge clock) if (!reset) begin
+    if (cache_owned) assert(halfword == cache_half);
+    if (cache_owned && parcel_valid) assert(data == parcel_value);
+    if (cache_owned && cache_filled[cache_address[5:2]]) assert(parcel_valid);
+    if (state==1 && hit_0 && !cache_abort) begin parcel_valid<=1; parcel_value<=halfword_value(formal_parcel_word); end
+    if (cache_reply && !cache_abort && !cache_error && PARCEL_VALID_BEAT && (bypass || word==cache_address[5:2])) begin
+      parcel_valid<=1; parcel_value<=bypass ? downstream_response_bits_data[31:0] : halfword_value(downstream_response_bits_data[31:0]);
+    end
+    if (upstream_response_valid && !cache_abort && !cache_fault) begin
+      if (state==1) assert(upstream_response_bits_data==halfword_value(formal_parcel_word));
+      else assert(parcel_valid && upstream_response_bits_data==parcel_value);
+    end
+    PARCEL_UPPER
+    if (upstream_request_valid && upstream_request_ready) begin cache_half<=upstream_request_bits_size==1; parcel_valid<=0; end
+    cover(upstream_response_valid && !cache_fault && cache_half && cache_address[1]);
+    cover(downstream_request_valid && bypass && cache_half && downstream_request_bits_size==1);
+  end
+'''
+                upper = 'if (state==6 && !cache_abort && !fault && word==cache_address[5:2]) begin parcel_valid<=1; parcel_value<=halfword_value(cache_upper); end' if manifest['parameters'].get('enableBurstRefill') else ''
+                body = body.replace('PARCEL_UPPER', upper).replace('PARCEL_VALID_BEAT', '(bypass || !cache_line_error)' if manifest['parameters'].get('enableBurstRefill') else "1'b1")
             body = body.replace('filling_0', 'formal_cache_filling')
             body += '\n  wire formal_cache_filling = ' + ' | '.join(f"({port['W0_en']})" for port in ports) + ';\n'
             if banks > 1:
@@ -6458,6 +6568,8 @@ endmodule''', 1)
                         guidance = guidance.replace('assume(allowed == !(cache_scenario == 3 && word == 1));', 'assume(allowed == (cache_scenario != 3));')
                         guidance = guidance.replace('state == 4 && word == 15', 'state == 6 && word == 15')
                         guidance += "  always @* assume(downstream_response_bits_last == (bypass || word >= 14));\n"
+                    if manifest['parameters'].get('enableC'):
+                        guidance = guidance.replace('upstream_request_bits_address == 0', 'upstream_request_bits_address == 2 && upstream_request_bits_size == 1')
                     guidance = guidance.replace('SCENARIO_MAX', '4' if scenario is None else '7')
                     if scenario is not None:
                         guidance += f'  always @* assume(cache_scenario == {scenario});\n'
@@ -6917,6 +7029,6 @@ if __name__ == '__main__':
     parser.add_argument('--output', type=Path, default=Path('result/formal'))
     parser.add_argument('--mutations', nargs='+')
     parser.add_argument('--jobs', type=int, default=1)
-    parser.add_argument('--modules', nargs='+', choices=('Fetch', 'WideFetch', 'Gpr', 'MulDiv', 'Backend', 'PipelineBackend', 'Pmp', 'PmpDecode', 'PmpInterval', 'PmpSubset', 'Csr', 'UserCsr', 'UserExecute', 'SupervisorCsr', 'SupervisorExecute', 'SupervisorFetch', 'Lsu', 'LsuReads', 'InterruptCsr', 'InterruptBackend', 'SynchronizationBackend', 'SharedCache', 'InstructionCache', 'DataCache', 'DataCacheWriteback', 'DataCacheAssociativity', 'Coherence', 'MemoryArbiter', 'ReadQueue', 'MemoryFabric', 'Memory', 'Axi', 'WordDecode', 'WordExecute', 'IntegerDecode', 'IntegerExecute', 'WfiBackend', 'WfiFrontend', 'LocalInterrupts', 'Translation'))
+    parser.add_argument('--modules', nargs='+', choices=('Fetch', 'CompressedFetch', 'WideFetch', 'Gpr', 'MulDiv', 'Backend', 'PipelineBackend', 'Pmp', 'PmpDecode', 'PmpInterval', 'PmpSubset', 'Csr', 'UserCsr', 'UserExecute', 'SupervisorCsr', 'SupervisorExecute', 'SupervisorFetch', 'Lsu', 'LsuReads', 'InterruptCsr', 'InterruptBackend', 'SynchronizationBackend', 'SharedCache', 'InstructionCache', 'DataCache', 'DataCacheWriteback', 'DataCacheAssociativity', 'Coherence', 'MemoryArbiter', 'ReadQueue', 'MemoryFabric', 'Memory', 'Axi', 'WordDecode', 'WordExecute', 'IntegerDecode', 'IntegerExecute', 'WfiBackend', 'WfiFrontend', 'LocalInterrupts', 'Translation'))
     args = parser.parse_args()
     verify(args.rtl, args.output, args.modules, args.mutations, args.jobs)

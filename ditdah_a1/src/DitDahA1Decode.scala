@@ -9,7 +9,7 @@ import me.jiuyang.zaozi.valuetpe.*
 
 class DitDahA1DecodeIO(parameter: DitDahA1Parameter) extends HWBundle(parameter):
   val input = Flipped(new Decoupled(new FetchPacket))
-  val output = Aligned(new Decoupled(new DecodedPacket))
+  val output = Aligned(new Decoupled(new DecodedPacket(parameter)))
 
 @generator
 object DitDahA1Decode extends Generator[DitDahA1Parameter, DitDahA1UnitLayers, DitDahA1DecodeIO, DitDahA1UnitProbe]:
@@ -19,7 +19,8 @@ object DitDahA1Decode extends Generator[DitDahA1Parameter, DitDahA1UnitLayers, D
     val io = summon[Interface[DitDahA1DecodeIO]]
     val in = io.input.bits
     val out = io.output.bits
-    val insn = in.instruction.asBits
+    val insn = if parameter.enableC then (in.length === 2.U(3)).?(DitDahA1Compressed(in.instruction), in.instruction.asBits) else in.instruction.asBits
+    out.functionCode.foreach(_ := (insn.bits(30, 30) ## insn.bits(14, 12)).asUInt)
     val opcode = insn.bits(6, 0)
     val funct3 = insn.bits(14, 12)
     val funct7 = insn.bits(31, 25)

@@ -19,6 +19,12 @@ object DitDahA1ParameterCheck:
       val selected = baseline.copy(enableA = enabled)
       assert(DitDahA1Config.parameter(DitDahA1Config.document(selected)) == selected)
       assert(DitDahA1Isa.atomicInstructions.forall(name => DitDahA1Isa.instructions(selected).contains(name) == enabled))
+    for enabled <- Seq(false, true); width <- 1 to 3 do
+      val selected = baseline.copy(enableC = enabled, issueWidth = width)
+      assert(DitDahA1Config.parameter(DitDahA1Config.document(selected)) == selected)
+      assert(DitDahA1Isa.compressedInstructions.forall(name => DitDahA1Isa.instructions(selected).contains(name) == enabled))
+      assert(!enabled || selected.fetchWords == 1 && selected.frontendCapacity >= width)
+      if enabled then selected.copy(resetVector = 2, virtualAddressBits = 0).validateFrontend()
     val highAddress = baseline.copy(resetVector = (BigInt(1) << 40) + 2)
     val encoded = upickle.default.write(highAddress)
     assert(upickle.default.read[DitDahA1Parameter](encoded) == highAddress)

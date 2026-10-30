@@ -8,8 +8,8 @@ import me.jiuyang.zaozi.reftpe.*
 import me.jiuyang.zaozi.valuetpe.*
 
 class DitDahA1IssueIO(parameter: DitDahA1Parameter) extends HWBundle(parameter):
-  val input = Flipped(new Decoupled(new DecodedPacket))
-  val output = Aligned(new Decoupled(new IssuedPacket))
+  val input = Flipped(new Decoupled(new DecodedPacket(parameter)))
+  val output = Aligned(new Decoupled(new IssuedPacket(parameter)))
   val raddr1 = Aligned(UInt(5))
   val raddr2 = Aligned(UInt(5))
   val rdata1 = Flipped(UInt(64))

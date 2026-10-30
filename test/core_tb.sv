@@ -317,7 +317,7 @@ module core_tb;
         if (arlen != (accepted_request[read_source].size == 6 ? 64 / (DW/8) - 1 : 0) || arburst != 1 || (arlock && arprot[2]) ||
             arcache != expected_cache(64'(araddr), (1 << arsize) * (1 + integer'(arlen)), arprot[2], 0, arlock) || arqos != 0) $fatal(1, "Read attributes");
         if (arprot != {accepted_request[read_source].fetch, 1'b0, accepted_request[read_source].privileged}) $fatal(1, "Read privilege");
-        if ((accepted_request[read_source].size == 6 ? arsize != $clog2(DW/8) : arprot[2] ? arsize != 2 : arsize > 3) ||
+        if ((accepted_request[read_source].size == 6 ? arsize != $clog2(DW/8) : arprot[2] ? (arsize != 2 && !(`COMPRESSED && arsize == 1)) : arsize > 3) ||
             (arlock && arsize != 2 && arsize != 3) || (araddr & ((1 << arsize) - 1)) != 0) $fatal(1, "Read alignment");
         if (HARTS > 1) $write("HART %0d ", (read_source % (2*HARTS)) / 2);
         emit_source(read_source);

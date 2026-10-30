@@ -10,6 +10,71 @@ def signed(value, bits):
     return (value & ((1 << (bits - 1)) - 1)) - (value & (1 << (bits - 1)))
 
 
+def compressed_instruction(c):
+    from programs import add, addi, alu, beq, jal, jalr, ld, lw, sd, sw
+    quadrant, function = c & 3, c >> 13
+    rd, rs2, a, b = (c >> 7) & 31, (c >> 2) & 31, 8 + ((c >> 7) & 7), 8 + ((c >> 2) & 7)
+    bit = lambda n: (c >> n) & 1
+    field = lambda low, width: (c >> low) & ((1 << width) - 1)
+    immediate = signed((bit(12) << 5) | rs2, 6)
+    shift = (bit(12) << 5) | rs2
+    if quadrant == 0:
+        offset = (field(7, 4) << 6) | (field(11, 2) << 4) | (bit(5) << 3) | (bit(6) << 2)
+        if function == 0 and offset:
+            return addi(b, 2, offset)
+        if function in (2, 3, 6, 7):
+            word = function & 1 == 0
+            offset = ((bit(5) << 6) | (field(10, 3) << 3) | (bit(6) << 2) if word else
+                      (field(5, 2) << 6) | (field(10, 3) << 3))
+            return (lw(b, a, offset) if word else ld(b, a, offset)) if function < 4 else (sw(b, a, offset) if word else sd(b, a, offset))
+    elif quadrant == 1:
+        if function in (0, 1, 2):
+            if function == 1:
+                return alu(rd, rd, immediate, 0, word=True, immediate=True) if rd else 0
+            return addi(rd, rd if function == 0 else 0, immediate)
+        if function == 3 and immediate:
+            if rd == 2:
+                offset = signed((bit(12) << 9) | (field(3, 2) << 7) | (bit(5) << 6) | (bit(2) << 5) | (bit(6) << 4), 10)
+                return addi(2, 2, offset)
+            return ((immediate & 0xfffff) << 12) | (rd << 7) | 0x37
+        if function == 4:
+            kind = field(10, 2)
+            if kind < 2:
+                return alu(a, a, shift | (0x400 if kind else 0), 5, immediate=True)
+            if kind == 2:
+                return alu(a, a, immediate, 7, immediate=True)
+            kind = field(5, 2)
+            if not bit(12):
+                return alu(a, a, b, (0, 4, 6, 7)[kind]) | ((1 << 30) if kind == 0 else 0)
+            if kind < 2:
+                return alu(a, a, b, 0, word=True) | ((1 << 30) if kind == 0 else 0)
+        if function == 5:
+            offset = signed((bit(12) << 11) | (bit(8) << 10) | (field(9, 2) << 8) | (bit(6) << 7) | (bit(7) << 6) | (bit(2) << 5) | (bit(11) << 4) | (field(3, 3) << 1), 12)
+            return jal(0, offset)
+        if function in (6, 7):
+            offset = signed((bit(12) << 8) | (field(5, 2) << 6) | (bit(2) << 5) | (field(10, 2) << 3) | (field(3, 2) << 1), 9)
+            return beq(a, 0, offset) | ((function & 1) << 12)
+    elif quadrant == 2:
+        if function == 0:
+            return alu(rd, rd, shift, 1, immediate=True)
+        if function in (2, 3) and rd:
+            offset = ((field(2, 2) << 6) | (bit(12) << 5) | (field(4, 3) << 2) if function == 2 else
+                      (field(2, 3) << 6) | (bit(12) << 5) | (field(5, 2) << 3))
+            return lw(rd, 2, offset) if function == 2 else ld(rd, 2, offset)
+        if function == 4:
+            if rs2:
+                return add(rd, rd if bit(12) else 0, rs2)
+            if rd:
+                return jalr(bit(12), rd, 0)
+            if bit(12):
+                return 0x00100073
+        if function in (6, 7):
+            offset = ((field(7, 2) << 6) | (field(9, 4) << 2) if function == 6 else
+                      (field(7, 3) << 6) | (field(10, 3) << 3))
+            return sw(rs2, 2, offset) if function == 6 else sd(rs2, 2, offset)
+    return 0
+
+
 def atomic_value(operation, old, operand, size):
     assert size in (4, 8) and operation in ATOMIC_OPERATIONS
     mask = (1 << (8 * size)) - 1
@@ -310,7 +375,7 @@ class Model:
         delegated = self.csrs.get(0x303 if cause >> 63 else 0x302, 0)
         supervisor = self.privilege != 3 and code < 64 and delegated & (1 << code)
         bank = 0x100 if supervisor else 0x300
-        self.csrs[bank + 0x41], self.csrs[bank + 0x42], self.csrs[bank + 0x43] = pc & ~3, cause, value
+        self.csrs[bank + 0x41], self.csrs[bank + 0x42], self.csrs[bank + 0x43] = pc & ~(1 if self.config.get('enableC') else 3), cause, value
         status = self.csrs[0x300]
         self.csrs[0x300] = ((status & ~0x122) | (int(self.privilege == 1) << 8) | ((status & 2) << 4)
                            if supervisor else (status & ~0x1888) | (self.privilege << 11) | ((status & 8) << 4))
@@ -385,7 +450,7 @@ class Model:
             mask = self.csrs[0x303] & 2
             self.csrs[0x344] = (self.csrs[0x344] & ~mask) | (value & mask)
         elif address in (0x105, 0x141, 0x305, 0x341):
-            self.csrs[address] = value & ~3
+            self.csrs[address] = value & ~(1 if address in (0x141, 0x341) and self.config.get('enableC') else 3)
         elif address in (0x140, 0x142, 0x143, 0x340, 0x342, 0x343):
             self.csrs[address] = value
         elif 0x3a0 <= address < 0x3b0:
@@ -406,11 +471,19 @@ class Model:
                     self.csrs[address] = value & ((1 << (self.config['physicalAddressBits'] - 2)) - 1)
 
     def step(self):
-        pc, insn = self.pc, 0
-        next_pc = (pc + 4) & MASK
+        pc, insn, raw = self.pc, 0, 0
+        length = 4
+        next_pc = (pc + length) & MASK
         rd, write, value, trap, cause, tval = 0, False, 0, False, 0, 0
         try:
-            insn = self.access(pc, 4, 'fetch')
+            if self.config.get('enableC'):
+                first = self.access(pc, 2, 'fetch')
+                length = 4 if first & 3 == 3 else 2
+                raw = first | (self.access((pc + 2) & MASK, 2, 'fetch') << 16) if length == 4 else first
+                insn = compressed_instruction(raw) if length == 2 else raw
+            else:
+                raw = insn = self.access(pc, 4, 'fetch')
+            next_pc = (pc + length) & MASK
             opcode, rd, funct3 = insn & 127, (insn >> 7) & 31, (insn >> 12) & 7
             rs1, rs2 = (insn >> 15) & 31, (insn >> 20) & 31
             a, b = self.registers[rs1], self.registers[rs2]
@@ -433,9 +506,9 @@ class Model:
             elif opcode == 0x6f:
                 displacement = signed(((insn >> 31) << 20) | (((insn >> 12) & 255) << 12)
                                       | (((insn >> 20) & 1) << 11) | (((insn >> 21) & 1023) << 1), 21)
-                value, write, next_pc = pc + 4, True, (pc + displacement) & MASK
+                value, write, next_pc = pc + length, True, (pc + displacement) & MASK
             elif opcode == 0x67 and funct3 == 0:
-                value, write, next_pc = pc + 4, True, ((a + immediate) & MASK) & ~1
+                value, write, next_pc = pc + length, True, ((a + immediate) & MASK) & ~1
             elif opcode == 0x03 and funct3 != 7:
                 size = 1 << (funct3 & 3)
                 value = self.access((a + immediate) & MASK, size, 'read')
@@ -484,16 +557,16 @@ class Model:
                 next_pc = self.return_from_trap(True)
             else:
                 raise Fault(2, insn)
-            if next_pc & 3:
+            if next_pc & (1 if self.config.get('enableC') else 3):
                 raise Fault(0, next_pc)
         except Fault as error:
-            trap, cause, tval, write = True, error.cause, error.value, False
+            trap, cause, tval, write = True, error.cause, raw if error.cause == 2 else error.value, False
             next_pc = self.trap(pc, cause, tval)
         write = write and rd != 0
         value = (value & MASK) if write else 0
         if write:
             self.registers[rd] = value
         self.pc = next_pc
-        record = (self.order, pc, insn, next_pc, rd, int(write), value, int(trap), cause, tval)
+        record = (self.order, pc, raw, next_pc, rd, int(write), value, int(trap), cause, tval)
         self.order += 1
         return record

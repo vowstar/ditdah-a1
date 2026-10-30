@@ -27,6 +27,7 @@ case class DitDahA1Parameter(
   loadQueueEntries: Int = 1,
   enableM: Boolean = true,
   enableA: Boolean = true,
+  enableC: Boolean = false,
   enableInterrupts: Boolean = false,
   enableUserMode: Boolean = false,
   enableSupervisorMode: Boolean = false,
@@ -69,7 +70,7 @@ case class DitDahA1Parameter(
     validateProtection()
     validatePrediction()
     require(!enableBurstRefill || iCacheBytes != 0, "Burst refill requires an instruction cache")
-    require((resetVector & 3) == 0, "Frontend requires a word-aligned resetVector")
+    require((resetVector & (if enableC then 1 else 3)) == 0, "Frontend resetVector must satisfy IALIGN")
 
   def validateBackend(): Unit =
     require(asidBits == 0 || enableTranslation, "ASID requires Sv39")
@@ -96,7 +97,7 @@ case class DitDahA1Parameter(
     validateDataCache()
     require(!enableDataBurstRefill || dCacheBytes != 0, "Data burst refill requires a data cache")
     validateSharedCache()
-    require(memoryRegions.exists(r => r.executable && resetVector >= r.base && resetVector + 4 <= r.base + r.size), "Reset vector must be in executable memory")
+    require(memoryRegions.exists(r => r.executable && resetVector >= r.base && resetVector + (if enableC then 2 else 4) <= r.base + r.size), "Reset vector must be in executable memory")
 
   def resolvedFabricReadSlots: Int = fabricReadSlots.getOrElse(if hartCount > 1 then 2 else 0)
 
@@ -132,9 +133,9 @@ case class DitDahA1Parameter(
   val registerCount: Int = 32
   val pipelineStages: Int = 8
   val cacheLineBytes: Int = 64
-  val fetchWords: Int = if iCacheBytes == 0 then 1 else 1 << (32 - Integer.numberOfLeadingZeros(issueWidth - 1))
+  val fetchWords: Int = if iCacheBytes == 0 || enableC then 1 else 1 << (32 - Integer.numberOfLeadingZeros(issueWidth - 1))
   val fetchCountBits: Int = 32 - Integer.numberOfLeadingZeros(fetchWords)
-  val frontendCapacity: Int = if iCacheBytes == 0 then issueWidth else 2 * math.max(1, fetchWords - 1)
+  val frontendCapacity: Int = if iCacheBytes == 0 || enableC then issueWidth else 2 * math.max(1, fetchWords - 1)
   val issueCountBits: Int = 32 - Integer.numberOfLeadingZeros(issueWidth)
   val backendCapacity: Int = (5 + loadQueueEntries) * issueWidth
   val pipelineOccupancyBits: Int = 32 - Integer.numberOfLeadingZeros(backendCapacity)

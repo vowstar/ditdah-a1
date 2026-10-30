@@ -10,7 +10,7 @@ import random
 import subprocess
 
 from programs import addi, alu, amo, beq, csr, sd, mul, muldiv, ld, lw, sw, load, store, fence
-from model import ATOMIC_OPERATIONS, Fault, LocalInterrupts, Model, MASK, atomic_value, muldiv_value, pmp_allowed, signed, sv39_walk
+from model import ATOMIC_OPERATIONS, Fault, LocalInterrupts, Model, MASK, atomic_value, compressed_instruction, muldiv_value, pmp_allowed, signed, sv39_walk
 
 
 def backend_control_signals(source):
@@ -41,7 +41,7 @@ def verify_storage(rtl, directory):
               for file in files if file.startswith(('instructions_', 'tags_', 'data_', 'dataTags_', 'dataDirty_', 'sharedData_', 'sharedTags_', 'mem_'))}
     assert ('DitDahA1InstructionCache.sv' in files) == bool(size)
     assert ('DitDahA1DataCache.sv' in files) == bool(data_size)
-    banks = 1 << (manifest['parameters']['issueWidth'] - 1).bit_length() if size else 1
+    banks = manifest['implementation']['fetchWords']
     expected = {} if not size else {'instructions': (size // (4 * banks), 32),
         'tags': (size // 64, manifest['parameters']['physicalAddressBits'] - (size // 64).bit_length() - 5)}
     if data_size:
@@ -562,7 +562,129 @@ def arbiter_contract(parameters):
     return body
 
 
-def decode_contract(parameters):
+def compressed_fetch_contract(parameters, frontend=False):
+    base = int(parameters['resetVector'])
+    prefix = 'output_bits_packets_0_' if frontend else 'output_bits_'
+    translated = parameters.get('virtualAddressBits') == 39
+    body = f'''    begin
+      reg [63:0] expected_pc, address;
+      integer size, tag, count;
+      expected_pc = 'h{base:x};
+      fork
+        begin forever begin
+          @(negedge clock); memory_request_ready=1;
+          if (memory_request_valid) begin
+            address=memory_request_bits_address; size=memory_request_bits_size; tag=memory_request_bits_tag;
+            check(size == 1 || size == 2 || size == 6, "Parcel, word or line fetch size");
+            tick(); memory_request_ready=0;
+            for (integer beat=0; beat<(size==6 ? 8 : 1); beat=beat+1) begin
+              repeat (2) tick(); memory_response_bits_data=0;
+              for (integer b=0; b<(size==6 ? 8 : 1<<size); b=b+1) begin
+                case ((address-'h{base:x}) + 8*beat+b)
+                  'h3e: memory_response_bits_data[8*b+:8]='h93;
+                  'h3f: memory_response_bits_data[8*b+:8]='h00;
+                  'h40: memory_response_bits_data[8*b+:8]='h70;
+                  'h41: memory_response_bits_data[8*b+:8]='h00;
+                  default: memory_response_bits_data[8*b+:8]=((address+8*beat+b)&1) ? 0 : 1;
+                endcase
+              end
+              memory_response_bits_tag=tag; memory_response_bits_last=(size!=6 || beat==7);
+              memory_response_valid=1;
+              while (!memory_response_ready) tick(); tick(); memory_response_valid=0;
+            end
+          end
+        end end
+      join_none
+'''
+    if translated:
+        body += '''      translation_request_ready=1;
+      fork begin forever begin
+        @(negedge clock);
+        translation_response_valid=translation_request_valid;
+        translation_response_bits_address=translation_request_bits_address;
+      end end join_none
+'''
+    if frontend:
+        body += f'''      output_ready=0; repeat (150) tick();
+      output_ready=1; count=0;
+      while (count<40) begin
+        @(negedge clock);
+        if (output_valid) begin
+'''
+        for lane in range(parameters['issueWidth']):
+            p = f'output_bits_packets_{lane}_'
+            body += f'''          if (output_bits_count>{lane}) begin
+            check({p}pc == expected_pc && !{p}fault && {p}instruction == (expected_pc=='h{base+0x3e:x} ? 'h00700093 : 1) && {p}length == (expected_pc=='h{base+0x3e:x} ? 4 : 2), "Mixed-length frontend queue, raw encoding and sequential PC");
+            expected_pc=expected_pc+(expected_pc=='h{base+0x3e:x} ? 4 : 2); count=count+1;
+          end
+'''
+        body += '        end\n        tick();\n      end\n'
+    else:
+        for n, offset in enumerate((0, 2, 0x3e, 0x42)):
+            body += f'''      request_valid=1; request_bits_pc='h{base+offset:x}; request_bits_tag={n+1};
+       #1; while (!request_ready) tick(); tick(); request_valid=0;
+      while (!output_valid) tick();
+      repeat (3) begin
+        check({prefix}pc == 'h{base+offset:x} && {prefix}tag == {n+1} && !{prefix}fault && {prefix}instruction == 'h{0x00700093 if offset==0x3e else 1:x} && {prefix}length == {4 if offset==0x3e else 2}, "Parcel assembly across words and lines, raw encoding and backpressure"); tick();
+      end
+      output_ready=1; tick(); output_ready=0;
+'''
+        body += f'''      request_bits_pc='h{base+1:x}; request_valid=1;
+       #1; while (!request_ready) tick(); tick(); request_valid=0;
+      check(output_valid && output_bits_fault && output_bits_cause==0 && output_bits_tval=='h{base+1:x}, "Odd instruction address fault");
+      cancel=1; tick(); cancel=0;
+      check(!output_valid, "Cancelled compressed fault escaped");
+'''
+    return body + '    end\n'
+
+
+def compressed_decode_contract(directory):
+    table = directory / 'compressed.hex'
+    values = []
+    for raw in range(65536):
+        insn = compressed_instruction(raw)
+        opcode, f = insn & 127, (insn >> 12) & 7
+        rs1, rs2, rd = (insn >> 15) & 31, (insn >> 20) & 31, (insn >> 7) & 31
+        op = {0x37: 1, 0x13: 3 if f == 0 else 21, 0x1b: 23,
+              0x33: 4 if f == 0 and insn >> 25 == 0 else 22, 0x3b: 24,
+              0x03: 18 if f == 2 else 8, 0x23: 20 if f == 2 else 9,
+              0x63: 5 if f == 0 else 25, 0x6f: 6, 0x67: 7, 0x73: 12}.get(opcode, 0)
+        immediate = signed(insn >> 20, 12)
+        if opcode == 0x37:
+            immediate = signed(insn & ~4095, 32)
+        elif opcode == 0x23:
+            immediate = signed(((insn >> 25) << 5) | ((insn >> 7) & 31), 12)
+        elif opcode == 0x63:
+            immediate = signed(((insn >> 31) << 12) | (((insn >> 7) & 1) << 11) | (((insn >> 25) & 63) << 5) | (((insn >> 8) & 15) << 1), 13)
+        elif opcode == 0x6f:
+            immediate = signed(((insn >> 31) << 20) | (((insn >> 12) & 255) << 12) | (((insn >> 20) & 1) << 11) | (((insn >> 21) & 1023) << 1), 21)
+        use1 = op in (3, 4, 5, 7, 8, 9, 18, 20, 21, 22, 23, 24, 25)
+        use2 = op in (4, 5, 9, 20, 22, 24, 25)
+        write = op not in (0, 5, 9, 12, 20, 25)
+        value = 0
+        for field, bits in ((op, 5), (rs1, 5), (rs2, 5), (rd, 5), (immediate & MASK, 64),
+                            (((insn >> 30) & 1) * 8 + f, 4), (int(use1), 1), (int(use2), 1), (int(write), 1)):
+            value = (value << bits) | field
+        values.append(f'{value:023x}')
+    table.write_text('\n'.join(values) + '\n')
+    return f'''    begin
+      reg [90:0] expected [0:65535];
+      $readmemh("{table.resolve()}", expected);
+      input_valid=1; output_ready=1; input_bits_length=2;
+      for (integer n=0; n<65536; n=n+1) begin
+        input_bits_instruction=n;
+        check({{output_bits_operation, output_bits_rs1, output_bits_rs2, output_bits_rd,
+          output_bits_immediate, output_bits_functionCode, output_bits_usesRs1,
+          output_bits_usesRs2, output_bits_writesRd}} == expected[n] &&
+          output_bits_instruction_instruction == n && output_bits_instruction_length == 2 && !output_bits_serializing,
+          "Exhaustive compressed decode, immediate, dependencies and raw encoding");
+      end
+    end
+    input_bits_length=4;
+'''
+
+
+def decode_contract(parameters, directory):
     cases = ((0x12345337, 0, 0, 1), (0x12345317, 0, 0, 1),
              (0x12328313, 1, 0, 1), (0x00728333, 1, 1, 1),
              (0x00728463, 1, 1, 0), (0x0080036f, 0, 0, 1),
@@ -620,7 +742,7 @@ def decode_contract(parameters):
 '''
         for word in (0x120000f3, 0x12001073, 0x14000073):
             body += f"    input_bits_instruction = 32'h{word:x}; check(output_bits_operation != 16, \"SFENCE requires its complete standard encoding\");\n"
-    return body + '''    input_bits_instruction = 32'h00728333; input_bits_fault = 1;
+    return body + (compressed_decode_contract(directory) if parameters.get('enableC') else "    input_bits_length=2; input_bits_instruction='h4485; check(output_bits_operation==0, \"Disabled compressed encoding\"); input_bits_length=4;\n") + '''    input_bits_instruction = 32'h00728333; input_bits_fault = 1;
     check(!output_bits_usesRs1 && !output_bits_usesRs2 && !output_bits_writesRd, "Faulting instruction dependencies");
     input_bits_instruction = 32'h34029373;
     check(!output_bits_usesRs1 && !output_bits_writesRd && !output_bits_serializing, "Faulting CSR serialization");
@@ -629,8 +751,8 @@ def decode_contract(parameters):
 '''
 
 
-def execute_contract():
-    config = dict(resetVector='0', physicalAddressBits=56, pmpEntries=0, enableInterrupts=True,
+def execute_contract(parameters):
+    config = dict(resetVector='0', physicalAddressBits=56, pmpEntries=0, enableInterrupts=True, enableC=parameters.get('enableC', False),
                   memoryRegions=[dict(base='0', size=str(1 << 56), readable=True, writable=True, executable=True, device=False, atomic=True)])
     body = ''
 
@@ -713,6 +835,9 @@ def execute_contract():
     check(output_bits_instruction_cause == 1 && output_bits_instruction_tval == 'habc, "Prior fetch fault precedes breakpoint");
     input_bits_decoded_instruction_fault = 0; privilege = 3;
 '''
+    if parameters.get('enableC'):
+        body = re.sub(r"(input_bits_decoded_instruction_instruction = [^;]+;)",
+                      r"\1 input_bits_decoded_functionCode = {input_bits_decoded_instruction_instruction[30], input_bits_decoded_instruction_instruction[14:12]};", body)
     return body
 
 
@@ -1057,7 +1182,7 @@ def prediction_contract(parameters):
 def instruction_cache_contract(parameters):
     base = int(parameters['resetVector'])
     burst = parameters.get('enableBurstRefill')
-    banks = 1 << (parameters['issueWidth'] - 1).bit_length()
+    banks = 1 if parameters.get('enableC') else 1 << (parameters['issueWidth'] - 1).bit_length()
     body = f'''
     allowed = 1; upstream_request_valid = 1;
     upstream_request_bits_address = 'h{base:x}; upstream_request_bits_tag = 33;
@@ -1337,7 +1462,7 @@ def frontend_group_contract(parameters):
 
 
 def wide_fetch_contract(parameters):
-    banks = 1 << (parameters['issueWidth'] - 1).bit_length()
+    banks = 1 if parameters.get('enableC') else 1 << (parameters['issueWidth'] - 1).bit_length()
     line = int(parameters['resetVector']) + 0x200
     translated = parameters.get('virtualAddressBits') == 39
     user_mode = bool(parameters.get('enableUserMode'))
@@ -3679,7 +3804,7 @@ def interrupt_csr_contract(parameters):
     return body + f'''
     trap = 1; trapPc = 'h123; trapCause = 64'h800000000000000b; trapValue = 0; tick(); trap = 0;
     readAddress = 'h300; check(readData == 'h{(2 << 32 if parameters.get('enableUserMode') else 0) | 0x1880:x} && !interruptPending, "Entry masks interrupts");
-    readAddress = 'h341; check(readData == 'h120, "Trap PC alignment");
+    readAddress = 'h341; check(readData == 'h{0x122 if parameters.get('enableC') else 0x120:x}, "Trap PC alignment");
     readAddress = 'h342; check(readData == 64'h800000000000000b, "Interrupt cause flag");
     readAddress = 'h343; check(readData == 0, "Interrupt trap value");
     mret = 1; tick(); mret = 0; readAddress = 'h300;
@@ -4545,8 +4670,8 @@ def verify(rtl, directory, modules=None):
                         LSU + (lsu_reservation_contract(parameters) if parameters.get('enableA', True) else '') + (protection_contract(False) if enabled else '') + lsu_refill_contract(parameters)),
                        ('DitDahA1MulDiv', muldiv_contract()),
                        ('DitDahA1Frontend', (burst_fetch_contract(parameters, True) if parameters.get('enableBurstRefill') else cached_fetch_contract(parameters, True)) if cached else frontend_contract(parameters)),
-                       ('DitDahA1Decode', decode_contract(parameters)),
-                       ('DitDahA1Execute', execute_contract()),
+                       ('DitDahA1Decode', decode_contract(parameters, directory)),
+                       ('DitDahA1Execute', execute_contract(parameters)),
                        ('DitDahA1Backend', backend_queue_contract(parameters) if parameters.get('loadQueueEntries', 1) == 2 else
                         backend_contract(parameters) + backend_fence_contract() + (backend_protection_contract() if enabled else '') +
                         (backend_interrupt_contract() if parameters['enableInterrupts'] else '')),
@@ -4595,6 +4720,9 @@ def verify(rtl, directory, modules=None):
         suites = tuple((name, body + (wide_fetch_contract(parameters) if name == 'DitDahA1Fetch' else '')) for name, body in suites)
     suites = tuple((name, (body if parameters['issueWidth'] == 1 and parameters.get('virtualAddressBits') != 39 else '') + frontend_group_contract(parameters) + prediction_contract(parameters)
                     if name == 'DitDahA1Frontend' else body) for name, body in suites)
+    if parameters.get('enableC'):
+        suites = tuple((name, compressed_fetch_contract(parameters, name == 'DitDahA1Frontend')
+                        if name in ('DitDahA1Fetch', 'DitDahA1Frontend') else body) for name, body in suites)
     assert not modules or set(modules) <= {name for name, _ in suites}, 'Unsupported contract selection'
     for name, body in suites:
         if name == 'DitDahA1MulDiv' and not parameters.get('enableM', True):

@@ -121,7 +121,7 @@ module memory_tb;
       if (core_port[p].request_valid && core_port[p].request_ready) begin
         if (core_pending[p]) $fatal(1, "Overlapping requests on one port");
         if (core_port[p].request.cacheOperation != 0 || core_port[p].request.fetch != (p == 0) ||
-            (p == 0 ? (core_port[p].request.size != 2 && core_port[p].request.size != 6) : core_port[p].request.size > 3) ||
+            (p == 0 ? (core_port[p].request.size != 2 && core_port[p].request.size != 6 && !(`COMPRESSED && core_port[p].request.size == 1)) : core_port[p].request.size > 3) ||
             core_port[p].request.mask != (core_port[p].request.write ? ((1 << (1 << core_port[p].request.size)) - 1) : 0) ||
             (p == 0 && (core_port[p].request.write || core_port[p].request.atomic)) ||
             (core_port[p].request.atomic && ((core_port[p].request.size != 2 && core_port[p].request.size != 3) ||

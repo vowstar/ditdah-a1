@@ -28,13 +28,17 @@ object DitDahA1Fetch extends Generator[DitDahA1Parameter, DitDahA1UnitLayers, Di
     given ResetScope = ResetScope.syncActiveHigh(io.reset)
     val wide = parameter.fetchWords > 1
     val bankBits = Integer.numberOfTrailingZeros(parameter.fetchWords)
-    val stateBits = if parameter.enableTranslation || wide then 3 else 2
+    val stateBits = if parameter.enableTranslation || wide || parameter.enableC then 3 else 2
     val state = RegInit(0.U(stateBits))
     val packet = Reg(new FetchPacket)
+    val second = Option.when(parameter.enableC)(RegInit(false.B))
+    val parcelAddress = second.map(value => (packet.pc + value.?(2.U(64), 0.U(64))).asBits.bits(63, 0).asUInt).getOrElse(packet.pc)
+    val parcelCheck = if parameter.enableC then state === 4.U(stateBits) else false.B
+    val demandSize = if parameter.enableC then 1 else 2
     val killed = RegInit(false.B)
     val flush = io.cancel | io.invalidate.getOrElse(false.B)
     val cached = parameter.iCacheBytes != 0
-    val pipelined = cached
+    val pipelined = cached && !parameter.enableC
     val accepting = Wire(Bool())
     val wholeBlock = Option.when(wide)(Reg(Bool()))
     val privilege = Option.when(parameter.enableUserMode)(Reg(UInt(2)))
@@ -44,12 +48,12 @@ object DitDahA1Fetch extends Generator[DitDahA1Parameter, DitDahA1UnitLayers, Di
     val response = cache.map(_.io.upstream.response).getOrElse(io.memory.response)
     val rechecking = if wide then state === 6.U(stateBits) else false.B
     val translating = if parameter.enableTranslation then state === 5.U(stateBits) else false.B
-    val checkingDemand = accepting | translating | rechecking
+    val checkingDemand = accepting | translating | rechecking | parcelCheck
     val demandAddress = io.translation.map(t => (accepting | translating).?(t.response.bits.address,
-      physicalAddress.get)).getOrElse(accepting.?(io.request.bits.pc, packet.pc))
+      physicalAddress.get)).getOrElse(accepting.?(io.request.bits.pc, parcelAddress))
     val checkedAddress = if wide then rechecking.?(demandAddress,
       (demandAddress.asBits.bits(63, bankBits + 2) ## 0.B(bankBits + 2)).asUInt) else demandAddress
-    val checkedSize = if wide then rechecking.?(2.U(3), (bankBits + 2).U(3)) else 2.U(3)
+    val checkedSize = if wide then rechecking.?(2.U(3), (bankBits + 2).U(3)) else demandSize.U(3)
     val permitted = if parameter.pmpEntries == 0 then true.B else
       val pmp = DitDahA1Pmp.instantiate(parameter)
       pmp.io.state :<= io.pmp.get
@@ -68,20 +72,21 @@ object DitDahA1Fetch extends Generator[DitDahA1Parameter, DitDahA1UnitLayers, Di
       val ordinary = if parameter.enableBurstRefill then (c.io.checkSize === 6.U(3)).?(
         DitDahA1Memory.executable(parameter, c.io.checkAddress, 64), DitDahA1Memory.executable(parameter, c.io.checkAddress, 4))
       else DitDahA1Memory.executable(parameter, c.io.checkAddress, 4)
-      c.io.allowed := permitted & ordinary
+      val narrow = if parameter.enableC then (c.io.checkSize === 1.U(3)).?(DitDahA1Memory.executable(parameter, c.io.checkAddress, 2), ordinary) else ordinary
+      c.io.allowed := permitted & narrow
       io.memory :<>= c.io.downstream
     }
     val ordinaryDemand = if wide then rechecking.?(DitDahA1Memory.executable(parameter, demandAddress, 4),
       DitDahA1Memory.executable(parameter, checkedAddress, 4 * parameter.fetchWords))
-      else DitDahA1Memory.executable(parameter, demandAddress, 4)
+      else DitDahA1Memory.executable(parameter, demandAddress, 1 << demandSize)
     val demandPermitted = if cache.isDefined then permitted & ordinaryDemand else permitted
     val shortReturn = if wide then io.output.valid & (io.output.bits.count.get <
       (parameter.fetchWords.U(parameter.fetchCountBits) - packet.pc.asBits.bits(bankBits + 1, 2).asUInt)) else false.B
     accepting := (state === 0.U(stateBits)) | (if pipelined then io.output.valid & io.output.ready & !io.output.bits.fault & !shortReturn else false.B)
-    val aligned = io.request.bits.pc.asBits.bits(1, 0) === 0.B(2)
+    val aligned = if parameter.enableC then !io.request.bits.pc.asBits.bit(0) else io.request.bits.pc.asBits.bits(1, 0) === 0.B(2)
     io.request.ready := accepting & !flush & io.translation.map(t => t.request.ready | !aligned)
       .getOrElse(if pipelined then request.ready else true.B)
-    io.output.valid := ((state === 3.U(stateBits)) | (if cached then (state === 2.U(stateBits)) & response.valid else false.B)) & !killed & !flush
+    io.output.valid := ((state === 3.U(stateBits)) | (if pipelined then (state === 2.U(stateBits)) & response.valid else false.B)) & !killed & !flush
     for field <- Seq("pc", "tag", "instruction", "length", "cause", "tval") do
       io.output.bits.asRecord.field[UInt](field) := packet.asRecord.field[UInt](field)
     io.output.bits.fault := packet.fault
@@ -89,7 +94,7 @@ object DitDahA1Fetch extends Generator[DitDahA1Parameter, DitDahA1UnitLayers, Di
     io.output.bits.predictedPc.get := 0.U(64)
     io.output.bits.count.foreach(_ := 1.U(parameter.fetchCountBits))
     io.output.bits.following.foreach { words => for i <- 0 until parameter.fetchWords - 1 do words(i) := 0.U(32) }
-    if cached then
+    if pipelined then
       when(state === 2.U(stateBits)) {
         val failed = response.bits.fault | (response.bits.tag =/= packet.tag)
         io.output.bits.instruction := failed.?(0.U(32), response.bits.data.asBits.bits(31, 0).asUInt)
@@ -107,9 +112,9 @@ object DitDahA1Fetch extends Generator[DitDahA1Parameter, DitDahA1UnitLayers, Di
       (if parameter.enableTranslation then translating & !killed else false.B)
     request.valid := (state === 1.U(stateBits)) |
       (if pipelined then direct & !flush & demandPermitted & translated else false.B)
-    request.bits.address := (if pipelined then demandAddress else physicalAddress.getOrElse(packet.pc))
+    request.bits.address := (if pipelined then demandAddress else physicalAddress.getOrElse(parcelAddress))
     request.bits.data := 0.U(64)
-    request.bits.size := (if wide then (accepting | translating).?(true.B, wholeBlock.get).?((bankBits + 2).U(3), 2.U(3)) else 2.U(3))
+    request.bits.size := (if wide then (accepting | translating).?(true.B, wholeBlock.get).?((bankBits + 2).U(3), 2.U(3)) else demandSize.U(3))
     request.bits.mask := 0.U(8)
     request.bits.tag := (if pipelined then accepting.?(io.request.bits.tag, packet.tag) else packet.tag)
     request.bits.fetch := true.B
@@ -122,14 +127,15 @@ object DitDahA1Fetch extends Generator[DitDahA1Parameter, DitDahA1UnitLayers, Di
     request.bits.cacheOperation := 0.U(2)
     request.bits.scEligible := false.B
     request.bits.refillSize := 0.U(3)
-    response.ready := (state === 2.U(stateBits)) & (if cached then killed | flush | io.output.ready else true.B)
+    response.ready := (state === 2.U(stateBits)) & (if pipelined then killed | flush | io.output.ready else true.B)
     io.translation.foreach { t =>
-      t.request.valid := accepting & io.request.valid & aligned & !flush
-      t.request.bits.address := io.request.bits.pc
-      t.request.bits.privilege := io.privilege
+      t.request.valid := ((accepting & io.request.valid & aligned) | (parcelCheck & !killed)) & !flush
+      t.request.bits.address := accepting.?(io.request.bits.pc, parcelAddress)
+      t.request.bits.privilege := accepting.?(io.privilege, privilege.getOrElse(3.U(2)))
       t.request.bits.fetch := true.B
       t.request.bits.write := false.B
-      t.response.ready := translating | (accepting & io.request.valid & aligned & !flush)
+      t.response.ready := translating | (((accepting & io.request.valid & aligned) | (parcelCheck & !killed)) & !flush)
+      when(parcelCheck & t.request.valid & t.request.ready) { state := 5.U(stateBits) }
     }
     if wide then
       when(state === 6.U(stateBits)) {
@@ -142,15 +148,38 @@ object DitDahA1Fetch extends Generator[DitDahA1Parameter, DitDahA1UnitLayers, Di
         }
         when(killed | flush) { state := 0.U(stateBits) }
       }
+    if parameter.enableC && !parameter.enableTranslation then
+      when(parcelCheck) {
+        state := 1.U(stateBits)
+        when(!demandPermitted) { packet.instruction := 0.U(32); packet.fault := true.B; packet.cause := 1.U(64); packet.tval := parcelAddress; state := 3.U(stateBits) }
+        when(killed | flush) { state := 0.U(stateBits) }
+      }
+    if parameter.enableC && parameter.enableTranslation then
+      when(parcelCheck & (killed | flush)) { state := 0.U(stateBits) }
     when(request.valid & request.ready) { state := 2.U(stateBits) }
     when(response.valid & response.ready) {
-      if !cached then
+      if parameter.enableC then
         val fault = response.bits.fault | (response.bits.tag =/= packet.tag)
-        packet.instruction := fault.?(0.U(32), response.bits.data.asBits.bits(31, 0).asUInt)
+        packet.instruction := second.get.?(response.bits.data.asBits.bits(15, 0) ## packet.instruction.asBits.bits(15, 0), 0.B(16) ## response.bits.data.asBits.bits(15, 0)).asUInt
         packet.fault := fault
         packet.cause := fault.?(1.U(64), 0.U(64))
-        packet.tval := fault.?(packet.pc, 0.U(64))
-      state := (if cached then 0 else 3).U(stateBits)
+        packet.tval := fault.?(parcelAddress, 0.U(64))
+        state := 3.U(stateBits)
+        when(!second.get & !fault & (response.bits.data.asBits.bits(1, 0) === 3.B(2))) {
+          second.get := true.B
+          packet.length := 4.U(3)
+          state := 4.U(stateBits)
+        }
+        when(fault) { packet.instruction := 0.U(32) }
+        when(killed | flush) { state := 0.U(stateBits) }
+      else
+        if !cached then
+          val fault = response.bits.fault | (response.bits.tag =/= packet.tag)
+          packet.instruction := fault.?(0.U(32), response.bits.data.asBits.bits(31, 0).asUInt)
+          packet.fault := fault
+          packet.cause := fault.?(1.U(64), 0.U(64))
+          packet.tval := fault.?(packet.pc, 0.U(64))
+        state := (if cached then 0 else 3).U(stateBits)
     }
     when(flush & (state =/= 0.U(stateBits))) { killed := true.B }
     when((state === 3.U(stateBits)) & (killed | flush | io.output.ready)) { state := 0.U(stateBits) }
@@ -159,11 +188,12 @@ object DitDahA1Fetch extends Generator[DitDahA1Parameter, DitDahA1UnitLayers, Di
       packet.pc := io.request.bits.pc
       packet.tag := io.request.bits.tag
       packet.instruction := 0.U(32)
-      packet.length := 4.U(3)
+      packet.length := (if parameter.enableC then 2 else 4).U(3)
       packet.fault := false.B
       packet.cause := 0.U(64)
       packet.tval := 0.U(64)
       killed := false.B
+      second.foreach(_ := false.B)
       wholeBlock.foreach(_ := true.B)
       state := (if parameter.enableTranslation then 5 else if pipelined then 2 else 1).U(stateBits)
       if !parameter.enableTranslation && (parameter.pmpEntries != 0 || cache.isDefined) then
@@ -177,7 +207,7 @@ object DitDahA1Fetch extends Generator[DitDahA1Parameter, DitDahA1UnitLayers, Di
             packet.tval := io.request.bits.pc
             state := 3.U(stateBits)
         }
-      when(io.request.bits.pc.asBits.bits(1, 0) =/= 0.B(2)) {
+      when(!aligned) {
         packet.fault := true.B
         packet.cause := 0.U(64)
         packet.tval := io.request.bits.pc
@@ -186,11 +216,12 @@ object DitDahA1Fetch extends Generator[DitDahA1Parameter, DitDahA1UnitLayers, Di
     }
     io.translation.foreach { t =>
       when(t.response.valid & t.response.ready) {
-        val va = accepting.?(io.request.bits.pc, packet.pc)
+        val va = accepting.?(io.request.bits.pc, parcelAddress)
         physicalAddress.get := t.response.bits.address
         packet.fault := t.response.bits.fault
         packet.cause := t.response.bits.fault.?(t.response.bits.cause, 0.U(64))
         packet.tval := t.response.bits.fault.?(va, 0.U(64))
+        if parameter.enableC then when(t.response.bits.fault | !demandPermitted) { packet.instruction := 0.U(32) }
         state := (request.valid & request.ready).?(2.U(stateBits), 1.U(stateBits))
         when(!t.response.bits.fault & !demandPermitted) {
           if wide then

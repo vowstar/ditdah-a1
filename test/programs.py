@@ -94,6 +94,12 @@ class Program:
                 self.memory[self.base + self.offset + i] = (word >> (8 * i)) & 255
             self.offset += 4
 
+    def half(self, *parcels):
+        for parcel in parcels:
+            self.memory[self.base + self.offset] = parcel & 255
+            self.memory[self.base + self.offset + 1] = parcel >> 8
+            self.offset += 2
+
     def address(self, rd, target):
         distance = target - self.offset
         upper = (distance + 2048) >> 12
@@ -199,7 +205,7 @@ def load_window_program(base, harts=1, cancel=False):
     return p.finish()
 
 
-def cases(base, protection=False, interrupts=False, user=False, local_interrupt_base=None, supervisor=False, sv39=False, writeback=False):
+def cases(base, protection=False, interrupts=False, user=False, local_interrupt_base=None, supervisor=False, sv39=False, writeback=False, compressed=False):
     if not sv39:
         yield 'load_window', load_window_program(base)
         yield 'load_cancel', load_window_program(base, cancel=True)
@@ -401,6 +407,9 @@ def cases(base, protection=False, interrupts=False, user=False, local_interrupt_
            mul(7, 2, 3) | (1 << 12), mul(7, 2, 3) | (4 << 12), mul(7, 2, 3) | 8)
     yield 'multiply', p.finish()
     yield from integer_cases(base)
+    if compressed:
+        yield from compressed_cases(base, protection, sv39)
+
     yield from synchronization_cases(base, writeback)
     yield 'data_cache', data_cache_program(base)
     yield from data_cache_access_cases(base, protection)
@@ -691,6 +700,87 @@ def user_cases(base, protection=False, interrupts=False, local_interrupt_base=No
                ld(7, 10, 8), sd(2, 10, 8), addi(11, 10, 8), amoadd(8, 11, 2),
                csr(5, 0x300, 0, True), csr(0, 0x300, 0), ld(6, 10))
         yield 'user_mprv', p.finish()
+
+
+def compressed_cases(base, protection=False, sv39=False):
+    p = Program(base)
+    p.address(2, 0x1800)
+    p.half(0x4485, 0x0495, 0x8526, 0x9526, 0x157d, 0x0505)
+    p.emit(addi(11, 10, 3), sd(11, 2))
+    p.half(0x6582, 0x0585, 0xe42e, 0x6122)
+    p.expected_registers = {9: 6, 10: 12, 11: 16, 2: 16}
+    yield 'compressed_integer', p.finish()
+
+    p = Program(base)
+    p.offset = 0x3c
+    # The initial stream jumps over the sparse bytes to the mixed-width loop.
+    p.memory.update((base + 12 + n, (jal(0, 0x3c - 12) >> (8*n)) & 255) for n in range(4))
+    p.half(0x4485)
+    p.emit(addi(10, 9, 7))
+    p.half(0x0505)
+    p.expected_registers = {9: 1, 10: 9}
+    yield 'compressed_boundary', p.finish()
+
+    for name, parcel in (('illegal', 0), ('breakpoint', 0x9002)):
+        p = Program(base)
+        p.half(0x4485, parcel, 0x0485)
+        p.expected_registers = {9: 2, 23: 1}
+        yield 'compressed_' + name, p.finish(resume_offset=p.offset - 2)
+
+    p = Program(base)
+    p.emit(addi(20, 0, -1), addi(21, 0, 7), muldiv(22, 20, 21, 5))
+    p.pipeline_groups = {base+p.offset: 3}
+    p.half(0x4485, 0x4509, 0x458d)
+    p.expected_registers = {9: 1, 10: 2, 11: 3}
+    yield 'compressed_groups', p.finish()
+
+    p = Program(base)
+    p.address(8, 0x100)
+    link = base+p.offset+2
+    p.half(0x9402, 0x8506)
+    p.emit(addi(11, 0, 3))
+    p.half(0x15fd, 0xfdfd)
+    p.finish()
+    p.offset = 0x100
+    p.half(0x0485, 0x8082)
+    p.expected_registers = {1: link, 9: 1, 10: link, 11: 0}
+    yield 'compressed_control', p
+
+    if sv39:
+        virtual = 0x40000000
+        for kind in ('page', 'success', 'pma', *(('pmp',) if protection else ())):
+            p = Program(base)
+            def data(address, value, size=8):
+                p.memory.update((address + n, value >> (8*n) & 255) for n in range(size))
+            for address, value in ((base+0x1008, ((base+0x2000)>>2)|1),
+                                   (base+0x2000, ((base+0x3000)>>2)|1),
+                                   (base+0x3000, ((base+0x4000)>>2)|0xcb),
+                                   (base+0x3008, 0 if kind=='page' else ((base+(0x7000 if kind=='pma' else 0x8000))>>2)|0xcb),
+                                   (base+0x600, (8<<60)|((base+0x1000)>>12)),
+                                   (base+0x608, virtual+0xffc), (base+0x610, 0x800)):
+                data(address, value)
+            if protection:
+                if kind == 'pmp':
+                    p.address(2, 0x8000)
+                    p.emit(alu(2, 2, 2, 5, immediate=True), csr(0, 0x3b0, 2), addi(2, 0, 0xf), csr(0, 0x3a0, 2))
+                else:
+                    p.emit(addi(2, 0, -1), csr(0, 0x3b0, 2), addi(2, 0, 0x1f), csr(0, 0x3a0, 2))
+            p.address(10, 0x600)
+            p.emit(ld(2, 10), csr(0, 0x180, 2), ld(2, 10, 16), csr(0, 0x300, 2), ld(2, 10, 8), csr(0, 0x341, 2), 0x30200073)
+            p.finish(fixed_return=True)
+            p.offset = 0x800
+            p.emit(csr(20, 0x342, 0, True), csr(21, 0x343, 0, True), csr(25, 0x341, 0, True), addi(23, 23, 1),
+                   csr(0, 0x180, 0), 0x00002637, addi(12, 12, -2048), csr(0, 0x300, 12))
+            p.address(22, p.stop-base)
+            p.emit(csr(0, 0x341, 22), 0x30200073)
+            data(base+0x4ffc, 0x85134485, 4)
+            if kind == 'success':
+                data(base+0x8000, 0x05050074, 4)
+                data(base+0x8004, 0x73, 4)
+            p.expected_registers = {9: 1, 10: 9 if kind=='success' else base+0x600, 20: 9 if kind=='success' else 12 if kind=='page' else 1,
+                                    21: 0 if kind=='success' else virtual+0x1000, 25: virtual+(0x1004 if kind=='success' else 0xffe), 23: 1}
+            p.required_fetch = (virtual+0xffc, 0x4485)
+            yield 'compressed_page_' + kind, p
 
 
 def integer_cases(base):

@@ -67,6 +67,7 @@ object DitDahA1Csr extends Generator[DitDahA1Parameter, DitDahA1UnitLayers, DitD
       (privilege === 3.U(2)) | ((privilege === 1.U(2)) & !status.asBits.bit(20)) else false.B)
     val mtvec = RegInit(0.U(64))
     val mscratch = RegInit(0.U(64))
+    val alignment = if parameter.enableC then 1 else 2
     val mepc = RegInit(0.U(64))
     val mcause = RegInit(0.U(64))
     val mtval = RegInit(0.U(64))
@@ -98,7 +99,8 @@ object DitDahA1Csr extends Generator[DitDahA1Parameter, DitDahA1UnitLayers, DitD
       when(io.readAddress === address.U(12)) { io.readData := register; io.legal := true.B }
       when(io.write & (io.writeAddress === address.U(12))) {
         if Set(0x105, 0x141, 0x305, 0x341).contains(address) then
-          register := (io.writeData.asBits.bits(63, 2) ## 0.B(2)).asUInt
+          val bits = if Set(0x141, 0x341).contains(address) then alignment else 2
+          register := (io.writeData.asBits.bits(63, bits) ## 0.B(bits)).asUInt
         else register := io.writeData
       }
     }
@@ -159,14 +161,14 @@ object DitDahA1Csr extends Generator[DitDahA1Parameter, DitDahA1UnitLayers, DitD
     when(io.trap) {
       when(supervisorTrap) {
         if parameter.enableSupervisorMode then
-          sepc.get := (io.trapPc.asBits.bits(63, 2) ## 0.B(2)).asUInt
+          sepc.get := (io.trapPc.asBits.bits(63, alignment) ## 0.B(alignment)).asUInt
           scause.get := io.trapCause
           stval.get := io.trapValue
           mode.get := 1.U(2)
           status := ((status.asBits & BigInt("fffffffffffffedd", 16).B(64)) |
             (privilege === 1.U(2)).?(0x100.B(64), 0.B(64)) | status.asBits.bit(1).?(0x20.B(64), 0.B(64))).asUInt
       }.otherwise {
-        mepc := (io.trapPc.asBits.bits(63, 2) ## 0.B(2)).asUInt
+        mepc := (io.trapPc.asBits.bits(63, alignment) ## 0.B(alignment)).asUInt
         mcause := io.trapCause
         mtval := io.trapValue
         mode.foreach(_ := 3.U(2))

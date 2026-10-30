@@ -6,6 +6,7 @@ import me.jiuyang.zaozi.*
 import me.jiuyang.zaozi.default.{*, given}
 import me.jiuyang.zaozi.reftpe.*
 import me.jiuyang.zaozi.valuetpe.*
+import org.llvm.mlir.scalalib.capi.ir.Block
 
 class DitDahA1InstructionCacheIO(parameter: DitDahA1Parameter) extends HWBundle(parameter):
   val clock = Flipped(Clock())
@@ -41,6 +42,10 @@ object DitDahA1InstructionCache extends Generator[DitDahA1Parameter, DitDahA1Uni
     val valid = RegInit(0.B(lines))
     val word = Reg(UInt(4))
     val bypass = Reg(Bool())
+    val halfword = Option.when(parameter.enableC)(Reg(Bool()))
+    def parcel(value: Referable[UInt])(using Block) = if parameter.enableC then
+      (halfword.get & address.asBits.bit(1)).?((0.B(16) ## value.asBits.bits(31, 16)).asUInt, value)
+      else value
     val killed = RegInit(false.B)
     val upperWord = Option.when(parameter.enableBurstRefill)(Reg(UInt(32)))
     val terminal = Option.when(parameter.enableBurstRefill)(Reg(Bool()))
@@ -56,7 +61,8 @@ object DitDahA1InstructionCache extends Generator[DitDahA1Parameter, DitDahA1Uni
     up.response.bits.tag := tag
     up.response.bits.last := true.B
     io.checkAddress := candidate
-    io.checkSize := burst.?(6.U(3), 2.U(3))
+    val narrow = if parameter.enableC then (bypass & halfword.get).?(1.U(3), 2.U(3)) else 2.U(3)
+    io.checkSize := burst.?(6.U(3), narrow)
     down.request.valid := state === 3.U(3)
     down.request.bits.address := candidate
     down.request.bits.data := 0.U(64)
@@ -107,7 +113,7 @@ object DitDahA1InstructionCache extends Generator[DitDahA1Parameter, DitDahA1Uni
       (tagRead === address.asBits.bits(parameter.physicalAddressBits - 1, indexBits + 6).asUInt)
     val lookupHit = (state === 1.U(3)) & hit & !abort
     up.response.valid := lookupHit | (state === 5.U(3))
-    up.response.bits.data := lookupHit.?(wordRead, data)
+    up.response.bits.data := lookupHit.?(parcel(wordRead), data)
     up.response.bits.fault := !lookupHit & fault
     up.response.bits.count.foreach(_ := lookupHit.?(lookupCount, count.get))
     up.request.ready := !io.cancel & !io.invalidate & ((state === 0.U(3)) | (!killed & up.response.valid & up.response.ready))
@@ -115,7 +121,7 @@ object DitDahA1InstructionCache extends Generator[DitDahA1Parameter, DitDahA1Uni
     when(state === 1.U(3)) {
       when(abort) { state := 5.U(3) }.otherwise {
         when(hit) {
-          data := wordRead
+          data := parcel(wordRead)
           count.foreach(_ := lookupCount)
           state := up.response.ready.?(0.U(3), 5.U(3))
         }.otherwise {
@@ -130,7 +136,7 @@ object DitDahA1InstructionCache extends Generator[DitDahA1Parameter, DitDahA1Uni
           if parameter.enableBurstRefill then
             when(bypass) { fault := true.B; state := 5.U(3) }.otherwise { bypass := true.B }
           else
-            when(bypass | (word === demandWord)) { fault := true.B; state := 5.U(3) }.otherwise {
+            when(bypass | ((word === demandWord) & !halfword.getOrElse(false.B))) { fault := true.B; state := 5.U(3) }.otherwise {
               bypass := true.B
             }
         }
@@ -140,12 +146,12 @@ object DitDahA1InstructionCache extends Generator[DitDahA1Parameter, DitDahA1Uni
     when(received & !burst) {
       when(abort) { state := 5.U(3) }.otherwise {
         when(responseFault) {
-          when(bypass | (word === demandWord)) { fault := true.B; state := 5.U(3) }.otherwise {
+          when(bypass | ((word === demandWord) & !halfword.getOrElse(false.B))) { fault := true.B; state := 5.U(3) }.otherwise {
             bypass := true.B
             state := 2.U(3)
           }
         }.otherwise {
-          when(bypass | (word === demandWord)) { data := down.response.bits.data.asBits.bits(31, 0).asUInt }
+          when(bypass | (word === demandWord)) { data := bypass.?(down.response.bits.data.asBits.bits(31, 0).asUInt, parcel(down.response.bits.data.asBits.bits(31, 0).asUInt)) }
           when(bypass) { state := 5.U(3) }.otherwise {
             when(complete) { valid := valid | mask; state := 5.U(3) }.otherwise {
               word := (word + 1.U(4)).asBits.bits(3, 0).asUInt
@@ -161,11 +167,11 @@ object DitDahA1InstructionCache extends Generator[DitDahA1Parameter, DitDahA1Uni
         terminal.get := down.response.bits.last
         fault := lineFault
         when(word =/= 15.U(4)) { word := (word + 1.U(4)).asBits.bits(3, 0).asUInt }
-        when((word === demandWord) & !abort & !lineFault) { data := down.response.bits.data.asBits.bits(31, 0).asUInt }
+        when((word === demandWord) & !abort & !lineFault) { data := parcel(down.response.bits.data.asBits.bits(31, 0).asUInt) }
         state := 6.U(3)
       }
       when(state === 6.U(3)) {
-        when((word === demandWord) & !abort & !fault) { data := upperWord.get }
+        when((word === demandWord) & !abort & !fault) { data := parcel(upperWord.get) }
         state := 4.U(3)
         when(word =/= 15.U(4)) { word := (word + 1.U(4)).asBits.bits(3, 0).asUInt }
         when(terminal.get) {
@@ -189,6 +195,7 @@ object DitDahA1InstructionCache extends Generator[DitDahA1Parameter, DitDahA1Uni
       fault := false.B
       word := 0.U(4)
       bypass := false.B
+      halfword.foreach(_ := up.request.bits.size === 1.U(3))
       killed := false.B
       state := 1.U(3)
     }

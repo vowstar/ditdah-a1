@@ -139,7 +139,8 @@ class BranchUpdate extends Bundle:
 class InstructionGroup(width: Int) extends Bundle:
   val count = Aligned(UInt(32 - Integer.numberOfLeadingZeros(width)))
   val packets = Aligned(Vec(width, new FetchPacket))
-class DecodedPacket extends Bundle:
+class DecodedPacket(parameter: DitDahA1Parameter) extends Bundle:
+  val functionCode = Option.when(parameter.enableC)(Aligned(UInt(4)))
   val instruction = Aligned(new FetchPacket)
   val operation = Aligned(UInt(DitDahA1Isa.operationBits))
   val rs1 = Aligned(UInt(5))
@@ -150,8 +151,8 @@ class DecodedPacket extends Bundle:
   val serializing = Aligned(Bool())
   val rd = Aligned(UInt(5))
   val immediate = Aligned(UInt(64))
-class IssuedPacket extends Bundle:
-  val decoded = Aligned(new DecodedPacket)
+class IssuedPacket(parameter: DitDahA1Parameter) extends Bundle:
+  val decoded = Aligned(new DecodedPacket(parameter))
   val operand1 = Aligned(UInt(64))
   val operand2 = Aligned(UInt(64))
 class ResultPacket extends Bundle:

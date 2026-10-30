@@ -4,10 +4,13 @@
 .PHONY: config check rtl software verify-software verify-data-software verify-supervisor-software zephyr verify-zephyr verify-zephyr-long verify-signoff verify-simulation verify-production verify-cache verify-platform verify-user verify-data-cache verify-supervisor verify-formal verify-scalar-formal verify-user-formal verify-data-formal verify-supervisor-formal verify-translation verify-translation-formal verify-translation-software verify-translation-cache verify-translation-cache-formal verify-translation-cache-software clean
 .PHONY: verify-burst verify-burst-formal verify-burst-software verify-widths verify-width-software
 .PHONY: verify-data-line verify-data-line-software verify-read-capacity verify-read-software
-.PHONY: verify-writeback verify-writeback-software verify-scalar-isa
+.PHONY: verify-writeback verify-writeback-software verify-scalar-isa verify-compressed-isa
 
 HART_COUNTS ?= 2 3 15 16
 SCALAR_OUTPUT ?= result/scalar-isa/gate
+COMPRESSED_OUTPUT ?= result/compressed-isa
+COMPRESSED_CASES := $(addprefix compressed_,integer boundary illegal breakpoint groups control)
+COMPRESSED_ARGS = $(foreach name,$(COMPRESSED_CASES),--case $(name))
 MULDIV_CASES := $(addprefix muldiv_,0 1 2 3 4 5 6 7 0w 4w 5w 6w 7w)
 ATOMIC_CASES := $(foreach size,2 3,$(addsuffix _$(size),$(addprefix atomic_,0 1 4 8 12 16 20 24 28) atomic_reservation))
 SCALAR_CASES := $(MULDIV_CASES) $(ATOMIC_CASES) integer_reserved integer_breakpoint
@@ -74,6 +77,7 @@ verify-zephyr-long:
 
 verify-signoff: verify-writeback verify-formal
 	$(MAKE) verify-scalar-isa
+	$(MAKE) verify-compressed-isa
 	$(MAKE) verify-widths
 	$(MAKE) verify-data-line
 	$(MAKE) verify-read-capacity
@@ -420,4 +424,18 @@ verify-scalar-isa:
 	for count in 1 2 16; do \
 		python3 scripts/build_software.py --config $(SOFTWARE_CONFIG) --isa rv64ima --program software/tests/atomic.c --harts $$count --issue-width $$((count < 3 ? count : 3)) --icache-bytes 8192 --dcache-bytes 8192 --stack-bytes 512 --console-base 0x10000000 --output $(SCALAR_OUTPUT)/software/harts$$count || exit $$?; \
 		python3 test/verify.py --elf $(SCALAR_OUTPUT)/software/harts$$count/software.elf --config $(SCALAR_OUTPUT)/software/harts$$count/input.json --output $(SCALAR_OUTPUT)/software/harts$$count/verification || exit $$?; \
+	done
+
+verify-compressed-isa:
+	python3 test/verify.py --compressed --width 64 --pmp-entries 0 $(COMPRESSED_ARGS) --output $(COMPRESSED_OUTPUT)/bare
+	python3 test/formal.py --rtl $(COMPRESSED_OUTPUT)/bare/axi64/rtl --output $(COMPRESSED_OUTPUT)/formal --modules CompressedFetch
+	python3 test/verify.py --compressed --width 128 --pmp-entries 0 --issue-width 3 --icache-bytes 8192 --branch-prediction --branch-predictor-entries 8 $(COMPRESSED_ARGS) --output $(COMPRESSED_OUTPUT)/cached
+	python3 test/formal.py --rtl $(COMPRESSED_OUTPUT)/cached/axi128/rtl --output $(COMPRESSED_OUTPUT)/cache-formal --modules InstructionCache
+	python3 test/verify.py --compressed $(SCALAR_CACHE) --burst-refill --sv39 --tlb-entries 4 --i-tlb-entries 4 --d-tlb-entries 2 --width 512 --pmp-entries 16 --issue-width 2 $(foreach kind,page success pma pmp,--case compressed_page_$(kind)) --output $(COMPRESSED_OUTPUT)/translated
+	python3 test/formal.py --rtl $(COMPRESSED_OUTPUT)/translated/irq-pmp16-axi512/rtl --output $(COMPRESSED_OUTPUT)/burst-formal --modules InstructionCache
+	python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); d=d.get("parameters",d); d["enableC"]=True; json.dump(d,open(sys.argv[2],"w"))' "$(SOFTWARE_CONFIG)" "$(COMPRESSED_OUTPUT)/software.json"
+	for count in 1 2 16; do \
+		image=$(COMPRESSED_OUTPUT)/software/harts$$count; \
+		python3 scripts/build_software.py --config $(COMPRESSED_OUTPUT)/software.json --isa rv64imac --program software/tests/atomic.c --harts $$count --issue-width $$((count < 3 ? count : 3)) --icache-bytes 8192 --dcache-bytes 8192 --stack-bytes 512 --console-base 0x10000000 --output $$image && \
+		python3 test/verify.py --elf $$image/software.elf --config $$image/input.json --output $$image/verification --jobs $(SOFTWARE_JOBS) || exit $$?; \
 	done

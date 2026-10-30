@@ -19,8 +19,8 @@ PMP is configurable to zero or sixteen entries per hart; the default uncached co
 Optional M uses a shared iterative multiply/divide resource; accepted operations retain their instruction owner through completion or cancellation draining.
 Branches recover in EX while retaining older work; `enableBranchPrediction` enables static backward-branch and direct-jump prediction.
 `branchPredictorEntries` selects 0/8/16 direct-mapped entries with two-bit direction counters and last indirect targets; nonzero requires prediction enabled. This does not implement a return stack.
-The manifest lists complete I/Zicsr/Zifencei and optional M/A through `enableM`/`enableA`; C/F/D/B and Sv48 remain targets.
-Core composes Frontend and Backend; Frontend owns PC sequencing and Backend owns execution and retirement. Non-fault Backend packets contain four-byte instructions and word-aligned PCs; producers supply fetch faults.
+The manifest lists complete I/Zicsr/Zifencei and optional M/A/C through `enableM`/`enableA`/`enableC`; F/D/B and Sv48 remain targets.
+Core composes Frontend and Backend; Frontend owns PC sequencing and Backend owns execution and retirement. `enableC` adds serial halfword fetch and two/four-byte packets with halfword-aligned PCs; raw encodings survive retirement and each parcel receives its own translation and permission check.
 Core exposes separate instruction/data memory ports; the physical fabric owns shared arbitration and AXI.
 Instruction permissions apply before cache lookup and to the complete refill request; region checks also protect external accesses.
 `loadQueueEntries` selects one or two ordinary data-read contexts per hart; replies retain their instruction owner and complete in order.

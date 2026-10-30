@@ -5,13 +5,15 @@ package com.vowstar.ditdah.a1
 object DitDahA1Isa:
   val mulDivInstructions = Seq("mul", "mulh", "mulhsu", "mulhu", "div", "divu", "rem", "remu",
     "mulw", "divw", "divuw", "remw", "remuw")
+  val compressedInstructions = Seq("c.addi4spn", "c.lw", "c.ld", "c.sw", "c.sd", "c.nop", "c.addi", "c.addiw", "c.li", "c.lui", "c.addi16sp",
+    "c.srli", "c.srai", "c.andi", "c.sub", "c.xor", "c.or", "c.and", "c.subw", "c.addw", "c.j", "c.beqz", "c.bnez", "c.slli", "c.lwsp", "c.ldsp", "c.jr", "c.mv", "c.ebreak", "c.jalr", "c.add", "c.swsp", "c.sdsp")
   val atomicOperations = Seq(0, 1, 4, 8, 12, 16, 20, 24, 28)
   val atomicInstructions = for size <- Seq("w", "d"); name <- Seq("lr", "sc", "amoadd", "amoswap", "amoxor", "amoor", "amoand", "amomin", "amomax", "amominu", "amomaxu") yield s"$name.$size"
   def instructions(parameter: DitDahA1Parameter) = Seq("lui", "auipc", "addi", "add", "beq", "jal", "jalr",
     "ld", "sd", "csrrw", "csrrs", "ecall", "ebreak", "mret", "fence", "fence.i", "lw", "lwu", "sw",
     "slli", "slti", "sltiu", "xori", "srli", "srai", "ori", "andi", "sub", "sll", "slt", "sltu", "xor", "srl", "sra", "or", "and",
     "addiw", "slliw", "srliw", "sraiw", "addw", "subw", "sllw", "srlw", "sraw", "bne", "blt", "bge", "bltu", "bgeu",
-    "lb", "lh", "lbu", "lhu", "sb", "sh", "csrrc", "csrrwi", "csrrsi", "csrrci", "wfi") ++ (if parameter.enableA then atomicInstructions else Seq.empty) ++ (if parameter.enableM then mulDivInstructions else Seq.empty)
+    "lb", "lh", "lbu", "lhu", "sb", "sh", "csrrc", "csrrwi", "csrrsi", "csrrci", "wfi") ++ (if parameter.enableA then atomicInstructions else Seq.empty) ++ (if parameter.enableM then mulDivInstructions else Seq.empty) ++ (if parameter.enableC then compressedInstructions else Seq.empty)
   val supervisorInstructions = Seq("sret")
   val Illegal = 0
   val Lui = 1

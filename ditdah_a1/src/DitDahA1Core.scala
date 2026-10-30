@@ -82,10 +82,10 @@ object DitDahA1Backend extends Generator[DitDahA1Parameter, DitDahA1Layers, DitD
     val instructionPackets = Reg(Vec(width, new FetchPacket))
     val decodedCount = RegInit(0.U(countBits))
     val decodedValid = decodedCount =/= 0.U
-    val decodedPackets = Reg(Vec(width, new DecodedPacket))
+    val decodedPackets = Reg(Vec(width, new DecodedPacket(parameter)))
     val issuedCount = RegInit(0.U(countBits))
     val issuedValid = issuedCount =/= 0.U
-    val issuedPackets = Reg(Vec(width, new IssuedPacket))
+    val issuedPackets = Reg(Vec(width, new IssuedPacket(parameter)))
     val issuedPacket = issuedPackets(0)
     val resultCount = RegInit(0.U(countBits))
     val resultValid = resultCount =/= 0.U
@@ -311,7 +311,7 @@ object DitDahA1Backend extends Generator[DitDahA1Parameter, DitDahA1Layers, DitD
     val decodedFree = width.U(countBits) - (decodedCount - issueCount)
     val decodeCount = (!flushYounger & !sleeping).?((instructionCount <= decodedFree).?(instructionCount, decodedFree), 0.U(countBits))
       .asBits.bits(countBits - 1, 0).asUInt
-    val decodedInput = Wire(Vec(width, new DecodedPacket))
+    val decodedInput = Wire(Vec(width, new DecodedPacket(parameter)))
     for lane <- 0 until width do
       decodes(lane).io.input.bits :<= instructionPackets(lane)
       decodes(lane).io.input.valid := (lane.U < instructionCount) & !flushYounger & !sleeping
@@ -518,14 +518,15 @@ object DitDahA1Frontend extends Generator[DitDahA1Parameter, DitDahA1UnitLayers,
     val flush = io.redirect | io.invalidate.getOrElse(false.B)
     val entries = parameter.branchPredictorEntries
     val indexBits = if entries == 0 then 0 else Integer.numberOfTrailingZeros(entries)
+    val alignBits = if parameter.enableC then 1 else 2
     val predictor = io.prediction.map { update =>
       val valid = RegInit(0.B(entries))
-      val tags = Reg(Vec(entries, UInt(62 - indexBits)))
+      val tags = Reg(Vec(entries, UInt(64 - alignBits - indexBits)))
       val targets = Reg(Vec(entries, UInt(64)))
       val counters = Reg(Vec(entries, UInt(2)))
       val conditional = Reg(Vec(entries, Bool()))
-      val index = update.pc.asBits.bits(indexBits + 1, 2).asUInt
-      val tag = update.pc.asBits.bits(63, indexBits + 2).asUInt
+      val index = update.pc.asBits.bits(indexBits + alignBits - 1, alignBits).asUInt
+      val tag = update.pc.asBits.bits(63, indexBits + alignBits).asUInt
       val hit = (valid.asUInt >> index).asBits.bit(0) & (tags.ref(index) === tag) & (conditional.ref(index) === update.conditional)
       val counter = counters.ref(index)
       val increment = (counter === 3.U(2)).?(counter, (counter + 1.U(2)).asBits.bits(1, 0).asUInt)
@@ -549,7 +550,7 @@ object DitDahA1Frontend extends Generator[DitDahA1Parameter, DitDahA1UnitLayers,
       incoming(i).predictedTaken := false.B
       incoming(i).predictedPc.get := 0.U(64)
       incoming(i).instruction := (if i == 0 then fetched.instruction else fetched.following.get(i - 1))
-      incoming(i).length := 4.U(3)
+      incoming(i).length := (if parameter.enableC then fetched.length else 4.U(3))
       incoming(i).fault := (if i == 0 then fetched.fault else false.B)
       incoming(i).cause := (if i == 0 then fetched.cause else 0.U(64))
       incoming(i).tval := (if i == 0 then fetched.tval else 0.U(64))
@@ -559,7 +560,7 @@ object DitDahA1Frontend extends Generator[DitDahA1Parameter, DitDahA1UnitLayers,
     predicted := false.B
     if parameter.enableBranchPrediction then
       for i <- (0 until words).reverse do
-        val insn = incoming(i).instruction.asBits
+        val insn = if parameter.enableC then (incoming(i).length === 2.U(3)).?(DitDahA1Compressed(incoming(i).instruction), incoming(i).instruction.asBits) else incoming(i).instruction.asBits
         val jump = insn.bits(6, 0) === 0x6f.B(7)
         val branch = (insn.bits(6, 0) === 0x63.B(7)) &
           ((insn.bits(14, 12) === 0.B(3)) | (insn.bits(14, 12) === 1.B(3)) | insn.bit(14))
@@ -573,9 +574,9 @@ object DitDahA1Frontend extends Generator[DitDahA1Parameter, DitDahA1UnitLayers,
         val target = Wire(UInt(64))
         target := (incoming(i).pc + jump.?(jumpOffset, branchOffset)).asBits.bits(63, 0).asUInt
         predictor.foreach { (valid, tags, targets, counters, conditional) =>
-          val index = incoming(i).pc.asBits.bits(indexBits + 1, 2).asUInt
+          val index = incoming(i).pc.asBits.bits(indexBits + alignBits - 1, alignBits).asUInt
           val hit = (valid.asUInt >> index).asBits.bit(0) &
-            (tags.ref(index) === incoming(i).pc.asBits.bits(63, indexBits + 2).asUInt)
+            (tags.ref(index) === incoming(i).pc.asBits.bits(63, indexBits + alignBits).asUInt)
           val learnedDirection = (0 until entries).map(n =>
             (index === n.U(indexBits)) & counters(n).asBits.bit(1)).reduce(_ | _)
           direction := (hit & conditional.ref(index)).?(learnedDirection, insn.bit(31))
@@ -622,6 +623,7 @@ object DitDahA1Frontend extends Generator[DitDahA1Parameter, DitDahA1UnitLayers,
     }
     when(returned) {
       pending := false.B
+      if parameter.enableC then pc := (fetched.pc + fetched.length).asBits.bits(63, 0).asUInt
       when(returnedCount < reserved) { pc := (fetched.pc + (returnedCount << 2)).asBits.bits(63, 0).asUInt }
       when(predicted) { pc := requestPc }
     }
@@ -629,7 +631,7 @@ object DitDahA1Frontend extends Generator[DitDahA1Parameter, DitDahA1UnitLayers,
       pending := true.B
       pendingPc := requestPc
       reserved := expected
-      pc := (requestPc + (expected << 2)).asBits.bits(63, 0).asUInt
+      pc := (if parameter.enableC then requestPc else (requestPc + (expected << 2)).asBits.bits(63, 0).asUInt)
       tag := (tag + expected).asBits.bits(7, 0).asUInt
     }
     when(flush) {

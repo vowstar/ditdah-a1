@@ -16,10 +16,20 @@ REVISION = '6e8a45123f14cebfb3df151a0e7b849b4389b33b'
 ARCHITECTURE = 'rv64i2p1_zicsr2p0_zifencei2p0'
 M_ARCHITECTURE = 'rv64i2p1_m2p0_zicsr2p0_zifencei2p0_zmmul1p0'
 A_ARCHITECTURES = {name: ARCHITECTURE + '_' + name.lower() + '1p0' for name in ('Zaamo', 'Zalrsc')}
+C_ARCHITECTURE = ARCHITECTURE + '_zca1p0'
 
 
 def digest(path):
     return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def instructions(data, start, end, compressed=False):
+    address = start
+    while address < end:
+        size = 4 if int.from_bytes(data[address:address + 2], 'little') & 3 == 3 else 2
+        assert address % (2 if compressed else 4) == 0 and (size == 4 or compressed) and address + size <= end, 'Invalid instruction boundary or unsupported compressed encoding'
+        yield address, int.from_bytes(data[address:address + size], 'little')
+        address += size
 
 
 def code_spans(elf, architecture=ARCHITECTURE, mapped_architectures=()):
@@ -41,10 +51,12 @@ def code_spans(elf, architecture=ARCHITECTURE, mapped_architectures=()):
             assert start <= address <= end <= start + len(data), 'Invalid code mapping bounds'
             if not name.startswith('$x') or address == end:
                 continue
-            assert address % 4 == 0 and (end - address) % 4 == 0
-            words = [int.from_bytes(data[offset:offset + 4], 'little') for offset in range(address - start, end - start, 4)]
-            assert all(word & 3 == 3 for word in words), 'Compressed instruction in code mapping'
-            assert name[2:] in (architecture, *mapped_architectures) or all(word == 0x13 for word in words), 'Unsupported code mapping architecture'
+            compressed = '_c2p0' in architecture or '_zca1p0' in architecture
+            assert address % (2 if compressed else 4) == 0
+            words = [word for _, word in instructions(data, address - start, end - start, compressed)]
+            if '_zca1p0' not in name and '_c2p0' not in name:
+                assert all(word & 3 == 3 or compressed and word == 1 for word in words), 'Compressed encoding in an uncompressed code mapping'
+            assert name[2:] in (architecture, *mapped_architectures, *((ARCHITECTURE,) if architecture == C_ARCHITECTURE else ())) or all(word == 0x13 or compressed and word == 1 for word in words), 'Unsupported code mapping architecture'
             spans.append(dict(section=section.name, start=address, end=end, architecture=name[2:]))
     assert spans, 'Missing executable code mappings'
     return spans
@@ -56,7 +68,7 @@ def main():
     from ruamel.yaml import YAML
 
     parser = argparse.ArgumentParser()
-    parser.add_argument('--extensions', nargs='+', choices=('I', 'M', 'Zaamo', 'Zalrsc'), default=['I'])
+    parser.add_argument('--extensions', nargs='+', choices=('I', 'M', 'Zaamo', 'Zalrsc', 'Zca'), default=['I'])
     parser.add_argument('--config', type=Path, required=True)
     parser.add_argument('--output', type=Path, default=Path('result/arch-test'))
     parser.add_argument('--arch-test-dir', type=Path, default=os.environ.get('ARCH_TEST_DIR'))
@@ -86,6 +98,7 @@ def main():
     assert 'M' not in extensions or config.get('enableM', True), 'M tests require enabled arithmetic'
     atomic = bool(set(extensions) & A_ARCHITECTURES.keys())
     assert not atomic or config.get('enableA', True), 'Atomic tests require enabled A'
+    assert 'Zca' not in extensions or config.get('enableC'), 'Compressed tests require enabled C'
     assert config['hartCount'] == 1 and config['pmpEntries'] == 0 and not config['virtualAddressBits']
     ram = next(r for r in config['memoryRegions'] if int(r['base']) == base and r['readable'] and r['writable'] and r['executable'] and not r['device'])
     assert int(ram['size']) >= 0x80000 and not base <= console < base + int(ram['size'])
@@ -107,6 +120,9 @@ def main():
         udb['implemented_extensions'] += [dict(name=name, version=version) for name, version in (('A', '= 2.1'), ('Zaamo', '= 1.0'), ('Zalrsc', '= 1.0'))]
         udb['params'].update(MISALIGNED_AMO=False, MUTABLE_MISA_A=False, LRSC_FAIL_ON_VA_SYNONYM=False, LRSC_FAIL_ON_NON_EXACT_LRSC=True,
                              LRSC_RESERVATION_STRATEGY='reserve exactly enough to cover the access', LRSC_MISALIGNED_BEHAVIOR='always raise misaligned exception')
+    if 'Zca' in extensions:
+        udb['implemented_extensions'] += [dict(name='C', version='= 2.0'), dict(name='Zca', version='= 1.0')]
+        udb['params']['MUTABLE_MISA_C'] = False
     (platform / 'udb.json').write_text(json.dumps(udb, indent=2) + '\n')
     sail = pyjson5.loads(subprocess.check_output([args.sail, '--print-default-config'], text=True))
     def disable(node):
@@ -124,6 +140,8 @@ def main():
         for name in ('A', 'Zaamo', 'Zalrsc'): sail['extensions'][name]['supported'] = True
         sail['memory']['misaligned']['exceptions'].update(amo=dict(Some='AlignmentException'), lrsc='AlignmentException')
         sail['platform']['reservation'].update(require_exact_reservation_addr=True, invalidate_on_same_hart_store=True)
+    if 'Zca' in extensions:
+        sail['extensions']['Zca']['supported'] = True
     sail['base']['writable_misa'] = False
     sail['base']['mtvec']['vectored']['supported'] = False
     sail['base']['privileged_isa_version'] = 'Privileged_ISA_1_12'
@@ -150,7 +168,7 @@ def main():
     generated = {str(p.relative_to(output)): digest(p) for p in [*platform.iterdir(), *(output / 'act/ditdah-a1-integer').glob('*.h')] if p.is_file()}
     reports, manifests = [], []
     for image in sorted(p for extension in extensions for p in (output / 'act/ditdah-a1-integer/elfs/rv64i' / extension).glob('*.elf')):
-        architecture = M_ARCHITECTURE if image.parent.name == 'M' else A_ARCHITECTURES.get(image.parent.name, ARCHITECTURE)
+        architecture = C_ARCHITECTURE if image.parent.name == 'Zca' else M_ARCHITECTURE if image.parent.name == 'M' else A_ARCHITECTURES.get(image.parent.name, ARCHITECTURE)
         target = output / image.stem
         target.mkdir(exist_ok=True)
         shutil.copyfile(image, target / 'software.elf')
@@ -167,7 +185,7 @@ def main():
             reference_symbols = {s.name: s['st_value'] for s in ELFFile(stream).get_section_by_name('.symtab').iter_symbols()}
         assert all(all_symbols.get(name) == reference_symbols.get(name) for name in
                    ('rvtest_code_begin', 'rvtest_code_end', 'scratch', 'begin_signature', 'end_signature', 'signature_base')), 'Reference test addresses differ'
-        manifest = dict(profile='arch-test', instructionArchitecture=architecture, sourceHashes=hashes, configurationHash=hashlib.sha256(configuration).hexdigest(),
+        manifest = dict(profile='arch-test', requiredExtensions=['C'] if image.parent.name == 'Zca' else [], instructionArchitecture=architecture, sourceHashes=hashes, configurationHash=hashlib.sha256(configuration).hexdigest(),
             imageHash=digest(image), symbols=symbols, codeSpans=spans, symbolTableHash=table_hash, commands=[command],
             upstreamRevision=REVISION, generatedHashes=generated, referenceHashes={suffix: digest(Path(str(reference) + suffix)) for suffix in ('.sig.elf', '.sig', '.results', '.sig.log')},
             toolVersions={tool: subprocess.check_output([tool, '--version'], text=True).splitlines()[0] for tool in (args.sail, args.tool_prefix + 'gcc', args.tool_prefix + 'ld', args.tool_prefix + 'objdump')},
@@ -175,7 +193,7 @@ def main():
             layout=dict(kind='arch-test', entrySymbol='rvtest_entry_point', entryAlias='_start', bssStart=symbols['__bss_start'], bssEnd=symbols['__bss_end'],
                         stacks=[dict(symbol='__stack_bottom', address=symbols['__stack_bottom'], size=symbols['__stack_bytes'], count=1, stride=symbols['__stack_bytes'])]))
         manifests.append((target, manifest))
-    assert len(manifests) == sum({'I': 51, 'M': 13, 'Zaamo': 18, 'Zalrsc': 4}[extension] for extension in extensions), 'Unexpected architecture test selection'
+    assert len(manifests) == sum({'I': 51, 'M': 13, 'Zaamo': 18, 'Zalrsc': 4, 'Zca': 32}[extension] for extension in extensions), 'Unexpected architecture test selection'
     assert args.config.read_bytes() == configuration and all(digest(Path(p)) == h for p, h in hashes.items()), 'Build inputs changed'
     clean_revision()
     for target, manifest in manifests:

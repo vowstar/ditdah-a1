@@ -19,7 +19,8 @@ object DitDahA1Alu:
     val b = in.operand2
     val imm = d.immediate
     val encoding = insn.instruction.asBits
-    val funct3 = encoding.bits(14, 12)
+    val function = d.functionCode.map(_.asBits).getOrElse(encoding.bits(30, 30) ## encoding.bits(14, 12))
+    val funct3 = function.bits(2, 0)
     val addImm = (a + imm).asBits.bits(63, 0).asUInt
     val pcImm = (insn.pc + imm).asBits.bits(63, 0).asUInt
     val value = Wire(UInt(64))
@@ -35,14 +36,14 @@ object DitDahA1Alu:
     val shift = word.?((0.B(1) ## rhs.asBits.bits(4, 0)).asUInt, rhs.asBits.bits(5, 0).asUInt)
     val lessSigned = left.asBits.asSInt < rhs.asBits.asSInt
     val alu = Wire(UInt(64))
-    alu := (register & encoding.bit(30)).?((left - rhs).asBits.bits(63, 0).asUInt, (left + rhs).asBits.bits(63, 0).asUInt)
+    alu := (register & function.bit(3)).?((left - rhs).asBits.bits(63, 0).asUInt, (left + rhs).asBits.bits(63, 0).asUInt)
     when(funct3 === 1.B(3)) { alu := (left << shift).asBits.bits(63, 0).asUInt }
     when(funct3 === 2.B(3)) { alu := lessSigned.asBits.asUInt }
     when(funct3 === 3.B(3)) { alu := (left < rhs).asBits.asUInt }
     when(funct3 === 4.B(3)) { alu := (left.asBits ^ rhs.asBits).asUInt }
     when(funct3 === 5.B(3)) {
       val logicalLeft = word.?((0.B(32) ## a.asBits.bits(31, 0)).asUInt, a)
-      alu := encoding.bit(30).?((left.asBits.asSInt >> shift).asBits.asUInt, logicalLeft >> shift)
+      alu := function.bit(3).?((left.asBits.asSInt >> shift).asBits.asUInt, logicalLeft >> shift)
     }
     when(funct3 === 6.B(3)) { alu := (left.asBits | rhs.asBits).asUInt }
     when(funct3 === 7.B(3)) { alu := (left.asBits & rhs.asBits).asUInt }
@@ -70,7 +71,7 @@ object DitDahA1Alu:
     (addImm, pcImm, sequential)
 
 class DitDahA1ExecuteIO(parameter: DitDahA1Parameter) extends HWBundle(parameter):
-  val input = Flipped(new Decoupled(new IssuedPacket))
+  val input = Flipped(new Decoupled(new IssuedPacket(parameter)))
   val output = Aligned(new Decoupled(new ResultPacket))
   val csrAddress = Aligned(UInt(12))
   val csrValue = Flipped(UInt(64))
@@ -96,7 +97,8 @@ object DitDahA1Execute extends Generator[DitDahA1Parameter, DitDahA1UnitLayers, 
     val a = in.operand1
     val b = in.operand2
     val encoding = insn.instruction.asBits
-    val funct3 = encoding.bits(14, 12)
+    val function = d.functionCode.map(_.asBits).getOrElse(encoding.bits(30, 30) ## encoding.bits(14, 12))
+    val funct3 = function.bits(2, 0)
     val (addImm, pcImm, sequential) = DitDahA1Alu.result(in, out)
     io.input.ready := io.output.ready
     io.output.valid := io.input.valid
@@ -149,13 +151,13 @@ object DitDahA1Execute extends Generator[DitDahA1Parameter, DitDahA1UnitLayers, 
         out.instruction.tval := insn.instruction
       }
       when(op === Ecall.U(operationBits)) {
-        val breakpoint = encoding === 0x00100073L.B(32)
+        val breakpoint = (encoding === 0x00100073L.B(32)) | (parameter.enableC.B & (encoding === 0x9002.B(32)))
         out.instruction.fault := true.B
         out.instruction.cause := breakpoint.?(3.U(64), machine.?(11.U(64),
           (parameter.enableSupervisorMode.B & (io.privilege === 1.U(2))).?(9.U(64), 8.U(64))))
         out.instruction.tval := breakpoint.?(insn.pc, 0.U(64))
       }
-      when(taken & (target.asBits.bits(1, 0) =/= 0.B(2))) {
+      when(taken & (if parameter.enableC then target.asBits.bit(0) else target.asBits.bits(1, 0) =/= 0.B(2))) {
         out.instruction.fault := true.B
         out.instruction.cause := 0.U(64)
         out.instruction.tval := target
