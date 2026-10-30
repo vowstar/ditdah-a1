@@ -205,7 +205,7 @@ def load_window_program(base, harts=1, cancel=False):
     return p.finish()
 
 
-def cases(base, protection=False, interrupts=False, user=False, local_interrupt_base=None, supervisor=False, sv39=False, writeback=False, compressed=False):
+def cases(base, protection=False, interrupts=False, user=False, local_interrupt_base=None, supervisor=False, sv39=False, writeback=False, compressed=False, floating_point_bits=None):
     if not sv39:
         yield 'load_window', load_window_program(base)
         yield 'load_cancel', load_window_program(base, cancel=True)
@@ -408,6 +408,22 @@ def cases(base, protection=False, interrupts=False, user=False, local_interrupt_
     yield 'multiply', p.finish()
     yield from integer_cases(base)
     yield from bitmanip_cases(base)
+    if floating_point_bits is not None:
+        yield from floating_cases(base, floating_point_bits)
+        yield from floating_state_cases(base, floating_point_bits)
+        if sv39 and floating_point_bits:
+            for name, p in sv39_cases(base, protection, writeback):
+                if name not in ('sv39_data', 'sv39_protection', 'sv39_sum', 'sv39_mxr'):
+                    continue
+                for byte in range(8):
+                    p.memory[base + 0x610 + byte] = p.memory.get(base + 0x610 + byte, 0) | ((0x2000 >> (byte*8)) & 255)
+                for pc in range(base, p.stop, 4):
+                    word = sum(p.memory.get(pc+i, 0) << (8*i) for i in range(4))
+                    if (word >> 15) & 31 == 11 and word & 127 in (3, 0x23):
+                        word = (word | 4) & ~(7 << 12) | ((2 if floating_point_bits == 32 else 3) << 12)
+                        p.memory.update((pc+i, (word >> (8*i)) & 255) for i in range(4))
+                p.floating_memory = (1, 2) if name == 'sv39_protection' else (1, 1) if name == 'sv39_mxr' else (2, 0)
+                yield 'floating_' + name, p
     if compressed:
         yield from compressed_cases(base, protection, sv39)
 
@@ -420,7 +436,7 @@ def cases(base, protection=False, interrupts=False, user=False, local_interrupt_
     if interrupts:
         yield from interrupt_cases(base, protection)
     if user:
-        yield from user_cases(base, protection, interrupts, local_interrupt_base)
+        yield from user_cases(base, protection, interrupts, local_interrupt_base, floating_point_bits or 0, supervisor)
     if supervisor:
         yield from supervisor_cases(base, protection)
     if sv39:
@@ -631,10 +647,11 @@ def supervisor_cases(base, protection=False):
         yield 'supervisor_' + name, p
 
 
-def user_cases(base, protection=False, interrupts=False, local_interrupt_base=None):
+def user_cases(base, protection=False, interrupts=False, local_interrupt_base=None, floating_point_bits=0, supervisor=False):
     for name in ('access', 'system', 'wait', *(['protection', 'fetch'] if protection else []),
                  *(['interrupt'] if interrupts else []),
-                 *(['device'] if protection and local_interrupt_base is not None else [])):
+                 *(['device'] if protection and local_interrupt_base is not None else []),
+                 *(['floating', 'floating_off', *(['floating_s', 'floating_s_off'] if supervisor else [])] if floating_point_bits else [])):
         p = Program(base)
         p.address(10, 0x1000)
         if protection:
@@ -653,10 +670,15 @@ def user_cases(base, protection=False, interrupts=False, local_interrupt_base=No
         p.address(1, 0x200)
         if name == 'interrupt':
             p.emit(addi(2, 0, 8), csr(0, 0x304, 2))
-        p.emit(csr(0, 0x341, 1), addi(1, 0, 1 if name == 'wait' else 0),
-               alu(1, 1, 21, 1, immediate=True), csr(0, 0x300, 1), 0x30200073)
+        fp = name.startswith('floating')
+        status = (0 if name.endswith('off') else 4) + int('_s' in name) if fp else int(name == 'wait')
+        p.emit(csr(0, 0x341, 1), addi(1, 0, status),
+               alu(1, 1, 11 if fp else 21, 1, immediate=True), csr(0, 0x300, 1), 0x30200073)
         p.offset = 0x200
-        if name == 'access':
+        if fp:
+            p.emit(0x3f8000b7, 0xf0008053, 0x00000053, 0xe00002d3, csr(6, 3, 0, True))
+            p.expected_registers = {5: 0 if name.endswith('off') else 0x40000000, 23: 5 if name.endswith('off') else 1}
+        elif name == 'access':
             p.emit(addi(2, 0, 17), sd(2, 10), ld(3, 10), amo(8, 4, 10, 2), amo(2, 5, 10), amo(3, 6, 10, 2))
             if not interrupts:
                 p.emit(0x10500073)
@@ -783,6 +805,82 @@ def compressed_cases(base, protection=False, sv39=False):
             p.required_fetch = (virtual+0xffc, 0x4485)
             yield 'compressed_page_' + kind, p
 
+
+
+
+def floating_cases(base, flen):
+    from floating import FLOATING_ENCODINGS
+    for width in ((32,) if flen == 32 else (32, 64)):
+        for seed in (range(3) if not flen else (-1,)):
+            p = Program(base)
+            p.emit(0x000020b7, csr(0, 0x300, 1, True))
+            p.address(10, 0x3000)
+            p.address(11, 0x2800)
+            size = 2 if width == 32 else 3
+            values = ((0x3f800000, 0x40000000, 0x40400000), (0xff800001, 0, 0x7f800000), (0x80000000, 0x3f800000, 0x80000000)) if width == 32 else (
+                (0x3ff0000000000000, 0x4000000000000000, 0x4008000000000000), (0xfff0000000000001, 0, 0x7ff0000000000000), (0x8000000000000000, 0x3ff0000000000000, 0x8000000000000000))
+            for index, operands in enumerate(values):
+                if seed >= 0 and index != seed:
+                    continue
+                for source, value in enumerate(operands, 1):
+                    offset = index * 32 + (source - 1) * 8
+                    for byte in range(8):
+                        p.memory[base + 0x3000 + offset + byte] = (value >> (8 * byte)) & 255
+                    p.emit((offset << 20) | (10 << 15) | (size << 12) | (source << 7) | 7)
+                p.emit(ld(1, 10, index * 32))
+                for name, (encoding, mask, rounding, fp_write, integer_source, minimum) in FLOATING_ENCODINGS.items():
+                    if minimum > (flen or 64) or encoding & 127 in (7, 0x27) or ((encoding >> 25) & 1) != int(width == 64):
+                        continue
+                    word = encoding | (1 << 15) | ((2 << 20) & ~mask) | ((3 << 27) & ~mask) | ((0 if fp_write else 6) << 7)
+                    p.emit(word, csr(8, 3, 0, True))
+                    if fp_write:
+                        result_size = 2 if not word & (1 << 25) else 3
+                        p.emit((11 << 15) | (result_size << 12) | 0x27, load(7, 11, 0, result_size, True if result_size == 2 else False))
+            assert p.offset < 0x800
+            yield 'floating_' + str(width) + (f'_disabled_{seed}' if seed >= 0 else ''), p.finish()
+
+
+
+def floating_state_cases(base, flen):
+    if not flen:
+        return
+    for width in ((32,) if flen == 32 else (32, 64)):
+        size = 2 if width == 32 else 3
+        one = 0x3f800000 if width == 32 else 0x3ff0000000000000
+        half = 0x33800000 if width == 32 else 0x3ca0000000000000
+        def setup():
+            p = Program(base)
+            p.emit(0x000020b7, csr(0, 0x300, 1, True))
+            p.address(10, 0x3000); p.address(11, 0x2800)
+            for offset, value in ((0, one), (8, half)):
+                for byte in range(8):
+                    p.memory[base + 0x3000 + offset + byte] = (value >> (8 * byte)) & 255
+            p.emit(load(1, 10, 0, size) | 4, load(2, 10, 8, size) | 4)
+            return p
+        p = setup()
+        for frm in range(8):
+            p.emit(csr(0, 2, frm, function=5))
+            for mode in (0, 1, 2, 3, 4, 7):
+                p.emit(csr(0, 1, 0, function=5), 0x00004fb7, csr(0, 0x300, 31),
+                       (int(width == 64) << 25) | (2 << 20) | (1 << 15) | (mode << 12) | 0x53,
+                       store(0, 11, 0, size) | 4, load(7, 11, 0, size, size == 2), csr(8, 3, 0, True), csr(9, 0x300, 0, True))
+        assert p.offset < 0x800
+        yield f'floating_rounding_{width}', p.finish()
+        for fault in ('read', 'write'):
+            p = setup()
+            p.emit(load(0, 10, 0, size) | 4, 0x00004fb7, csr(0, 0x300, 31))
+            p.emit((load(0, 10, 256, size) if fault == 'read' else store(0, 10, 256, size)) | 4,
+                   store(0, 11, 0, size) | 4, load(7, 11, 0, size, size == 2), csr(8, 0x300, 0, True), csr(9, 3, 0, True))
+            p.faults[fault] = base + 0x3100
+            p.expected_registers = {7: one, 23: 1}
+            yield f'floating_{fault}_fault_{width}', p.finish()
+    p = Program(base)
+    p.emit(load(0, 0, 1, 2) | 4, store(0, 0, 1, 2) | 4, csr(6, 3, 0, True),
+           0x000020b7, csr(0, 0x300, 1, True), 0x3f8000b7, 0xf0008053,
+           0x00004fb7, csr(0, 0x300, 31), 0xe0001353, csr(7, 0x300, 0, True),
+           0x04000053, 0x00005053, 0x00006053)
+    p.expected_registers = {23: 6}
+    yield 'floating_state', p.finish()
 
 
 def bitmanip_cases(base):

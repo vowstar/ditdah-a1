@@ -2,6 +2,8 @@
 # SPDX-License-Identifier: MIT
 """Instruction-level oracle for the implemented scalar operations."""
 
+from floating import floating_decode, floating_value
+
 MASK = (1 << 64) - 1
 ATOMIC_OPERATIONS = (0, 1, 4, 8, 12, 16, 20, 24, 28)
 
@@ -10,14 +12,23 @@ def signed(value, bits):
     return (value & ((1 << (bits - 1)) - 1)) - (value & (1 << (bits - 1)))
 
 
-def compressed_instruction(c):
-    from programs import add, addi, alu, beq, jal, jalr, ld, lw, sd, sw
+def compressed_instruction(c, double_precision=False):
+    from programs import add, addi, alu, beq, jal, jalr, ld, lw, sd, store, sw
     quadrant, function = c & 3, c >> 13
     rd, rs2, a, b = (c >> 7) & 31, (c >> 2) & 31, 8 + ((c >> 7) & 7), 8 + ((c >> 2) & 7)
     bit = lambda n: (c >> n) & 1
     field = lambda low, width: (c >> low) & ((1 << width) - 1)
     immediate = signed((bit(12) << 5) | rs2, 6)
     shift = (bit(12) << 5) | rs2
+    if double_precision and quadrant in (0, 2) and function in (1, 5):
+        if quadrant == 0:
+            offset = (field(5, 2) << 6) | (field(10, 3) << 3)
+            return ((offset << 20) | (a << 15) | (3 << 12) | (b << 7) | 7) if function == 1 else store(b, a, offset, 3) | 4
+        if function == 1:
+            offset = (field(2, 3) << 6) | (bit(12) << 5) | (field(5, 2) << 3)
+            return (offset << 20) | (2 << 15) | (3 << 12) | (rd << 7) | 7
+        offset = (field(7, 3) << 6) | (field(10, 3) << 3)
+        return store(rs2, 2, offset, 3) | 4
     if quadrant == 0:
         offset = (field(7, 4) << 6) | (field(11, 2) << 4) | (bit(5) << 3) | (bit(6) << 2)
         if function == 0 and offset:
@@ -317,9 +328,13 @@ class Model:
         self.pc = int(config['resetVector'])
         self.privilege = 3
         self.registers = [0] * 32
+        self.fp_registers = [0] * 32 if config.get("floatingPointBits", 0) else []
+        self.fp_state = 0
         self.csrs = {address: 0 for address in (0x300, 0x301, 0x304, 0x305, 0x340,
                                                0x341, 0x342, 0x343, 0x344,
                                                0xf11, 0xf12, 0xf13, 0xf14, 0xf15)}
+        if self.fp_registers:
+            self.csrs.update({1: 0, 2: 0, 3: 0})
         if config.get('enableUserMode'):
             self.csrs.update({0x306: 0, 0x30a: 0})
         if config.get('enableSupervisorMode'):
@@ -456,12 +471,17 @@ class Model:
         return (self.csrs[0x3a0 + (index // 8) * 2] >> ((index % 8) * 8)) & 255
 
     def csr_legal(self, address):
-        return address in self.csrs and (address >> 8) & 3 <= self.privilege and not (
+        return address in self.csrs and (address not in (1, 2, 3) or self.fp_state != 0) and (address >> 8) & 3 <= self.privilege and not (
             address == 0x180 and self.privilege == 1 and self.csrs[0x300] & (1 << 20))
 
     def read_csr(self, address):
+        if address in (1, 2, 3):
+            return self.csrs[3] & 31 if address == 1 else self.csrs[3] >> 5 if address == 2 else self.csrs[3]
+        fp_status = (self.fp_state << 13) | ((1 << 63) if self.fp_state == 3 else 0)
+        if address == 0x300:
+            return self.csrs[address] | fp_status
         if address == 0x100:
-            return self.csrs[0x300] & ((3 << 32) | 0x122 | (0xc0000 if self.config.get('virtualAddressBits') == 39 else 0))
+            return (self.csrs[0x300] & ((3 << 32) | 0x122 | (0xc0000 if self.config.get('virtualAddressBits') == 39 else 0))) | fp_status
         if address in (0x104, 0x144):
             return self.csrs[address + 0x200] & self.csrs[0x303]
         return self.csrs[address]
@@ -482,6 +502,12 @@ class Model:
         return self.csrs[0x141 if supervisor else 0x341]
 
     def write_csr(self, address, value):
+        if address in (1, 2, 3):
+            self.csrs[3] = ((self.csrs[3] & 0xe0) | (value & 31)) if address == 1 else ((self.csrs[3] & 31) | ((value & 7) << 5)) if address == 2 else value & 255
+            self.fp_state = 3
+            return
+        if self.fp_registers and address in (0x100, 0x300):
+            self.fp_state = (value >> 13) & 3
         if address == 0x300:
             previous = (value >> 11) & 3
             if self.config.get('enableSupervisorMode'):
@@ -533,6 +559,7 @@ class Model:
     def step(self):
         pc, insn, raw = self.pc, 0, 0
         length = 4
+        fp_write, fp_value, fp_flags = False, 0, 0
         next_pc = (pc + length) & MASK
         rd, write, value, trap, cause, tval = 0, False, 0, False, 0, 0
         try:
@@ -540,7 +567,7 @@ class Model:
                 first = self.access(pc, 2, 'fetch')
                 length = 4 if first & 3 == 3 else 2
                 raw = first | (self.access((pc + 2) & MASK, 2, 'fetch') << 16) if length == 4 else first
-                insn = compressed_instruction(raw) if length == 2 else raw
+                insn = compressed_instruction(raw, self.config.get("floatingPointBits") == 64) if length == 2 else raw
             else:
                 raw = insn = self.access(pc, 4, 'fetch')
             next_pc = (pc + length) & MASK
@@ -556,6 +583,27 @@ class Model:
                 if opcode in (0x33, 0x3b) and insn >> 25 == 1 and not self.config.get('enableM', True):
                     raise Fault(2, insn)
                 value, write = integer_value(insn, a, b, self.config), True
+            elif opcode in (7, 0x27, 0x43, 0x47, 0x4b, 0x4f, 0x53):
+                decoded = floating_decode(insn, self.config.get('floatingPointBits', 0))
+                if decoded is None or not self.fp_state:
+                    raise Fault(2, insn)
+                fp_write, integer_source = decoded[3:5]
+                if opcode in (7, 0x27):
+                    displacement = immediate if opcode == 7 else signed(((insn >> 25) << 5) | ((insn >> 7) & 31), 12)
+                    if opcode == 7:
+                        fp_value = self.access((a + displacement) & MASK, 1 << funct3, 'read')
+                        if funct3 == 2 and self.config['floatingPointBits'] == 64:
+                            fp_value |= 0xffffffff00000000
+                    else:
+                        self.access((a + displacement) & MASK, 1 << funct3, 'write', self.fp_registers[rs2])
+                else:
+                    mode = self.csrs[3] >> 5 if funct3 == 7 else funct3
+                    try:
+                        value, fp_flags = floating_value(insn, a if integer_source else self.fp_registers[rs1],
+                            self.fp_registers[rs2], self.fp_registers[insn >> 27], mode, self.config['floatingPointBits'])
+                    except ValueError:
+                        raise Fault(2, insn) from None
+                    fp_value, write = value, not fp_write
             elif opcode == 0x63 and funct3 in (0, 1, 4, 5, 6, 7):
                 displacement = signed(((insn >> 31) << 12) | (((insn >> 7) & 1) << 11)
                                       | (((insn >> 25) & 63) << 5) | (((insn >> 8) & 15) << 1), 13)
@@ -622,6 +670,11 @@ class Model:
         except Fault as error:
             trap, cause, tval, write = True, error.cause, raw if error.cause == 2 else error.value, False
             next_pc = self.trap(pc, cause, tval)
+        if not trap and (fp_write or fp_flags):
+            self.fp_state = 3
+            self.csrs[3] |= fp_flags
+            if fp_write:
+                self.fp_registers[rd] = fp_value & ((1 << self.config['floatingPointBits']) - 1)
         write = write and rd != 0
         value = (value & MASK) if write else 0
         if write:

@@ -6,13 +6,14 @@ import argparse
 import hashlib
 import json
 import os
+import re
 from pathlib import Path
 import subprocess
 import tempfile
 
 
 def source_hashes():
-    paths = sorted(Path("ditdah_a1/src").glob("*.scala")) + [
+    paths = sorted(Path("ditdah_a1/src").glob("*.scala")) + sorted(p for p in Path("rtl").rglob("*") if p.is_file()) + [
         Path(name) for name in ("flake.nix", "flake.lock", "nix/stable-toolchain.nix", "scripts/build_rtl.py")]
     return {str(path): hashlib.sha256(path.read_bytes()).hexdigest() for path in paths}
 
@@ -88,6 +89,16 @@ def main():
             for path in generated.iterdir():
                 if "DV" in path.name or path.name.startswith("ref_"):
                     path.unlink()
+        if manifest["parameters"]["floatingPointBits"] and (generated / "DitDahA1Backend.sv").exists():
+            library = Path("rtl/ieee754")
+            def inline(path):
+                def header(match):
+                    include = next((folder / match[1] for folder in (library / "RISCV", library) if (folder / match[1]).is_file()), None)
+                    assert include is not None, "Missing arithmetic header"
+                    return inline(include)
+                return re.sub(r'`include "([^"]+)"', header, path.read_text())
+            (generated / "DitDahA1Fpu.sv").write_bytes(Path("rtl/DitDahA1Fpu.sv").read_bytes())
+            (generated / "DitDahA1FloatLibrary.sv").write_text("\n".join(inline(path) for path in sorted(library.rglob("*.v"))))
         files = sorted(path.name for path in generated.glob("*.sv"))
         # Remove only files owned by the previous generated manifest.
         previous = output / "filelist.f"

@@ -28,6 +28,7 @@ case class DitDahA1Parameter(
   enableM: Boolean = true,
   enableA: Boolean = true,
   enableC: Boolean = false,
+  floatingPointBits: Int = 0,
   enableZba: Boolean = false,
   enableZbb: Boolean = false,
   enableZbs: Boolean = false,
@@ -62,6 +63,7 @@ case class DitDahA1Parameter(
   require(Set(0, 16, 64).contains(pmpEntries), "pmpEntries must be 0, 16 or 64")
 
   require(Set(1, 2).contains(loadQueueEntries), "loadQueueEntries must be one or two")
+  require(Set(0, 32, 64).contains(floatingPointBits), "floatingPointBits must be zero, 32 or 64")
   require(issueWidth >= 1 && issueWidth <= 3, "issueWidth must be between 1 and 3")
   require(Set(0, 8, 16).contains(branchPredictorEntries), "branchPredictorEntries must be zero, eight or sixteen")
   memoryRegions.foreach(r => require(r.base + r.size <= (BigInt(1) << physicalAddressBits), "Memory region exceeds physical address space"))

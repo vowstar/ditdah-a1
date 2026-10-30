@@ -8,6 +8,10 @@ import me.jiuyang.zaozi.reftpe.*
 import me.jiuyang.zaozi.valuetpe.*
 
 class DitDahA1CsrIO(parameter: DitDahA1Parameter) extends HWBundle(parameter):
+  val fpEnabled = Option.when(parameter.floatingPointBits != 0)(Aligned(Bool()))
+  val roundingMode = Option.when(parameter.floatingPointBits != 0)(Aligned(UInt(3)))
+  val fpDirty = Option.when(parameter.floatingPointBits != 0)(Flipped(Bool()))
+  val fpFlags = Option.when(parameter.floatingPointBits != 0)(Flipped(UInt(5)))
   val interrupts = Option.when(parameter.enableInterrupts)(Flipped(new InterruptBundle))
   val interruptPending = Option.when(parameter.enableInterrupts)(Aligned(Bool()))
   val wakeup = Option.when(parameter.enableInterrupts)(Aligned(Bool()))
@@ -46,6 +50,27 @@ object DitDahA1Csr extends Generator[DitDahA1Parameter, DitDahA1UnitLayers, DitD
     given ClockScope = ClockScope.posedge(io.clock)
     given ResetScope = ResetScope.syncActiveHigh(io.reset)
     val status = RegInit(0.U(64))
+    io.readData := 0.U(64)
+    io.legal := false.B
+    val fpStatus = Wire(UInt(64))
+    fpStatus := 0.U(64)
+    if parameter.floatingPointBits != 0 then
+      val fs = RegInit(0.U(2))
+      val fcsr = RegInit(0.U(8))
+      fpStatus := ((fs === 3.U(2)).asBits ## 0.B(48) ## fs.asBits ## 0.B(13)).asUInt
+      io.fpEnabled.get := fs =/= 0.U(2)
+      io.roundingMode.get := fcsr.asBits.bits(7, 5).asUInt
+      when(io.write & ((io.writeAddress === 0x300.U(12)) | (parameter.enableSupervisorMode.B & (io.writeAddress === 0x100.U(12))))) { fs := io.writeData.asBits.bits(14, 13).asUInt }
+      when(io.fpDirty.get) { fcsr := (fcsr.asBits | io.fpFlags.get.asBits).asUInt; fs := 3.U(2) }
+      for address <- 1 to 3 do
+        when(io.readAddress === address.U(12)) {
+          io.readData := (if address == 1 then fcsr.asBits.bits(4, 0) else if address == 2 then fcsr.asBits.bits(7, 5) else fcsr.asBits).asUInt
+          io.legal := io.fpEnabled.get
+        }
+        when(io.write & io.fpEnabled.get & (io.writeAddress === address.U(12))) {
+          fcsr := (if address == 1 then fcsr.asBits.bits(7, 5) ## io.writeData.asBits.bits(4, 0) else if address == 2 then io.writeData.asBits.bits(2, 0) ## fcsr.asBits.bits(4, 0) else io.writeData.asBits.bits(7, 0)).asUInt
+          fs := 3.U(2)
+        }
     val satp = Option.when(parameter.enableTranslation)(RegInit(0.U(64)))
     if parameter.enableTranslation then
       io.translationState.get.satp := satp.get
@@ -85,8 +110,6 @@ object DitDahA1Csr extends Generator[DitDahA1Parameter, DitDahA1UnitLayers, DitD
     else false.B
     io.trapVector := (if parameter.enableSupervisorMode then supervisorTrap.?(stvec.get, mtvec) else mtvec)
     io.returnPc := (if parameter.enableSupervisorMode then io.sret.?(sepc.get, mepc) else mepc)
-    io.readData := 0.U(64)
-    io.legal := false.B
     Seq(0x301, 0x304, 0x344, 0xf11, 0xf12, 0xf13, 0xf14, 0xf15).foreach { address =>
       when(io.readAddress === address.U(12)) { io.legal := true.B }
     }
@@ -106,7 +129,7 @@ object DitDahA1Csr extends Generator[DitDahA1Parameter, DitDahA1UnitLayers, DitD
     }
     val fixedStatus = if parameter.enableSupervisorMode then BigInt("a00000000", 16)
       else if parameter.enableUserMode then BigInt("200000000", 16) else BigInt(0x1800)
-    when(io.readAddress === 0x300.U(12)) { io.readData := (status.asBits | fixedStatus.B(64)).asUInt; io.legal := true.B }
+    when(io.readAddress === 0x300.U(12)) { io.readData := (status.asBits | fixedStatus.B(64) | fpStatus.asBits).asUInt; io.legal := true.B }
     when(io.write & (io.writeAddress === 0x300.U(12))) {
       if parameter.enableUserMode then
         val mpp = io.writeData.asBits.bits(12, 11)
@@ -119,7 +142,7 @@ object DitDahA1Csr extends Generator[DitDahA1Parameter, DitDahA1UnitLayers, DitD
     if parameter.enableSupervisorMode then
       val supervisorMask = if parameter.enableTranslation then 0xc0122 else 0x122
       when(io.readAddress === 0x100.U(12)) {
-        io.readData := ((status.asBits & supervisorMask.B(64)) | BigInt("200000000", 16).B(64)).asUInt
+        io.readData := ((status.asBits & supervisorMask.B(64)) | BigInt("200000000", 16).B(64) | fpStatus.asBits).asUInt
         io.legal := true.B
       }
       when(io.write & (io.writeAddress === 0x100.U(12))) {

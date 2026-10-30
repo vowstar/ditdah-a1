@@ -14,6 +14,7 @@ class DitDahA1IssueIO(parameter: DitDahA1Parameter) extends HWBundle(parameter):
   val raddr2 = Aligned(UInt(5))
   val rdata1 = Flipped(UInt(64))
   val rdata2 = Flipped(UInt(64))
+  val rdata3 = Option.when(parameter.floatingPointBits != 0)(Flipped(UInt(parameter.floatingPointBits)))
 
 @generator
 object DitDahA1Issue extends Generator[DitDahA1Parameter, DitDahA1UnitLayers, DitDahA1IssueIO, DitDahA1UnitProbe]:
@@ -24,6 +25,7 @@ object DitDahA1Issue extends Generator[DitDahA1Parameter, DitDahA1UnitLayers, Di
     io.output.valid := io.input.valid
     io.raddr1 := io.input.bits.usesRs1.?(io.input.bits.rs1, 0.U(5))
     io.raddr2 := io.input.bits.usesRs2.?(io.input.bits.rs2, 0.U(5))
+    io.output.bits.operand3.foreach(_ := io.rdata3.get)
     io.output.bits.decoded :<= io.input.bits
     io.output.bits.operand1 := io.rdata1
     io.output.bits.operand2 := io.rdata2

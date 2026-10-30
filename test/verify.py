@@ -16,6 +16,7 @@ import subprocess
 from types import SimpleNamespace
 
 from contracts import verify as verify_contracts, verify_storage, backend_control_signals, axi_cache_attributes
+from floating import FLOATING_ENCODINGS, floating_decode
 from model import BITMANIP_ENCODINGS, ATOMIC_OPERATIONS, ExclusiveMonitor, Fault, LocalInterrupts, Model, MASK, atomic_value, compressed_instruction, integer_value, pmp_allowed, sv39_walk
 from programs import cases, multicore_cases, platform_program
 
@@ -590,7 +591,7 @@ def prediction_target(config, table, pc, instruction):
     if not config.get('enableBranchPrediction'):
         return None
     if config.get('enableC') and instruction & 3 != 3:
-        instruction = compressed_instruction(instruction)
+        instruction = compressed_instruction(instruction, config.get("floatingPointBits") == 64)
     entries = config.get('branchPredictorEntries', 0)
     shift = 1 if config.get('enableC') else 2
     row = table.get((pc >> shift) % entries) if entries else None
@@ -645,7 +646,7 @@ def fetch_checker(config, faults, local_faults, architectural=None, buffered=())
     align = 2 if compressed else 4
     shift = 1 if compressed else 2
     length = lambda word: 2 if compressed and word & 3 != 3 else 4
-    expand = lambda word: compressed_instruction(word) if compressed and word & 3 != 3 else word
+    expand = lambda word: compressed_instruction(word, config.get("floatingPointBits") == 64) if compressed and word & 3 != 3 else word
     lengths = {}
     pending, requests, demand, physical_demand, parcel_va = None, {}, None, None, None
     arch_accepted, arch_completed, arch_wraps = 0, 0, 0
@@ -1236,7 +1237,7 @@ def compare(binary, directory, config, transport='axi', selected=()):
     count = 0
     reports, burst_guards = [], []
     pipeline_max, dependency_stalls = 0, 0
-    for name, program in cases(base, config['pmpEntries'] != 0, config['enableInterrupts'], config.get('enableUserMode', False), local_interrupt_base(config), config.get('enableSupervisorMode', False), config.get('virtualAddressBits') == 39, config.get('dCacheWriteback', False), config.get('enableC', False)):
+    for name, program in cases(base, config['pmpEntries'] != 0, config['enableInterrupts'], config.get('enableUserMode', False), local_interrupt_base(config), config.get('enableSupervisorMode', False), config.get('virtualAddressBits') == 39, config.get('dCacheWriteback', False), config.get('enableC', False), config.get('floatingPointBits', 0) if config.get('floatingPointBits') or any(name.startswith('floating_') for name in selected) else None):
         if selected and name not in selected:
             continue
         image = directory / (name + '.hex')
@@ -1327,6 +1328,9 @@ def compare(binary, directory, config, transport='axi', selected=()):
             bus = [(v[1], int(v[2], 16), int(v[3]), int(v[4], 16))
                    for line in lines if line.startswith('BUS ') for v in [line.split()]]
             assert len(actual) == len(expected), f'{name}: trace length {len(actual)} != {len(expected)}'
+            if hasattr(program, 'floating_memory'):
+                accesses = [record for record in actual if record[2] & 127 in (7, 0x27)]
+                assert tuple(sum(record[7] == fault for record in accesses) for fault in (0, 1)) == program.floating_memory, 'Floating translation did not exercise its memory and fault contracts'
             for index, (observed, wanted) in enumerate(zip(actual, expected)):
                 assert observed == wanted, f'{name} trace {index}:\nactual {observed}\nexpected {wanted}'
             assert all(model.registers[register] == value for register, value in getattr(program, 'expected_registers', {}).items()), 'Directed program register result'
@@ -2703,18 +2707,18 @@ def load_software(image, config_path):
     assert hashlib.sha256(image.read_bytes()).hexdigest() == manifest['imageHash'], 'Software image changed'
     assert all(hashlib.sha256(Path(name).read_bytes()).hexdigest() == digest for name, digest in manifest['sourceHashes'].items()), 'Stale software sources'
     required = manifest.get('requiredExtensions', [])
-    assert set(required) <= {'M', 'A', 'C', 'Zba', 'Zbb', 'Zbs'} and all(config.get('enable' + name, name in ('M', 'A')) for name in required), 'Software requires disabled extensions'
+    assert set(required) <= {'M', 'A', 'C', 'F', 'D', 'Zba', 'Zbb', 'Zbs'} and all((config.get('floatingPointBits', 0) >= (64 if name == 'D' else 32) if name in ('F', 'D') else config.get('enable' + name, name in ('M', 'A'))) for name in required), 'Software requires disabled extensions'
     base, harts, memory, spans, payloads = int(config['resetVector']), config['hartCount'], {}, [], []
     ram = next(r for r in config['memoryRegions'] if int(r['base']) == base and r['readable'] and r['writable'] and r['executable'] and not r['device'])
     memory_bytes = max(65536, int(ram['size']))
-    assert memory_bytes <= 524288, 'Software RAM exceeds supported test profile'
+    assert memory_bytes <= 1048576, 'Software RAM exceeds supported test profile'
     layout, code = manifest.get('layout', {}), []
     kind = layout.get('kind', 'runtime')
     assert kind in ('runtime', 'arch-test', 'zephyr'), 'Unknown software layout'
     with image.open('rb') as stream:
         elf = ELFFile(stream)
         assert elf.elfclass == 64 and elf.little_endian and elf['e_machine'] == 'EM_RISCV' and elf['e_type'] == 'ET_EXEC', 'Unsupported executable format'
-        assert not elf['e_flags'] & 6 and (kind == 'arch-test' or config.get('enableC') or not elf['e_flags'] & 1), 'Unsupported compressed or floating-point ABI'
+        assert (elf['e_flags'] & 6) in (0, *([2] if config.get('floatingPointBits', 0) >= 32 else []), *([4] if config.get('floatingPointBits') == 64 else [])) and (kind == 'arch-test' or config.get('enableC') or not elf['e_flags'] & 1), 'Unsupported compressed or floating-point ABI'
         table = elf.get_section_by_name('.symtab')
         assert table is not None, 'Software symbols are missing'
         all_symbols = {symbol.name: symbol for symbol in table.iter_symbols() if symbol['st_shndx'] != 'SHN_UNDEF'}
@@ -2743,10 +2747,11 @@ def load_software(image, config_path):
             spec.loader.exec_module(builder)
             integer = 'rv64i2p1_zicsr2p0_zifencei2p0'
             architecture = 'rv64i2p1_a2p1_zicsr2p0_zifencei2p0_zaamo1p0_zalrsc1p0' if kind == 'zephyr' else manifest.get('instructionArchitecture', integer)
-            assert kind != 'arch-test' or architecture in (integer, builder.M_ARCHITECTURE, builder.C_ARCHITECTURE, *builder.A_ARCHITECTURES.values(), *builder.B_ARCHITECTURES.values()), 'Unsupported software architecture profile'
+            assert kind != 'arch-test' or architecture in (integer, builder.M_ARCHITECTURE, builder.C_ARCHITECTURE, *builder.A_ARCHITECTURES.values(), *builder.B_ARCHITECTURES.values(), *builder.FP_ARCHITECTURES.values()), 'Unsupported software architecture profile'
             assert architecture != builder.M_ARCHITECTURE or config.get('enableM', True), 'Software requires disabled arithmetic'
             assert architecture not in builder.A_ARCHITECTURES.values() or config.get('enableA', True), 'Software requires disabled atomics'
             assert architecture != builder.C_ARCHITECTURE or config.get('enableC'), 'Software requires disabled compressed instructions'
+            assert all(architecture != value or config.get('floatingPointBits', 0) >= (32 if name == 'F' else 64) for name, value in builder.FP_ARCHITECTURES.items()), 'Software requires disabled floating precision'
             assert all(architecture != value or config.get('enable' + name) for name, value in builder.B_ARCHITECTURES.items()), 'Software requires disabled bit manipulation'
             code = builder.code_spans(elf, architecture, (integer,) if kind == 'zephyr' else ())
             if kind == 'arch-test':
@@ -2757,16 +2762,18 @@ def load_software(image, config_path):
                 data = section.data()
                 for address, word in builder.instructions(data, span['start'] - section['sh_addr'], span['end'] - section['sh_addr'], config.get('enableC', False)):
                     if word & 3 != 3:
-                        word = compressed_instruction(word)
+                        word = compressed_instruction(word, config.get("floatingPointBits") == 64)
                         assert word, 'Unsupported compressed software instruction'
                     opcode, funct3, funct7 = word & 127, (word >> 12) & 7, word >> 25
-                    assert opcode in (3, 15, 19, 23, 27, 35, 47, 51, 55, 59, 99, 103, 111, 115), 'Unsupported software instruction family'
+                    assert opcode in (3, 7, 15, 19, 23, 27, 35, 39, 47, 51, 55, 59, 67, 71, 75, 79, 83, 99, 103, 111, 115), 'Unsupported software instruction family'
                     assert not (opcode in (51, 59) and funct7 == 1) or config.get('enableM', True), 'Software requires disabled arithmetic'
                     if opcode in (19, 27, 51, 59):
                         try:
                             integer_value(word, 0, 0, config)
                         except Fault as error:
                             raise AssertionError('Unsupported software integer encoding') from error
+                    elif opcode in (7, 39, 67, 71, 75, 79, 83):
+                        assert floating_decode(word, config.get('floatingPointBits', 0)) is not None, 'Unsupported software floating encoding'
                     elif opcode in (3, 15, 35, 99, 103):
                         assert funct3 in {3: range(7), 15: (0, 1), 35: range(4), 99: (0, 1, 4, 5, 6, 7), 103: (0,)}[opcode], 'Unsupported software memory/control encoding'
                     elif opcode == 47:
@@ -2825,22 +2832,27 @@ def load_software(image, config_path):
         assert frequency == 10000000 and local_interrupt_base(config) is not None and config['enableInterrupts']
         assert all(hashlib.sha256(image.with_name(name).read_bytes()).hexdigest() == digest for name, digest in manifest['generatedHashes'].items()), 'Generated software configuration changed'
     return config, SimpleNamespace(memory=memory, faults={}, stop=symbols['__test_halt'],
-        software=dict(kind=kind, console=console, results=symbols['__test_results'], bss=bss, expectedConsole=expected, expectedInterruptCauses=interrupt_causes, requiredExtensions=required,
+        software=dict(kind=kind, console=console, results=symbols['__test_results'], bss=bss, expectedConsole=expected, expectedInterruptCauses=interrupt_causes, requiredExtensions=required, testInstruction=manifest.get('testInstruction'),
                       memoryBytes=memory_bytes, timebaseHz=frequency, timeTickCycles=100000000 // frequency,
                       idleCycles=4 * 100000000 // 100 if kind == 'zephyr' else 0)), manifest
 
 
 def test_source_hashes():
     return {str(p): hashlib.sha256(p.read_bytes()).hexdigest() for name in
-            ('verify.py', 'contracts.py', 'model.py', 'programs.py', 'core_tb.sv', 'memory_tb.sv')
+            ('verify.py', 'contracts.py', 'model.py', 'floating.py', 'programs.py', 'core_tb.sv', 'memory_tb.sv')
             for p in (Path('test') / name,)}
 
 
 def check_software_output(lines, config, program, console):
     report = check_multicore(lines, config, program, 'software', atomic_metadata=True, software_output=True)
     assert Counter(console.read_text().splitlines()) == Counter(f'[hart {hart}] {line}' for hart, text in enumerate(program.software['expectedConsole']) for line in text.splitlines()), 'Console log differs from software bytes'
-    required = set(program.software.get('requiredExtensions', [])) & {'C', 'Zba', 'Zbb', 'Zbs'}
-    observed = set()
+    required = set(program.software.get('requiredExtensions', [])) & {'C', 'F', 'D', 'Zba', 'Zbb', 'Zbs'}
+    target = program.software.get('testInstruction') if program.software['kind'] == 'arch-test' else None
+    if target in FLOATING_ENCODINGS:
+        required -= {'F', 'D'}
+    elif target and target.startswith('c.f'):
+        required.discard('F')
+    observed, exercised = set(), set()
     for line in log_lines(lines):
         fields = line.split()
         hart = int(fields[1]) if fields[:1] == ['HART'] else 0
@@ -2853,6 +2865,15 @@ def check_software_output(lines, config, program, console):
         for extension, encoding, mask in BITMANIP_ENCODINGS.values():
             if instruction & mask == encoding:
                 observed.add((hart, extension))
+        canonical = compressed_instruction(instruction, config.get('floatingPointBits') == 64) if instruction & 3 != 3 else instruction
+        if target in FLOATING_ENCODINGS:
+            encoding, mask, *_ = FLOATING_ENCODINGS[target]
+            if canonical & mask == encoding:
+                exercised.add(hart)
+        floating = floating_decode(compressed_instruction(instruction, config.get('floatingPointBits') == 64) if instruction & 3 != 3 else instruction, config.get('floatingPointBits', 0))
+        if floating:
+            observed.add((hart, 'F' if floating[-1] == 32 else 'D'))
+    assert target not in FLOATING_ENCODINGS or exercised == set(range(config['hartCount'])), 'Architecture test did not retire its floating target'
     assert {(hart, name) for hart in range(config['hartCount']) for name in required} <= observed, 'Software profile lacks extension retirement on every hart'
     return report
 
@@ -3161,6 +3182,7 @@ def main():
     parser.add_argument('--supervisor-mode', action='store_true')
     parser.add_argument('--sv39', action='store_true')
     parser.add_argument('--compressed', action='store_true')
+    parser.add_argument('--floating-point-bits', type=int, choices=(0, 32, 64), default=0)
     parser.add_argument('--bitmanip', nargs='+', choices=('Zba', 'Zbb', 'Zbs'), default=[])
     parser.add_argument('--burst-refill', action='store_true')
     parser.add_argument('--branch-prediction', action='store_true')
@@ -3262,7 +3284,7 @@ def main():
         directory.mkdir(parents=True, exist_ok=True)
         config = configuration(width)
         config.update({'enable' + name: name in args.bitmanip for name in ('Zba', 'Zbb', 'Zbs')})
-        config.update(enableM=not args.no_m, enableA=not args.no_a, enableC=args.compressed, l2CacheBytes=args.l2_cache_bytes or 0, issueWidth=args.issue_width, loadQueueEntries=args.load_queue_entries, pmpEntries=entries, enableInterrupts=interrupts, iCacheBytes=args.icache_bytes, dCacheBytes=args.dcache_bytes, dCacheWays=args.dcache_ways, dCacheRefillBytes=args.dcache_refill_bytes, dCacheWriteback=args.dcache_writeback, tlbEntries=args.tlb_entries, iTlbEntries=args.i_tlb_entries, dTlbEntries=args.d_tlb_entries, asidBits=args.asid_bits, enableBurstRefill=args.burst_refill, enableBranchPrediction=args.branch_prediction, branchPredictorEntries=args.branch_predictor_entries)
+        config.update(enableM=not args.no_m, enableA=not args.no_a, enableC=args.compressed, floatingPointBits=args.floating_point_bits, l2CacheBytes=args.l2_cache_bytes or 0, issueWidth=args.issue_width, loadQueueEntries=args.load_queue_entries, pmpEntries=entries, enableInterrupts=interrupts, iCacheBytes=args.icache_bytes, dCacheBytes=args.dcache_bytes, dCacheWays=args.dcache_ways, dCacheRefillBytes=args.dcache_refill_bytes, dCacheWriteback=args.dcache_writeback, tlbEntries=args.tlb_entries, iTlbEntries=args.i_tlb_entries, dTlbEntries=args.d_tlb_entries, asidBits=args.asid_bits, enableBurstRefill=args.burst_refill, enableBranchPrediction=args.branch_prediction, branchPredictorEntries=args.branch_predictor_entries)
         if args.fabric_read_slots is not None:
             config['fabricReadSlots'] = args.fabric_read_slots
         config['memoryRegions'][0]['dataCacheable'] = bool(args.dcache_bytes)
@@ -3330,7 +3352,7 @@ def main():
             directory = args.output / f'harts{harts}-axi{width}'
             directory.mkdir(parents=True, exist_ok=True)
             config = dict(configuration(width), enableM=not args.no_m, enableA=not args.no_a, l2CacheBytes=args.l2_cache_bytes or 0, issueWidth=args.issue_width, loadQueueEntries=args.load_queue_entries, hartCount=harts, pmpEntries=entries, enableInterrupts=interrupts, iCacheBytes=args.icache_bytes, dCacheBytes=args.dcache_bytes, dCacheWays=args.dcache_ways, dCacheRefillBytes=args.dcache_refill_bytes, dCacheWriteback=args.dcache_writeback, tlbEntries=args.tlb_entries, iTlbEntries=args.i_tlb_entries, dTlbEntries=args.d_tlb_entries, asidBits=args.asid_bits, enableBurstRefill=args.burst_refill, enableBranchPrediction=args.branch_prediction, branchPredictorEntries=args.branch_predictor_entries)
-            config.update(enableC=args.compressed, **{'enable' + name: name in args.bitmanip for name in ('Zba', 'Zbb', 'Zbs')})
+            config.update(enableC=args.compressed, floatingPointBits=args.floating_point_bits, **{'enable' + name: name in args.bitmanip for name in ('Zba', 'Zbb', 'Zbs')})
             if args.fabric_read_slots is not None:
                 config['fabricReadSlots'] = args.fabric_read_slots
             config['memoryRegions'][0]['dataCacheable'] = bool(args.dcache_bytes)

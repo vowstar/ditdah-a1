@@ -32,6 +32,18 @@ int main(void)
     if (address != 0x8000000000000001UL + 8 * hart ||
         rotated != 3 + 16 * hart || toggled != (0x8000000000000003UL + 16 * hart)) return 5;
 #endif
+#if defined(__riscv_flen)
+    __asm__ volatile ("csrs mstatus, %0" :: "r"(0x2000UL));
+    uint64_t floating;
+    __asm__ volatile ("fcvt.s.lu ft0, %1; fadd.s ft1, ft0, ft0; fcvt.lu.s %0, ft1, rtz"
+                      : "=r"(floating) : "r"(hart + 3) : "ft0", "ft1");
+    if (floating != 2 * (hart + 3)) return 6;
+#if __riscv_flen == 64
+    __asm__ volatile ("fcvt.d.lu ft0, %1; fadd.d ft1, ft0, ft0; fcvt.lu.d %0, ft1, rtz"
+                      : "=r"(floating) : "r"(hart + 5) : "ft0", "ft1");
+    if (floating != 2 * (hart + 5)) return 7;
+#endif
+#endif
     uint32_t old = __atomic_fetch_add(&state.counter, 1, __ATOMIC_ACQ_REL);
     if (old >= DITDAH_HART_COUNT) return 2;
     uint32_t expected = 0;

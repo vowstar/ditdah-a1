@@ -140,6 +140,8 @@ class InstructionGroup(width: Int) extends Bundle:
   val count = Aligned(UInt(32 - Integer.numberOfLeadingZeros(width)))
   val packets = Aligned(Vec(width, new FetchPacket))
 class DecodedPacket(parameter: DitDahA1Parameter) extends Bundle:
+  val floating = Option.when(parameter.floatingPointBits != 0)(Aligned(Bool()))
+  val fpWrite = Option.when(parameter.floatingPointBits != 0)(Aligned(Bool()))
   val functionCode = Option.when(parameter.enableC)(Aligned(UInt(4)))
   val instruction = Aligned(new FetchPacket)
   val operation = Aligned(UInt(DitDahA1Isa.operationBits))
@@ -152,10 +154,13 @@ class DecodedPacket(parameter: DitDahA1Parameter) extends Bundle:
   val rd = Aligned(UInt(5))
   val immediate = Aligned(UInt(64))
 class IssuedPacket(parameter: DitDahA1Parameter) extends Bundle:
+  val operand3 = Option.when(parameter.floatingPointBits != 0)(Aligned(UInt(parameter.floatingPointBits)))
   val decoded = Aligned(new DecodedPacket(parameter))
   val operand1 = Aligned(UInt(64))
   val operand2 = Aligned(UInt(64))
-class ResultPacket extends Bundle:
+class ResultPacket(parameter: DitDahA1Parameter) extends Bundle:
+  val fpWrite = Option.when(parameter.floatingPointBits != 0)(Aligned(Bool()))
+  val fpFlags = Option.when(parameter.floatingPointBits != 0)(Aligned(UInt(5)))
   val instruction = Aligned(new FetchPacket(predictionTarget = false))
   val rd = Aligned(UInt(5))
   val rdWrite = Aligned(Bool())

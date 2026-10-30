@@ -10,7 +10,7 @@ import java.lang.foreign.Arena
 import org.llvm.mlir.scalalib.capi.ir.{Block, Context}
 
 object DitDahA1Compressed:
-  def apply(raw: Referable[UInt])(using Arena, Context, Block, InstanceContext): Referable[Bits] =
+  def apply(raw: Referable[UInt], doublePrecision: Boolean = false)(using Arena, Context, Block, InstanceContext): Referable[Bits] =
     val c = raw.asBits
     val rd = c.bits(11, 7)
     val rs2 = c.bits(6, 2)
@@ -22,20 +22,20 @@ object DitDahA1Compressed:
       imm ## a ## f.B(3) ## d ## (if word then 0x1b else 0x13).B(7)
     def r(d: Referable[Bits], a: Referable[Bits], b: Referable[Bits], f: Referable[Bits], upper: Int = 0, word: Boolean = false)(using Block) =
       upper.B(7) ## b ## a ## f ## d ## (if word then 0x3b else 0x33).B(7)
-    def load(d: Referable[Bits], a: Referable[Bits], imm: Referable[Bits], f: Int)(using Block) =
-      imm ## a ## f.B(3) ## d ## 0x03.B(7)
-    def store(a: Referable[Bits], b: Referable[Bits], imm: Referable[Bits], f: Int)(using Block) =
-      imm.bits(11, 5) ## b ## a ## f.B(3) ## imm.bits(4, 0) ## 0x23.B(7)
+    def load(d: Referable[Bits], a: Referable[Bits], imm: Referable[Bits], f: Int, floating: Boolean = false)(using Block) =
+      imm ## a ## f.B(3) ## d ## (if floating then 0x07 else 0x03).B(7)
+    def store(a: Referable[Bits], b: Referable[Bits], imm: Referable[Bits], f: Int, floating: Boolean = false)(using Block) =
+      imm.bits(11, 5) ## b ## a ## f.B(3) ## imm.bits(4, 0) ## (if floating then 0x27 else 0x23).B(7)
     val out = Wire(Bits(32))
     out := 0.B(32)
     when(c.bits(1, 0) === 0.B(2)) {
       val spOffset = 0.B(2) ## c.bits(10, 7) ## c.bits(12, 11) ## c.bits(5, 5) ## c.bits(6, 6) ## 0.B(2)
       when((c.bits(15, 13) === 0.B(3)) & (spOffset =/= 0.B(12))) { out := i(target, 2.B(5), spOffset) }
-      for (f, size) <- Seq(2 -> 2, 3 -> 3) do
+      for (f, size) <- (Seq(2 -> 2, 3 -> 3) ++ (if doublePrecision then Seq(1 -> 3) else Seq.empty)) do
         val offset = if size == 2 then 0.B(5) ## c.bits(5, 5) ## c.bits(12, 10) ## c.bits(6, 6) ## 0.B(2)
           else 0.B(4) ## c.bits(6, 5) ## c.bits(12, 10) ## 0.B(3)
-        when(c.bits(15, 13) === f.B(3)) { out := load(target, compact, offset, size) }
-        when(c.bits(15, 13) === (f + 4).B(3)) { out := store(compact, target, offset, size) }
+        when(c.bits(15, 13) === f.B(3)) { out := load(target, compact, offset, size, f == 1) }
+        when(c.bits(15, 13) === (f + 4).B(3)) { out := store(compact, target, offset, size, f == 1) }
     }
     when(c.bits(1, 0) === 1.B(2)) {
       when(c.bits(15, 13) === 0.B(3)) { out := i(rd, rd, immediate) }
@@ -80,13 +80,13 @@ object DitDahA1Compressed:
     }
     when(c.bits(1, 0) === 2.B(2)) {
       when(c.bits(15, 13) === 0.B(3)) { out := i(rd, rd, shift, 1) }
-      for (f, size) <- Seq(2 -> 2, 3 -> 3) do
+      for (f, size) <- (Seq(2 -> 2, 3 -> 3) ++ (if doublePrecision then Seq(1 -> 3) else Seq.empty)) do
         val offset = if size == 2 then 0.B(4) ## c.bits(3, 2) ## c.bits(12, 12) ## c.bits(6, 4) ## 0.B(2)
           else 0.B(3) ## c.bits(4, 2) ## c.bits(12, 12) ## c.bits(6, 5) ## 0.B(3)
-        when((c.bits(15, 13) === f.B(3)) & (rd =/= 0.B(5))) { out := load(rd, 2.B(5), offset, size) }
+        when((c.bits(15, 13) === f.B(3)) & ((rd =/= 0.B(5)) | (f == 1).B)) { out := load(rd, 2.B(5), offset, size, f == 1) }
         val storeOffset = if size == 2 then 0.B(4) ## c.bits(8, 7) ## c.bits(12, 9) ## 0.B(2)
           else 0.B(3) ## c.bits(9, 7) ## c.bits(12, 10) ## 0.B(3)
-        when(c.bits(15, 13) === (f + 4).B(3)) { out := store(2.B(5), rs2, storeOffset, size) }
+        when(c.bits(15, 13) === (f + 4).B(3)) { out := store(2.B(5), rs2, storeOffset, size, f == 1) }
       when(c.bits(15, 13) === 4.B(3)) {
         when(rs2 =/= 0.B(5)) { out := r(rd, c.bit(12).?(rd, 0.B(5)), rs2, 0.B(3)) }
         when((rs2 === 0.B(5)) & (rd =/= 0.B(5))) { out := 0.B(12) ## rd ## 0.B(3) ## (0.B(4) ## c.bits(12, 12)) ## 0x67.B(7) }

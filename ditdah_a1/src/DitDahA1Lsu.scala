@@ -12,8 +12,8 @@ class DitDahA1LsuIO(parameter: DitDahA1Parameter) extends HWBundle(parameter):
   val clock = Flipped(Clock())
   val reset = Flipped(Reset())
   val privilege = Flipped(UInt(2))
-  val input = Flipped(new Decoupled(new ResultPacket))
-  val output = Aligned(new Decoupled(new ResultPacket))
+  val input = Flipped(new Decoupled(new ResultPacket(parameter)))
+  val output = Aligned(new Decoupled(new ResultPacket(parameter)))
   val storeAllowed = Flipped(Bool())
   val cancel = Option.when(parameter.loadQueueEntries == 2)(Flipped(Bool()))
   val translation = Option.when(parameter.enableTranslation)(Aligned(new TranslationPort))
@@ -31,8 +31,8 @@ object DitDahA1Lsu extends Generator[DitDahA1Parameter, DitDahA1UnitLayers, DitD
     val stateBits = if parameter.enableTranslation || checkRefill then 3 else 2
     val state = RegInit(0.U(stateBits))
     val concurrent = parameter.loadQueueEntries == 2
-    val packet = Reg(new ResultPacket)
-    val packets = Seq(packet) ++ Option.when(concurrent)(Reg(new ResultPacket))
+    val packet = Reg(new ResultPacket(parameter))
+    val packets = Seq(packet) ++ Option.when(concurrent)(Reg(new ResultPacket(parameter)))
     val owner = Option.when(concurrent)(RegInit(0.U(1)))
     val head = Option.when(concurrent)(RegInit(0.U(1)))
     val tail = Option.when(concurrent)(RegInit(0.U(1)))
@@ -46,12 +46,12 @@ object DitDahA1Lsu extends Generator[DitDahA1Parameter, DitDahA1UnitLayers, DitD
     val offered = Option.when(concurrent)(RegInit(false.B))
     val poisoned = Option.when(concurrent)(RegInit(false.B))
     val current = if !concurrent then packet else
-      val selected = Wire(new ResultPacket)
+      val selected = Wire(new ResultPacket(parameter))
       selected :<= packet
       when(owner.get === 1.U(1)) { selected :<= packets(1) }
       selected
     val updated = if !concurrent then packet else
-      val next = Wire(new ResultPacket)
+      val next = Wire(new ResultPacket(parameter))
       next :<= current
       next
     val privileged = Option.when(parameter.enableUserMode && !parameter.enableTranslation && !checkRefill)(Reg(Bool()))
@@ -251,7 +251,7 @@ object DitDahA1Lsu extends Generator[DitDahA1Parameter, DitDahA1UnitLayers, DitD
           for size <- 0 to 2 do
             val bits = 8 << size
             val low = response.bits.data.asBits.bits(bits - 1, 0)
-            val high = (!completed.unsignedLoad & low.bit(bits - 1)).?(((BigInt(1) << (64 - bits)) - 1).B(64 - bits), 0.B(64 - bits))
+            val high = ((if parameter.floatingPointBits == 64 && size == 2 then completed.fpWrite.get else false.B) | (!completed.unsignedLoad & low.bit(bits - 1))).?(((BigInt(1) << (64 - bits)) - 1).B(64 - bits), 0.B(64 - bits))
             when(completed.memorySize === size.U(3)) { completed.value := (high ## low).asUInt }
         }
         when(response.bits.fault | poisoned.getOrElse(false.B) | (if concurrent then !response.bits.last else false.B) | (response.bits.tag =/= identity)) {

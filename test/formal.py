@@ -2750,6 +2750,132 @@ def integer_cases(parameters):
 
 
 
+
+def floating_csr_case(parameters):
+    supervisor = int(parameters.get('enableSupervisorMode', False))
+    body = f"""
+  reg fp_past=0;
+  reg [1:0] fp_state;
+  reg [4:0] fp_exceptions;
+  reg [2:0] fp_rounding;
+  always @(posedge clock) begin
+    fp_past<=1;
+    if(!fp_past) assume(reset); else assume(!reset);
+    if(reset)begin fp_state<=0;fp_exceptions<=0;fp_rounding<=0;end
+    else begin
+      if(write && (writeAddress==12'h300 || ({supervisor} && writeAddress==12'h100))) fp_state<=writeData[14:13];
+      if(fpDirty) begin fp_state<=3;fp_exceptions<=fp_exceptions|fpFlags;end
+      if(write && fp_state!=0 && writeAddress>=1 && writeAddress<=3)begin
+        fp_state<=3;
+        fp_exceptions<=writeAddress==2?fp_exceptions:writeData[4:0];
+        fp_rounding<=writeAddress==1?fp_rounding:writeAddress==2?writeData[2:0]:writeData[7:5];
+      end
+    end
+  end
+  always @* if(fp_past && !reset)begin
+    assert((status & 64'h8000000000006000)==0);
+    assert(fs==fp_state && fcsr=={{fp_rounding,fp_exceptions}});
+    assert(fpEnabled==(fp_state!=0) && roundingMode==fp_rounding);
+    if(readAddress>=1 && readAddress<=3)begin
+      assert(legal==(fp_state!=0));
+      assert(readData==(readAddress==1?{{59'd0,fp_exceptions}}:readAddress==2?{{61'd0,fp_rounding}}:{{56'd0,fp_rounding,fp_exceptions}}));
+    end
+    if(readAddress==12'h300 || ({supervisor} && readAddress==12'h100))
+      assert(readData[14:13]==fp_state && readData[63]==(fp_state==3));
+    cover(fp_state==1 && legal && readAddress==3);
+    cover(fp_state==3 && fp_rounding==7 && fp_exceptions==31);
+    cover(fp_state==2 && trap && mret);
+    cover(fp_state==0 && !legal && readAddress==1 && fp_exceptions!=0);
+  end
+"""
+    return ('FloatingCsr', body, 'assign fpEnabled =', "assign fpEnabled = 1'h0 &")
+
+
+def floating_fpu_case(parameters):
+    body = r'''
+  reg fp_past=0, fp_owned, fp_complete, fp_double;
+  reg [63:0] fp_value;
+  reg [4:0] fp_flags;
+  always @(posedge clock) begin
+    fp_past<=1;
+    if(!fp_past) assume(reset); else assume(!reset);
+    if(reset) begin fp_owned<=0;fp_complete<=0;end
+    else begin
+      assert(!(busy && valid) && fp_owned==(busy || valid));
+      assert(fp_complete==valid && !singleReady==(busy && !fp_double));
+      if(FLEN==64) assert(!doubleReady==(busy && fp_double));
+      assert(output_valid==(fp_owned && fp_complete));
+      if(output_valid) assert(output_bits_value==fp_value && output_bits_flags==fp_flags);
+      if(accept) begin
+        assert(!fp_owned);fp_owned<=1;fp_double<=doublePrecision;fp_complete<=!division;
+        fp_value<=doublePrecision?doubleResult:singleResult;
+        fp_flags<=doublePrecision?doubleFlags:singleFlags;
+      end
+      if(busy && (singleDone || doubleDone)) begin
+        assert(fp_owned && !fp_complete && (doubleDone==fp_double));
+        fp_complete<=1;fp_value<=fp_double?doubleDivide:singleDivide;
+        fp_flags<=fp_double?doubleDivideFlags:singleDivideFlags;
+      end
+      if(output_valid && output_ready) begin fp_owned<=0;fp_complete<=0;end
+      if($past(!reset && output_valid && !output_ready)) begin
+        assert(output_valid && $stable({output_bits_value,output_bits_flags}));
+      end
+      cover(accept && division);
+      cover(output_valid && !output_ready && fp_double);
+      cover(output_valid && output_ready && !fp_double);
+    end
+  end
+'''
+    return ('FloatingFpu', body, 'assign output_valid=valid;', 'assign output_valid=valid||busy;')
+
+
+def floating_backend_case(parameters, source):
+    pins = {name: instance_ports(source, 'DitDahA1'+name)[0][1] for name in ('Commit', 'Csr', 'Fpu', 'MulDiv')}
+    cp, fp, mp = (pins[name] for name in ('Commit', 'Fpu', 'MulDiv'))
+    retired = f"({cp['output_valid']}) && ({cp['output_ready']})"
+    write = f"({retired}) && !({cp['output_bits_instruction_fault']}) && ({cp['output_bits_fpWrite']})"
+    body = f'''
+  wire fp_retired={retired}, fp_write={write};
+  wire fp_dirty=({pins['Csr']['fpDirty']});
+  wire fp_accept=({fp['input_valid']}) && ({fp['input_ready']});
+  wire fp_reply=({fp['output_valid']}) && ({fp['output_ready']});
+  wire md_accept=({mp['input_valid']}) && ({mp['input_ready']});
+  wire md_reply=({mp['output_valid']}) && ({mp['output_ready']});
+  reg fp_past=0, fp_owner, md_owner;
+  (* anyconst *) reg [4:0] fp_row;
+  (* anyconst *) reg [{(parameters['floatingPointBits']-1).bit_length()-1}:0] fp_bit;
+  reg fp_known, fp_stored;
+  wire [31:0] fp_observations={{{', '.join('registers' + ('_'+str(n-1) if n else '')+'[fp_bit]' for n in reversed(range(32)))}}};
+  wire fp_observed=fp_observations[fp_row];
+  wire [63:0] fp_retired_value=({cp['output_bits_value']});
+  always @(posedge clock) begin
+    fp_past<=1;
+    if(!fp_past) assume(reset); else assume(!reset);
+    if(reset) begin fp_owner<=0;md_owner<=0;fp_known<=0;end
+    else begin
+      assert(!(fp_owner && md_owner) && executePending==(fp_owner || md_owner));
+      if(fp_accept)begin assert(!fp_owner && !md_owner);fp_owner<=1;end
+      if(md_accept)begin assert(!fp_owner && !md_owner);md_owner<=1;end
+      if(fp_reply)begin assert(fp_owner);fp_owner<=0;end
+      if(md_reply)begin assert(md_owner);md_owner<=0;end
+      assert(write==fp_write);
+      assert(fp_dirty==(fp_retired && !({cp['output_bits_instruction_fault']}) &&
+        (({cp['output_bits_fpWrite']}) || |({cp['output_bits_fpFlags']}))));
+      if(fp_known)assert(fp_observed==fp_stored);
+      if(fp_write && ({cp['output_bits_rd']})==fp_row)begin
+        fp_known<=1;fp_stored<=fp_retired_value[fp_bit];
+      end
+      cover(fp_owner && !issuedValid);
+      cover(fp_write && ({cp['output_bits_rd']})==0);
+      cover(fp_reply && issuedValid);
+    end
+  end
+'''
+    if not parameters['enableInterrupts']:
+        body = body.replace('cover(fp_owner && !issuedValid);', 'cover(fp_accept);')
+    return ('FloatingBackend', body, 'registers <=', "registers <= 64'h0 &")
+
+
 def bitmanip_cases(parameters):
     from model import BITMANIP_ENCODINGS
     decode, execute = '', r"""
@@ -2898,7 +3024,7 @@ def local_interrupt_case(parameters):
 
 
 def instance_ports(source, pattern=r'instructions_\d+x32', instance=r'\w+'):
-    arrays = re.findall(pattern + r'\s+' + instance + r'\s*\((.*?)\n  \);', source, re.S)
+    arrays = re.findall(pattern + r'(?:\s*#\s*\(.*?\))?\s+' + instance + r'\s*\((.*?)\n  \);', source, re.S)
     return [(array, dict(re.findall(r'\.(\w+)\s*\((.*?)\)(?=\s*,|\s*$)', array, re.S))) for array in arrays]
 
 
@@ -5038,6 +5164,10 @@ def verify(rtl, directory, modules=None, mutations=None, jobs=1):
             ('Backend', BACKEND, '(~issuedValid | executed) & ~executePending & ~redirect_0', '(~issuedValid | executed) & ~redirect_0'))
     cases = [*cases, gpr_case(manifest['parameters']), *word_cases(manifest['parameters']), *integer_cases(manifest['parameters']), *bitmanip_cases(manifest['parameters']), *wfi_cases(manifest['parameters']), synchronization_case(manifest['parameters']),
              arbiter_case(manifest['parameters']), memory_case(manifest['parameters']), axi_case(manifest['parameters'])]
+    if manifest['parameters'].get('floatingPointBits'):
+        cases += [floating_csr_case(manifest['parameters']), floating_fpu_case(manifest['parameters'])]
+        if 'DitDahA1Backend.sv' in sources and manifest['parameters'].get('enableM', True):
+            cases.append(floating_backend_case(manifest['parameters'], sources['DitDahA1Backend.sv']))
     if manifest['parameters'].get('loadQueueEntries', 1) == 2 and not enabled and manifest['parameters'].get('virtualAddressBits') == 0:
         cases.append(lsu_reads_case(manifest['parameters']))
     if 'DitDahA1ReadQueue.sv' in sources:
@@ -5075,7 +5205,7 @@ def verify(rtl, directory, modules=None, mutations=None, jobs=1):
             continue
         if modules and name not in modules and not (name.startswith('Pmp') and 'Pmp' in modules):
             continue
-        unit = name.removeprefix('BitManip').removeprefix('Compressed').removeprefix('Interrupt').removeprefix('Synchronization').removeprefix('Pipeline').removeprefix('Word').removeprefix('Integer').removeprefix('Wfi').removeprefix('User').removeprefix('Supervisor').removeprefix('Wide')
+        unit = name.removeprefix('Floating').removeprefix('BitManip').removeprefix('Compressed').removeprefix('Interrupt').removeprefix('Synchronization').removeprefix('Pipeline').removeprefix('Word').removeprefix('Integer').removeprefix('Wfi').removeprefix('User').removeprefix('Supervisor').removeprefix('Wide')
         if name in ('DataCacheWriteback', 'DataCacheAssociativity'):
             unit = 'DataCache'
         if name == 'LsuReads':
@@ -5274,6 +5404,26 @@ def verify(rtl, directory, modules=None, mutations=None, jobs=1):
             files = {module + '.sv': license + 'module formal_subset(input [64:0] low, high, input [7:0] config, input [63:0] address, input [1:0] privilege, input prior_whole, prior_subset);\nendmodule\n'}
         else:
             files = dict(sources) if unit in ('Backend', 'Frontend', 'InstructionCache', 'DataCache', 'SharedCache', 'MemoryFabric') or unit == 'Fetch' and manifest['parameters'].get('iCacheBytes') else {module + '.sv': sources[module + '.sv']}
+        if unit == 'Fpu':
+            if manifest['parameters']['floatingPointBits'] == 32:
+                body = body.replace('!output_ready && fp_double', '!output_ready && !fp_double')
+                files[module + '.sv'] = files[module + '.sv'].replace('module DitDahA1Fpu #(parameter FLEN=64)', 'module DitDahA1Fpu #(parameter FLEN=32)')
+            abstract = header(sources[module + '.sv']) + r'''
+  reg pending;
+  (* anyseq *) reg finish;
+  (* anyseq *) reg [63:0] arbitraryResult, arbitraryDivide;
+  (* anyseq *) reg [4:0] arbitraryFlags, arbitraryDivideFlags;
+  assign result=arbitraryResult, flags=arbitraryFlags;
+  assign divideResult=arbitraryDivide, divideFlags=arbitraryDivideFlags;
+  assign divideReady=!pending, divideDone=pending&&finish;
+  always @(posedge clock) if(reset) pending<=0;
+  else begin
+    if(divideDone)pending<=0;
+    if(divideValid)begin assert(divideReady);pending<=1;end
+  end
+endmodule
+'''
+            files[module + '.sv'] = re.sub(r'module DitDahA1FloatFormat\b.*?endmodule', lambda _: abstract, files[module + '.sv'], count=1, flags=re.S)
         if unit == 'MemoryFabric':
             count = 2 * manifest['parameters']['hartCount']
             slot_bits = (count - 1).bit_length() + 1
@@ -5470,7 +5620,7 @@ def verify(rtl, directory, modules=None, mutations=None, jobs=1):
                               and f'request_address{suffix} ' in expression]
                 assert len(candidates) == 1, 'Ambiguous read authorization driver'
                 body += f'\n  wire rq_dut_permission_{slot} = {candidates[0]};\n'
-        if unit in ('Backend', 'Frontend', 'Gpr', 'MulDiv', 'Csr', 'MemoryArbiter', 'ReadQueue', 'MemoryFabric', 'Memory', 'Axi', 'InstructionCache', 'DataCache', 'Coherence', 'SharedCache', 'Lsu', 'LocalInterrupts', 'Translation') or (enabled and unit not in ('Decode', 'Execute')) or unit == 'Fetch' and manifest['parameters'].get('iCacheBytes'):
+        if unit in ('Backend', 'Frontend', 'Gpr', 'MulDiv', 'Fpu', 'Csr', 'MemoryArbiter', 'ReadQueue', 'MemoryFabric', 'Memory', 'Axi', 'InstructionCache', 'DataCache', 'Coherence', 'SharedCache', 'Lsu', 'LocalInterrupts', 'Translation') or (enabled and unit not in ('Decode', 'Execute')) or unit == 'Fetch' and manifest['parameters'].get('iCacheBytes'):
             if unit == 'Backend':
                 dual = manifest['parameters'].get('loadQueueEntries', 1) == 2
                 owned = '{1\'b0, contexts != 0} + {1\'b0, contexts_0 != 0}' if dual else 'state != 0'
@@ -5531,6 +5681,11 @@ endmodule''', 1)
   end
 ''')
                 files['DitDahA1MulDiv.sv'] = license + header(sources['DitDahA1MulDiv.sv']) + RESOURCE + 'endmodule\n'
+                if manifest['parameters'].get('floatingPointBits'):
+                    resource = RESOURCE.replace('[63:0]', '[68:0]').replace('assign output_bits = data;', 'assign output_bits_value=data[63:0]; assign output_bits_flags=data[68:64];')
+                    resource = resource.replace('if (input_valid && input_ready) pending <= 1;', 'if(input_valid && input_ready)begin pending<=1;if(finish)begin valid<=1;data<=result;end end')
+                    files['DitDahA1Fpu.sv'] = license + header('module DitDahA1Fpu'+sources['DitDahA1Fpu.sv'].split('module DitDahA1Fpu', 1)[1]) + resource + 'endmodule\n'
+                    files.pop('DitDahA1FloatLibrary.sv', None)
             if name == 'InterruptBackend':
                 observed = files[module + '.sv']
                 writes = [f'we_{lane}' for lane in range(manifest['parameters']['issueWidth'])]
@@ -5542,7 +5697,11 @@ endmodule''', 1)
                     body += f'\n  wire {"[63:0] " if port.startswith("trap") else ""}formal_{port} = {connections[0]};\n'
                 body += '  wire formal_we = ' + ' | '.join('formal_' + name for name in writes) + ';\n'
                 files[module + '.sv'] = observed
-            files[module + '.sv'] = files[module + '.sv'].replace('endmodule', body + '\nendmodule', 1)
+            if unit == 'Fpu':
+                prefix, suffix = files[module + '.sv'].rsplit('endmodule', 1)
+                files[module + '.sv'] = prefix + body + '\nendmodule' + suffix
+            else:
+                files[module + '.sv'] = files[module + '.sv'].replace('endmodule', body + '\nendmodule', 1)
             top = module
         else:
             top = 'formal_top'
@@ -5571,6 +5730,8 @@ endmodule''', 1)
             before = re.search(r': ~\w+ \| abort \| responseFault \| bypass \| ~complete', sources[module + '.sv']).group()
             after = before.replace(' | abort', '')
         checks = [('prove', before, after), ('cover', before, after), ('mutation', before, after)]
+        if name == 'FloatingBackend':
+            checks[1:2] = [(f'cover-{n}', before, after) for n in range(3)]
         if unit == 'SharedCache':
             original = sources[module + '.sv']
             invalidation = re.search(r'valid <=\s*writeAccepted[^;]+;', original).group()
@@ -6817,6 +6978,33 @@ endmodule''', 1)
                         assert len(rows) == 1, 'Ambiguous storage witness row'
                         text, count = re.subn(r'\(\* anyconst \*\) reg (\[[^]]+\]) auth_watched;', r'wire \1 auth_watched = ' + rows[0] + ';', text)
                         assert count == 1, 'Missing storage witness row'
+                if name == 'FloatingBackend' and not proving and filename == module + '.sv':
+                    fp_words = ([0x40100093, 0x00309093, 0x30009073, 0x30445073] if manifest['parameters']['enableInterrupts'] else [0x000020b7, 0x30009073])+[0xf0008053, 0x13]
+                    fp_instruction = ''.join(f"fp_sequence=={n}?32'h{word:x}:" for n, word in enumerate(fp_words[:-1]))+"32'h13"
+                    fp_drives = [('instruction_bits_packets_0_instruction', 32, fp_instruction), ('instruction_bits_count', manifest['parameters']['issueWidth'].bit_length(), '1'), ('instruction_valid', 1, '1')]
+                    fp_drives += [('instruction_bits_packets_0_'+pin, width, value) for pin, width, value in (('pc',64,"64'h100+fp_sequence*4"),('tag',8,'0'),('length',3,'4'),('fault',1,'0'),('predictedTaken',1,'0'),('predictedPc',64,'0'))]
+                    if manifest['parameters']['enableInterrupts']:
+                        fp_drives += [('interrupts_software',1,'fp_interrupt_witness && fp_owner'),('interrupts_timer',1,'0'),('interrupts_external',1,'0')]
+                        text = text.replace('endmodule', f'wire fp_interrupt_witness={int(mode=="cover-0")};\nendmodule', 1)
+                    for pin, width, expression in fp_drives:
+                        fp_header, fp_impl = text.split(');', 1)
+                        fp_header, count = re.subn(r'\b'+pin+r'\b', 'formal_unused_'+pin, fp_header)
+                        text = fp_header+');'+fp_impl
+                        assert count == 1
+                        text = text.replace('endmodule', f"wire [{width-1}:0] {pin}={expression};\nendmodule", 1)
+                    text = re.sub(r'\(\* anyconst \*\) reg (\[[^]]+\]) (fp_row|fp_bit);', lambda match: f'wire {match[1]} {match[2]}={13 if match[2]=="fp_bit" else 0};', text)
+                    text = text.replace('endmodule', f'''
+  reg [{(len(fp_words)-1).bit_length()-1}:0] fp_sequence=0;
+  always @(posedge clock) if(reset)fp_sequence<=0;
+  else if(instruction_valid && instruction_ready && fp_sequence!={len(fp_words)-1})fp_sequence<=fp_sequence+1;
+endmodule''', 1)
+                    if mode.startswith('cover-'):
+                        text = partition_covers(text, int(mode.split('-')[-1]), 3)
+                if name == 'FloatingBackend' and not proving and filename == 'DitDahA1Fpu.sv':
+                    fp_expected = (0xffffffff00000000 if manifest['parameters']['floatingPointBits']==64 else 0) | (0x2008 if manifest['parameters']['enableInterrupts'] else 0x2000)
+                    text = text.replace('(* anyseq *) reg [68:0] result;', f"wire [68:0] result=69'h{fp_expected:x};")
+                    if manifest['parameters']['enableInterrupts']:
+                        text = text.replace('(* anyseq *) reg finish;', "wire finish=1;")
                 if mutating and filename == mutated_file:
                     assert text.count(before) == (2 if name == 'Csr' else 1), (name, before)
                     text = text.replace(before, after, 1)
@@ -6869,7 +7057,7 @@ endmodule''', 1)
             task = 'bmc' if mutating else 'prove' if proving else 'cover' if mode.startswith('cover') else mode
             if mode == 'mutation' and name == 'Fetch':
                 task = 'prove'
-            engine = 'abc pdr' if task == 'prove' and unit not in ('Gpr', 'MulDiv', 'Pmp', 'PmpDecode', 'PmpInterval', 'PmpSubset', 'Csr', 'Memory', 'Axi', 'InstructionCache', 'DataCache', 'Coherence', 'SharedCache', 'Decode', 'Execute', 'LocalInterrupts', 'Translation') and name not in ('SynchronizationBackend', 'WfiBackend') else 'smtbmc z3'
+            engine = 'abc pdr' if task == 'prove' and unit not in ('Gpr', 'MulDiv', 'Fpu', 'Pmp', 'PmpDecode', 'PmpInterval', 'PmpSubset', 'Csr', 'Memory', 'Axi', 'InstructionCache', 'DataCache', 'Coherence', 'SharedCache', 'Decode', 'Execute', 'LocalInterrupts', 'Translation') and name not in ('SynchronizationBackend', 'WfiBackend') else 'smtbmc z3'
             if unit == 'ReadQueue':
                 engine = 'smtbmc z3'
                 if (mode == 'prove-control' or mode.startswith('prove-response-') or read_bit_step == 4 and mode.startswith('prove-storage-')) and manifest['parameters']['hartCount'] > 2:
@@ -6884,11 +7072,13 @@ endmodule''', 1)
                 engine = 'smtbmc --syn --unroll z3'
             if unit == 'Backend' and task != 'prove':
                 engine = 'smtbmc --syn --unroll z3'
+            if name == 'FloatingBackend' and task != 'prove':
+                engine = 'smtbmc --nopresat --unroll z3' if mutating else 'smtbmc --unroll z3'
             if witness:
                 engine = 'smtbmc --unroll z3'
             if name in ('WfiBackend', 'SynchronizationBackend') and task == 'prove':
                 engine = 'smtbmc --syn --unroll z3'
-            timeout = 180 if name in ('SharedCache', 'InterruptBackend', 'SynchronizationBackend') and task == 'cover' else 60
+            timeout = 90 if name == 'FloatingBackend' and task != 'prove' else 180 if name in ('SharedCache', 'InterruptBackend', 'SynchronizationBackend') and task == 'cover' else 60
             if name == 'InterruptBackend' and task == 'cover' and manifest['parameters']['issueWidth'] == 3:
                 timeout = 600
             if name in ('InterruptBackend', 'PipelineBackend') and mutating and manifest['parameters']['issueWidth'] == 3:
@@ -6899,6 +7089,8 @@ endmodule''', 1)
                 engine = 'abc pdr'
             if unit == 'Backend' and task == 'prove' and (manifest['parameters']['issueWidth'] > 1 or manifest['parameters'].get('loadQueueEntries', 1) == 2):
                 timeout = 180
+            if unit == 'Fpu':
+                depth = 4 if task == 'prove' else 12
             if name == 'WideFetch' and task == 'cover' and manifest['parameters'].get('virtualAddressBits') == 39:
                 timeout = 180
             if name == 'DataCacheWriteback' and task == 'cover':
@@ -6939,7 +7131,7 @@ endmodule''', 1)
                     timeout = 180
             if name in ('WideFetch', 'WfiFrontend', 'PipelineBackend') and task == 'prove':
                 depth = 6 if name == 'WideFetch' else 4
-            if name in ('WfiBackend', 'InterruptBackend') and mutating:
+            if name in ('FloatingBackend', 'WfiBackend', 'InterruptBackend') and mutating:
                 depth = 32 if name == 'WfiBackend' else 40
             config = f'''[options]
 mode {task}
@@ -6948,12 +7140,12 @@ timeout {timeout}
 {witness_option}[engines]
 {engine}
 [script]
-read -formal -sv {'-noautowire ' if name in ('PipelineBackend', 'DataCacheAssociativity') else ''}{' '.join(files)}
+read -formal -sv {'-noautowire ' if name in ('FloatingFpu', 'FloatingBackend', 'PipelineBackend', 'DataCacheAssociativity') else ''}{' '.join(files)}
 {preparation}
 [files]
 ''' + '\n'.join(files) + '\n'
             (work / 'check.sby').write_text(config)
-            counted = (work / (module + '.sv')).read_text() if unit in ('ReadQueue', 'Axi', 'DataCache', 'MemoryFabric') or name in ('PipelineBackend', 'WfiFrontend') else body
+            counted = (work / (module + '.sv')).read_text() if unit in ('ReadQueue', 'Axi', 'DataCache', 'MemoryFabric') or name in ('FloatingBackend', 'PipelineBackend', 'WfiFrontend') else body
             arguments = (work, timeout, name, mode, module, engine, counted)
             if jobs > 1 and mode.startswith('prove-bits-'):
                 proof_futures.append(executor.submit(run_check, *arguments))
@@ -7027,11 +7219,14 @@ read -formal -sv {'-noautowire ' if name in ('PipelineBackend', 'DataCacheAssoci
         if port_modes:
             assert {r['mode']: r['covers'] for r in reports if r['propertyGroup'] == 'MemoryFabric' and r['mode'] in ('cover', 'cover-response')} == {'cover': 3, 'cover-response': 1}, 'Incomplete fabric covers'
         assert {'prove-control', *port_modes, *tag_modes, 'cover', 'mutation-data', *(f'prove-stability-{i}' for i in range(2 * manifest['parameters']['hartCount']))} <= {r['mode'] for r in reports if r['propertyGroup'] == 'MemoryFabric'}, 'Incomplete fabric proof'
+    if 'FloatingBackend' in proved and mutations is None: assert {'prove', 'cover-0', 'cover-1', 'cover-2', 'mutation'} <= {r['mode'] for r in reports if r['propertyGroup']=='FloatingBackend'}, 'Incomplete floating ownership proof'
     if 'Axi' in proved:
         assert {'prove-control', 'prove-payload-state', *axi_output_modes(), 'cover'} <= {r['mode'] for r in reports if r['propertyGroup'] == 'Axi'}, 'Incomplete AXI proof'
     summary.write_text(json.dumps(dict(
         scope='selected negative controls only' if mutations is not None else 'module-level safety, cover reachability and mutation detection',
         selectedMutations=mutations, propertyGroups=sorted(proved),
+        floatingRetirement='actual backend FPR bank watched over every row and bit, retired fault/write/dirty gates and independent M/F accepted-owner ledgers; arithmetic replies abstracted with arbitrary latency and payload, no progress claim' if 'FloatingBackend' in proved else None,
+        floatingTransport='actual shared service and selected FLEN; arithmetic format interfaces abstract numerical payloads and arbitrary completion delay, with a private accepted-request ledger per format; no progress or arithmetic-equivalence claim' if 'FloatingFpu' in proved else None,
         assumptions='initial reset, then no reset except CSR proofs; Fetch responses require accepted requests and stable blocked payloads; enabled control proofs abstract combinational authorization',
         fabricProbeAssumptions='probe responses require accepted requests and stable held frames; concrete cache endpoint proofs discharge these contracts; controller/physical ownership overlap and retained maintenance tags are checked, including noncacheable-line-base internal releases' if any(r['propertyGroup'] == 'MemoryFabric' and r['mode'] == 'prove-control' for r in reports) and manifest['parameters'].get('dCacheBytes') else None,
         cacheRoutingMutation=dict(applicable=cache_routing_base is not None, lineBase=cache_routing_base,
@@ -7102,6 +7297,6 @@ if __name__ == '__main__':
     parser.add_argument('--output', type=Path, default=Path('result/formal'))
     parser.add_argument('--mutations', nargs='+')
     parser.add_argument('--jobs', type=int, default=1)
-    parser.add_argument('--modules', nargs='+', choices=('Fetch', 'CompressedFetch', 'WideFetch', 'Gpr', 'MulDiv', 'Backend', 'PipelineBackend', 'Pmp', 'PmpDecode', 'PmpInterval', 'PmpSubset', 'Csr', 'UserCsr', 'UserExecute', 'SupervisorCsr', 'SupervisorExecute', 'SupervisorFetch', 'Lsu', 'LsuReads', 'InterruptCsr', 'InterruptBackend', 'SynchronizationBackend', 'SharedCache', 'InstructionCache', 'DataCache', 'DataCacheWriteback', 'DataCacheAssociativity', 'Coherence', 'MemoryArbiter', 'ReadQueue', 'MemoryFabric', 'Memory', 'Axi', 'WordDecode', 'WordExecute', 'BitManipDecode', 'BitManipExecute', 'IntegerDecode', 'IntegerExecute', 'WfiBackend', 'WfiFrontend', 'LocalInterrupts', 'Translation'))
+    parser.add_argument('--modules', nargs='+', choices=('FloatingBackend', 'FloatingFpu', 'Fetch', 'CompressedFetch', 'WideFetch', 'Gpr', 'MulDiv', 'Backend', 'PipelineBackend', 'Pmp', 'PmpDecode', 'PmpInterval', 'PmpSubset', 'Csr', 'FloatingCsr', 'UserCsr', 'UserExecute', 'SupervisorCsr', 'SupervisorExecute', 'SupervisorFetch', 'Lsu', 'LsuReads', 'InterruptCsr', 'InterruptBackend', 'SynchronizationBackend', 'SharedCache', 'InstructionCache', 'DataCache', 'DataCacheWriteback', 'DataCacheAssociativity', 'Coherence', 'MemoryArbiter', 'ReadQueue', 'MemoryFabric', 'Memory', 'Axi', 'WordDecode', 'WordExecute', 'BitManipDecode', 'BitManipExecute', 'IntegerDecode', 'IntegerExecute', 'WfiBackend', 'WfiFrontend', 'LocalInterrupts', 'Translation'))
     args = parser.parse_args()
     verify(args.rtl, args.output, args.modules, args.mutations, args.jobs)

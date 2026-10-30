@@ -9,6 +9,7 @@ import re
 import random
 import subprocess
 
+from floating import FLOATING_ENCODINGS, floating_decode, floating_value
 from programs import addi, alu, amo, beq, csr, sd, mul, muldiv, ld, lw, sw, load, store, fence
 from model import BITMANIP_ENCODINGS, ATOMIC_OPERATIONS, Fault, LocalInterrupts, Model, MASK, atomic_value, compressed_instruction, muldiv_value, pmp_allowed, signed, sv39_walk
 
@@ -638,45 +639,50 @@ def compressed_fetch_contract(parameters, frontend=False):
     return body + '    end\n'
 
 
-def compressed_decode_contract(directory):
+def compressed_decode_contract(directory, parameters):
     table = directory / 'compressed.hex'
     values = []
     for raw in range(65536):
-        insn = compressed_instruction(raw)
+        insn = compressed_instruction(raw, parameters.get("floatingPointBits") == 64)
         opcode, f = insn & 127, (insn >> 12) & 7
         rs1, rs2, rd = (insn >> 15) & 31, (insn >> 20) & 31, (insn >> 7) & 31
         op = {0x37: 1, 0x13: 3 if f == 0 else 21, 0x1b: 23,
               0x33: 4 if f == 0 and insn >> 25 == 0 else 22, 0x3b: 24,
-              0x03: 18 if f == 2 else 8, 0x23: 20 if f == 2 else 9,
+              0x03: 18 if f == 2 else 8, 0x23: 20 if f == 2 else 9, 7: 8, 0x27: 9,
               0x63: 5 if f == 0 else 25, 0x6f: 6, 0x67: 7, 0x73: 12}.get(opcode, 0)
         immediate = signed(insn >> 20, 12)
         if opcode == 0x37:
             immediate = signed(insn & ~4095, 32)
-        elif opcode == 0x23:
+        elif opcode in (0x23, 0x27):
             immediate = signed(((insn >> 25) << 5) | ((insn >> 7) & 31), 12)
         elif opcode == 0x63:
             immediate = signed(((insn >> 31) << 12) | (((insn >> 7) & 1) << 11) | (((insn >> 25) & 63) << 5) | (((insn >> 8) & 15) << 1), 13)
         elif opcode == 0x6f:
             immediate = signed(((insn >> 31) << 20) | (((insn >> 12) & 255) << 12) | (((insn >> 20) & 1) << 11) | (((insn >> 21) & 1023) << 1), 21)
         use1 = op in (3, 4, 5, 7, 8, 9, 18, 20, 21, 22, 23, 24, 25)
-        use2 = op in (4, 5, 9, 20, 22, 24, 25)
-        write = op not in (0, 5, 9, 12, 20, 25)
+        floating = opcode in (7, 0x27)
+        use2 = op in (4, 5, 9, 20, 22, 24, 25) and not floating
+        write = op not in (0, 5, 9, 12, 20, 25) and not floating
         value = 0
         for field, bits in ((op, 5), (rs1, 5), (rs2, 5), (rd, 5), (immediate & MASK, 64),
                             (((insn >> 30) & 1) * 8 + f, 4), (int(use1), 1), (int(use2), 1), (int(write), 1)):
             value = (value << bits) | field
+        if parameters.get('floatingPointBits'):
+            value = (value << 3) | (int(floating) << 2) | (int(opcode == 7) << 1) | int(floating)
         values.append(f'{value:023x}')
     table.write_text('\n'.join(values) + '\n')
+    fields = ', output_bits_floating, output_bits_fpWrite, output_bits_serializing' if parameters.get('floatingPointBits') else ''
+    serial = '' if fields else ' && !output_bits_serializing'
     return f'''    begin
-      reg [90:0] expected [0:65535];
+      reg [{93 if fields else 90}:0] expected [0:65535];
       $readmemh("{table.resolve()}", expected);
       input_valid=1; output_ready=1; input_bits_length=2;
       for (integer n=0; n<65536; n=n+1) begin
         input_bits_instruction=n;
         check({{output_bits_operation, output_bits_rs1, output_bits_rs2, output_bits_rd,
           output_bits_immediate, output_bits_functionCode, output_bits_usesRs1,
-          output_bits_usesRs2, output_bits_writesRd}} == expected[n] &&
-          output_bits_instruction_instruction == n && output_bits_instruction_length == 2 && !output_bits_serializing,
+          output_bits_usesRs2, output_bits_writesRd{fields}}} == expected[n] &&
+          output_bits_instruction_instruction == n && output_bits_instruction_length == 2{serial},
           "Exhaustive compressed decode, immediate, dependencies and raw encoding");
       end
     end
@@ -752,13 +758,139 @@ def decode_contract(parameters, directory):
 '''
         for word in (0x120000f3, 0x12001073, 0x14000073):
             body += f"    input_bits_instruction = 32'h{word:x}; check(output_bits_operation != 16, \"SFENCE requires its complete standard encoding\");\n"
-    return body + (compressed_decode_contract(directory) if parameters.get('enableC') else "    input_bits_length=2; input_bits_instruction='h4485; check(output_bits_operation==0, \"Disabled compressed encoding\"); input_bits_length=4;\n") + '''    input_bits_instruction = 32'h00728333; input_bits_fault = 1;
+    body += floating_decode_contract(parameters)
+    return body + (compressed_decode_contract(directory, parameters) if parameters.get('enableC') else "    input_bits_length=2; input_bits_instruction='h4485; check(output_bits_operation==0, \"Disabled compressed encoding\"); input_bits_length=4;\n") + '''    input_bits_instruction = 32'h00728333; input_bits_fault = 1;
     check(!output_bits_usesRs1 && !output_bits_usesRs2 && !output_bits_writesRd, "Faulting instruction dependencies");
     input_bits_instruction = 32'h34029373;
     check(!output_bits_usesRs1 && !output_bits_writesRd && !output_bits_serializing, "Faulting CSR serialization");
     input_bits_instruction = 32'h0000100f;
     check(!output_bits_usesRs1 && !output_bits_usesRs2 && !output_bits_writesRd && !output_bits_serializing, "Faulting instruction synchronization");
 '''
+
+
+
+def floating_decode_contract(parameters):
+    body = ''
+    for name, (encoding, mask, rounding, fp_write, integer_source, minimum) in FLOATING_ENCODINGS.items():
+        for mode in (range(8) if rounding else (0,)):
+            instruction = encoding | (6 << 7) | (5 << 15) | ((7 << 20) & ~mask) | ((mode << 12) if rounding else 0)
+            decoded = floating_decode(instruction, parameters.get('floatingPointBits', 0))
+            opcode, function = instruction & 127, (instruction >> 12) & 7
+            op = (18 if function == 2 else 8) if opcode == 7 else (20 if function == 2 else 9) if opcode == 0x27 else 14
+            valid = decoded is not None
+            use1, write = valid and integer_source, valid and not fp_write and opcode != 0x27
+            body += f"    input_bits_instruction=32'h{instruction:08x}; input_bits_length=4;\n"
+            body += f'    check(output_bits_operation=={op if valid else 0} && output_bits_usesRs1=={int(use1)} && !output_bits_usesRs2 && output_bits_writesRd=={int(write)} && output_bits_serializing=={int(valid)}, "Floating encoding and dependencies {name}/{mode}");\n'
+            if parameters.get('floatingPointBits'):
+                body += f'    check(output_bits_floating=={int(valid)} && output_bits_fpWrite=={int(valid and fp_write)}, "Floating register destination");\n'
+    return body
+
+
+
+def floating_csr_contract(parameters):
+    return """    write=0; fpDirty=0; fpFlags=0;
+    readAddress=1; check(!legal && !fpEnabled && roundingMode==0, "FS off blocks floating CSR");
+    write=1; writeAddress='h300; writeData='h2000; tick(); write=0;
+    readAddress=3; check(legal && readData==0 && fpEnabled, "FS initial enables shared floating CSR");
+    write=1; writeAddress=1; writeData='h15; tick(); write=0;
+    readAddress='h300; check(readData[63] && readData[14:13]==3, "Retired floating CSR marks context dirty");
+    write=1; writeAddress=2; writeData=7; tick(); write=0;
+    readAddress=3; check(readData=='hf5 && roundingMode==7, "Reserved dynamic rounding value is retained");
+    fpFlags='ha; fpDirty=1; tick(); fpDirty=0;
+    readAddress=1; check(readData=='h1f, "Retired flags accumulate");
+    write=1; writeAddress=1; writeData=0; tick(); write=0;
+    readAddress=3; check(readData=='he0, "Flag clear preserves rounding mode");
+    write=1; writeAddress='h300; writeData='h4000; tick(); write=0;
+    fpFlags='h10; tick(); readAddress='h300;
+    check(!readData[63] && readData[14:13]==2, "Unretired flags do not dirty context");
+    fpDirty=1; tick(); fpDirty=0;
+    readAddress=3; check(readData=='hf0, "New retired exception preserves rounding mode");
+    trap=1; trapCause=3; trapPc='h108; tick(); trap=0;
+    mret=1; tick(); mret=0; readAddress='h300;
+    check(readData[63] && readData[14:13]==3, "Trap and return preserve floating context");
+    write=1; writeAddress='h300; writeData=0; tick(); write=0;
+    readAddress=3; check(!legal && !fpEnabled, "FS off blocks access without erasing context");
+    write=1; writeAddress='h300; writeData='h2000; tick(); write=0;
+    readAddress=3; check(legal && readData=='hf0, "Context restored after FS enable");
+"""
+
+
+def floating_execute_contract(parameters):
+    if not parameters.get('floatingPointBits'):
+        return ''
+    body = ''
+    for word, operation in ((0x00007053, 14), (0x10000053, 14), (0x00002007, 26), (0x00002027, 27)):
+        for enabled in (0, 1):
+            for mode in range(8):
+                for fault in (0, 1):
+                    illegal = not enabled or word == 0x00007053 and mode > 4
+                    body += f'''    input_valid=1; input_bits_decoded_floating=1; input_bits_decoded_fpWrite=1;
+    input_bits_decoded_operation={operation}; input_bits_decoded_instruction_instruction='h{word:x};
+    input_bits_decoded_functionCode={(word >> 12) & 7};
+    input_bits_decoded_instruction_fault={fault}; input_bits_decoded_instruction_cause=1;
+    input_bits_decoded_instruction_tval='h1234; fpEnabled={enabled}; roundingMode={mode};
+    check(output_bits_instruction_fault=={int(bool(fault or illegal))}, "Floating context legality");
+'''
+                    if fault or illegal:
+                        body += f'    check(output_bits_instruction_cause=={1 if fault else 2} && output_bits_instruction_tval==\'h{0x1234 if fault else word:x}, "Floating fault priority");\n'
+    return body
+
+
+def floating_contract(parameters, directory):
+    flen, rows = parameters['floatingPointBits'], []
+    rng = random.Random(2026)
+    for name, (encoding, mask, rounding, fp_write, integer_source, minimum) in FLOATING_ENCODINGS.items():
+        if minimum > flen or encoding & 127 in (7, 0x27):
+            continue
+        width = 32 if not encoding & (1 << 25) else 64
+        fraction = 23 if width == 32 else 52
+        infinity = ((1 << (width - fraction - 1)) - 1) << fraction
+        edges = (0, 1 << (width - 1), 1, 1 << fraction, infinity, infinity | (1 << (width - 1)), infinity | 1, infinity | (1 << (fraction - 1)), (1 << width) - 1)
+        for mode in (range(5) if rounding else (0,)):
+            instruction = encoding | ((mode << 12) if rounding else 0)
+            for index in range(13 if encoding & 127 != 0x53 else 12):
+                values = [edges[(index + offset) % len(edges)] if index < len(edges) else rng.getrandbits(width) for offset in (0, 3, 5)]
+                if index == 12:
+                    values = [1 << fraction, 1 << fraction, (1 << fraction) - 1]
+                if integer_source:
+                    values[0] = (0, 1, MASK, 1 << 63, (1 << 63) - 1, 0x80000000, 0xffffffff)[index % 7]
+                for operand in range(3):
+                    if width == 32 and flen == 64 and not (operand == 0 and integer_source):
+                        values[operand] |= 0xffffffff00000000
+                if name == 'fcvt.s.d':
+                    values[0] = rng.getrandbits(64)
+                elif name == 'fcvt.d.s':
+                    values[0] = 0xffffffff00000000 | rng.getrandbits(32)
+                if width == 32 and flen == 64 and index == 11 and not integer_source:
+                    values[0] &= 0xffffffff
+                value, flags = floating_value(instruction, *values, mode, flen)
+                packed = 0
+                for field, bits in ((instruction, 32), *((v, 64) for v in values), (mode, 3), (value, 64), (flags, 5)):
+                    packed = (packed << bits) | (field & ((1 << bits) - 1))
+                rows.append(f'{packed:074x}')
+    table = directory / 'floating.hex'
+    table.write_text('\n'.join(rows) + '\n')
+    return f"""    begin
+      reg [295:0] vectors[0:{len(rows)-1}];
+      reg [63:0] expected;
+      reg [4:0] expectedFlags;
+      integer cycles;
+      $readmemh("{table.resolve()}", vectors);
+      for(integer n=0; n<{len(rows)}; n++) begin
+        {{input_bits_instruction,input_bits_a,input_bits_b,input_bits_c,input_bits_roundingMode,expected,expectedFlags}}=vectors[n];
+        input_valid=1; output_ready=0;
+        check(input_ready, "Floating request acceptance"); tick(); input_valid=0;
+        input_bits_instruction=~input_bits_instruction; input_bits_a=~input_bits_a; input_bits_b=~input_bits_b; input_bits_c=~input_bits_c; input_bits_roundingMode=~input_bits_roundingMode;
+        cycles=0; while(!output_valid && cycles<128) begin tick();cycles++;end
+        repeat(3)begin
+          if(!output_valid || input_ready || output_bits_value!==expected || output_bits_flags!==expectedFlags)
+            $display("Floating mismatch index=%0d vector=%h result=%h/%h expected=%h/%h",n,vectors[n],output_bits_value,output_bits_flags,expected,expectedFlags);
+          check(output_valid && !input_ready && output_bits_value==expected && output_bits_flags==expectedFlags, "Floating value, flags, captured request and held response"); tick();
+        end
+        output_ready=1; tick(); output_ready=0;
+      end
+    end
+"""
 
 
 def execute_contract(parameters):
@@ -3150,6 +3282,44 @@ def backend_queue_contract(parameters):
     return body
 
 
+def backend_floating_contract(parameters):
+    if not parameters.get('floatingPointBits') or not parameters['enableInterrupts']:
+        return ''
+    def send(words):
+        return ''.join(f'''    instruction_bits_pc='h{0x100 + 4*n:x}; instruction_bits_instruction='h{word:x};
+    instruction_bits_tag={n}; instruction_valid=1;
+    while(!instruction_ready) tick(); tick(); instruction_valid=0;
+''' for n, word in enumerate(words))
+    def stored(value):
+        return f'''    while(!data_request_valid) tick();
+    check(data_request_bits_write && data_request_bits_data==64'h{value:x}, "Floating cancellation and resource reuse");
+    data_response_bits_tag=data_request_bits_tag; data_request_ready=1; tick(); data_request_ready=0;
+    data_response_valid=1; while(!data_response_ready) tick(); tick(); data_response_valid=0;
+    repeat(8) tick();
+'''
+    body = ''
+    for completed in (False, True):
+        body += '''    reset=1; tick(); reset=0; tick();
+    interrupts_external=0; interrupts_software=0; interrupts_timer=0;
+    data_request_ready=0; data_response_valid=0;
+'''
+        body += send((0x000020b7, csr(0, 0x300, 1), 0x3f8000b7, 0xf0008053,
+                      0x404000b7, 0xf00080d3, 0xf0000153, 0x00004237, addi(4, 4, 8), csr(0, 0x300, 4),
+                      addi(1, 0, -1), csr(0, 0x304, 1)))
+        body += '    repeat(10) tick();\n'
+        body += send((0x18200053 if completed else 0x18100053,))
+        body += f'''    while(!dut.fpu.{'valid' if completed else 'busy'}) tick();
+    interrupts_external=1; #1; while(!redirect) tick(); tick(); interrupts_external=0;
+    check(!dut.issuedValid && dut.csr.fcsr==0 && dut.csr.fs==2,
+      "Cancelled floating operation changed context");
+'''
+        body += send((0xe00002d3, sd(5, 0))) + stored(0x3f800000)
+        body += send((addi(2, 0, 21), addi(3, 0, 3), muldiv(5, 2, 3, 4), sd(5, 0))) + stored(7)
+        body += send((0x00000053, 0xe00002d3, sd(5, 0))) + stored(0x40000000)
+        body += '    check(dut.csr.fcsr==0 && dut.csr.fs==3, "Retired floating operation updates context");\n'
+    return body
+
+
 def backend_contract(parameters):
     words = [(2 << 12) | (1 << 7) | 0x37, addi(2, 0, 42), sd(2, 1), 0x73, sd(2, 1, 8)]
     body = f'''    instruction_bits_length = 4;
@@ -3472,7 +3642,7 @@ def backend_fence_contract():
 
 
 def module_ports(module):
-    header = module.read_text().split(');', 1)[0].split('(', 1)[1]
+    header = re.search(r'\bmodule\s+' + re.escape(module.stem) + r'\s*(?:#\([^)]*\))?\s*\((.*?)\);', module.read_text(), re.S).group(1)
     ports = []
     direction, width = None, ''
     for item in header.split(','):
@@ -4685,6 +4855,9 @@ def verify(rtl, directory, modules=None):
     if not parameters.get('enableA', True):
         lsu_source = emitted_source('DitDahA1Lsu')
         assert 'reservedWord' not in lsu_source and 'reservedDoubleword' not in lsu_source, 'Disabled reservation state was emitted'
+    if not parameters.get('floatingPointBits'):
+        assert not (rtl / 'DitDahA1Fpu.sv').exists() and not (rtl / 'DitDahA1FloatLibrary.sv').exists(), 'Disabled floating resource was emitted'
+        assert 'fpWrite' not in emitted_source('DitDahA1Backend') and 'fcsr' not in emitted_source('DitDahA1Csr'), 'Disabled floating state was emitted'
     suites = (('DitDahA1Fetch', (burst_fetch_contract(parameters) if parameters.get('enableBurstRefill') else cached_fetch_contract(parameters)) if cached else FETCH + (protection_contract(True) if enabled else '')),
                        ('DitDahA1Lsu', lsu_queue_contract(parameters) if parameters.get('loadQueueEntries', 1) == 2 else
                         LSU + (lsu_reservation_contract(parameters) if parameters.get('enableA', True) else '') + (protection_contract(False) if enabled else '') + lsu_refill_contract(parameters)),
@@ -4701,6 +4874,8 @@ def verify(rtl, directory, modules=None):
                         (burst_axi_contract(parameters) if parameters.get('enableBurstRefill') else '') +
                         (burst_axi_contract(parameters, False) if parameters.get('dCacheRefillBytes') == 64 else '')),
                        ('DitDahA1MemoryFabric', fabric_contract(parameters)))
+    if parameters.get('floatingPointBits'):
+        suites += (('DitDahA1Fpu', floating_contract(parameters, directory)),)
     if parameters.get('fabricReadSlots') or parameters['hartCount'] > 1:
         suites += (('DitDahA1ReadQueue', read_queue_contract(parameters)),)
     if cached:
@@ -4724,6 +4899,10 @@ def verify(rtl, directory, modules=None):
                 (supervisor_csr_contract(parameters) if parameters.get('enableSupervisorMode') else
                  (interrupt_csr_contract(parameters) if parameters['enableInterrupts'] else '') +
                  (user_csr_contract(parameters) if parameters.get('enableUserMode') else ''))),)
+    if parameters.get('floatingPointBits'):
+        suites = tuple((name, body + (floating_csr_contract(parameters) if name == 'DitDahA1Csr' else
+                       backend_floating_contract(parameters) if name == 'DitDahA1Backend' else
+                       floating_execute_contract(parameters) if name == 'DitDahA1Execute' else '')) for name, body in suites)
     if parameters.get('enableUserMode'):
         suites = tuple((name, body + (privilege_memory_contract(parameters, name != 'DitDahA1Lsu', name == 'DitDahA1Frontend')
                        if name in ('DitDahA1Fetch', 'DitDahA1Frontend', 'DitDahA1Lsu') and
@@ -4762,6 +4941,9 @@ def verify(rtl, directory, modules=None):
                               r'(dut.\1Count != 0)', body)
                 body += backend_group_contract(parameters) + (backend_branch_contract() if parameters.get('loadQueueEntries', 1) == 1 else '') + backend_memory_group_contract(parameters)
         source = bench(module, body, 4 + 69 * body.count('MulDiv resource reuse')) if name == 'DitDahA1MulDiv' else bench(module, body)
+        if name == 'DitDahA1Fpu':
+            source = bench(module, body, 150 * (directory / 'floating.hex').read_text().count('\n')).replace('DitDahA1Fpu dut(', f"DitDahA1Fpu #(.FLEN({parameters['floatingPointBits']})) dut(")
+
         if name in ('DitDahA1Axi', 'DitDahA1ReadQueue'):
             prefix = 'axi_' if name == 'DitDahA1Axi' else ''
             checks = axi_cache_attributes(parameters)
@@ -4797,6 +4979,8 @@ def verify(rtl, directory, modules=None):
                             if file.startswith(('sharedData_', 'sharedTags_', 'mem_'))]
         if name == 'DitDahA1Backend':
             dependencies = [rtl / ('DitDahA1' + child + '.sv') for child in ('Decode', 'Issue', 'Execute', 'Commit', 'Gpr', 'Csr', 'Lsu', *(('MulDiv',) if parameters.get('enableM', True) else ())) ]
+        if name in ('DitDahA1Backend', 'DitDahA1Fpu') and parameters.get('floatingPointBits'):
+            dependencies += [rtl / (name + '.sv') for name in (('DitDahA1Fpu', 'DitDahA1FloatLibrary') if name == 'DitDahA1Backend' else ('DitDahA1FloatLibrary',))]
         if enabled and name in ('DitDahA1Fetch', 'DitDahA1Lsu', 'DitDahA1Frontend', 'DitDahA1Backend'):
             dependencies.append(rtl / 'DitDahA1Pmp.sv')
         if enabled and name == 'DitDahA1Translation':

@@ -89,26 +89,26 @@ object DitDahA1Backend extends Generator[DitDahA1Parameter, DitDahA1Layers, DitD
     val issuedPacket = issuedPackets(0)
     val resultCount = RegInit(0.U(countBits))
     val resultValid = resultCount =/= 0.U
-    val resultPackets = Reg(Vec(width, new ResultPacket))
+    val resultPackets = Reg(Vec(width, new ResultPacket(parameter)))
     val resultPacket = resultPackets(0)
     val resultResolved = RegInit(false.B)
     val memoryCount = RegInit(0.U(countBits))
     val memoryValid = memoryCount =/= 0.U
-    val memoryPackets = Reg(Vec(width, new ResultPacket))
+    val memoryPackets = Reg(Vec(width, new ResultPacket(parameter)))
     val memoryPacket = memoryPackets(0)
     val memoryResolved = RegInit(false.B)
     val commitCount = RegInit(0.U(countBits))
     val commitValid = commitCount =/= 0.U
-    val commitPackets = Reg(Vec(width, new ResultPacket))
+    val commitPackets = Reg(Vec(width, new ResultPacket(parameter)))
     val commitPacket = commitPackets(0)
     val commitResolved = RegInit(false.B)
     val memoryPending = RegInit(false.B)
     val concurrent = parameter.loadQueueEntries == 2
     val extraCount = Option.when(concurrent)(RegInit(0.U(countBits)))
-    val extraPackets = Option.when(concurrent)(Reg(Vec(width, new ResultPacket)))
+    val extraPackets = Option.when(concurrent)(Reg(Vec(width, new ResultPacket(parameter))))
     val extraPending = Option.when(concurrent)(RegInit(false.B))
     val extraValid = extraCount.map(_ =/= 0.U).getOrElse(false.B)
-    val executePending = Option.when(parameter.enableM)(RegInit(false.B))
+    val executePending = Option.when(parameter.enableM || parameter.floatingPointBits != 0)(RegInit(false.B))
     val resumePc = Option.when(parameter.enableInterrupts)(RegInit(parameter.resetVector.U(64)))
     val sleep = Option.when(parameter.enableInterrupts)(RegInit(false.B))
     val sleeping = if parameter.enableInterrupts then sleep.get else false.B
@@ -118,6 +118,7 @@ object DitDahA1Backend extends Generator[DitDahA1Parameter, DitDahA1Layers, DitD
     val issues = issue +: Seq.fill(width - 1)(DitDahA1Issue.instantiate(parameter))
     val execute = DitDahA1Execute.instantiate(parameter)
     val mulDiv = Option.when(parameter.enableM)(DitDahA1MulDiv.instantiate(parameter))
+    val fpu = Option.when(parameter.floatingPointBits != 0)(DitDahA1Fpu.instantiate(parameter))
     val commit = DitDahA1Commit.instantiate(parameter)
     val gpr = DitDahA1Gpr.instantiate(parameter)
     val csr = DitDahA1Csr.instantiate(parameter)
@@ -134,6 +135,9 @@ object DitDahA1Backend extends Generator[DitDahA1Parameter, DitDahA1Layers, DitD
     lsu.io.clock := io.clock
     lsu.io.reset := io.reset
     mulDiv.foreach { resource => resource.io.clock := io.clock; resource.io.reset := io.reset }
+    fpu.foreach { resource => resource.io.clock := io.clock; resource.io.reset := io.reset }
+    execute.io.fpEnabled.foreach(_ := csr.io.fpEnabled.get)
+    execute.io.roundingMode.foreach(_ := csr.io.roundingMode.get)
     execute.io.input.bits :<= issuedPacket
     execute.io.csrValue := csr.io.readData
     execute.io.csrLegal := csr.io.legal
@@ -162,11 +166,20 @@ object DitDahA1Backend extends Generator[DitDahA1Parameter, DitDahA1Layers, DitD
     val retire = commit.io.output
     val retired = retire.valid & retire.ready
     val retireCount = retired.?(retire.bits.instruction.fault.?(1.U(countBits), commitCount), 0.U(countBits))
-    val retirement = Wire(Vec(width, new ResultPacket))
+    val retirement = Wire(Vec(width, new ResultPacket(parameter)))
     retirement(0) :<= retire.bits
     for lane <- 1 until width do
       retirement(lane) :<= commitPackets(lane)
       retirement(lane).rdWrite := commitPackets(lane).rdWrite & (commitPackets(lane).rd =/= 0.U(5))
+    val floatingOperands = Option.when(parameter.floatingPointBits != 0) {
+      val packet = decodedPackets(0)
+      val write = retired & !retire.bits.instruction.fault & retire.bits.fpWrite.get
+      csr.io.fpDirty.get := write | (retired & !retire.bits.instruction.fault & (retire.bits.fpFlags.get =/= 0.U(5)))
+      csr.io.fpFlags.get := retire.bits.fpFlags.get
+      DitDahA1RegisterFile(parameter.floatingPointBits, false,
+        Seq(packet.rs1, packet.rs2, packet.instruction.instruction.asBits.bits(31, 27).asUInt),
+        Seq((write, retire.bits.rd, retire.bits.value)))
+    }
     val sequentialPc = (retire.bits.instruction.pc + retire.bits.instruction.length).asBits.bits(63, 0).asUInt
     val enterWfi = retired & retire.bits.wfi & !retire.bits.instruction.fault
     val pmpUpdate = if parameter.pmpEntries == 0 then false.B else
@@ -191,7 +204,7 @@ object DitDahA1Backend extends Generator[DitDahA1Parameter, DitDahA1Layers, DitD
     val commitReady = !commitValid | retired
     val memoryOperation = (resultPacket.load | resultPacket.store) & !resultPacket.instruction.fault
     val memoryCompletion = (memoryPacket.load | memoryPacket.store) & !memoryPacket.instruction.fault
-    val completion = Wire(new ResultPacket)
+    val completion = Wire(new ResultPacket(parameter))
     completion :<= memoryPacket
     when(memoryPending & (if concurrent then lsu.io.output.valid else true.B)) { completion :<= lsu.io.output.bits }
     val memoryFault = memoryValid & completion.instruction.fault
@@ -204,8 +217,13 @@ object DitDahA1Backend extends Generator[DitDahA1Parameter, DitDahA1Layers, DitD
       resultPacket.load & !resultPacket.store & !resultPacket.atomic & !resultPacket.instruction.fault
     val resultAdvance = resultValid & ((!memoryValid | (memoryAdvance & !extraValid)) | append) &
       (!memoryOperation | (lsu.io.input.valid & lsu.io.input.ready)) & !redirect
-    val isMulDiv = parameter.enableM.B & (issuedPacket.decoded.operation === DitDahA1Isa.MulDiv.U(DitDahA1Isa.operationBits)) & !issuedPacket.decoded.instruction.fault
-    execute.io.input.valid := issuedValid & (!isMulDiv | (executePending.getOrElse(false.B) & mulDiv.map(_.io.output.valid).getOrElse(false.B))) & !redirect
+    val floating = issuedPacket.decoded.floating.getOrElse(false.B)
+    val arithmetic = issuedPacket.decoded.operation === DitDahA1Isa.Arithmetic.U(DitDahA1Isa.operationBits)
+    val isMulDiv = parameter.enableM.B & arithmetic & !floating & !issuedPacket.decoded.instruction.fault
+    val isFloating = floating & arithmetic & !execute.io.output.bits.instruction.fault
+    val longOperation = isMulDiv | isFloating
+    val longReady = (isMulDiv & mulDiv.map(_.io.output.valid).getOrElse(false.B)) | (isFloating & fpu.map(_.io.output.valid).getOrElse(false.B))
+    execute.io.input.valid := issuedValid & (!longOperation | (executePending.getOrElse(false.B) & longReady)) & !redirect
     execute.io.output.ready := (!resultValid | resultAdvance) & !redirect
     mulDiv.foreach { resource =>
       resource.io.input.bits :<= issuedPacket
@@ -214,10 +232,23 @@ object DitDahA1Backend extends Generator[DitDahA1Parameter, DitDahA1Layers, DitD
       when(resource.io.input.valid & resource.io.input.ready) { executePending.get := true.B }
       when(resource.io.output.valid & resource.io.output.ready) { executePending.get := false.B }
     }
+    fpu.foreach { resource =>
+      val encoding = issuedPacket.decoded.instruction.instruction.asBits
+      resource.io.input.bits.instruction := encoding.asUInt
+      resource.io.input.bits.a := issuedPacket.operand1
+      resource.io.input.bits.b := issuedPacket.operand2
+      resource.io.input.bits.c := issuedPacket.operand3.get
+      resource.io.input.bits.roundingMode := (encoding.bits(14, 12) === 7.B(3)).?(csr.io.roundingMode.get, encoding.bits(14, 12).asUInt)
+      resource.io.input.valid := issuedValid & isFloating & !executePending.get & !redirect
+      resource.io.output.ready := !issuedValid | (isFloating & execute.io.output.ready)
+      when(resource.io.input.valid & resource.io.input.ready) { executePending.get := true.B }
+      when(resource.io.output.valid & resource.io.output.ready) { executePending.get := false.B }
+    }
     val executed = execute.io.output.valid & execute.io.output.ready
-    val execution = Wire(Vec(width, new ResultPacket))
+    val execution = Wire(Vec(width, new ResultPacket(parameter)))
     execution(0) :<= execute.io.output.bits
     mulDiv.foreach { resource => when(isMulDiv) { execution(0).value := resource.io.output.bits } }
+    fpu.foreach { resource => when(isFloating) { execution(0).value := resource.io.output.bits.value; execution(0).fpFlags.get := resource.io.output.bits.flags } }
     for lane <- 1 until width do DitDahA1Alu.result(parameter, issuedPackets(lane), execution(lane))
     val control = Seq(DitDahA1Isa.Beq, DitDahA1Isa.Branch, DitDahA1Isa.Jal, DitDahA1Isa.Jalr)
       .map(op => issuedPacket.decoded.operation === op.U(DitDahA1Isa.operationBits)).reduce(_ | _)
@@ -277,7 +308,7 @@ object DitDahA1Backend extends Generator[DitDahA1Parameter, DitDahA1Layers, DitD
       !decodedPackets(lane).instruction.fault & Seq(Lui, Auipc, Addi, Add, AluImmediate, AluRegister,
         AluWordImmediate, AluWordRegister).map(op => decodedPackets(lane).operation === op.U(operationBits)).reduce(_ | _)
     }
-    val groupedHead = simple(0) | (!decodedPackets(0).instruction.fault &
+    val groupedHead = simple(0) | (!decodedPackets(0).floating.getOrElse(false.B) & !decodedPackets(0).instruction.fault &
       Seq(DitDahA1Isa.Ld, DitDahA1Isa.Lw, DitDahA1Isa.Lwu, DitDahA1Isa.Load, DitDahA1Isa.Sd, DitDahA1Isa.Sw, DitDahA1Isa.Store)
         .map(op => decodedPackets(0).operation === op.U(DitDahA1Isa.operationBits)).reduce(_ | _))
     val dependencies = (0 until width).map { lane =>
@@ -290,6 +321,14 @@ object DitDahA1Backend extends Generator[DitDahA1Parameter, DitDahA1Layers, DitD
       val (operand2, blocked2) = resolve(unit.io.raddr2, gpr.io.rdata2(lane))
       unit.io.rdata1 := operand1
       unit.io.rdata2 := operand2
+      if parameter.floatingPointBits != 0 then
+        unit.io.rdata3.get := (if lane == 0 then floatingOperands.get(2) else 0.U(parameter.floatingPointBits))
+        if lane == 0 then
+          when(packet.floating.get) {
+            when((packet.operation === DitDahA1Isa.Arithmetic.U(5)) & !packet.usesRs1) { unit.io.rdata1 := floatingOperands.get(0) }
+            unit.io.rdata2 := floatingOperands.get(1)
+          }
+
       val blocked = blocked1 | blocked2 | (packet.serializing & older)
       val conflict = (0 until lane).map { previous =>
         val writer = decodedPackets(previous)

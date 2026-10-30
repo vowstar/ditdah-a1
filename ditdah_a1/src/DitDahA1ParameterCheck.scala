@@ -29,6 +29,12 @@ object DitDahA1ParameterCheck:
       val selected = baseline.copy(enableZba = (mask & 1) != 0, enableZbb = (mask & 2) != 0, enableZbs = (mask & 4) != 0)
       assert(DitDahA1Config.parameter(DitDahA1Config.document(selected)) == selected)
       assert(DitDahA1BitManip.encodings(selected).size == (if selected.enableZba then 8 else 0) + (if selected.enableZbb then 24 else 0) + (if selected.enableZbs then 8 else 0))
+    for bits <- Seq(0, 32, 64) do
+      val selected = baseline.copy(floatingPointBits = bits)
+      assert(DitDahA1Config.parameter(DitDahA1Config.document(selected)) == selected)
+      assert(DitDahA1Isa.floatingInstructions(bits).size == (if bits == 0 then 0 else if bits == 32 then 30 else 62))
+    rejects { baseline.copy(floatingPointBits = 16); () }
+    rejects { baseline.copy(floatingPointBits = 128); () }
     val highAddress = baseline.copy(resetVector = (BigInt(1) << 40) + 2)
     val encoded = upickle.default.write(highAddress)
     assert(upickle.default.read[DitDahA1Parameter](encoded) == highAddress)

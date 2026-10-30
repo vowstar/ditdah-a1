@@ -8,8 +8,8 @@ import me.jiuyang.zaozi.reftpe.*
 import me.jiuyang.zaozi.valuetpe.*
 
 class DitDahA1CommitIO(parameter: DitDahA1Parameter) extends HWBundle(parameter):
-  val input = Flipped(new Decoupled(new ResultPacket))
-  val output = Aligned(new Decoupled(new ResultPacket))
+  val input = Flipped(new Decoupled(new ResultPacket(parameter)))
+  val output = Aligned(new Decoupled(new ResultPacket(parameter)))
   val trapVector = Flipped(UInt(64))
   val returnPc = Flipped(UInt(64))
 
@@ -26,6 +26,8 @@ object DitDahA1Commit extends Generator[DitDahA1Parameter, DitDahA1UnitLayers, D
     when(io.input.bits.instruction.fault) {
       out.nextPc := io.trapVector
       out.rdWrite := false.B
+      out.fpWrite.foreach(_ := false.B)
+      out.fpFlags.foreach(_ := 0.U)
       out.csrWrite := false.B
       out.mret := false.B
       out.sret := false.B

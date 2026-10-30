@@ -6,6 +6,23 @@ import me.jiuyang.zaozi.*
 import me.jiuyang.zaozi.default.{*, given}
 import me.jiuyang.zaozi.reftpe.*
 import me.jiuyang.zaozi.valuetpe.*
+import java.lang.foreign.Arena
+import org.llvm.mlir.scalalib.capi.ir.{Block, Context}
+
+object DitDahA1RegisterFile:
+  def apply(width: Int, zero: Boolean, addresses: Seq[Referable[UInt]],
+      writes: Seq[(Referable[Bool], Referable[UInt], Referable[UInt])])(
+      using Arena, Context, Block, InstanceContext, ClockScope, ResetScope): Seq[Referable[UInt]] =
+    val registers = Seq.fill(if zero then 31 else 32)(if zero then RegInit(0.U(width)) else Reg(UInt(width)))
+    val outputs = addresses.map { address =>
+      val value = Wire(UInt(width))
+      value := 0.U(width)
+      for i <- registers.indices do when(address === (i + (if zero then 1 else 0)).U(5)) { value := registers(i) }
+      value
+    }
+    for (enable, address, data) <- writes; i <- registers.indices do
+      when(enable & (address === (i + (if zero then 1 else 0)).U(5))) { registers(i) := data.asBits.bits(width - 1, 0).asUInt }
+    outputs
 
 class DitDahA1GprIO(parameter: DitDahA1Parameter) extends HWBundle(parameter):
   val clock = Flipped(Clock())
@@ -25,11 +42,9 @@ object DitDahA1Gpr extends Generator[DitDahA1Parameter, DitDahA1UnitLayers, DitD
     val io = summon[Interface[DitDahA1GprIO]]
     given ClockScope = ClockScope.posedge(io.clock)
     given ResetScope = ResetScope.syncActiveHigh(io.reset)
-    val registers = Seq.fill(31)(RegInit(0.U(64)))
+    val values = DitDahA1RegisterFile(64, true,
+      (0 until parameter.issueWidth).flatMap(n => Seq(io.raddr1(n), io.raddr2(n))),
+      (0 until parameter.issueWidth).map(n => (io.we(n), io.waddr(n), io.wdata(n))))
     for lane <- 0 until parameter.issueWidth do
-      io.rdata1(lane) := 0.U(64)
-      io.rdata2(lane) := 0.U(64)
-      for i <- 1 to 31 do
-        when(io.raddr1(lane) === i.U(5)) { io.rdata1(lane) := registers(i - 1) }
-        when(io.raddr2(lane) === i.U(5)) { io.rdata2(lane) := registers(i - 1) }
-        when(io.we(lane) & (io.waddr(lane) === i.U(5))) { registers(i - 1) := io.wdata(lane) }
+      io.rdata1(lane) := values(2 * lane)
+      io.rdata2(lane) := values(2 * lane + 1)

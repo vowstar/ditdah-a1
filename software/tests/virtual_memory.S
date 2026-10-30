@@ -122,6 +122,28 @@ main:
     csrs mstatus, t0
     mret
 .Lsupervisor:
+#ifdef __riscv_compressed
+    .option rvc
+    c.nop
+    .option norvc
+#endif
+#if defined(__riscv_flen) && __riscv_flen == 64
+    li t0, 0x2000
+    csrs sstatus, t0
+    fcvt.s.lu ft0, s0
+    fcvt.d.s ft0, ft0
+    fadd.d ft1, ft0, ft0
+    fcvt.lu.d t0, ft1, rtz
+    slli t1, s0, 1
+    bne t0, t1, .Lfail_supervisor
+#endif
+#if defined(__riscv_zba) && defined(__riscv_zbb) && defined(__riscv_zbs)
+    sh1add t0, s0, s0
+    andn t1, t0, zero
+    bseti t1, t1, 8
+    addi t0, t0, 256
+    bne t0, t1, .Lfail_supervisor
+#endif
     addi a2, s0, 64
     li t0, 0x40000000
     jalr ra, t0, 0
@@ -205,6 +227,7 @@ main:
     addi a0, a0, 4
     j .Lprint
 2:  ret
+.balign 4
 .Ltrap:
     addi sp, sp, -64
     sd t0, 0(sp)

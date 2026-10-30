@@ -7,13 +7,18 @@ object DitDahA1Isa:
     "mulw", "divw", "divuw", "remw", "remuw")
   val compressedInstructions = Seq("c.addi4spn", "c.lw", "c.ld", "c.sw", "c.sd", "c.nop", "c.addi", "c.addiw", "c.li", "c.lui", "c.addi16sp",
     "c.srli", "c.srai", "c.andi", "c.sub", "c.xor", "c.or", "c.and", "c.subw", "c.addw", "c.j", "c.beqz", "c.bnez", "c.slli", "c.lwsp", "c.ldsp", "c.jr", "c.mv", "c.ebreak", "c.jalr", "c.add", "c.swsp", "c.sdsp")
+  def floatingInstructions(bits: Int) = (if bits == 0 then Seq.empty else (if bits == 64 then Seq("s", "d") else Seq("s")).flatMap { format =>
+    Seq("fmadd", "fmsub", "fnmsub", "fnmadd", "fadd", "fsub", "fmul", "fdiv", "fsqrt", "fsgnj", "fsgnjn", "fsgnjx", "fmin", "fmax", "feq", "flt", "fle", "fclass").map(_ + "." + format) ++
+      Seq("w", "wu", "l", "lu").flatMap(integer => Seq(s"fcvt.$integer.$format", s"fcvt.$format.$integer")) ++
+      (if format == "s" then Seq("flw", "fsw", "fmv.x.w", "fmv.w.x") else Seq("fld", "fsd", "fmv.x.d", "fmv.d.x", "fcvt.s.d", "fcvt.d.s"))
+  })
   val atomicOperations = Seq(0, 1, 4, 8, 12, 16, 20, 24, 28)
   val atomicInstructions = for size <- Seq("w", "d"); name <- Seq("lr", "sc", "amoadd", "amoswap", "amoxor", "amoor", "amoand", "amomin", "amomax", "amominu", "amomaxu") yield s"$name.$size"
   def instructions(parameter: DitDahA1Parameter) = Seq("lui", "auipc", "addi", "add", "beq", "jal", "jalr",
     "ld", "sd", "csrrw", "csrrs", "ecall", "ebreak", "mret", "fence", "fence.i", "lw", "lwu", "sw",
     "slli", "slti", "sltiu", "xori", "srli", "srai", "ori", "andi", "sub", "sll", "slt", "sltu", "xor", "srl", "sra", "or", "and",
     "addiw", "slliw", "srliw", "sraiw", "addw", "subw", "sllw", "srlw", "sraw", "bne", "blt", "bge", "bltu", "bgeu",
-    "lb", "lh", "lbu", "lhu", "sb", "sh", "csrrc", "csrrwi", "csrrsi", "csrrci", "wfi") ++ (if parameter.enableA then atomicInstructions else Seq.empty) ++ (if parameter.enableM then mulDivInstructions else Seq.empty) ++ (if parameter.enableC then compressedInstructions else Seq.empty) ++ DitDahA1BitManip.encodings(parameter).map(_._1)
+    "lb", "lh", "lbu", "lhu", "sb", "sh", "csrrc", "csrrwi", "csrrsi", "csrrci", "wfi") ++ (if parameter.enableA then atomicInstructions else Seq.empty) ++ (if parameter.enableM then mulDivInstructions else Seq.empty) ++ (if parameter.enableC then compressedInstructions else Seq.empty) ++ DitDahA1BitManip.encodings(parameter).map(_._1) ++ floatingInstructions(parameter.floatingPointBits) ++ (if parameter.enableC && parameter.floatingPointBits == 64 then Seq("c.fld", "c.fsd", "c.fldsp", "c.fsdsp") else Seq.empty)
   val supervisorInstructions = Seq("sret")
   val Illegal = 0
   val Lui = 1
@@ -29,7 +34,7 @@ object DitDahA1Isa:
   val Csrrs = 11
   val Ecall = 12
   val Mret = 13
-  val MulDiv = 14
+  val Arithmetic = 14
   val AmoaddD = 15
   val Fence = 16
   val FenceI = 17

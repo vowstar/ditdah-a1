@@ -19,7 +19,9 @@ object DitDahA1Decode extends Generator[DitDahA1Parameter, DitDahA1UnitLayers, D
     val io = summon[Interface[DitDahA1DecodeIO]]
     val in = io.input.bits
     val out = io.output.bits
-    val insn = if parameter.enableC then (in.length === 2.U(3)).?(DitDahA1Compressed(in.instruction), in.instruction.asBits) else in.instruction.asBits
+    val insn = if parameter.enableC then (in.length === 2.U(3)).?(DitDahA1Compressed(in.instruction, parameter.floatingPointBits == 64), in.instruction.asBits) else in.instruction.asBits
+    out.floating.foreach(_ := false.B)
+    out.fpWrite.foreach(_ := false.B)
     out.functionCode.foreach(_ := (insn.bits(30, 30) ## insn.bits(14, 12)).asUInt)
     val opcode = insn.bits(6, 0)
     val funct3 = insn.bits(14, 12)
@@ -53,7 +55,7 @@ object DitDahA1Decode extends Generator[DitDahA1Parameter, DitDahA1UnitLayers, D
     when((opcode === 0x33.B(7)) & (funct3 === 0.B(3)) & (insn.bits(31, 25) === 0.B(7))) { out.operation := Add.U(operationBits) }
     if parameter.enableM then
       when(((opcode === 0x33.B(7)) | ((opcode === 0x3b.B(7)) & ((funct3 === 0.B(3)) | funct3.bit(2)))) &
-        (funct7 === 1.B(7))) { out.operation := MulDiv.U(operationBits) }
+        (funct7 === 1.B(7))) { out.operation := Arithmetic.U(operationBits) }
     when((opcode === 0x63.B(7)) & (funct3 === 0.B(3))) { out.operation := Beq.U(operationBits); out.immediate := immB }
     when((opcode === 0x63.B(7)) & ((funct3 === 1.B(3)) | funct3.bit(2))) { out.operation := Branch.U(operationBits); out.immediate := immB }
     when(opcode === 0x6f.B(7)) { out.operation := Jal.U(operationBits); out.immediate := immJ }
@@ -87,11 +89,33 @@ object DitDahA1Decode extends Generator[DitDahA1Parameter, DitDahA1UnitLayers, D
         val unary = (encoding & 0x7f) == 0x13 || (encoding & 0x7f) == 0x1b || mask == 0xfff0707fL
         out.operation := (if unary then AluImmediate else AluRegister).U(operationBits)
       }
+    if parameter.floatingPointBits != 0 then
+      val format = (insn.bits(26, 25) === 0.B(2)) | ((parameter.floatingPointBits == 64).B & (insn.bits(26, 25) === 1.B(2)))
+      val function = insn.bits(31, 27)
+      val rounding = (funct3.asUInt <= 4.U(3)) | (funct3 === 7.B(3))
+      val unary = out.rs2 === 0.U(5)
+      val conversion = ((function === 24.B(5)) | (function === 26.B(5))) & (out.rs2 <= 3.U(5)) & rounding
+      val formatConversion = (parameter.floatingPointBits == 64).B & (function === 8.B(5)) & rounding &
+        (insn.bit(25).?((out.rs2 === 0.U(5)), (out.rs2 === 1.U(5))))
+      val supported = ((function.asUInt <= 3.U(5)) & rounding) | ((function === 11.B(5)) & unary & rounding) |
+        (((function === 4.B(5)) | (function === 20.B(5))) & (funct3.asUInt <= 2.U(3))) |
+        ((function === 5.B(5)) & (funct3.asUInt <= 1.U(3))) | conversion | formatConversion |
+        ((function === 28.B(5)) & unary & (funct3.asUInt <= 1.U(3))) | ((function === 30.B(5)) & unary & (funct3 === 0.B(3)))
+      val fused = Seq(0x43, 0x47, 0x4b, 0x4f).map(op => opcode === op.B(7)).reduce(_ | _)
+      val arithmetic = format & (((opcode === 0x53.B(7)) & supported) | (fused & rounding))
+      val memory = ((funct3 === 2.B(3)) | ((parameter.floatingPointBits == 64).B & (funct3 === 3.B(3))))
+      val load = (opcode === 0x07.B(7)) & memory
+      val store = (opcode === 0x27.B(7)) & memory
+      out.floating.get := arithmetic | load | store
+      out.fpWrite.get := !in.fault & (load | (arithmetic & (fused | !Seq(20, 24, 28).map(f => function === f.B(5)).reduce(_ | _))))
+      when(arithmetic) { out.operation := Arithmetic.U(operationBits) }
+      when(load) { out.operation := (funct3 === 2.B(3)).?(Lw.U(operationBits), Ld.U(operationBits)) }
+      when(store) { out.operation := (funct3 === 2.B(3)).?(Sw.U(operationBits), Sd.U(operationBits)); out.immediate := immS }
     val operation = out.operation
     val csr = (operation === Csrrw.U(operationBits)) | (operation === Csrrs.U(operationBits)) | (operation === Csr.U(operationBits))
     val branch = (operation === Beq.U(operationBits)) | (operation === Branch.U(operationBits))
     val store = (operation === Sd.U(operationBits)) | (operation === Sw.U(operationBits)) | (operation === Store.U(operationBits))
-    val both = (operation === Add.U(operationBits)) | (operation === MulDiv.U(operationBits)) | branch | store | (operation === AmoaddD.U(operationBits)) | (operation === AluRegister.U(operationBits)) | (operation === AluWordRegister.U(operationBits))
+    val both = (operation === Add.U(operationBits)) | (operation === Arithmetic.U(operationBits)) | branch | store | (operation === AmoaddD.U(operationBits)) | (operation === AluRegister.U(operationBits)) | (operation === AluWordRegister.U(operationBits))
     out.usesRs1 := !in.fault & (both | (operation === Addi.U(operationBits)) | (operation === AluImmediate.U(operationBits)) | (operation === AluWordImmediate.U(operationBits)) | (operation === Jalr.U(operationBits)) | (operation === Ld.U(operationBits)) | (operation === Lw.U(operationBits)) | (operation === Lwu.U(operationBits)) | (operation === Load.U(operationBits)) | (csr & !funct3.bit(2)))
     out.usesRs2 := !in.fault & both
     when(operation === Atomic.U(operationBits)) {
@@ -107,3 +131,11 @@ object DitDahA1Decode extends Generator[DitDahA1Parameter, DitDahA1UnitLayers, D
       }
     out.writesRd := !in.fault & (operation =/= Illegal.U(operationBits)) & !branch & !store & (operation =/= Ecall.U(operationBits)) & (operation =/= Mret.U(operationBits)) & (operation =/= Sret.U(operationBits)) & (operation =/= Fence.U(operationBits)) & (operation =/= FenceI.U(operationBits)) & (operation =/= Wfi.U(operationBits))
     out.serializing := !in.fault & (csr | (operation === Mret.U(operationBits)) | (operation === Sret.U(operationBits)) | (operation === Fence.U(operationBits)) | (operation === FenceI.U(operationBits)) | (operation === Wfi.U(operationBits)))
+    if parameter.floatingPointBits != 0 then
+      when(out.floating.get) {
+        val arithmetic = operation === Arithmetic.U(operationBits)
+        out.usesRs2 := false.B
+        when(arithmetic) { out.usesRs1 := !in.fault & ((insn.bits(31, 27) === 26.B(5)) | (insn.bits(31, 27) === 30.B(5))) & (opcode === 0x53.B(7)) }
+        out.writesRd := !in.fault & arithmetic & !out.fpWrite.get
+        out.serializing := !in.fault
+      }

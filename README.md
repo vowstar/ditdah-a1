@@ -19,7 +19,7 @@ PMP is configurable to zero or sixteen entries per hart; the default uncached co
 Optional M uses a shared iterative multiply/divide resource; accepted operations retain their instruction owner through completion or cancellation draining.
 Branches recover in EX while retaining older work; `enableBranchPrediction` enables static backward-branch and direct-jump prediction.
 `branchPredictorEntries` selects 0/8/16 direct-mapped entries with two-bit direction counters and last indirect targets; nonzero requires prediction enabled. This does not implement a return stack.
-The manifest lists complete I/Zicsr/Zifencei and optional M/A/C through `enableM`/`enableA`/`enableC`; F/D/B and Sv48 remain targets.
+The manifest lists I/Zicsr/Zifencei and optional M/A/C, F/D and Zba/Zbb/Zbs. `floatingPointBits` selects 0/32/64; FPRs and FCSR/FS are updated at retirement, and Sv48 remains a target.
 Core composes Frontend and Backend; Frontend owns PC sequencing and Backend owns execution and retirement. `enableC` adds serial halfword fetch and two/four-byte packets with halfword-aligned PCs; raw encodings survive retirement and each parcel receives its own translation and permission check.
 Core exposes separate instruction/data memory ports; the physical fabric owns shared arbitration and AXI.
 Instruction permissions apply before cache lookup and to the complete refill request; region checks also protect external accesses.
@@ -94,7 +94,7 @@ This checks the implemented instruction subset, not full ISA compliance or physi
 - [DitDah-E1](https://github.com/vowstar/ditdah-e1): project structure and reproducible configuration workflow.
 - [Zaozi](https://github.com/xinpian-tech/zaozi): hardware description framework and pinned development tools.
 - [RISC-V specifications](https://riscv.org/specifications/ratified/): instruction and privilege contracts.
-- [LLVM](https://github.com/llvm/llvm-project) and [CIRCT](https://github.com/llvm/circt): compiler toolchain.
-- [YosysHQ](https://github.com/YosysHQ): synthesis and formal verification tools.
+- [LLVM](https://github.com/llvm/llvm-project), [CIRCT](https://github.com/llvm/circt) and [YosysHQ](https://github.com/YosysHQ): compiler and verification tools.
+- [Berkeley HardFloat](https://www.jhauser.us/arithmetic/HardFloat.html): IEEE 754 arithmetic.
 - [RISC-V architectural tests](https://github.com/riscv-non-isa/riscv-arch-test) and [Sail](https://github.com/riscv/sail-riscv): executable architectural checks.
 - [Zephyr](https://github.com/zephyrproject-rtos/zephyr): multicore software tests.
