@@ -44,7 +44,7 @@ module core_tb;
   core_request_t requests[2*HARTS];
   core_response_t responses[2*HARTS];
   wire [2*HARTS-1:0] request_valid, request_ready, response_valid, response_ready;
-  wire [HARTS-1:0] multiply_busy;
+  wire [HARTS-1:0] muldiv_busy;
   logic [HARTS-1:0] finished = 0;
   integer bus_owner = 0, active_source[CLIENT_CONTEXTS], transport_id[CLIENT_CONTEXTS], completed_transactions = 0;
   core_request_t accepted_request[CLIENT_CONTEXTS], writeback_request;
@@ -143,7 +143,7 @@ module core_tb;
 `else
     5: irq_activate = pending_instruction_target && traces[irq_hart][0].pipelineOccupancy == 0;
 `endif
-    6: irq_activate = multiply_busy[irq_hart];
+    6: irq_activate = muldiv_busy[irq_hart];
     7: irq_activate = irq_retired;
     8: irq_activate = pending_exclusive_target;
     9: irq_activate = irq_retired && pending_peer;
@@ -318,7 +318,7 @@ module core_tb;
             arcache != expected_cache(64'(araddr), (1 << arsize) * (1 + integer'(arlen)), arprot[2], 0, arlock) || arqos != 0) $fatal(1, "Read attributes");
         if (arprot != {accepted_request[read_source].fetch, 1'b0, accepted_request[read_source].privileged}) $fatal(1, "Read privilege");
         if ((accepted_request[read_source].size == 6 ? arsize != $clog2(DW/8) : arprot[2] ? arsize != 2 : arsize > 3) ||
-            (arlock && arsize != 3) || (araddr & ((1 << arsize) - 1)) != 0) $fatal(1, "Read alignment");
+            (arlock && arsize != 2 && arsize != 3) || (araddr & ((1 << arsize) - 1)) != 0) $fatal(1, "Read alignment");
         if (HARTS > 1) $write("HART %0d ", (read_source % (2*HARTS)) / 2);
         emit_source(read_source);
         $display("BUS %s %016h %0d %016h", arlock ? "exclusive_read" : (arprot[2] ? "fetch" : "read"), 64'(araddr), accepted_request[read_source].size == 6 ? 64 : 1 << arsize, 64'b0);
@@ -391,7 +391,7 @@ module core_tb;
       end
       if (awvalid && awready) begin
         if (!console_address(64'(awaddr)) && (64'(awaddr) < base_address || 64'(awaddr) + (1 << awsize) > base_address + MB)) $fatal(1, "Truncated or unexpected write address");
-        if (awid >= HARTS || active_source[bus_owner] < 0 || awid != IDW'(bus_owner / 2) || awlen != 0 || awsize > 3 || (awlock && awsize != 3) ||
+        if (awid >= HARTS || active_source[bus_owner] < 0 || awid != IDW'(bus_owner / 2) || awlen != 0 || awsize > 3 || (awlock && awsize != 2 && awsize != 3) ||
             awburst != 1 || awcache != expected_cache(64'(awaddr), 1 << awsize, 0, 1, awlock) ||
             awprot != (writeback_pending ? 3'b001 : {2'b0, accepted_request[bus_owner].privileged}) || awqos != 0 ||
             (awaddr & ((1 << awsize) - 1)) != 0) $fatal(1, "Write attributes");

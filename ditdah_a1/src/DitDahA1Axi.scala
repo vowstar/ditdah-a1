@@ -112,10 +112,21 @@ object DitDahA1Axi extends Generator[DitDahA1Parameter, DitDahA1UnitLayers, DitD
     val laneBits = Integer.numberOfTrailingZeros(parameter.axiDataBits / 8)
     val lane = request.address.asBits.bits(laneBits - 1, 0).asUInt
     val byteShift = (lane.asBits ## 0.B(3)).asUInt
-    val update = (request.atomicOperation === 1.U(5)).?(request.data,
-      (request.atomicOperation === 8.U(5)).?((data.asBits | request.data.asBits).asUInt,
-        (data + request.data).asBits.bits(63, 0).asUInt))
-    val writeData = amo.?(update, request.data)
+    val update = Wire(UInt(64))
+    update := request.data
+    if parameter.enableA then
+      def operand(value: Referable[UInt]): Referable[UInt] =
+        (request.size === 2.U(3)).?((value.asBits.bit(31).?(BigInt("ffffffff", 16).B(32), 0.B(32)) ## value.asBits.bits(31, 0)).asUInt, value)
+      val left = operand(data)
+      val right = operand(request.data)
+      val less = request.atomicOperation.asBits.bit(3).?(left < right, left.asBits.asSInt < right.asBits.asSInt)
+      update := (left + right).asBits.bits(63, 0).asUInt
+      when(request.atomicOperation === 1.U(5)) { update := right }
+      when(request.atomicOperation === 4.U(5)) { update := (left.asBits ^ right.asBits).asUInt }
+      when(request.atomicOperation === 8.U(5)) { update := (left.asBits | right.asBits).asUInt }
+      when(request.atomicOperation === 12.U(5)) { update := (left.asBits & right.asBits).asUInt }
+      when(request.atomicOperation.asBits.bit(4)) { update := (less ^ request.atomicOperation.asBits.bit(2)).?(left, right) }
+    val writeData = amo.?((request.size === 2.U(3)).?(update.asBits.bits(31, 0).asUInt, update), request.data)
     w.bits.data := (writeData << byteShift).asBits.bits(parameter.axiDataBits - 1, 0).asUInt
     w.bits.strb := (request.mask << lane).asBits.bits(parameter.axiDataBits / 8 - 1, 0).asUInt
     val readValue = readData(request.size, r.bits.data, byteShift)

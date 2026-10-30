@@ -152,7 +152,7 @@ for directory, top in profiles:
                          if re.search(r'\baxi_' + channel + r'_bits_id\b', m[2])), None)
             assert port and (int(port[1]) + 1 if port[1] else 1) == width, 'AXI transaction identity width mismatch'
     if top == 'DitDahA1Backend':
-        assert set(files) == {'DitDahA1' + name + '.sv' for name in ('Backend', 'Decode', 'Issue', 'Execute', 'Multiply', 'Commit', 'Gpr', 'Csr', 'Lsu', *(('Pmp',) if enabled else ()))}
+        assert set(files) == {'DitDahA1' + name + '.sv' for name in ('Backend', 'Decode', 'Issue', 'Execute', *(('MulDiv',) if manifest['parameters'].get('enableM', True) else ()), 'Commit', 'Gpr', 'Csr', 'Lsu', *(('Pmp',) if enabled else ()))}
         assert (rtl / (top + '.sv')).read_bytes() == Path('result/verify/' + ('irq-' if interrupts else '') + ('pmp16-' if enabled else '') + 'axi512/rtl', top + '.sv').read_bytes()
     if top == 'DitDahA1MemoryFabric':
         assert set(files) == {name + '.sv' for name in (top, 'DitDahA1MemoryArbiter', 'DitDahA1Memory', 'DitDahA1Axi',

@@ -4,9 +4,14 @@
 .PHONY: config check rtl software verify-software verify-data-software verify-supervisor-software zephyr verify-zephyr verify-zephyr-long verify-signoff verify-simulation verify-production verify-cache verify-platform verify-user verify-data-cache verify-supervisor verify-formal verify-scalar-formal verify-user-formal verify-data-formal verify-supervisor-formal verify-translation verify-translation-formal verify-translation-software verify-translation-cache verify-translation-cache-formal verify-translation-cache-software clean
 .PHONY: verify-burst verify-burst-formal verify-burst-software verify-widths verify-width-software
 .PHONY: verify-data-line verify-data-line-software verify-read-capacity verify-read-software
-.PHONY: verify-writeback verify-writeback-software
+.PHONY: verify-writeback verify-writeback-software verify-scalar-isa
 
 HART_COUNTS ?= 2 3 15 16
+SCALAR_OUTPUT ?= result/scalar-isa/gate
+MULDIV_CASES := $(addprefix muldiv_,0 1 2 3 4 5 6 7 0w 4w 5w 6w 7w)
+ATOMIC_CASES := $(foreach size,2 3,$(addsuffix _$(size),$(addprefix atomic_,0 1 4 8 12 16 20 24 28) atomic_reservation))
+SCALAR_CASES := $(MULDIV_CASES) $(ATOMIC_CASES) integer_reserved integer_breakpoint
+SCALAR_CACHE := --icache-bytes 8192 --dcache-bytes 8192 --dcache-writeback --l2-cache-bytes 131072
 ICACHE_CASES := pipeline_reuse pipeline_integer_stream pipeline_dependency_stream pipeline_dependency_chain cache_replacement fence_ordering fence_i_prefetch synchronization atomic_ordering atomic_denied atomic_retry bus_fetch pipeline_redirect pmp_fetch pmp_update interrupt_fence interrupt_fence_i interrupt_fetch_fault
 PIPELINE_CASES := memory_groups memory_group_alignment memory_group_bus_read memory_group_bus_write pipeline_recovery pipeline_recovery_fault
 USER_CASES := user_access user_system user_wait user_protection user_fetch user_mprv
@@ -68,6 +73,7 @@ verify-zephyr-long:
 	for count in 1 2 16; do $(MAKE) verify-zephyr SOFTWARE_HARTS=$$count || exit $$?; done
 
 verify-signoff: verify-writeback verify-formal
+	$(MAKE) verify-scalar-isa
 	$(MAKE) verify-widths
 	$(MAKE) verify-data-line
 	$(MAKE) verify-read-capacity
@@ -403,3 +409,15 @@ verify-data-formal: verify-user-formal
 
 clean:
 	rm -rf result
+
+verify-scalar-isa:
+	python3 test/verify.py --interrupts --issue-width 3 --width 64 --pmp-entries 0 $(foreach name,$(SCALAR_CASES) interrupt_divide,--case $(name)) --output $(SCALAR_OUTPUT)/enabled
+	python3 test/formal.py --rtl $(SCALAR_OUTPUT)/enabled/irq-axi64/rtl --output $(SCALAR_OUTPUT)/formal --modules MulDiv IntegerDecode WordExecute Lsu Memory Axi InterruptBackend --jobs 2
+	python3 test/verify.py --no-m --no-a --issue-width 2 --width 64 --pmp-entries 0 $(foreach name,$(SCALAR_CASES),--case $(name)) --output $(SCALAR_OUTPUT)/disabled
+	python3 test/formal.py --rtl $(SCALAR_OUTPUT)/disabled/axi64/rtl --output $(SCALAR_OUTPUT)/disabled-formal --modules IntegerDecode Memory --jobs 2
+	python3 test/verify.py $(SCALAR_CACHE) --issue-width 3 --load-queue-entries 2 --fabric-read-slots 4 --multicore-only --harts 2 --width 64 --pmp-entries 0 --case atomic_lrsc_shared_word --case atomic_lrsc_private_word --case atomic_lrsc_shared --case atomic_lrsc_private --case atomic --output $(SCALAR_OUTPUT)/coherent
+	python3 test/verify.py $(SCALAR_CACHE) --sv39 --issue-width 2 --load-queue-entries 2 --width 512 --pmp-entries 16 --tlb-entries 4 --i-tlb-entries 4 --d-tlb-entries 4 --asid-bits 4 --case sv39_atomic --case sv39_protection --output $(SCALAR_OUTPUT)/translated
+	for count in 1 2 16; do \
+		python3 scripts/build_software.py --config $(SOFTWARE_CONFIG) --isa rv64ima --program software/tests/atomic.c --harts $$count --issue-width $$((count < 3 ? count : 3)) --icache-bytes 8192 --dcache-bytes 8192 --stack-bytes 512 --console-base 0x10000000 --output $(SCALAR_OUTPUT)/software/harts$$count || exit $$?; \
+		python3 test/verify.py --elf $(SCALAR_OUTPUT)/software/harts$$count/software.elf --config $(SCALAR_OUTPUT)/software/harts$$count/input.json --output $(SCALAR_OUTPUT)/software/harts$$count/verification || exit $$?; \
+	done

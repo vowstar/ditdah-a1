@@ -31,9 +31,10 @@ object DitDahA1Memory extends Generator[DitDahA1Parameter, DitDahA1UnitLayers, D
     allowed := false.B
     val operation = request.atomicOperation
     val lr = operation === 2.U(5)
-    val writeAtomic = Seq(0, 1, 3, 8).map(op => operation === op.U(5)).reduce(_ | _)
-    val atomicShape = !request.fetch & (request.size === 3.U(3)) &
-      ((lr & !request.write) | (writeAtomic & request.write & (request.mask === 255.U(8))))
+    val writeAtomic = (DitDahA1Isa.atomicOperations :+ 3).map(op => operation === op.U(5)).reduce(_ | _)
+    val atomicMask = (request.size === 2.U(3)).?(15.U(8), 255.U(8))
+    val atomicShape = parameter.enableA.B & !request.fetch & ((request.size === 2.U(3)) | (request.size === 3.U(3))) &
+      ((lr & !request.write) | (writeAtomic & request.write & (request.mask === atomicMask)))
     for size <- 0 to 3 do
       val bytes = 1 << size
       val aligned = if size == 0 then true.B else request.address.asBits.bits(size - 1, 0).asUInt === 0.U(size)

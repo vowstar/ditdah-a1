@@ -9,8 +9,8 @@ import re
 import random
 import subprocess
 
-from programs import addi, alu, amo, beq, csr, sd, mul, ld, lw, sw, load, store, fence
-from model import Fault, LocalInterrupts, Model, MASK, atomic_value, pmp_allowed, signed, sv39_walk
+from programs import addi, alu, amo, beq, csr, sd, mul, muldiv, ld, lw, sw, load, store, fence
+from model import ATOMIC_OPERATIONS, Fault, LocalInterrupts, Model, MASK, atomic_value, muldiv_value, pmp_allowed, signed, sv39_walk
 
 
 def backend_control_signals(source):
@@ -442,12 +442,12 @@ def lsu_queue_contract(parameters):
 def lsu_reservation_contract(parameters):
     body, serial = '', 0
 
-    def transfer(operation, address=0x1000, value=0, fault=False, eligible=False, local_fault=0, wrong_tag=False):
+    def transfer(operation, address=0x1000, value=0, fault=False, eligible=False, local_fault=0, wrong_tag=False, size=3):
         nonlocal body, serial
         serial += 1
         tag = 80 + serial
-        body += f'''    input_bits_atomic = 1; input_bits_instruction_instruction = 32'h{amo(operation, 7, 1, 0 if operation == 2 else 2):x};
-    input_bits_instruction_fault = 0; input_bits_instruction_tag = {tag}; input_bits_memorySize = 3;
+        body += f'''    input_bits_atomic = 1; input_bits_instruction_instruction = 32'h{amo(operation, 7, 1, 0 if operation == 2 else 2, size=size):x};
+    input_bits_instruction_fault = 0; input_bits_instruction_tag = {tag}; input_bits_memorySize = {size};
     input_bits_load = {int(operation != 3)}; input_bits_store = {int(operation != 2)};
     input_bits_address = 64'h{address:x}; input_bits_storeData = 9; input_bits_rd = 7; input_bits_rdWrite = 1;
     input_valid = 1; storeAllowed = 1; tick(); input_valid = 0; storeAllowed = 0;
@@ -457,13 +457,13 @@ def lsu_reservation_contract(parameters):
             body += f'    check(output_valid && output_bits_instruction_fault && output_bits_instruction_cause == {local_fault} && !memory_request_valid, "Reservation local fault");\n'
         else:
             body += f'''    repeat (3) begin
-      check(memory_request_valid && memory_request_bits_atomic && memory_request_bits_atomicOperation == {operation} && memory_request_bits_scEligible == {int(eligible)} && memory_request_bits_address == 64'h{address:x} && memory_request_bits_mask == {0 if operation == 2 else 255}, "Reservation request capture"); tick();
+      check(memory_request_valid && memory_request_bits_atomic && memory_request_bits_atomicOperation == {operation} && memory_request_bits_scEligible == {int(eligible)} && memory_request_bits_address == 64'h{address:x} && memory_request_bits_mask == {0 if operation == 2 else (1 << (1 << size)) - 1}, "Reservation request capture"); tick();
     end
     memory_request_ready = 1; tick(); memory_request_ready = 0;
     memory_response_bits_tag = {tag + int(wrong_tag)}; memory_response_bits_fault = {int(fault)};
     memory_response_bits_data = 64'h{value:x}; memory_response_valid = 1; tick(); memory_response_valid = 0;
     repeat (3) begin
-      check(output_valid && output_bits_instruction_fault == {int(fault or wrong_tag)} && output_bits_rd == 7 && output_bits_rdWrite && output_bits_value == 64'h{value:x}, "Reservation result retention"); tick();
+      check(output_valid && output_bits_instruction_fault == {int(fault or wrong_tag)} && output_bits_rd == 7 && output_bits_rdWrite && output_bits_value == 64'h{signed(value, 32) & MASK if size == 2 else value:x}, "Reservation result retention"); tick();
     end
 '''
             if fault or wrong_tag:
@@ -504,6 +504,14 @@ def lsu_reservation_contract(parameters):
         transfer(3, local_fault=7)
         transfer(0, local_fault=7)
         body += '    pmp_config = 0; pmp_address = 0;\n'
+    for size in (2, 3):
+        transfer(2, value=0x80000000, size=size)
+        transfer(3, eligible=True, size=size)
+        transfer(3, value=1, size=size)
+        transfer(2, size=size)
+        transfer(3, value=1, size=5-size)
+        transfer(2, 0x1004 if size == 2 else 0x1008, size=size)
+        transfer(3, value=1, size=size)
     return body + '    input_bits_atomic = 0; input_bits_load = 0; input_bits_store = 0;\n'
 
 
@@ -560,9 +568,9 @@ def decode_contract(parameters):
              (0x00728463, 1, 1, 0), (0x0080036f, 0, 0, 1),
              (0x00428367, 1, 0, 1), (0x0082b303, 1, 0, 1),
              (0x0072b423, 1, 1, 0), (0x34029373, 1, 0, 1),
-             (0x3402a373, 1, 0, 1), (0x00000073, 0, 0, 0),
+             (0x3402a373, 1, 0, 1), (0x00000073, 0, 0, 0), (0x00100073, 0, 0, 0),
              (0x30200073, 0, 0, 0), (0x10500073, 0, 0, 0), (0x10400073, 0, 0, 0), (0x10508073, 0, 0, 0), (0x105000f3, 0, 0, 0), (0xffffffff, 0, 0, 0))
-    cases += ((mul(6, 5, 7), 1, 1, 1), (mul(6, 5, 7) | (1 << 12), 0, 0, 0))
+    cases += ((mul(6, 5, 7), 1, 1, 1), (mul(6, 5, 7) | (1 << 12), 1, 1, 1))
     cases += ((lw(6, 5, 4), 1, 0, 1), (lw(6, 5, 4, True), 1, 0, 1), (sw(7, 5, 4), 1, 1, 0))
     extra = {alu(6, 5, 7, f): 22 for f in range(1, 8)}
     extra.update({alu(6, 5, 7, f, immediate=True): 21 for f in range(1, 8)})
@@ -571,13 +579,17 @@ def decode_contract(parameters):
     extra.update({load(6, 5, 4, s, u): 26 for s in (0, 1) for u in (False, True)})
     extra.update({store(7, 5, 4, s): 27 for s in (0, 1)})
     extra.update({csr(6, 0x340, 5, function=f): 28 for f in (3, 5, 6, 7)})
-    extra.update({amo(op, 6, 5, 0 if op == 2 else 7, order): 30 for op in (1, 2, 3, 8) for order in range(4)})
+    extra.update({amo(op, 6, 5, 0 if op == 2 else 7, order, size): 15 if op == 0 and size == 3 else 30
+                  for op in (*ATOMIC_OPERATIONS, 2, 3) for size in (2, 3) for order in range(4)})
+    extra.update({muldiv(6, 5, 7, function, word): 14 for word in (False, True) for function in ((0, 4, 5, 6, 7) if word else range(8))})
     if parameters.get('enableSupervisorMode'):
         extra[0x10200073] = 31
-    cases += tuple((word, int(op != 31 and (op != 28 or (word >> 12) & 4 == 0)), int(op in (22, 24, 25, 27) or op == 30 and word >> 27 != 2), int(op not in (25, 27, 31))) for word, op in extra.items())
-    invalid = {amo(op, 6, 5, 0 if op == 2 else 7) ^ ((3 ^ size) << 12) for op in (0, 1, 2, 3, 8) for size in range(8) if size != 3}
-    invalid.update(amo(op, 6, 5, 7) for op in range(32) if op not in (0, 1, 2, 3, 8))
+    cases += tuple((word, int(op != 31 and (op != 28 or (word >> 12) & 4 == 0)), int(op in (14, 15, 22, 24, 25, 27) or op == 30 and word >> 27 != 2), int(op not in (25, 27, 31))) for word, op in extra.items())
+    invalid = {amo(op, 6, 5, 0 if op == 2 else 7) ^ ((3 ^ size) << 12) for op in (*ATOMIC_OPERATIONS, 2, 3) for size in range(8) if size not in (2, 3)}
+    invalid.update(amo(op, 6, 5, 7) for op in range(32) if op not in (*ATOMIC_OPERATIONS, 2, 3))
     invalid.update(amo(2, 6, 5, rs) for rs in (1, 31))
+    invalid.update((0x00108073, 0x001000f3, 0x00200073, 0x000000f3))
+    invalid.update(muldiv(6, 5, 7, function, True) for function in (1, 2, 3))
     cases += tuple((word, 0, 0, 0) for word in sorted(invalid))
     cases += ((alu(6, 5, 32, 1, True, True), 0, 0, 0), (alu(6, 5, 64, 1, immediate=True), 0, 0, 0), (csr(6, 0x340, 5, function=4), 0, 0, 0))
     cases += tuple((0x0072b32f | (ordering << 25), 1, 1, 1) for ordering in range(4))
@@ -586,11 +598,19 @@ def decode_contract(parameters):
     cases += ((0x200f, 0, 0, 0), (0x700f, 0, 0, 0))
     body = '    input_valid = 1; output_ready = 1;\n'
     for word, rs1, rs2, rd in cases:
+        if word & 127 in (0x33, 0x3b) and word >> 25 == 1 and not parameters.get('enableM', True):
+            rs1 = rs2 = rd = 0
+            extra[word] = 0
+        if word & 127 == 0x2f and not parameters.get('enableA', True):
+            rs1 = rs2 = rd = 0
+            extra[word] = 0
         serial = int((word & 127 == 0x73 and (word >> 12) & 7 in (1, 2, 3, 5, 6, 7)) or word in (0x30200073, 0x10500073) or word == 0x10200073 and parameters.get('enableSupervisorMode') or word & 0x707f in (0x0f, 0x100f))
         body += (f"    input_bits_instruction = 32'h{word:08x};\n"
                  f'    check(output_valid && input_ready && output_bits_usesRs1 == {rs1} && output_bits_usesRs2 == {rs2} && output_bits_writesRd == {rd} && output_bits_serializing == {serial}, "Decode dependency metadata {word:08x}");\n')
         if word in extra or word in invalid:
             body += f'    check(output_bits_operation == {extra.get(word, 0)}, "Scalar operation class {word:08x}");\n'
+        if word in (0x00000073, 0x00100073):
+            body += '    check(output_bits_operation == 12, "Environment exception operation class");\n'
     if parameters.get('virtualAddressBits') == 39:
         precise = any(parameters.get(key) for key in ('tlbEntries', 'iTlbEntries', 'dTlbEntries')) and any(parameters.get(key) for key in ('asidBits', 'iTlbEntries', 'dTlbEntries'))
         for rs1, rs2 in ((0, 0), (1, 0), (0, 31), (31, 31)):
@@ -670,12 +690,28 @@ def execute_contract():
         for unsigned in (False, True):
             check_instruction(load(6, 1, 4, size, unsigned), 26, 0x1000)
         check_instruction(store(2, 1, 4, size), 27, 0x1000, MASK, 4)
-    for operation in (0, 1, 2, 3, 8):
+    for operation, size in ((op, size) for op in (*ATOMIC_OPERATIONS, 2, 3) for size in (2, 3)):
         for order in range(4):
-            body += f'''    input_bits_decoded_operation = {15 if operation == 0 else 30}; input_bits_decoded_immediate = 0;
-    input_bits_decoded_instruction_instruction = 32'h{amo(operation, 6, 1, 0 if operation == 2 else 2, order):x};
+            body += f'''    input_bits_decoded_operation = {15 if operation == 0 and size == 3 else 30}; input_bits_decoded_immediate = 0;
+    input_bits_decoded_instruction_instruction = 32'h{amo(operation, 6, 1, 0 if operation == 2 else 2, order, size):x};
     input_bits_decoded_writesRd = 1; input_bits_operand1 = 'h1000; input_bits_operand2 = 64'h{0 if operation == 2 else MASK:x};
-    check(output_valid && output_bits_atomic && output_bits_load == {int(operation != 3)} && output_bits_store == {int(operation != 2)} && output_bits_memorySize == 3 && output_bits_address == 'h1000 && output_bits_storeData == 64'h{0 if operation == 2 else MASK:x}, "Doubleword atomic execution metadata");
+    check(output_valid && output_bits_atomic && output_bits_load == {int(operation != 3)} && output_bits_store == {int(operation != 2)} && output_bits_memorySize == {size} && output_bits_address == 'h1000 && output_bits_storeData == 64'h{0 if operation == 2 else MASK:x}, "Atomic execution metadata");
+'''
+    body += '''    input_bits_decoded_operation = 12; input_bits_decoded_writesRd = 0;
+    input_bits_decoded_instruction_instruction = 32'h00100073; input_bits_decoded_instruction_pc = 'h104;
+    input_bits_decoded_instruction_fault = 0;
+'''
+    for privilege in (3, 1, 0):
+        for ready in (0, 1):
+            body += f'''    privilege = {privilege}; output_ready = {ready};
+    check(output_valid && input_ready == {ready} && output_bits_instruction_fault && output_bits_instruction_cause == 3 &&
+      output_bits_instruction_tval == 'h104 && !output_bits_rdWrite && !output_bits_load && !output_bits_store &&
+      !output_bits_atomic && !output_bits_csrWrite && !output_bits_mret && !output_bits_sret, "Breakpoint exception and effects");
+'''
+    body += '''    input_bits_decoded_instruction_fault = 1; input_bits_decoded_instruction_cause = 1;
+    input_bits_decoded_instruction_tval = 'habc;
+    check(output_bits_instruction_cause == 1 && output_bits_instruction_tval == 'habc, "Prior fetch fault precedes breakpoint");
+    input_bits_decoded_instruction_fault = 0; privilege = 3;
 '''
     return body
 
@@ -691,11 +727,11 @@ def memory_contract(parameters):
              (1 << parameters['physicalAddressBits'], 3, 0, 0, 0, False),
              (0x8000, 2, 0, 1, 0, True), (0x8000, 2, 0, 0, 0, False))
     cases = tuple((*case[:-1], 0, case[-1]) for case in cases)
-    ram_atomic = any(r.get('atomic', False) and int(r['base']) <= base + 0x1000 < int(r['base']) + int(r['size'])
+    ram_atomic = parameters.get('enableA', True) and any(r.get('atomic', False) and int(r['base']) <= base + 0x1000 < int(r['base']) + int(r['size'])
                      for r in parameters['memoryRegions'])
     cases += ((0x1000, 3, 1, 0, 255, 1, ram_atomic),
               (0x1000, 3, 0, 0, 255, 1, False), (0x1000, 3, 1, 1, 255, 1, False),
-              (0x1000, 2, 1, 0, 15, 1, False), (0x1000, 3, 1, 0, 127, 1, False),
+              (0x1000, 2, 1, 0, 15, 1, ram_atomic), (0x1000, 3, 1, 0, 127, 1, False),
               (0x1001, 3, 1, 0, 255, 1, False), (0x4000, 3, 1, 0, 255, 1, False),
               (0x5000, 3, 1, 0, 255, 1, False), (0x7000, 3, 1, 0, 255, 1, False),
               (0x8000, 3, 1, 0, 255, 1, False))
@@ -703,8 +739,8 @@ def memory_contract(parameters):
     cases += tuple((0x1000, 3, int(op != 2), 0, 0 if op == 2 else 255, 1, op, int(op == 3), ram_atomic) for op in (1, 2, 3, 8))
     cases += ((0x1000, 3, 1, 0, 255, 1, 3, 0, ram_atomic),
               (0x1000, 3, 1, 0, 255, 1, 2, 0, False), (0x1000, 3, 0, 0, 0, 1, 3, 1, False))
-    cases += tuple((0x1000, 3, 1, 0, 255, 1, op, 0, False) for op in (4, 5, 12, 16, 20, 24, 28))
-    cases += tuple((0x1000, 2, int(op != 2), 0, 0 if op == 2 else 15, 1, op, 0, False) for op in (1, 2, 3, 8))
+    cases += tuple((0x1000, 3, 1, 0, 255, 1, op, 0, ram_atomic and op in ATOMIC_OPERATIONS) for op in (4, 5, 12, 16, 20, 24, 28))
+    cases += tuple((0x1004, size, int(op != 2), 0, 0 if op == 2 else (1 << (1 << size)) - 1, 1, op, 0, ram_atomic and size == 2) for op in (*ATOMIC_OPERATIONS, 2, 3) for size in (2, 3))
     for fetch in (0, 1):
         enabled = parameters.get('enableBurstRefill') if fetch else parameters.get('dCacheRefillBytes') == 64
         cacheable = any(r.get('dataCacheable') and not r['device'] and r['readable'] and
@@ -764,7 +800,7 @@ def axi_cache_attributes(parameters):
 ''' + regions + '  endfunction\n'
 
 
-def axi_contract(width, harts):
+def axi_contract(width, harts, enable_a=True):
     bus_bytes = width // 8
     read_data = sum((0xa0 + byte) << (8 * byte) for byte in range(bus_bytes))
     write_data = 0x8877665544332211
@@ -804,12 +840,10 @@ def axi_contract(width, harts):
     end
     memory_response_ready = 1; tick(); memory_response_ready = 0;
 '''
-    return body + axi_atomic_contract(width) + axi_reservation_contract(width, harts)
+    return body + (axi_atomic_contract(width) + axi_reservation_contract(width, harts) if enable_a else '')
 
 
 def axi_atomic_contract(width):
-    lane = width // 8 - 8
-    shift = lane * 8
     body = ''
     cases = ((1, 0, 1, 0, 0, False), (1, 0, 1, 0, 2, False),
              (0, 0, 1, 0, 0, False), (2, 0, 1, 0, 0, False),
@@ -818,21 +852,27 @@ def axi_atomic_contract(width):
              (1, 0, 1, 1, 0, False), (1, 0, 0, 1, 0, False),
              (1, 0, 1, 0, 0, True))
     cases = tuple((0, *case) for case in cases) + tuple((op, 1, 0, 1, 0, retries, False) for op in (1, 8) for retries in (0, 2))
-    for index, (operation, read_resp, read_id, write_resp, write_id, retries, malformed) in enumerate(cases):
+    cases = tuple((size, *case, -3, 5) for size in (2, 3) for case in cases) + tuple(
+        (size, op, 1, 0, 1, 0, 0, False, a, b) for size in (2, 3) for op in ATOMIC_OPERATIONS
+        for a, b in ((0, -1), (-1, 0), (0x80000000, 1), (0x7fffffff, 0xffffffff), (1 << 63, 1), ((1 << 63)-1, 1 << 63)))
+    for index, (size, operation, read_resp, read_id, write_resp, write_id, retries, malformed, initial, operand) in enumerate(cases):
+        lane = width // 8 - (1 << size)
+        shift, mask = lane * 8, (1 << (8 << size)) - 1
+        operand &= mask
         body += f'''
     memory_request_bits_atomic = 1; memory_request_bits_write = 1; memory_request_bits_atomicOperation = {operation};
-    memory_request_bits_address = 'h{0x1000 + lane:x}; memory_request_bits_size = 3;
-    memory_request_bits_mask = 255; memory_request_bits_data = 5; memory_request_bits_tag = 201;
+    memory_request_bits_address = 'h{0x1000 + lane:x}; memory_request_bits_size = {size};
+    memory_request_bits_mask = {(1 << (1 << size)) - 1}; memory_request_bits_data = 64'h{operand:x}; memory_request_bits_tag = 201;
     memory_request_valid = 1; tick(); memory_request_valid = 0;
     memory_request_bits_atomic = 0; memory_request_bits_data = 99; memory_request_bits_address = 0;
 '''
         fault = read_resp != 1 or read_id != 0 or write_resp != 1 or write_id != 0 or malformed
         for attempt in range(retries + 1):
-            old = ((1 << 64) - 3 + attempt * 11) & ((1 << 64) - 1)
-            value = atomic_value(operation, old, 5, 8)
+            old = (initial + attempt * 11) & mask
+            value = atomic_value(operation, old, operand, 1 << size)
             body += f'''
     repeat (3) begin
-      check(axi_ar_valid && !axi_aw_valid && !axi_w_valid && !memory_response_valid && !memory_request_ready && axi_ar_bits_lock && axi_ar_bits_addr == 'h{0x1000 + lane:x} && axi_ar_bits_id == 0 && axi_ar_bits_len == 0 && axi_ar_bits_size == 3, "Exclusive read ownership"); tick();
+      check(axi_ar_valid && !axi_aw_valid && !axi_w_valid && !memory_response_valid && !memory_request_ready && axi_ar_bits_lock && axi_ar_bits_addr == 'h{0x1000 + lane:x} && axi_ar_bits_id == 0 && axi_ar_bits_len == 0 && axi_ar_bits_size == {size}, "Exclusive read ownership"); tick();
     end
     axi_ar_ready = 1; tick(); axi_ar_ready = 0;
     repeat (2) begin check(axi_r_ready && !memory_response_valid && !axi_aw_valid, "Exclusive read response wait"); tick(); end
@@ -848,7 +888,7 @@ def axi_atomic_contract(width):
             if read_resp == 1 and read_id == 0 and not malformed:
                 body += f'''
     repeat (3) begin
-      check(axi_aw_valid && axi_w_valid && !axi_ar_valid && !memory_response_valid && !memory_request_ready && axi_aw_bits_lock && axi_aw_bits_addr == 'h{0x1000 + lane:x} && axi_aw_bits_id == 0 && axi_aw_bits_len == 0 && axi_aw_bits_size == 3 && axi_w_bits_data == 'h{value << shift:x} && axi_w_bits_strb == 'h{255 << lane:x} && axi_w_bits_last, "Exclusive sum and captured operand"); tick();
+      check(axi_aw_valid && axi_w_valid && !axi_ar_valid && !memory_response_valid && !memory_request_ready && axi_aw_bits_lock && axi_aw_bits_addr == 'h{0x1000 + lane:x} && axi_aw_bits_id == 0 && axi_aw_bits_len == 0 && axi_aw_bits_size == {size} && axi_w_bits_data == 'h{value << shift:x} && axi_w_bits_strb == 'h{((1 << (1 << size)) - 1) << lane:x} && axi_w_bits_last, "Exclusive sum and captured operand"); tick();
     end
 '''
                 first, second = ('aw', 'w') if (index + attempt) % 2 else ('w', 'aw')
@@ -2791,30 +2831,33 @@ def fabric_exclusive_contract(parameters):
     return body + '    end\n'
 
 
-def multiply_contract():
-    edges = (0, 1, 2, (1 << 64) - 1, 1 << 63, (1 << 63) - 1, 1 << 32, 0xaaaaaaaa55555555)
+def muldiv_contract():
+    edges = (0, 1, 2, (1 << 64) - 1, 1 << 63, (1 << 63) - 1, 1 << 32, 0x80000000, 0x80000001, 0xaaaaaaaa55555555)
     rng = random.Random(2026)
     pairs = [(a, b) for a in edges for b in edges]
     pairs += [(rng.getrandbits(64), rng.getrandbits(64)) for _ in range(32)]
     body = ''
-    for a, b in pairs:
+    for instruction, a, b in ((muldiv(6, 1, 2, function, word), a, b) for word in (False, True)
+                              for function in ((0, 4, 5, 6, 7) if word else range(8)) for a, b in pairs):
         body += f'''
+    input_bits_decoded_instruction_instruction = 32'h{instruction:x};
     input_bits_operand1 = 64'h{a:x}; input_bits_operand2 = 64'h{b:x}; input_valid = 1;
-    check(input_ready && !output_valid, "Multiply resource reuse"); tick();
+    check(input_ready && !output_valid, "MulDiv resource reuse"); tick();
     input_bits_operand1 = ~input_bits_operand1; input_bits_operand2 = ~input_bits_operand2;
+    input_bits_decoded_instruction_instruction = '1;
     for (integer cycles = 0; !output_valid; cycles++) begin
-      check(!input_ready && cycles < 64, "Multiply acceptance or completion bound"); tick();
+      check(!input_ready && cycles < {32 if instruction & 127 == 0x3b else 64}, "MulDiv acceptance or completion bound"); tick();
     end
     input_valid = 0;
     repeat (3) begin
-      check(!input_ready && output_valid && output_bits == 64'h{(a * b) & ((1 << 64) - 1):x}, "Multiply value and held completion"); tick();
+      check(!input_ready && output_valid && output_bits == 64'h{muldiv_value(instruction, a, b) & MASK:x}, "MulDiv value and held completion"); tick();
     end
     output_ready = 1; tick(); output_ready = 0;
 '''
     return body
 
 
-def backend_multiply_contract():
+def backend_muldiv_contract():
     def send(words, pc, tag):
         return ''.join(f'''
     instruction_bits_pc = 'h{pc + 4 * index:x}; instruction_bits_instruction = 'h{word:x};
@@ -2835,15 +2878,15 @@ def backend_multiply_contract():
     body = reset + setup + send((sd(3, 0), addi(6, 0, 0), mul(4, 2, 3), addi(5, 4, 1)), 0x180, 10)
     body += '''
     while (!data_request_valid) tick();
-    while (!dut.multiply.output_valid) tick();
+    while (!dut.mulDiv.output_valid) tick();
     repeat (3) begin
       check(data_request_valid && data_request_bits_write && data_request_bits_tag == 10 &&
-        dut.executePending && dut.issuedValid && !dut.multiply.input_valid &&
-        dut.multiply.output_valid && dut.multiply.output_bits == 1, "Blocked multiply retains owner and destination"); tick();
+        dut.executePending && dut.issuedValid && !dut.mulDiv.input_valid &&
+        dut.mulDiv.output_valid && dut.mulDiv.output_bits == 1, "Blocked mulDiv retains owner and destination"); tick();
     end
 ''' + complete + send((sd(5, 0),), 0x200, 20) + '''
     while (!data_request_valid) tick();
-    check(data_request_bits_write && data_request_bits_data == 2, "Dependent instruction used a stale multiply result");
+    check(data_request_bits_write && data_request_bits_data == 2, "Dependent instruction used a stale mulDiv result");
 ''' + complete
     for held in (False, True):
         body += reset + setup
@@ -2851,22 +2894,22 @@ def backend_multiply_contract():
         body += send(words, 0x180, 10)
         if held:
             body += '''
-    while (!data_request_valid || dut.multiply.multiplier != 7) tick();
-    check(dut.executePending && !dut.multiply.output_valid, "Fault response did not precede multiply completion");
+    while (!data_request_valid || dut.mulDiv.remaining != 7) tick();
+    check(dut.executePending && !dut.mulDiv.output_valid, "Fault response did not precede mulDiv completion");
     data_request_ready = 1; tick(); data_request_ready = 0;
     data_response_bits_tag = 10; data_response_bits_fault = 1; data_response_valid = 1;
     tick(); data_response_valid = 0; data_response_bits_fault = 0;
 '''
         body += f'''
     while (!redirect) begin check(!data_request_valid, "Younger store escaped before redirect"); tick(); end
-    check(dut.executePending && dut.multiply.{'valid' if held else 'busy'}, "Redirect did not overlap the multiply operation");
+    check(dut.executePending && dut.mulDiv.{'valid' if held else 'busy'}, "Redirect did not overlap the mulDiv operation");
     tick();
     check(!dut.issuedValid && !data_request_valid, "Redirect retained a younger effect");
 '''
         body += send((addi(5, 4, 7), sd(5, 0)), 0x200, 20) + '''
     while (!data_request_valid) tick();
     check(data_request_bits_write && data_request_bits_data == 7 && data_request_bits_tag == 21,
-      "Cancelled multiply wrote its destination or polluted slot reuse");
+      "Cancelled mulDiv wrote its destination or polluted slot reuse");
 ''' + complete
     return body
 
@@ -2962,7 +3005,7 @@ def backend_queue_contract(parameters):
     return body
 
 
-def backend_contract():
+def backend_contract(parameters):
     words = [(2 << 12) | (1 << 7) | 0x37, addi(2, 0, 42), sd(2, 1), 0x73, sd(2, 1, 8)]
     body = f'''    instruction_bits_length = 4;
     instruction_bits_instruction = 'h{addi(2, 0, 7):x}; instruction_valid = 1;
@@ -3019,7 +3062,7 @@ def backend_contract():
     data_request_ready = 1; tick(); data_request_ready = 0;
     data_response_bits_tag = 8; data_response_valid = 1; tick(); data_response_valid = 0;
     repeat (6) begin check(!data_request_valid && !redirect, "Unexpected backend effect"); tick(); end
-''' + backend_multiply_contract()
+''' + (backend_muldiv_contract() if parameters.get('enableM', True) else '')
 
 
 def backend_group_contract(parameters):
@@ -3089,13 +3132,13 @@ def backend_group_contract(parameters):
         body += f'''
     instruction_bits_count = 2; instruction_bits_packets_0_pc = 'h200;
     instruction_bits_packets_0_instruction = 'h10500073;
-    instruction_bits_packets_1_pc = 'h204; instruction_bits_packets_1_instruction = 'h{mul(3, 1, 1):x};
+    instruction_bits_packets_1_pc = 'h204; instruction_bits_packets_1_instruction = 'h{mul(3, 1, 1) if parameters.get('enableM', True) else addi(3, 1, 1):x};
     instruction_bits_packets_1_length = 4; instruction_bits_packets_1_fault = 0;
     instruction_valid = 1; while (!instruction_ready) tick(); tick(); instruction_valid = 0;
     while (dut.commitCount == 0 || !dut.commitPackets_0_wfi) tick();
-    tick(); check(status_sleep && dut.executePending && dut.resumePc == 'h204, "WFI cancels younger multiply and retains resume PC");
+    tick(); check(status_sleep && {"dut.executePending && " if parameters.get("enableM", True) else ""}dut.resumePc == 'h204, "WFI cancels younger mulDiv and retains resume PC");
     repeat (8) begin check(status_sleep && !instruction_ready && !data_request_valid, "Sleep drains owned execution"); tick(); end
-    check(!dut.executePending, "Cancelled multiply drained");
+    check({"!dut.executePending" if parameters.get("enableM", True) else "!data_request_valid"}, "Cancelled execution drained");
     interrupts_software = 1; tick();
     check(!status_sleep && instruction_ready && !status_trap, "Locally enabled wake without global trap");
     interrupts_software = 0;
@@ -3496,7 +3539,7 @@ def verify_cache_coherence(cache_rtl, fabric_rtl, directory, mutations=False):
     print('  Two-cache dirty ownership, masked recall, failed writeback and replacement passed', flush=True)
 
 
-def bench(module, body):
+def bench(module, body, cycle_limit=10000):
     declarations, connections, names = [], [], []
     for direction, width, name in module_ports(module):
         initial = (" = 3" if name == 'privilege' else " = 1" if name == 'wfiLegal' or name.endswith(('_privileged', '_response_bits_last')) else " = '0") if direction == 'input' else ''
@@ -3518,7 +3561,7 @@ def bench(module, body):
             + body.replace('check(', '`CHECK(') + '''
     $display("PASS"); $finish;
   end
-  initial begin #100000; $fatal(1, "Timeout"); end
+  initial begin #''' + str(cycle_limit * 10) + '''; $fatal(1, "Timeout"); end
 endmodule
 ''')
 
@@ -4264,7 +4307,7 @@ def backend_protection_contract():
     end
 ''' + send((sd(4, 1),), 0x200) + '''
     while (!data_request_valid) tick();
-    check(data_request_bits_data == 0 && data_request_bits_address == 'h1000, "Younger multiply wrote a destination");
+    check(data_request_bits_data == 0 && data_request_bits_address == 'h1000, "Younger mulDiv wrote a destination");
     data_request_ready = 1; tick(); data_request_ready = 0;
     data_response_bits_tag = data_request_bits_tag; data_response_valid = 1;
     tick(); data_response_valid = 0; repeat (8) tick();
@@ -4490,22 +4533,26 @@ def verify(rtl, directory, modules=None):
     directory.mkdir(parents=True, exist_ok=True)
     manifest = json.loads((rtl / 'ditdah_a1_config.json').read_text())
     parameters = manifest['parameters']
+    def emitted_source(name): return (rtl / (name + '.sv')).read_text() if (rtl / (name + '.sv')).is_file() else ''
     verified = []
     enabled = parameters['pmpEntries'] != 0
     cached = bool(parameters['iCacheBytes'])
+    if not parameters.get('enableA', True):
+        lsu_source = emitted_source('DitDahA1Lsu')
+        assert 'reservedWord' not in lsu_source and 'reservedDoubleword' not in lsu_source, 'Disabled reservation state was emitted'
     suites = (('DitDahA1Fetch', (burst_fetch_contract(parameters) if parameters.get('enableBurstRefill') else cached_fetch_contract(parameters)) if cached else FETCH + (protection_contract(True) if enabled else '')),
                        ('DitDahA1Lsu', lsu_queue_contract(parameters) if parameters.get('loadQueueEntries', 1) == 2 else
-                        LSU + lsu_reservation_contract(parameters) + (protection_contract(False) if enabled else '') + lsu_refill_contract(parameters)),
-                       ('DitDahA1Multiply', multiply_contract()),
+                        LSU + (lsu_reservation_contract(parameters) if parameters.get('enableA', True) else '') + (protection_contract(False) if enabled else '') + lsu_refill_contract(parameters)),
+                       ('DitDahA1MulDiv', muldiv_contract()),
                        ('DitDahA1Frontend', (burst_fetch_contract(parameters, True) if parameters.get('enableBurstRefill') else cached_fetch_contract(parameters, True)) if cached else frontend_contract(parameters)),
                        ('DitDahA1Decode', decode_contract(parameters)),
                        ('DitDahA1Execute', execute_contract()),
                        ('DitDahA1Backend', backend_queue_contract(parameters) if parameters.get('loadQueueEntries', 1) == 2 else
-                        backend_contract() + backend_fence_contract() + (backend_protection_contract() if enabled else '') +
+                        backend_contract(parameters) + backend_fence_contract() + (backend_protection_contract() if enabled else '') +
                         (backend_interrupt_contract() if parameters['enableInterrupts'] else '')),
                        ('DitDahA1MemoryArbiter', arbiter_contract(parameters)),
                        ('DitDahA1Memory', memory_contract(parameters)),
-                       ('DitDahA1Axi', axi_contract(parameters['axiDataBits'], parameters['hartCount']) +
+                       ('DitDahA1Axi', axi_contract(parameters['axiDataBits'], parameters['hartCount'], parameters.get('enableA', True)) +
                         (burst_axi_contract(parameters) if parameters.get('enableBurstRefill') else '') +
                         (burst_axi_contract(parameters, False) if parameters.get('dCacheRefillBytes') == 64 else '')),
                        ('DitDahA1MemoryFabric', fabric_contract(parameters)))
@@ -4550,6 +4597,10 @@ def verify(rtl, directory, modules=None):
                     if name == 'DitDahA1Frontend' else body) for name, body in suites)
     assert not modules or set(modules) <= {name for name, _ in suites}, 'Unsupported contract selection'
     for name, body in suites:
+        if name == 'DitDahA1MulDiv' and not parameters.get('enableM', True):
+            assert not (rtl / (name + '.sv')).exists(), 'Disabled arithmetic resource was emitted'
+            assert name not in emitted_source('DitDahA1Backend'), 'Disabled arithmetic resource was instantiated'
+            continue
         if modules and name not in modules:
             continue
         module = rtl / (name + '.sv')
@@ -4562,7 +4613,7 @@ def verify(rtl, directory, modules=None):
                 body = re.sub(r'\bdut\.(instruction|decoded|issued|result|memory|commit)Valid\b',
                               r'(dut.\1Count != 0)', body)
                 body += backend_group_contract(parameters) + (backend_branch_contract() if parameters.get('loadQueueEntries', 1) == 1 else '') + backend_memory_group_contract(parameters)
-        source = bench(module, body)
+        source = bench(module, body, 4 + 69 * body.count('MulDiv resource reuse')) if name == 'DitDahA1MulDiv' else bench(module, body)
         if name in ('DitDahA1Axi', 'DitDahA1ReadQueue'):
             prefix = 'axi_' if name == 'DitDahA1Axi' else ''
             checks = axi_cache_attributes(parameters)
@@ -4597,7 +4648,7 @@ def verify(rtl, directory, modules=None):
             dependencies = [rtl / file for file in (rtl / 'filelist.f').read_text().splitlines()
                             if file.startswith(('sharedData_', 'sharedTags_', 'mem_'))]
         if name == 'DitDahA1Backend':
-            dependencies = [rtl / ('DitDahA1' + child + '.sv') for child in ('Decode', 'Issue', 'Execute', 'Multiply', 'Commit', 'Gpr', 'Csr', 'Lsu')]
+            dependencies = [rtl / ('DitDahA1' + child + '.sv') for child in ('Decode', 'Issue', 'Execute', 'Commit', 'Gpr', 'Csr', 'Lsu', *(('MulDiv',) if parameters.get('enableM', True) else ())) ]
         if enabled and name in ('DitDahA1Fetch', 'DitDahA1Lsu', 'DitDahA1Frontend', 'DitDahA1Backend'):
             dependencies.append(rtl / 'DitDahA1Pmp.sv')
         if enabled and name == 'DitDahA1Translation':

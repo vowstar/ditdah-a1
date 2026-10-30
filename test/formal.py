@@ -100,11 +100,14 @@ FETCH_PHYSICAL = r'''
   end
 '''
 
-MULTIPLY = r'''
+MULDIV = r'''
   reg past_valid = 0;
   reg pending, completed;
   reg [6:0] age;
   reg [63:0] first, second;
+  reg [3:0] operation;
+  wire [63:0] normalized_second = operation[3] ? {32'd0, second[31:0]} : second;
+  wire [63:0] division_mask = operation[3] ? 64'h80000000 : 64'h8000000000000000;
   always @(posedge clock) begin
     past_valid <= 1;
     if (!past_valid) assume(reset);
@@ -120,22 +123,33 @@ MULTIPLY = r'''
         age <= 0;
         first <= input_bits_operand1;
         second <= input_bits_operand2;
+        operation <= {input_bits_decoded_instruction_instruction[6:0] == 7'h3b,
+                      input_bits_decoded_instruction_instruction[14:12]};
       end else if (pending && !output_valid) age <= age + 1;
       if (output_valid && output_ready) begin pending <= 0; completed <= 1; end
       assert(input_ready == !pending);
       assert(pending == (busy || valid));
       assert(!(busy && valid));
-      assert(age <= 64);
-      if (pending) assert(multiplier == (second >> age));
-      if (pending && first == 0) assert(multiplicand == 0 && product == 0);
-      if (pending && second == 0) assert(multiplier == 0 && product == 0);
-      if (pending && second == 1) assert(
-        (busy && multiplier == 1 && product == 0 && multiplicand == first) ||
-        (valid && product == first));
+      if (pending) begin
+        assert(age <= (operation[3] ? 32 : 64));
+        assert(functionCode == operation[2:0] && wordOperation == operation[3]);
+        assert(remaining == ((operation[2] ? division_mask : normalized_second) >> age));
+        if (busy && age != 0) assert(remaining != 0);
+      end
+      if (pending && operation == 0) begin
+        if (first == 0) assert(factor == 0 && work == 0);
+        if (second == 0) assert(remaining == 0 && work == 0);
+        if (second == 1) assert(
+          (busy && remaining == 1 && work == 0 && factor == {64'd0, first}) ||
+          (valid && work == {64'd0, first}));
+      end
       if (output_valid) begin
         assert(pending);
-        if (first == 0 || second == 0) assert(output_bits == 0);
-        if (second == 1) assert(output_bits == first);
+        if (operation == 0) begin
+          if (first == 0 || second == 0) assert(output_bits == 0);
+          if (second == 1) assert(output_bits == first);
+        end
+        if (operation[3]) assert(output_bits[63:32] == {32{output_bits[31]}});
       end
       if (past_valid && $past(!reset && output_valid && !output_ready)) begin
         assert(output_valid);
@@ -146,6 +160,9 @@ MULTIPLY = r'''
       cover(output_valid && age == 64);
       cover(pending && age > 2 && input_valid && !input_ready);
       cover(completed && input_valid && input_ready);
+      cover(output_valid && operation[2] && age == 64);
+      cover(output_valid && operation[3] && age == 32 && output_bits[31]);
+      cover(output_valid && operation[2] && second == 0);
     end
   end
 '''
@@ -235,7 +252,7 @@ def pipeline_case(source, parameters):
       cover(commitResolved && retireCount != 0 && !redirect_0);
       if (memoryPending) assert(memoryCount >= 1{"" if dual else ' && !commitValid'});
       if (lsu_input_valid) assert(resultCount >= 1);
-      if (multiply_input_valid) assert(issuedCount == 1);
+      if (mulDiv_input_valid) assert(issuedCount == 1);
       cover(pipeline_owned == {6 * width} && received && retireCount == {width});
       cover(memoryPending && decodedValid && !issued);
       cover(issueCount == {width} && retireCount == {width});
@@ -337,7 +354,7 @@ def pipeline_case(source, parameters):
                     if stage == 'issued':
                         p += '_decoded'
                         ready = '_execute_output_valid && !_execute_output_bits_instruction_fault && !_execute_output_bits_load && !_execute_output_bits_store' if previous == 0 else '_execute_output_valid && !' + p + '_instruction_fault'
-                        value = 'isMultiply ? _multiply_output_bits : _execute_output_bits_value' if previous == 0 else f'pipeline_execution_{previous}'
+                        value = 'isMulDiv ? _mulDiv_output_bits : _execute_output_bits_value' if previous == 0 else f'pipeline_execution_{previous}'
                     else:
                         ready = ('!memoryOperation && ' if stage == 'result' and previous == 0 else
                                  '(!memoryPending || _lsu_output_valid) && ' if dual and stage == 'memory' and previous == 0 else
@@ -462,7 +479,7 @@ BACKEND = r'''
     else assume(!reset);
     if (reset) begin owned <= 0; cancelled <= 0; end
     else begin
-      if (multiply_input_valid && _multiply_input_ready) begin
+      if (mulDiv_input_valid && _mulDiv_input_ready) begin
         assert(!owned);
         owned <= 1;
         cancelled <= 0;
@@ -471,22 +488,22 @@ BACKEND = r'''
         owner_rd <= issuedPacket_decoded_rd;
       end
       if (redirect_0 && owned) cancelled <= 1;
-      if (_multiply_output_valid && multiply_output_ready) begin
+      if (_mulDiv_output_valid && mulDiv_output_ready) begin
         assert(owned);
         owned <= 0;
       end
       assert(owned == executePending);
       if (owned) begin
-        assert(!issued && !multiply_input_valid);
+        assert(!issued && !mulDiv_input_valid);
         assert(issuedPacket_decoded_instruction_pc == owner_pc);
         assert(issuedPacket_decoded_instruction_tag == owner_tag && issuedPacket_decoded_rd == owner_rd);
         if (cancelled) assert(!issuedValid && !executed && !commitValid && !data_request_valid);
       end
-      if (redirect_0) assert(!executed && !multiply_input_valid);
-      cover(owned && !cancelled && _multiply_output_valid && !multiply_output_ready);
-      cover(owned && redirect_0 && !_multiply_output_valid);
-      cover(owned && redirect_0 && _multiply_output_valid);
-      cover(owned && cancelled && _multiply_output_valid && multiply_output_ready);
+      if (redirect_0) assert(!executed && !mulDiv_input_valid);
+      cover(owned && !cancelled && _mulDiv_output_valid && !mulDiv_output_ready);
+      cover(owned && redirect_0 && !_mulDiv_output_valid);
+      cover(owned && redirect_0 && _mulDiv_output_valid);
+      cover(owned && cancelled && _mulDiv_output_valid && mulDiv_output_ready);
       cover(owned && cancelled && instruction_valid && instruction_ready);
     end
   end
@@ -975,13 +992,14 @@ def user_cases():
         assert(output_bits_instruction_cause == input_bits_decoded_instruction_cause);
         assert(output_bits_instruction_tval == input_bits_decoded_instruction_tval);
       end else if (u_op == 12) begin
-        assert(output_bits_instruction_cause == (privilege == 0 ? 8 : 11));
-        assert(output_bits_instruction_tval == 0);
+        assert(output_bits_instruction_cause == (u_word == 32'h00100073 ? 3 : privilege == 0 ? 8 : 11));
+        assert(output_bits_instruction_tval == (u_word == 32'h00100073 ? input_bits_decoded_instruction_pc : 0));
       end else if ((u_op == 13 && privilege != 3) || (u_op == 29 && !wfiLegal)) begin
         assert(output_bits_instruction_cause == 2 && output_bits_instruction_tval == {32'd0, u_word});
       end
     end
     cover(input_valid && !u_fault && u_op == 12 && privilege == 0);
+    cover(input_valid && !u_fault && u_op == 12 && u_word == 32'h00100073 && privilege == 0);
     cover(input_valid && !u_fault && u_op == 13 && privilege == 0);
     cover(input_valid && !u_fault && u_op == 13 && privilege == 3);
     cover(input_valid && !u_fault && u_op == 29 && !wfiLegal);
@@ -1117,13 +1135,17 @@ def supervisor_cases(parameters):
     assume(privilege == 0 || privilege == 1 || privilege == 3);
     if (s_op == 12 || s_op == 13 || s_op == 29 || s_op == 31) begin
       assert(output_bits_instruction_fault == (s_prior_fault || s_op == 12 || s_illegal));
-      if (!s_prior_fault && s_op == 12) assert(output_bits_instruction_cause == (privilege == 3 ? 11 : privilege == 1 ? 9 : 8));
+      if (!s_prior_fault && s_op == 12) begin
+        assert(output_bits_instruction_cause == (input_bits_decoded_instruction_instruction == 32'h00100073 ? 3 : privilege == 3 ? 11 : privilege == 1 ? 9 : 8));
+        assert(output_bits_instruction_tval == (input_bits_decoded_instruction_instruction == 32'h00100073 ? input_bits_decoded_instruction_pc : 0));
+      end
       if (!s_prior_fault && s_illegal) assert(output_bits_instruction_cause == 2 && output_bits_instruction_tval == {32'd0, input_bits_decoded_instruction_instruction});
       assert(output_bits_sret == (s_op == 31));
     end
     cover(input_valid && !s_prior_fault && s_op == 31 && sretLegal && privilege == 1);
     cover(input_valid && !s_prior_fault && s_op == 31 && !sretLegal && privilege == 1);
     cover(input_valid && !s_prior_fault && s_op == 12 && privilege == 1);
+    cover(input_valid && !s_prior_fault && s_op == 12 && input_bits_decoded_instruction_instruction == 32'h00100073 && privilege == 1);
   end
 '''
     if parameters.get('virtualAddressBits') == 39:
@@ -1688,7 +1710,7 @@ def wfi_cases(parameters):
         wfi_slept <= 1;
         assert(!instructionValid && !decodedValid && !issuedValid && !resultValid && !memoryValid && !commitValid);
         assert(!instruction_ready && !data_request_valid && !memoryPending);
-        assert(!issued && !executed && !multiply_input_valid);
+        assert(!issued && !executed && !mulDiv_input_valid);
         PC_ASSERT
       end
       if (wfi_past && $past(!reset && wfi_retired)) begin
@@ -2158,6 +2180,7 @@ def word_cases(parameters):
   reg word_load, word_store, word_unsigned, word_atomic, word_pair, word_reservation;
   reg [4:0] word_operation;
   reg [63:0] word_reserved_address;
+  reg [2:0] word_reserved_size;
   reg [2:0] word_size;
   reg [63:0] word_address, word_data, word_value, word_cause, word_tval, word_pc;
   reg [7:0] word_tag;
@@ -2178,7 +2201,10 @@ def word_cases(parameters):
     else begin
       assert(word_owned == (state != 0));
       assert(word_reservation == reserved);
-      if (word_reservation) assert(word_reserved_address == {PAD_RESERVED, reservedWord, 3'd0});
+      if (word_reservation) begin
+        assert(word_reserved_address == {PAD_RESERVED, reservedWord, 2'd0});
+        assert(reservedDoubleword == (word_reserved_size == 3));
+      end
       if (word_owned) begin
         assert(packet_address == word_address && packet_atomic == word_atomic && packet_instruction_instruction[31:27] == word_operation);
         assert(packet_memorySize == word_size && packet_instruction_tag == word_tag);
@@ -2193,7 +2219,7 @@ def word_cases(parameters):
         word_load <= input_bits_load; word_store <= input_bits_store;
         word_atomic <= input_bits_atomic; word_operation <= input_bits_instruction_instruction[31:27];
         word_pair <= input_bits_atomic && input_bits_instruction_instruction[31:27] == 3 && word_reservation &&
-          input_bits_address == word_reserved_address && input_bits_memorySize == 3;
+          input_bits_address == word_reserved_address && input_bits_memorySize == word_reserved_size;
         if (input_bits_atomic) word_reservation <= 0;
         word_address <= input_bits_address; word_data <= input_bits_storeData;
         word_value <= input_bits_value; word_tag <= input_bits_instruction_tag;
@@ -2218,8 +2244,8 @@ def word_cases(parameters):
         assert(word_owned && word_sent && !word_replied);
         word_replied <= 1; word_done <= 1;
         if (word_load || word_atomic) word_value <= word_extended;
-        if (word_atomic && word_operation == 2 && word_size == 3 && !memory_response_bits_fault && memory_response_bits_tag == word_tag) begin
-          word_reservation <= 1; word_reserved_address <= word_address & MASK_RESERVED;
+        if (word_atomic && word_operation == 2 && (word_size == 2 || word_size == 3) && !memory_response_bits_fault && memory_response_bits_tag == word_tag) begin
+          word_reservation <= 1; word_reserved_address <= word_address & MASK_RESERVED; word_reserved_size <= word_size;
         end
         if (memory_response_bits_fault || memory_response_bits_tag != word_tag) begin
           word_fault <= 1; word_cause <= word_store ? 7 : 5; word_tval <= word_address;
@@ -2266,7 +2292,7 @@ def word_cases(parameters):
   end
 '''.replace('PERMITTED', '_pmp_allowed' if parameters['pmpEntries'] else "1'b1").replace(
         'PAD_RESERVED', f"{64 - parameters['physicalAddressBits']}'d0").replace(
-        'MASK_RESERVED', f"64'h{((1 << parameters['physicalAddressBits']) - 1) & ~7:x}")
+        'MASK_RESERVED', f"64'h{((1 << parameters['physicalAddressBits']) - 1) & ~3:x}")
     data_line = parameters.get('dCacheRefillBytes', 8) == 64 and parameters.get('dCacheBytes')
     if parameters.get('dCacheBytes') and not data_line:
         ranges = ' || '.join(f"((input_bits_address & ~64'd7) >= 64'h{int(r['base']):x} && (input_bits_address & ~64'd7) <= 64'h{int(r['base'])+int(r['size'])-8:x})"
@@ -2475,7 +2501,7 @@ def integer_cases(parameters):
         i_registers = 1;
         if (i_funct7 == 0) i_operation = i_funct3 == 0 ? 4 : 22;
         else if (i_funct7 == 32 && (i_funct3 == 0 || i_funct3 == 5)) i_operation = 22;
-        else if (i_funct7 == 1 && i_funct3 == 0) i_operation = 14;
+        else if (i_funct7 == 1) i_operation = 14;
       end
       7'h1b: if (i_funct3 == 0 || (i_funct3 == 1 && i_funct7 == 0) ||
         (i_funct3 == 5 && (i_funct7 == 0 || i_funct7 == 32))) i_operation = 23;
@@ -2483,6 +2509,7 @@ def integer_cases(parameters):
         i_registers = 1;
         if (((i_funct3 == 0 || i_funct3 == 5) && (i_funct7 == 0 || i_funct7 == 32)) ||
           (i_funct3 == 1 && i_funct7 == 0)) i_operation = 24;
+        if (i_funct7 == 1 && (i_funct3 == 0 || i_funct3 >= 4)) i_operation = 14;
       end
       7'h63: begin
         i_registers = 1; i_branch = 1;
@@ -2498,9 +2525,10 @@ def integer_cases(parameters):
       end
       7'h2f: begin
         i_registers = i_word[31:27] != 2; i_immediate = 0;
-        if (i_funct3 == 3) begin
-          if (i_word[31:27] == 0) i_operation = 15;
-          else if (i_word[31:27] == 1 || i_word[31:27] == 3 || i_word[31:27] == 8 ||
+        if (A_ENABLED && (i_funct3 == 2 || i_funct3 == 3)) begin
+          if (i_word[31:27] == 0) i_operation = i_funct3 == 3 ? 15 : 30;
+          else if (i_word[31:27] == 1 || i_word[31:27] == 3 || i_word[31:27] == 4 || i_word[31:27] == 8 ||
+            i_word[31:27] == 12 || i_word[31:27] == 16 || i_word[31:27] == 20 || i_word[31:27] == 24 || i_word[31:27] == 28 ||
             (i_word[31:27] == 2 && i_word[24:20] == 0)) i_operation = 30;
         end
       end
@@ -2513,7 +2541,10 @@ def integer_cases(parameters):
       end
       default: i_checked = 0;
     endcase
-    if (i_opcode == 7'h73 && i_funct3 == 0 && i_word != 32'h00000073 && i_word != 32'h30200073) begin
+    if (i_word == 32'h00000073 || i_word == 32'h00100073) begin
+      assert(output_bits_operation == 12 && !output_bits_usesRs1 && !output_bits_usesRs2 && !output_bits_writesRd && !output_bits_serializing);
+    end
+    if (i_opcode == 7'h73 && i_funct3 == 0 && i_word != 32'h00000073 && i_word != 32'h00100073 && i_word != 32'h30200073) begin
       assert(output_bits_operation == (i_word == 32'h10500073 ? 29 : 0));
       assert(!output_bits_usesRs1 && !output_bits_usesRs2 && !output_bits_writesRd);
       assert(output_bits_serializing == (!input_bits_fault && i_word == 32'h10500073));
@@ -2532,7 +2563,7 @@ def integer_cases(parameters):
     cover(input_valid && i_operation == 23 && i_funct3 == 5);
     cover(input_valid && i_operation == 28 && i_word[19:15] == 0);
     cover(input_valid && i_operation == 30 && i_word[31:27] == 2 && i_word[26:25] == 3);
-    cover(input_valid && i_opcode == 7'h2f && i_funct3 == 2 && i_operation == 0);
+    cover(input_valid && i_opcode == 7'h2f && i_funct3 == 1 && i_operation == 0);
   end
 '''
     if parameters.get('enableSupervisorMode'):
@@ -2577,7 +2608,7 @@ def integer_cases(parameters):
     assert(output_bits_atomic == (i_op == 15 || i_op == 30));
     if (i_op == 30) begin
       assert(output_bits_load == (i_word[31:27] != 3) && output_bits_store == (i_word[31:27] != 2));
-      assert(output_bits_memorySize == 3 && !output_bits_unsignedLoad);
+      assert(output_bits_memorySize == {1'b0, i_function[1:0]} && !output_bits_unsignedLoad);
       assert(output_bits_address == i_a + i_imm && output_bits_storeData == i_b && output_bits_nextPc == i_sequential);
       assert(output_bits_instruction_fault == input_bits_decoded_instruction_fault);
       assert(!output_bits_csrWrite && !output_bits_mret && !output_bits_fenceI && !output_bits_wfi);
@@ -2635,6 +2666,11 @@ def integer_cases(parameters):
       !i_write && csrLegal && input_bits_decoded_rs1 == i_word[19:15]);
   end
 '''
+    decode = decode.replace('A_ENABLED', str(int(parameters.get('enableA', True))))
+    if not parameters.get('enableA', True):
+        decode = decode.replace('i_operation == 30 && i_word[31:27] == 2', "i_opcode == 7'h2f && i_operation == 0 && i_word[31:27] == 2")
+    if not parameters.get('enableM', True):
+        decode = decode.replace('if (i_funct7 == 1', 'if (0 && i_funct7 == 1')
     if parameters.get('enableUserMode'):
         execute = execute.replace('i_sequential && output_bits_instruction_fault == input_bits_decoded_instruction_fault',
                                   'i_sequential && output_bits_instruction_fault == (input_bits_decoded_instruction_fault || !wfiLegal)')
@@ -4163,8 +4199,10 @@ def memory_case(parameters):
   wire [4:0] m_operation = upstream_request_bits_atomicOperation;
   wire [63:0] m_address = upstream_request_bits_address;
   wire [7:0] m_mask = upstream_request_bits_mask;
-  wire m_shape = !m_atomic || (!m_fetch && upstream_request_bits_size == 3 &&
-    (m_operation == 2 ? !m_write : (m_operation == 0 || m_operation == 1 || m_operation == 3 || m_operation == 8) && m_write && m_mask == 255));
+  wire m_shape = !m_atomic || (A_ENABLED && !m_fetch && (upstream_request_bits_size == 2 || upstream_request_bits_size == 3) &&
+    (m_operation == 2 ? !m_write : (m_operation == 0 || m_operation == 1 || m_operation == 3 || m_operation == 4 || m_operation == 8 ||
+      m_operation == 12 || m_operation == 16 || m_operation == 20 || m_operation == 24 || m_operation == 28) &&
+      m_write && m_mask == (upstream_request_bits_size == 2 ? 15 : 255)));
   reg m_allowed;
   always @* begin
     m_allowed = 0;
@@ -4215,7 +4253,7 @@ def memory_case(parameters):
     end
   end
 '''.replace('DOWNSTREAM_PAYLOAD', payload('downstream_request')).replace('UPSTREAM_PAYLOAD', payload('upstream_request'))
-    if any(region['atomic'] for region in parameters['memoryRegions']):
+    if parameters.get('enableA', True) and any(region['atomic'] for region in parameters['memoryRegions']):
         body += '''  always @(posedge clock) if (!reset) begin
     cover(downstream_request_valid && m_atomic && m_operation == 2 && m_mask != 0);
     cover(downstream_request_valid && m_atomic && m_operation == 3 && !upstream_request_bits_scEligible);
@@ -4227,7 +4265,12 @@ def memory_case(parameters):
     cover(upstream_request_valid && upstream_request_ready && !m_fetch && upstream_request_bits_size == 6 && !m_allowed);
   end
 '''
+    body = body.replace('A_ENABLED', str(int(parameters.get('enableA', True))))
     return ('Memory', body, 'assign downstream_request_valid =', "assign downstream_request_valid = 1'h1 |")
+
+
+def axi_output_modes():
+    return [f'prove-payload-output-{operation}-{word}' for operation in (0, 1, 4, 8, 12, 16, 20, 24, 28) for word in (0, 1)] + ['prove-payload-output-other']
 
 
 def axi_case(parameters):
@@ -4261,8 +4304,24 @@ def axi_case(parameters):
     accepted_size == 2 ? {32'd0, shifted_value[31:0]} : accepted_size == 3 ? shifted_value : 0;
   wire read_bad = expected_fault || axi_r_bits_id != accepted_id || !axi_r_bits_last ||
     axi_r_bits_resp != (is_atomic ? 1 : 0);
-  wire [63:0] update_value = accepted_operation == 1 ? addend : accepted_operation == 8 ? old_value | addend : old_value + addend;
-  wire [63:0] stored_value = is_rmw ? update_value : addend;
+  wire [63:0] left = accepted_size == 2 ? {{32{old_value[31]}}, old_value[31:0]} : old_value;
+  wire [63:0] right = accepted_size == 2 ? {{32{addend[31]}}, addend[31:0]} : addend;
+  wire valid_rmw = accepted_operation == 0 || accepted_operation == 1 || accepted_operation == 4 || accepted_operation == 8 ||
+    accepted_operation == 12 || accepted_operation == 16 || accepted_operation == 20 || accepted_operation == 24 || accepted_operation == 28;
+  reg [63:0] update_value;
+  always @* case (accepted_operation)
+    0: update_value = left + right;
+    1: update_value = right;
+    4: update_value = left ^ right;
+    8: update_value = left | right;
+    12: update_value = left & right;
+    16: update_value = $signed(left) < $signed(right) ? left : right;
+    20: update_value = $signed(left) > $signed(right) ? left : right;
+    24: update_value = left < right ? left : right;
+    28: update_value = left > right ? left : right;
+    default: update_value = 0;
+  endcase
+  wire [63:0] stored_value = is_rmw ? (accepted_size == 2 ? {32'd0, update_value[31:0]} : update_value) : addend;
   wire [WIDTH-1:0] stored_lanes = {{PAD{1'b0}}, stored_value};
   wire [BYTES-1:0] stored_mask = {{MASKPAD{1'b0}}, accepted_mask};
   always @(posedge clock) begin
@@ -4331,7 +4390,7 @@ def axi_case(parameters):
       end
       if (axi_w_valid) begin
         assert(axi_w_bits_last);
-        assert(axi_w_bits_data == (stored_lanes << (accepted_address[LANE:0] * 8)));
+        if (!is_rmw || valid_rmw) assert(axi_w_bits_data == (stored_lanes << (accepted_address[LANE:0] * 8)));
         assert(axi_w_bits_strb == (stored_mask << accepted_address[LANE:0]));
       end
       if (read_fire) begin assert(!read_owned); read_owned <= 1; end
@@ -4490,7 +4549,7 @@ def axi_case(parameters):
     body = body.replace('assert($stable({memory_response_bits_data, memory_response_bits_fault, memory_response_bits_tag, memory_response_bits_last}));',
                         'assert($stable(memory_response_bits_data)); assert($stable({memory_response_bits_fault, memory_response_bits_tag, memory_response_bits_last}));')
     body = body.replace('assert($stable({axi_w_bits_data, axi_w_bits_strb, axi_w_bits_last}));',
-                        'assert($stable(axi_w_bits_data)); assert($stable({axi_w_bits_strb, axi_w_bits_last}));')
+                        'assert($stable({request_data, data, request_size, request_address, request_atomic, request_atomicOperation})); assert($stable(axi_w_bits_data)); assert($stable({axi_w_bits_strb, axi_w_bits_last}));')
     return ('Axi', body, 'request_atomic <= memory_request_bits_atomic;', 'request_atomic <= 0;')
 
 
@@ -4780,7 +4839,8 @@ def partition_covers(text, selected, count):
     pattern = r'\bcover\([^;]+;'
     assert len(re.findall(pattern, text)) == count, 'Unknown cover inventory'
     positions = iter(range(count))
-    return re.sub(pattern, lambda match: match[0] if next(positions) == selected else 'begin end', text)
+    selected = {selected} if isinstance(selected, int) else set(selected)
+    return re.sub(pattern, lambda match: match[0] if next(positions) in selected else 'begin end', text)
 
 
 def verify(rtl, directory, modules=None, mutations=None, jobs=1):
@@ -4830,7 +4890,7 @@ def verify(rtl, directory, modules=None, mutations=None, jobs=1):
     enabled = manifest['parameters']['pmpEntries'] != 0
     cases = protection_cases(manifest['parameters']) if enabled else (
             ('Fetch', FETCH, '& ~killed & ~cancel', '& ~cancel'),
-            ('Multiply', MULTIPLY, '~busy & ~valid', '~valid'),
+            ('MulDiv', MULDIV, '~busy & ~valid', '~valid'),
             ('Backend', BACKEND, '(~issuedValid | executed) & ~executePending & ~redirect_0', '(~issuedValid | executed) & ~redirect_0'))
     cases = [*cases, gpr_case(manifest['parameters']), *word_cases(manifest['parameters']), *integer_cases(manifest['parameters']), *wfi_cases(manifest['parameters']), synchronization_case(manifest['parameters']),
              arbiter_case(manifest['parameters']), memory_case(manifest['parameters']), axi_case(manifest['parameters'])]
@@ -5131,9 +5191,10 @@ def verify(rtl, directory, modules=None, mutations=None, jobs=1):
         if unit == 'Backend':
             body = backend_names(body, sources[module + '.sv'])
             if name == 'InterruptBackend':
-                next_pc = 'commit_output_bits_nextPc_layerCapture'
+                retirement = instance_ports(sources[module + '.sv'], 'DitDahA1Commit')[0][1]
+                next_pc = retirement['output_bits_nextPc']
                 for lane in range(1, manifest['parameters']['issueWidth']):
-                    next_pc = f'(commitCount == {lane+1} ? commitPackets_{lane}_nextPc : {next_pc})'
+                    next_pc = f"(!({retirement['output_bits_instruction_fault']}) && commitCount == {lane+1} ? commitPackets_{lane}_nextPc : {next_pc})"
                 body = body.replace('$past(commit_output_bits_nextPc_layerCapture)', '$past(' + next_pc + ')')
             if name == 'PipelineBackend' and observation_sources:
                 observation = observation_sources[backend_dv.name].split('();', 1)[1].rsplit('endmodule', 1)[0]
@@ -5226,7 +5287,7 @@ def verify(rtl, directory, modules=None, mutations=None, jobs=1):
                               and f'request_address{suffix} ' in expression]
                 assert len(candidates) == 1, 'Ambiguous read authorization driver'
                 body += f'\n  wire rq_dut_permission_{slot} = {candidates[0]};\n'
-        if unit in ('Backend', 'Frontend', 'Gpr', 'Multiply', 'Csr', 'MemoryArbiter', 'ReadQueue', 'MemoryFabric', 'Memory', 'Axi', 'InstructionCache', 'DataCache', 'Coherence', 'SharedCache', 'Lsu', 'LocalInterrupts', 'Translation') or (enabled and unit not in ('Decode', 'Execute')) or unit == 'Fetch' and manifest['parameters'].get('iCacheBytes'):
+        if unit in ('Backend', 'Frontend', 'Gpr', 'MulDiv', 'Csr', 'MemoryArbiter', 'ReadQueue', 'MemoryFabric', 'Memory', 'Axi', 'InstructionCache', 'DataCache', 'Coherence', 'SharedCache', 'Lsu', 'LocalInterrupts', 'Translation') or (enabled and unit not in ('Decode', 'Execute')) or unit == 'Fetch' and manifest['parameters'].get('iCacheBytes'):
             if unit == 'Backend':
                 dual = manifest['parameters'].get('loadQueueEntries', 1) == 2
                 owned = '{1\'b0, contexts != 0} + {1\'b0, contexts_0 != 0}' if dual else 'state != 0'
@@ -5286,7 +5347,7 @@ endmodule''', 1)
     end
   end
 ''')
-                files['DitDahA1Multiply.sv'] = license + header(sources['DitDahA1Multiply.sv']) + RESOURCE + 'endmodule\n'
+                files['DitDahA1MulDiv.sv'] = license + header(sources['DitDahA1MulDiv.sv']) + RESOURCE + 'endmodule\n'
             if name == 'InterruptBackend':
                 observed = files[module + '.sv']
                 writes = [f'we_{lane}' for lane in range(manifest['parameters']['issueWidth'])]
@@ -5455,9 +5516,13 @@ endmodule''', 1)
             checks += [('mutation-wfi', "input_bits_instruction == 32'h10500073", "input_bits_instruction[31:20] == 12'h105")] if unit == 'Decode' else [
                 ('mutation-wfi', re.search(r'assign output_bits_wfi\s*=\s*[^;]+;', sources[module + '.sv']).group(), 'assign output_bits_wfi = 0;')]
             if unit == 'Decode':
-                checks += [('mutation-atomic-width', "input_bits_instruction[14:12] == 3'h3", "input_bits_instruction[14:13] == 2'h1"),
-                           ('mutation-lr-source', "input_bits_instruction[24:20] == 5'h0", "1'h1"),
-                           ('mutation-atomic-operation', "input_bits_instruction[31:27] == 5'h8", "1'h1")]
+                if manifest['parameters'].get('enableA', True):
+                    shape = re.search(r"input_bits_instruction\[6:0\] == 7'h2F & \([^)]*\)", sources[module + '.sv']).group()
+                    checks += [('mutation-atomic-width', shape, "input_bits_instruction[6:0] == 7'h2F"),
+                               ('mutation-lr-source', "input_bits_instruction[24:20] == 5'h0", "1'h1"),
+                               ('mutation-atomic-operation', "input_bits_instruction[31:27] == 5'h8", "1'h1")]
+                else:
+                    checks += [('mutation-atomic-disabled', 'assign output_bits_operation =', "assign output_bits_operation = input_bits_instruction[6:0] == 7'h2F ? 5'h1E :")]
             else:
                 atomic_assignment = re.search(r'assign output_bits_atomic\s*=\s*[^;]+;', sources[module + '.sv']).group()
                 checks += [('mutation-atomic', atomic_assignment, 'assign output_bits_atomic = 0;')]
@@ -5515,8 +5580,17 @@ endmodule''', 1)
                                ('mutation-tlb-global', inherited[0], f'wire [63:0] {inherited[1]} = memory_response_bits_data;'),
                                ('mutation-tlb-asid-select', scope, scope.replace('~maintenance_asidValid', "1'h1")),
                                ('mutation-tlb-address-select', scope, scope.replace('~maintenance_addressValid', "1'h1"))]
+        if unit == 'MulDiv':
+            assert body.count('cover(') == 8
+            checks[1:2] = [('cover-short', before, after), ('cover-long', before, after)]
+            checks += [('mutation-mode', 'functionCode <= input_bits_decoded_instruction_instruction[14:12];', "functionCode <= 3'h0;"),
+                       ('mutation-word', '{{32{value[31]}}, value[31:0]}', "{32'h0, value[31:0]}")]
         if name == 'UserExecute':
             checks += [('mutation-return', 'assign output_bits_instruction_fault =', 'assign output_bits_instruction_fault = 0 &')]
+        if name in ('UserExecute', 'SupervisorExecute'):
+            comparison = re.search(r"wire\s+breakpoint\s*=\s*input_bits_decoded_instruction_instruction == 32'h100073;", sources[module + '.sv']).group()
+            checks += [('mutation-breakpoint', comparison, "wire breakpoint = 1'h0;"),
+                       ('mutation-breakpoint-value', "breakpoint ? input_bits_decoded_instruction_pc : 64'h0", "64'h0")]
         if name == 'SupervisorExecute':
             checks += [('mutation-return', 'assign output_bits_instruction_fault =', 'assign output_bits_instruction_fault = 0 &')]
         if name == 'InterruptBackend':
@@ -5543,7 +5617,7 @@ endmodule''', 1)
                        ('mutation-priority', advance, "next <= '0;")]
             if manifest['parameters']['hartCount'] > 1:
                 checks += [('mutation-identity', 'assign hartId =', "assign hartId = 4'h0 &")]
-        if unit == 'Memory' and any(region['atomic'] for region in manifest['parameters']['memoryRegions']):
+        if unit == 'Memory' and manifest['parameters'].get('enableA', True) and any(region['atomic'] for region in manifest['parameters']['memoryRegions']):
             shape = re.search(r'wire\s+atomicShape\w*\s*=\s*[^;]*upstream_request_bits_atomicOperation[^;]+;', sources[module + '.sv']).group()
             checks += [('mutation-shape', shape, shape.split('=', 1)[0] + "= 1'h1;")]
         if unit == 'Memory':
@@ -5560,8 +5634,7 @@ endmodule''', 1)
             read_fault = re.search(r'amo & ~\w+', original).group()
             response_data = re.search(r'assign memory_response_bits_data\s*=\s*([^;]+);', original).group()
             checks[2] = ('mutation', 'request_atomic <= memory_request_bits_atomic;', 'request_atomic <= 0;')
-            if manifest['parameters']['axiDataBits'] == 512:
-                checks[:1] = [(mode, before, after) for mode in ('prove-control', 'prove-payload')]
+            checks[:1] = [(mode, before, after) for mode in ('prove-control', 'prove-payload-state', *axi_output_modes())]
             read_update = re.search(r'if \((\w+)\)\n\s+data <=', original).group(0)
             checks += [('mutation-retry', retry_state, "state <= 3'h4;"),
                        ('mutation-stale', read_update, read_update.replace(')', ' && !retried)', 1)),
@@ -5572,6 +5645,10 @@ endmodule''', 1)
                        ('mutation-swap', "request_atomicOperation == 5'h1", "1'h0"),
                        ('mutation-lr-write', read_fault, read_fault.replace('amo', 'request_atomic', 1)),
                        ('mutation-sc-empty', 'inputSc & ~memory_request_bits_scEligible', "1'h0")]
+            comparison = re.search(r'\$signed\((\w+)\) < \$signed\((\w+)\)', original)
+            checks += [('mutation-minmax', comparison.group(), f'{comparison[1]} < {comparison[2]}'),
+                       ('mutation-word-sign', '{{32{data[31]}}, data[31:0]}', "{32'd0, data[31:0]}")]
+
             if manifest['parameters'].get('enableUserMode'):
                 checks += [('mutation-privilege', 'assign axi_ar_bits_prot =', "assign axi_ar_bits_prot = 3'h1 |")]
             retry = re.search(r'wire\s+(\w+)\s*=\s*amo\s*&\s*[^;]*axi_b_bits_id[^;]+;', original).group()
@@ -5610,7 +5687,7 @@ endmodule''', 1)
             success = re.search(r'wire\s+(\w+)\s*=\s*[^;]*packet_atomic[^;]*~memory_response_bits_fault[^;]+;', original).group()
             checks += [('mutation-consume', update, re.sub(r'~\([^;]+?\) & reserved', 'reserved', update)),
                        ('mutation-pair', pair, "scEligible <= 1'h0;"),
-                       ('mutation-alias', pair, f"scEligible <= input_bits_atomic & input_bits_instruction_instruction[31:27] == 3 & reserved & input_bits_address[{manifest['parameters']['physicalAddressBits']-1}:3] == reservedWord & input_bits_memorySize == 3;"),
+                       ('mutation-alias', pair, f"scEligible <= input_bits_atomic & input_bits_instruction_instruction[31:27] == 3 & reserved & input_bits_address[{manifest['parameters']['physicalAddressBits']-1}:2] == reservedWord & input_bits_memorySize == (reservedDoubleword ? 3 : 2);"),
                        ('mutation-lr-fault', success, success.replace('~memory_response_bits_fault', "1'h1"))]
             if manifest['parameters'].get('virtualAddressBits') == 39:
                 assignment = re.search(r'assign memory_request_bits_address\s*=[^;]+;', original).group()
@@ -5925,13 +6002,22 @@ endmodule''', 1)
                     for port in range(1, 2 * manifest['parameters']['hartCount']):
                         guidance += f'    assume(!{"instruction" if port % 2 == 0 else "data"}_{port//2}_request_valid);\n'
                     text = text.replace('\nendmodule', '\n' + guidance + '  end\nendmodule')
-                if unit == 'Axi' and filename == module + '.sv' and mode in ('prove-control', 'prove-payload'):
+                if unit == 'Axi' and filename == module + '.sv' and mode in ('prove-control', 'prove-payload-state', *axi_output_modes()):
                     def partition_axi(match):
                         expression = match.group()
                         payload = re.search(r'\b(request_data|old_value|axi_w_bits_data|memory_response_bits_data|block)\b', expression)
                         if mode == 'prove-control':
                             return 'assert(1);' if payload else expression
-                        return expression if payload else expression.replace('assert(', 'assume(', 1)
+                        output = 'axi_w_bits_data' in expression
+                        output_mode = mode.startswith('prove-payload-output-')
+                        selected = payload and (output if output_mode else not output)
+                        if selected and output_mode:
+                            selection = '!is_rmw || !valid_rmw'
+                            if mode != 'prove-payload-output-other':
+                                operation, word = map(int, mode.rsplit('-', 2)[1:])
+                                selection = f'is_rmw && valid_rmw && accepted_operation == {operation} && (accepted_size == 2) == {word}'
+                            return f'if ({selection}) ' + expression
+                        return expression if selected else expression.replace('assert(', 'assume(', 1)
                     text = re.sub(r'\bassert\([^;]+;', partition_axi, text)
                 if unit == 'ReadQueue' and filename == module + '.sv':
                     read_body = "  (* anyconst *) reg [5:0] rq_bit;\n"
@@ -6229,24 +6315,26 @@ endmodule''', 1)
 ''' + guidance + '  end\nendmodule', 1)
                 if unit == 'Axi' and mutating and not mode.startswith('mutation-line-') and filename == module + '.sv':
                     width = manifest['parameters']['axiDataBits']
-                    atomic_operation = {'mutation-or': 8, 'mutation-swap': 1, 'mutation-lr-write': 2,
+                    atomic_operation = {'mutation-minmax': 16, 'mutation-word-sign': 16, 'mutation-or': 8, 'mutation-swap': 1, 'mutation-lr-write': 2,
                                         'mutation-sc-empty': 3, 'mutation-sc-retry': 3, 'mutation-sc-status': 3,
                                         'mutation-read-identity': 2, 'mutation-write-identity': 3}.get(mode, 0)
                     identity = int('identity' in mode)
                     read_code = 2 if mode == 'mutation-read-error' else 1
                     write_code = '0' if mode in ('mutation-retry', 'mutation-sc-retry', 'mutation-sc-status') else '2' if mode == 'mutation-write-error' else '(retried ? 1 : 0)' if mode == 'mutation-stale' else '1'
+                    atomic_size = 2 if mode == 'mutation-word-sign' else 3
+                    read_value = (1 << 31) if atomic_size == 2 else (1 << 63) if mode == 'mutation-minmax' else 7
                     guidance = f'''
   always @* begin
     assume(memory_request_valid && memory_request_bits_atomic && memory_request_bits_write == {int(atomic_operation != 2)} && !memory_request_bits_fetch);
     assume(memory_request_bits_atomicOperation == {atomic_operation} && memory_request_bits_scEligible == {int(mode != 'mutation-sc-empty')});
     assume(hartId == {"(held ? 0 : 1)" if mode == 'mutation-read-identity' else identity});
     assume(memory_request_bits_address == 8 && memory_request_bits_data == 1 && memory_request_bits_tag == 37);
-    assume(memory_request_bits_size == 3 && memory_request_bits_mask == {0 if atomic_operation == 2 else 255} && memory_response_ready);
+    assume(memory_request_bits_size == {atomic_size} && memory_request_bits_mask == {0 if atomic_operation == 2 else (1 << (1 << atomic_size)) - 1} && memory_response_ready);
     assume(axi_ar_ready && axi_aw_ready && axi_w_ready);
     assume(axi_r_valid == read_owned && axi_b_valid == (address_sent && data_sent));
     assume(axi_r_bits_id == {identity} && axi_r_bits_last && axi_b_bits_id == {identity});
     assume(axi_r_bits_resp == {read_code} && axi_b_bits_resp == {write_code});
-    assume(axi_r_bits_data == ((retried ? {width}'d11 : {width}'d7) << {8 * (8 % (width // 8))}));
+    assume(axi_r_bits_data == ((retried ? {width}'d11 : {width}'d{read_value}) << {8 * (8 % (width // 8))}));
   end
 '''
                     text = text.replace('endmodule', guidance + '\nendmodule', 1)
@@ -6317,11 +6405,32 @@ endmodule''', 1)
   end
 '''
                     text = text.replace('endmodule', guidance + '\nendmodule', 1)
+                if unit == 'MulDiv' and mode.startswith('cover-') and filename == module + '.sv':
+                    text = partition_covers(text, (2, 5) if mode == 'cover-long' else (0, 1, 3, 4, 6, 7), 8)
+                if unit == 'MulDiv' and mode == 'cover-long' and filename == module + '.sv':
+                    text = text.replace('endmodule', "  always @* assume(input_valid && output_ready && input_bits_decoded_instruction_instruction == 32'h0220d333 && input_bits_operand1 == 0 && input_bits_operand2 == 0);\nendmodule", 1)
+                if unit == 'MulDiv' and mode == 'cover-short' and filename == module + '.sv':
+                    text = text.replace('endmodule', '''
+  always @* begin
+    assume(input_bits_decoded_instruction_instruction == 32'h02000033 ||
+           input_bits_decoded_instruction_instruction == 32'h02005033 ||
+           input_bits_decoded_instruction_instruction == 32'h0200503b);
+    assume(input_bits_operand1 == 0 || input_bits_operand1 == 64'hffffffffffffffff);
+    assume(input_bits_operand2 == 0 || input_bits_operand2 == 1 || input_bits_operand2 == 64'hffffffffffffffff);
+  end
+  always @(posedge clock) if (past_valid && $past(!reset && input_valid && !input_ready))
+    assume(input_valid && $stable({input_bits_decoded_instruction_instruction, input_bits_operand1, input_bits_operand2}));
+endmodule''', 1)
                 if name == 'UserExecute' and mutating and filename == module + '.sv':
-                    operation = 12 if mode == 'mutation' else 13
+                    operation = 12 if mode == 'mutation' or mode.startswith('mutation-breakpoint') else 13
                     text = text.replace('endmodule', f'  always @* assume(input_valid && !input_bits_decoded_instruction_fault && input_bits_decoded_operation == {operation} && privilege == 0);\nendmodule', 1)
-                if name == 'IntegerDecode' and mode in ('mutation-atomic-width', 'mutation-lr-source', 'mutation-atomic-operation') and filename == module + '.sv':
-                    instruction = {'mutation-atomic-width': 0x4000a12f, 'mutation-lr-source': 0x1010b12f, 'mutation-atomic-operation': 0x2800b12f}[mode]
+                if unit == 'MulDiv' and mode in ('mutation-mode', 'mutation-word') and filename == module + '.sv':
+                    instruction, first, second = (0x0220d333, 0, 0) if mode == 'mutation-mode' else (0x0220833b, (1 << 64) - 1, 1)
+                    text = text.replace('endmodule', f"  always @* assume(input_valid && output_ready && input_bits_decoded_instruction_instruction == 32'h{instruction:x} && input_bits_operand1 == 64'h{first:x} && input_bits_operand2 == {second});\nendmodule", 1)
+                if name in ('UserExecute', 'SupervisorExecute') and mode.startswith('mutation-breakpoint') and filename == module + '.sv':
+                    text = text.replace('endmodule', "  always @* assume(input_valid && !input_bits_decoded_instruction_fault && input_bits_decoded_operation == 12 && input_bits_decoded_instruction_instruction == 32'h00100073 && input_bits_decoded_instruction_pc == 64'h104);\nendmodule", 1)
+                if name == 'IntegerDecode' and mode in ('mutation-atomic-width', 'mutation-lr-source', 'mutation-atomic-operation', 'mutation-atomic-disabled') and filename == module + '.sv':
+                    instruction = {'mutation-atomic-width': 0x4000912f, 'mutation-lr-source': 0x1010b12f, 'mutation-atomic-operation': 0x2800b12f, 'mutation-atomic-disabled': 0x1820a12f}[mode]
                     text = text.replace('endmodule', f"  always @* assume(input_valid && !input_bits_fault && input_bits_instruction == 32'h{instruction:x});\nendmodule", 1)
                 if unit == 'InstructionCache' and mode != 'prove' and filename == module + '.sv':
                     scenario = {'mutation': 7, 'mutation-hold': 1, 'mutation-word': 0,
@@ -6566,7 +6675,7 @@ endmodule''', 1)
                         text = text.replace('endmodule', '  always @* assume(instruction_bits_count == 1);\nendmodule', 1)
                     if name == 'InterruptBackend' and mode != 'prove':
                         text = text.replace(');', ', output [4:0] formal_events);', 1)
-                        text = text.replace('endmodule', "  assign formal_events = {(issuedCount != 0 && issuedPackets_0_decoded_instruction_instruction[6:0] == 7'h0f), takeInterrupt_layerCapture, irq_memory_owned, _multiply_output_valid, owned};\nendmodule", 1)
+                        text = text.replace('endmodule', "  assign formal_events = {(issuedCount != 0 && issuedPackets_0_decoded_instruction_instruction[6:0] == 7'h0f), takeInterrupt_layerCapture, irq_memory_owned, _mulDiv_output_valid, owned};\nendmodule", 1)
                 (work / filename).write_text(text)
             if witness:
                 files['witness.sv'] = license + witness_wrapper((work / (module + '.sv')).read_text(), *witness(manifest['parameters'], mode))
@@ -6575,7 +6684,7 @@ endmodule''', 1)
             task = 'bmc' if mutating else 'prove' if proving else 'cover' if mode.startswith('cover') else mode
             if mode == 'mutation' and name == 'Fetch':
                 task = 'prove'
-            engine = 'abc pdr' if task == 'prove' and unit not in ('Gpr', 'Multiply', 'Pmp', 'PmpDecode', 'PmpInterval', 'PmpSubset', 'Csr', 'Memory', 'Axi', 'InstructionCache', 'DataCache', 'Coherence', 'SharedCache', 'Decode', 'Execute', 'LocalInterrupts', 'Translation') and name not in ('SynchronizationBackend', 'WfiBackend') else 'smtbmc z3'
+            engine = 'abc pdr' if task == 'prove' and unit not in ('Gpr', 'MulDiv', 'Pmp', 'PmpDecode', 'PmpInterval', 'PmpSubset', 'Csr', 'Memory', 'Axi', 'InstructionCache', 'DataCache', 'Coherence', 'SharedCache', 'Decode', 'Execute', 'LocalInterrupts', 'Translation') and name not in ('SynchronizationBackend', 'WfiBackend') else 'smtbmc z3'
             if unit == 'ReadQueue':
                 engine = 'smtbmc z3'
                 if (mode == 'prove-control' or mode.startswith('prove-response-') or read_bit_step == 4 and mode.startswith('prove-storage-')) and manifest['parameters']['hartCount'] > 2:
@@ -6611,7 +6720,7 @@ endmodule''', 1)
                 timeout = 180 if mode == 'cover-storage' and manifest['parameters'].get('dCacheRefillBytes', 8) == 64 else 90
             if unit == 'DataCache' and task == 'prove':
                 timeout = 180
-            if name == 'DataCacheAssociativity' and mode in ('cover-3', 'mutation-way-victim') and manifest['parameters']['dCacheBytes'] == 65536 and manifest['parameters'].get('loadQueueEntries', 1) == 2:
+            if name == 'DataCacheAssociativity' and mode in ('cover-1', 'cover-3', 'mutation-way-victim') and manifest['parameters']['dCacheBytes'] == 65536 and manifest['parameters'].get('loadQueueEntries', 1) == 2:
                 timeout = 120
             if name == 'DataCacheWriteback' and mode == 'prove-storage-bytes' and manifest['parameters']['dCacheBytes'] > 8192:
                 engine = 'smtbmc --syn --unroll z3'
@@ -6632,7 +6741,7 @@ endmodule''', 1)
                            if name.startswith('Pmp') else f'prep -top {top} -flatten')
             if unit == 'SharedCache':
                 timeout = 180
-            depth = 6 * manifest['parameters']['hartCount'] + 8 if unit == 'MemoryArbiter' else 72 if task == 'cover' or (unit == 'InstructionCache' and mode in ('mutation', 'mutation-invalidate', 'mutation-count')) else 1 if name.startswith('Pmp') or unit in ('Decode', 'Execute') else (3 if task == 'prove' else 8) if unit == 'Csr' else 6 if unit in ('DataCache', 'Coherence', 'SharedCache') and task == 'prove' else 4 if name in ('Gpr', 'Multiply', 'Memory', 'Axi', 'SynchronizationBackend', 'WfiBackend', 'InstructionCache', 'LocalInterrupts') and task == 'prove' else 24
+            depth = 2 if unit == 'Axi' and mode.startswith('prove-payload-output-') else 6 * manifest['parameters']['hartCount'] + 8 if unit == 'MemoryArbiter' else 72 if task == 'cover' or (unit == 'InstructionCache' and mode in ('mutation', 'mutation-invalidate', 'mutation-count')) else 1 if name.startswith('Pmp') or unit in ('Decode', 'Execute') else (3 if task == 'prove' else 8) if unit == 'Csr' else 6 if unit in ('DataCache', 'Coherence', 'SharedCache') and task == 'prove' else 4 if name in ('Gpr', 'MulDiv', 'Memory', 'Axi', 'SynchronizationBackend', 'WfiBackend', 'InstructionCache', 'LocalInterrupts') and task == 'prove' else 24
             if mode == 'mutation-buffer-stage' and manifest['parameters'].get('enableBurstRefill'):
                 depth = 40
             if unit == 'ReadQueue' and task == 'prove':
@@ -6733,8 +6842,8 @@ read -formal -sv {'-noautowire ' if name in ('PipelineBackend', 'DataCacheAssoci
         if port_modes:
             assert {r['mode']: r['covers'] for r in reports if r['propertyGroup'] == 'MemoryFabric' and r['mode'] in ('cover', 'cover-response')} == {'cover': 3, 'cover-response': 1}, 'Incomplete fabric covers'
         assert {'prove-control', *port_modes, *tag_modes, 'cover', 'mutation-data', *(f'prove-stability-{i}' for i in range(2 * manifest['parameters']['hartCount']))} <= {r['mode'] for r in reports if r['propertyGroup'] == 'MemoryFabric'}, 'Incomplete fabric proof'
-    if 'Axi' in proved and manifest['parameters']['axiDataBits'] == 512:
-        assert {'prove-control', 'prove-payload', 'cover'} <= {r['mode'] for r in reports if r['propertyGroup'] == 'Axi'}, 'Incomplete AXI proof'
+    if 'Axi' in proved:
+        assert {'prove-control', 'prove-payload-state', *axi_output_modes(), 'cover'} <= {r['mode'] for r in reports if r['propertyGroup'] == 'Axi'}, 'Incomplete AXI proof'
     summary.write_text(json.dumps(dict(
         scope='selected negative controls only' if mutations is not None else 'module-level safety, cover reachability and mutation detection',
         selectedMutations=mutations, propertyGroups=sorted(proved),
@@ -6748,7 +6857,7 @@ read -formal -sv {'-noautowire ' if name in ('PipelineBackend', 'DataCacheAssoci
         fabricWitnessGuidance='For 16 harts, covers select read pressure or one writer; negative controls direct exclusive reads, held replies, early drain, isolation and bypass faults. These witness constraints are absent from safety proofs.' if 'MemoryFabric' in proved else None,
         pmpComposition='Pmp uses independently proved PmpInterval identities and PmpDecode request spans; no table-value restrictions; data-line configurations also prove that one arbitrary priority-fold entry preserves whole-range permission implying contained-demand permission, assuming only the prior-fold implication whose initial M-mode defaults are equal' if 'Pmp' in proved else None,
         registerFile='arbitrary nonzero architectural register and immutable data bit, exact reset and ordered multiport writes, zero-register isolation and every asynchronous read port; unrestricted addresses, data and same-address writes' if 'Gpr' in proved else None,
-        backendAbstraction='arbitrary multiply result and completion delay; safety overapproximates nonzero GPR reads, with actual GPR retained for covers/mutations; resource and register contracts are separately proved',
+        backendAbstraction='arbitrary mulDiv result and completion delay; safety overapproximates nonzero GPR reads, with actual GPR retained for covers/mutations; resource and register contracts are separately proved',
         resourceWitnessGuidance='cover/mutations only: faulting SD or configured PMP update followed by MUL and NOP, arbitrary response delay and quiescent interrupts' if 'Backend' in proved else None,
         pipelineMutationGuidance='mutations only: legal ADDI forwarding/dependency groups, SD/ALU/JAL or leading-JAL recovery sequences, faulted grouped LD and ALUs, or two loads with reverse returns or an older fault; observed PC/prediction bit selected for identity corruption; actual arithmetic and register storage' if 'PipelineBackend' in proved else None,
         pipelineCoverGuidance='cover only: independent ADDI groups, a leading SD with arbitrary response delay, lane-0-to-lane-1 RAW, recovery, or two loads with reverse returns or an older fault; translated witnesses use retained identity replies' if 'PipelineBackend' in proved else None,
@@ -6778,10 +6887,10 @@ read -formal -sv {'-noautowire ' if name in ('PipelineBackend', 'DataCacheAssoci
         wideFetch='actual cache connections, captured privilege and permission, full-block and scalar fallback shapes, bounded suffix count, short-return barrier, stable payload and cancellation drain; arbitrary native SRAM read outputs; translation replies require accepted requests and successful replies preserve the page offset' if 'WideFetch' in proved else None,
         frontendQueue='actual queue RTL with abstract single-owner fetch contract; arbitrary stalls, payloads, cancellation and 1-to-demand-suffix returns; independent credit history and complete reference FIFO over an arbitrary immutable packet bit proves conservation of every field through compaction, stable groups and oldest restart; concrete fetch and translation proofs are composition prerequisites' if 'WfiFrontend' in proved else None,
         wideFetchWitnessGuidance='cover only: full-count return uses aligned repeated demand, granted permission, successful immediate service, zero data and matching tag-array reads; other covers retain arbitrary requests and responses with zero native instruction reads; safety and mutations unrestricted' if 'WideFetch' in proved else None,
-        atomicTransport='independent request and AXI channel ownership and retained hart identity; LR read-only, one-shot SC status/no-bus failure, ADD/OR/SWAP exclusive retry and error isolation; no external-memory atomicity or eventual-success theorem' if 'Axi' in proved else None,
+        atomicTransport='independent request and AXI channel ownership and retained hart identity; LR read-only, one-shot SC status/no-bus failure, W/D standard AMO updates, exclusive retry and error isolation; no external-memory atomicity or eventual-success theorem' if 'Axi' in proved else None,
         axiAssumptions='initial reset only; R requires accepted AR, B requires accepted AW and W; blocked response payloads persist; all request metadata, hart/response IDs, data, responses, last and delays unrestricted' if 'Axi' in proved else None,
-        axiComposition='512-bit configurations prove all control first; payload consumes exactly those proved assertions without restricting data, addresses, operations or response timing' if 'Axi' in proved and manifest['parameters']['axiDataBits'] == 512 else None,
-        axiMutationGuidance='mutations only: aligned D ADD/OR/SWAP/LR/SC at address8, operand1, values7 then11 after retry, immediate service, per-fault codes, SC eligibility and valid hart1 with changing live sideband for retained-ID check; prove and cover unrestricted' if 'Axi' in proved else None,
+        axiComposition='control, retained values and stable operands proved first; arithmetic/output consumes those facts; all original assertions retained without new environmental constraints' if 'Axi' in proved else None,
+        axiMutationGuidance='mutations only: aligned W/D AMO/LR/SC at address8, operand1, values7 then11 after retry, immediate service, per-fault codes, SC eligibility and valid hart1 with changing live sideband for retained-ID check; prove and cover unrestricted' if 'Axi' in proved else None,
         wordMemory='independent decode and execution metadata, accepted LSU ownership, size/mask, alignment, authorization, narrow extension and response fault attribution; metadata inputs unrestricted, functional completion checked for byte/halfword/word/doubleword sizes' if 'Lsu' in proved else None,
         dualReadOwnership='Bare aligned ordinary doubleword reads without PMP; independent two-context acceptance and completion ledger, arbitrary stalls/data/errors/tags/cancellation, all payload bits, in-order completion and held-request retention; no device, translation or progress claim' if 'LsuReads' in proved else None,
         reservation='independent last-LR physical word and validity, successful matching LR completion only, any atomic acceptance consumes old pair, full-EA SC qualification captured before protection and stable through backpressure; endpoint exclusivity is separate' if 'Lsu' in proved else None,
@@ -6808,6 +6917,6 @@ if __name__ == '__main__':
     parser.add_argument('--output', type=Path, default=Path('result/formal'))
     parser.add_argument('--mutations', nargs='+')
     parser.add_argument('--jobs', type=int, default=1)
-    parser.add_argument('--modules', nargs='+', choices=('Fetch', 'WideFetch', 'Gpr', 'Multiply', 'Backend', 'PipelineBackend', 'Pmp', 'PmpDecode', 'PmpInterval', 'PmpSubset', 'Csr', 'UserCsr', 'UserExecute', 'SupervisorCsr', 'SupervisorExecute', 'SupervisorFetch', 'Lsu', 'LsuReads', 'InterruptCsr', 'InterruptBackend', 'SynchronizationBackend', 'SharedCache', 'InstructionCache', 'DataCache', 'DataCacheWriteback', 'DataCacheAssociativity', 'Coherence', 'MemoryArbiter', 'ReadQueue', 'MemoryFabric', 'Memory', 'Axi', 'WordDecode', 'WordExecute', 'IntegerDecode', 'IntegerExecute', 'WfiBackend', 'WfiFrontend', 'LocalInterrupts', 'Translation'))
+    parser.add_argument('--modules', nargs='+', choices=('Fetch', 'WideFetch', 'Gpr', 'MulDiv', 'Backend', 'PipelineBackend', 'Pmp', 'PmpDecode', 'PmpInterval', 'PmpSubset', 'Csr', 'UserCsr', 'UserExecute', 'SupervisorCsr', 'SupervisorExecute', 'SupervisorFetch', 'Lsu', 'LsuReads', 'InterruptCsr', 'InterruptBackend', 'SynchronizationBackend', 'SharedCache', 'InstructionCache', 'DataCache', 'DataCacheWriteback', 'DataCacheAssociativity', 'Coherence', 'MemoryArbiter', 'ReadQueue', 'MemoryFabric', 'Memory', 'Axi', 'WordDecode', 'WordExecute', 'IntegerDecode', 'IntegerExecute', 'WfiBackend', 'WfiFrontend', 'LocalInterrupts', 'Translation'))
     args = parser.parse_args()
     verify(args.rtl, args.output, args.modules, args.mutations, args.jobs)

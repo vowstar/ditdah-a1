@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: 2026 Huang Rui <vowstar@gmail.com>
 # SPDX-License-Identifier: MIT
-"""Build selected integer self-checking executables for one machine-mode hart."""
+"""Build selected scalar self-checking executables for one machine-mode hart."""
 
 import argparse
 import hashlib
@@ -14,6 +14,8 @@ import sys
 
 REVISION = '6e8a45123f14cebfb3df151a0e7b849b4389b33b'
 ARCHITECTURE = 'rv64i2p1_zicsr2p0_zifencei2p0'
+M_ARCHITECTURE = 'rv64i2p1_m2p0_zicsr2p0_zifencei2p0_zmmul1p0'
+A_ARCHITECTURES = {name: ARCHITECTURE + '_' + name.lower() + '1p0' for name in ('Zaamo', 'Zalrsc')}
 
 
 def digest(path):
@@ -54,6 +56,7 @@ def main():
     from ruamel.yaml import YAML
 
     parser = argparse.ArgumentParser()
+    parser.add_argument('--extensions', nargs='+', choices=('I', 'M', 'Zaamo', 'Zalrsc'), default=['I'])
     parser.add_argument('--config', type=Path, required=True)
     parser.add_argument('--output', type=Path, default=Path('result/arch-test'))
     parser.add_argument('--arch-test-dir', type=Path, default=os.environ.get('ARCH_TEST_DIR'))
@@ -64,7 +67,7 @@ def main():
     output, source = args.output.resolve(), Path('software/arch-test')
     output.mkdir(parents=True, exist_ok=True)
     (output / 'manifest.json').unlink(missing_ok=True)
-    for old in output.glob('I-*/manifest.json'):
+    for old in output.glob('*/manifest.json'):
         old.unlink()
     assert args.arch_test_dir is not None, 'Set ARCH_TEST_DIR or --arch-test-dir'
     upstream = args.arch_test_dir.resolve()
@@ -78,12 +81,17 @@ def main():
     document = json.loads(configuration)
     config = document.get('parameters', document)
     base, console = int(config['resetVector']), args.console_base
+    extensions = tuple(sorted(set(args.extensions)))
+    assert len(extensions) == len(args.extensions), 'Duplicate extension selection'
+    assert 'M' not in extensions or config.get('enableM', True), 'M tests require enabled arithmetic'
+    atomic = bool(set(extensions) & A_ARCHITECTURES.keys())
+    assert not atomic or config.get('enableA', True), 'Atomic tests require enabled A'
     assert config['hartCount'] == 1 and config['pmpEntries'] == 0 and not config['virtualAddressBits']
     ram = next(r for r in config['memoryRegions'] if int(r['base']) == base and r['readable'] and r['writable'] and r['executable'] and not r['device'])
     assert int(ram['size']) >= 0x80000 and not base <= console < base + int(ram['size'])
     assert console % 4 == 0 and any(r['device'] and r['writable'] and not r['executable'] and not r['atomic'] and int(r['base']) <= console and console + 4 <= int(r['base']) + int(r['size']) for r in config['memoryRegions'])
     paths = [*sorted(source.iterdir()), Path(__file__), *sorted((upstream / 'tests/env').glob('*.*')),
-             *sorted((upstream / 'tests/rv64i/I').glob('*.S'))]
+             *(p for extension in extensions for p in sorted((upstream / 'tests/rv64i' / extension).glob('*.S')))]
     hashes = {str(p): digest(p) for p in paths if p.is_file()}
     platform = output / 'platform'
     platform.mkdir(exist_ok=True)
@@ -92,6 +100,13 @@ def main():
     linker.write_text(f'__ram_base = {base};\n__ram_bytes = {int(ram["size"])};\n__console_base = {console};\n' + (source / 'link.ld').read_text())
     udb = YAML(typ='safe').load((source / 'rv64-integer.yaml').read_text())
     udb['params']['PHYS_ADDR_WIDTH'] = config['physicalAddressBits']
+    if 'M' in extensions:
+        udb['implemented_extensions'] += [dict(name='M', version='= 2.0'), dict(name='Zmmul', version='= 1.0')]
+        udb['params']['MUTABLE_MISA_M'] = False
+    if atomic:
+        udb['implemented_extensions'] += [dict(name=name, version=version) for name, version in (('A', '= 2.1'), ('Zaamo', '= 1.0'), ('Zalrsc', '= 1.0'))]
+        udb['params'].update(MISALIGNED_AMO=False, MUTABLE_MISA_A=False, LRSC_FAIL_ON_VA_SYNONYM=False, LRSC_FAIL_ON_NON_EXACT_LRSC=True,
+                             LRSC_RESERVATION_STRATEGY='reserve exactly enough to cover the access', LRSC_MISALIGNED_BEHAVIOR='always raise misaligned exception')
     (platform / 'udb.json').write_text(json.dumps(udb, indent=2) + '\n')
     sail = pyjson5.loads(subprocess.check_output([args.sail, '--print-default-config'], text=True))
     def disable(node):
@@ -102,6 +117,13 @@ def main():
                 else: disable(value)
     disable(sail['extensions'])
     for name in ('Zicsr', 'Zifencei'): sail['extensions'][name]['supported'] = True
+    if 'M' in extensions:
+        sail['extensions']['M']['supported'] = True
+        sail['extensions']['Zmmul']['supported'] = True
+    if atomic:
+        for name in ('A', 'Zaamo', 'Zalrsc'): sail['extensions'][name]['supported'] = True
+        sail['memory']['misaligned']['exceptions'].update(amo=dict(Some='AlignmentException'), lrsc='AlignmentException')
+        sail['platform']['reservation'].update(require_exact_reservation_addr=True, invalidate_on_same_hart_store=True)
     sail['base']['writable_misa'] = False
     sail['base']['mtvec']['vectored']['supported'] = False
     sail['base']['privileged_isa_version'] = 'Privileged_ISA_1_12'
@@ -114,17 +136,21 @@ def main():
     memory['attributes']['misaligned_exceptions']['load_store'] = dict(Some='AlignmentException')
     memory['attributes'].update(atomic_support='AMONone', reservability='RsrvNone', supports_cbo_zero=False,
                                 supports_pte_read=False, supports_pte_write=False)
+    if atomic:
+        memory['attributes'].update(atomic_support='AMOArithmetic', reservability='RsrvEventual')
+        memory['attributes']['misaligned_exceptions']['amo'] = 'AlignmentException'
     (platform / 'sail.json').write_text(json.dumps(sail, indent=2) + '\n')
     test_config = dict(name='ditdah-a1-integer', compiler_exe=args.tool_prefix + 'gcc', objdump_exe=args.tool_prefix + 'objdump',
                        ref_model_exe=args.sail, udb_config='udb.json', linker_script='link.ld', dut_include_dir='.', include_priv_tests=False)
     (platform / 'test_config.json').write_text(json.dumps(test_config, indent=2) + '\n')
     command = [sys.executable, '-m', 'act.act', str(platform / 'test_config.json'), '--test-dir', str(upstream / 'tests'),
-               '--coverpoint-dir', str(upstream / 'coverpoints'), '--workdir', str(output / 'act'), '--extensions', 'I', '--jobs', '2']
+               '--coverpoint-dir', str(upstream / 'coverpoints'), '--workdir', str(output / 'act'), '--extensions', ','.join(extensions), '--jobs', '2']
     with (output / 'build.log').open('w') as log:
         subprocess.run(command, check=True, stdout=log, stderr=subprocess.STDOUT, timeout=600)
     generated = {str(p.relative_to(output)): digest(p) for p in [*platform.iterdir(), *(output / 'act/ditdah-a1-integer').glob('*.h')] if p.is_file()}
     reports, manifests = [], []
-    for image in sorted((output / 'act/ditdah-a1-integer/elfs/rv64i/I').glob('*.elf')):
+    for image in sorted(p for extension in extensions for p in (output / 'act/ditdah-a1-integer/elfs/rv64i' / extension).glob('*.elf')):
+        architecture = M_ARCHITECTURE if image.parent.name == 'M' else A_ARCHITECTURES.get(image.parent.name, ARCHITECTURE)
         target = output / image.stem
         target.mkdir(exist_ok=True)
         shutil.copyfile(image, target / 'software.elf')
@@ -133,29 +159,29 @@ def main():
             table = elf.get_section_by_name('.symtab')
             symbols = {s.name: s['st_value'] for s in table.iter_symbols() if s['st_info']['bind'] in ('STB_GLOBAL', 'STB_WEAK') and s['st_shndx'] != 'SHN_UNDEF'}
             all_symbols = {s.name: s['st_value'] for s in table.iter_symbols()}
-            spans, table_hash = code_spans(elf), hashlib.sha256(table.data()).hexdigest()
+            spans, table_hash = code_spans(elf, architecture), hashlib.sha256(table.data()).hexdigest()
         assert base <= symbols['__bss_start'] <= symbols['__test_results'] < symbols['__bss_end'] <= symbols['__stack_bottom'] < symbols['__stack_top'] <= base + int(ram['size'])
-        reference = output / 'act/ditdah-a1-integer/build/rv64i/I' / image.stem
-        assert 'SUCCESS' in reference.with_suffix('.sig.log').read_text()
-        with reference.with_suffix('.sig.elf').open('rb') as stream:
+        reference = output / 'act/ditdah-a1-integer/build/rv64i' / image.parent.name / image.stem
+        assert 'SUCCESS' in Path(str(reference) + '.sig.log').read_text()
+        with Path(str(reference) + '.sig.elf').open('rb') as stream:
             reference_symbols = {s.name: s['st_value'] for s in ELFFile(stream).get_section_by_name('.symtab').iter_symbols()}
         assert all(all_symbols.get(name) == reference_symbols.get(name) for name in
                    ('rvtest_code_begin', 'rvtest_code_end', 'scratch', 'begin_signature', 'end_signature', 'signature_base')), 'Reference test addresses differ'
-        manifest = dict(profile='arch-test', sourceHashes=hashes, configurationHash=hashlib.sha256(configuration).hexdigest(),
+        manifest = dict(profile='arch-test', instructionArchitecture=architecture, sourceHashes=hashes, configurationHash=hashlib.sha256(configuration).hexdigest(),
             imageHash=digest(image), symbols=symbols, codeSpans=spans, symbolTableHash=table_hash, commands=[command],
-            upstreamRevision=REVISION, generatedHashes=generated, referenceHashes={suffix: digest(reference.with_suffix(suffix)) for suffix in ('.sig.elf', '.sig', '.results', '.sig.log')},
+            upstreamRevision=REVISION, generatedHashes=generated, referenceHashes={suffix: digest(Path(str(reference) + suffix)) for suffix in ('.sig.elf', '.sig', '.results', '.sig.log')},
             toolVersions={tool: subprocess.check_output([tool, '--version'], text=True).splitlines()[0] for tool in (args.sail, args.tool_prefix + 'gcc', args.tool_prefix + 'ld', args.tool_prefix + 'objdump')},
             console=dict(transport='word', base=console), expectedConsole=[f'\nRVCP-SUMMARY: TEST PASSED - Test File "{image.stem}.S"\n\n'],
             layout=dict(kind='arch-test', entrySymbol='rvtest_entry_point', entryAlias='_start', bssStart=symbols['__bss_start'], bssEnd=symbols['__bss_end'],
                         stacks=[dict(symbol='__stack_bottom', address=symbols['__stack_bottom'], size=symbols['__stack_bytes'], count=1, stride=symbols['__stack_bytes'])]))
         manifests.append((target, manifest))
-    assert len(manifests) == 51, 'Unexpected integer test selection'
+    assert len(manifests) == sum({'I': 51, 'M': 13, 'Zaamo': 18, 'Zalrsc': 4}[extension] for extension in extensions), 'Unexpected architecture test selection'
     assert args.config.read_bytes() == configuration and all(digest(Path(p)) == h for p, h in hashes.items()), 'Build inputs changed'
     clean_revision()
     for target, manifest in manifests:
         (target / 'manifest.json').write_text(json.dumps(manifest, indent=2) + '\n')
         reports.append(dict(test=target.name, manifestHash=digest(target / 'manifest.json')))
-    (output / 'manifest.json').write_text(json.dumps(dict(scope='selected integer self-checking images; not full ISA compliance', tests=reports), indent=2) + '\n')
+    (output / 'manifest.json').write_text(json.dumps(dict(scope='selected scalar self-checking images; not full ISA compliance', tests=reports), indent=2) + '\n')
 
 
 if __name__ == '__main__':

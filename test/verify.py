@@ -16,7 +16,7 @@ import subprocess
 from types import SimpleNamespace
 
 from contracts import verify as verify_contracts, verify_storage, backend_control_signals, axi_cache_attributes
-from model import ExclusiveMonitor, Fault, LocalInterrupts, Model, MASK, atomic_value, integer_value, pmp_allowed, sv39_walk
+from model import ATOMIC_OPERATIONS, ExclusiveMonitor, Fault, LocalInterrupts, Model, MASK, atomic_value, integer_value, pmp_allowed, sv39_walk
 from programs import cases, multicore_cases, platform_program
 
 
@@ -387,7 +387,7 @@ def compile_tb(rtl, directory, width, pa, top='core_tb', source=None, extra_file
         assert names == [f'core_{h}' for h in range(harts)], names
         for hart, name in enumerate(names):
             core = f'dut.{name}'
-            bindings.append(f'assign multiply_busy[{hart}] = {core}.backend.multiply.busy;')
+            bindings.append(f'assign muldiv_busy[{hart}] = ' + (f'{core}.backend.mulDiv.busy;' if parameters.get('enableM', True) else "1'b0;"))
             for kind, port in enumerate(('instruction', 'data')):
                 index = 2 * hart + kind
                 physical = f'dut.fabric.{port}_{hart}'
@@ -465,7 +465,7 @@ def compile_tb(rtl, directory, width, pa, top='core_tb', source=None, extra_file
          f'-DAXI_BITS={width}', f'-DPA_BITS={pa}', f'-DHARTS={harts}',
          f'-DFABRIC_READ_SLOTS={parameters.get("fabricReadSlots") or (2 if harts > 1 else 0)}',
          f'-DLOAD_QUEUE_ENTRIES={parameters.get("loadQueueEntries", 1)}',
-         '-I' + str(directory.resolve()), *(['-DENABLE_INTERRUPTS'] if interrupts else []), '-I' + str(rtl.resolve()),
+         '-I' + str(directory.resolve()), *(['-DENABLE_M'] if parameters.get('enableM', True) else []), *(['-DENABLE_INTERRUPTS'] if interrupts else []), '-I' + str(rtl.resolve()),
          *(['-DICACHE'] if parameters['iCacheBytes'] else []),
          *(['-DLOCAL_INTERRUPTS'] if local_base is not None else []),
          *(['-DSOFTWARE'] if software else []),
@@ -1309,6 +1309,8 @@ def compare(binary, directory, config, transport='axi', selected=()):
                     assert translation_report['pteReads'] == expected_reads, 'ASID retention, zero-register selectors and ignored high bits'
             else:
                 assert data_bus == expected_bus, f'{name}: unexpected data accesses\nactual {data_bus}\nexpected {expected_bus}'
+            if hasattr(program, 'required_atomics'):
+                assert sum(line.startswith('REQUEST atomic ') for line in lines) == program.required_atomics, 'Required translated atomic requests were not exercised'
             if transport == 'memory':
                 assert [tuple(int(value, 16) for value in line.split()[1:]) for line in lines if line.startswith('ATOMIC ')] == expected_atomics, 'Memory atomic metadata differs from independent instructions'
                 requests = [(v[1], int(v[2], 16), int(v[3]), int(v[4], 16)) for line in lines
@@ -1993,7 +1995,7 @@ def check_multicore(lines, config, program, name, atomic_metadata=False, softwar
                 instruction_address = models[hart].translate(models[hart].pc, 'fetch')
                 instruction = sum(memory.get(instruction_address + byte, 0) << (8 * byte) for byte in range(4))
                 operation = instruction >> 27
-                assert instruction & 127 == 47 and (instruction >> 12) & 7 == 3 and operation in (0, 1, 2, 3, 8)
+                assert instruction & 127 == 47 and (instruction >> 12) & 7 in (2, 3) and operation in (*ATOMIC_OPERATIONS, 2, 3)
                 assert operation != 2 or (instruction >> 20) & 31 == 0
                 active.update(operation=operation, eligible=operation == 3 and models[hart].local_reservation == event[1:3])
             sources.add(2 * hart + int(event[0] != 'fetch'))
@@ -2039,7 +2041,7 @@ def check_multicore(lines, config, program, name, atomic_metadata=False, softwar
             if event[0] in ('exclusive_read', 'exclusive_write'):
                 assert active and active['hart'] == hart and active['event'][0] == 'atomic'
                 _, address, size, addend = active['event']
-                assert event[1:3] == (address, size) and size == 8
+                assert event[1:3] == (address, size) and size in (4, 8)
                 if event[0] == 'exclusive_read':
                     assert active['operation'] != 3 and active.get('phase') in (None, 'retry') and event[3] == 0
                     active.update(bus=True, phase='read')
@@ -2049,7 +2051,7 @@ def check_multicore(lines, config, program, name, atomic_metadata=False, softwar
                         assert active.get('phase') is None and active['eligible'] and event[3] == addend, 'SC without a matching local LR or incorrect operand'
                         active.update(bus=True, old=sum(memory.get(address + byte, 0) << (8 * byte) for byte in range(size)))
                     else:
-                        assert active['operation'] in (0, 1, 8) and active['phase'] == 'write' and event[3] == atomic_value(active['operation'], active['old'], addend, size)
+                        assert active['operation'] in ATOMIC_OPERATIONS and active['phase'] == 'write' and event[3] == atomic_value(active['operation'], active['old'], addend, size)
                     active['phase'] = 'response'
                 continue
             assert active and active['hart'] == hart and active['event'] == event and not active['bus']
@@ -2325,11 +2327,16 @@ def check_multicore(lines, config, program, name, atomic_metadata=False, softwar
         job = program.lrsc
         word = lambda address: sum(memory.get(address + byte, 0) << (8 * byte) for byte in range(8))
         witnesses = [[word(job['witnesses'] + hart * job['stride'] + 8 * round) for round in range(job['rounds'])] for hart in range(harts)]
+        counter = lambda address: sum(memory.get(address + byte, 0) << (8 * byte) for byte in range(job.get('size', 8)))
+        if job.get('size') == 4:
+            assert all(counter(job['counter'] - 4 + (0 if job['shared'] else 8 * hart)) == 87 for hart in range(harts)), 'Word atomic corrupted adjacent bytes'
+            if writeback:
+                assert sum(c['writebacks'] for c in cache_counts), 'Word atomic did not recall dirty ownership'
         if job['shared']:
-            assert word(job['counter']) == job['rounds'] * harts
+            assert counter(job['counter']) == job['rounds'] * harts
             assert sorted(value for group in witnesses for value in group) == list(range(job['rounds'] * harts)), 'Lost or duplicate conditional store'
         else:
-            assert all(word(job['counter'] + 8 * hart) == job['rounds'] and witnesses[hart] == list(range(job['rounds'])) for hart in range(harts)), 'Private LR/SC result mismatch'
+            assert all(counter(job['counter'] + 8 * hart) == job['rounds'] and witnesses[hart] == list(range(job['rounds'])) for hart in range(harts)), 'Private LR/SC result mismatch'
             assert reservation_max >= min(harts, 2), 'Independent exclusive IDs were not simultaneously live'
         assert all(sc_results[hart, True] == job['rounds'] for hart in range(harts)), 'Missing per-hart successful SC'
     elif harts > 1 and 'atomic' in name:
@@ -2635,6 +2642,8 @@ def load_software(image, config_path):
     assert hashlib.sha256(config_path.read_bytes()).hexdigest() == manifest['configurationHash'], 'Software configuration changed'
     assert hashlib.sha256(image.read_bytes()).hexdigest() == manifest['imageHash'], 'Software image changed'
     assert all(hashlib.sha256(Path(name).read_bytes()).hexdigest() == digest for name, digest in manifest['sourceHashes'].items()), 'Stale software sources'
+    required = manifest.get('requiredExtensions', [])
+    assert set(required) <= {'M', 'A'} and all(config.get('enable' + name, True) for name in required), 'Software requires disabled extensions'
     base, harts, memory, spans, payloads = int(config['resetVector']), config['hartCount'], {}, [], []
     ram = next(r for r in config['memoryRegions'] if int(r['base']) == base and r['readable'] and r['writable'] and r['executable'] and not r['device'])
     memory_bytes = max(65536, int(ram['size']))
@@ -2673,7 +2682,10 @@ def load_software(image, config_path):
             builder = importlib.util.module_from_spec(spec)
             spec.loader.exec_module(builder)
             integer = 'rv64i2p1_zicsr2p0_zifencei2p0'
-            architecture = 'rv64i2p1_a2p1_zicsr2p0_zifencei2p0_zaamo1p0_zalrsc1p0' if kind == 'zephyr' else integer
+            architecture = 'rv64i2p1_a2p1_zicsr2p0_zifencei2p0_zaamo1p0_zalrsc1p0' if kind == 'zephyr' else manifest.get('instructionArchitecture', integer)
+            assert kind != 'arch-test' or architecture in (integer, builder.M_ARCHITECTURE, *builder.A_ARCHITECTURES.values()), 'Unsupported software architecture profile'
+            assert architecture != builder.M_ARCHITECTURE or config.get('enableM', True), 'Software requires disabled arithmetic'
+            assert architecture not in builder.A_ARCHITECTURES.values() or config.get('enableA', True), 'Software requires disabled atomics'
             code = builder.code_spans(elf, architecture, (integer,) if kind == 'zephyr' else ())
             if kind == 'arch-test':
                 assert code == manifest['codeSpans'] and hashlib.sha256(table.data()).hexdigest() == manifest['symbolTableHash'], 'Executable mappings changed'
@@ -2685,7 +2697,7 @@ def load_software(image, config_path):
                     word = int.from_bytes(data[address - section['sh_addr']:address - section['sh_addr'] + 4], 'little')
                     opcode, funct3, funct7 = word & 127, (word >> 12) & 7, word >> 25
                     assert opcode in (3, 15, 19, 23, 27, 35, 47, 51, 55, 59, 99, 103, 111, 115), 'Unsupported software instruction family'
-                    assert not (opcode in (51, 59) and funct7 == 1), 'Software requires multiplication or division'
+                    assert not (opcode in (51, 59) and funct7 == 1) or config.get('enableM', True), 'Software requires disabled arithmetic'
                     if opcode in (19, 27, 51, 59):
                         try:
                             integer_value(word, 0, 0)
@@ -2694,10 +2706,10 @@ def load_software(image, config_path):
                     elif opcode in (3, 15, 35, 99, 103):
                         assert funct3 in {3: range(7), 15: (0, 1), 35: range(4), 99: (0, 1, 4, 5, 6, 7), 103: (0,)}[opcode], 'Unsupported software memory/control encoding'
                     elif opcode == 47:
-                        assert kind == 'zephyr' and funct3 == 3 and word >> 27 in (0, 1, 2, 3, 8) and (word >> 27 != 2 or (word >> 20) & 31 == 0), 'Unsupported software atomic instruction'
+                        assert config.get('enableA', True) and funct3 in (2, 3) and word >> 27 in (*ATOMIC_OPERATIONS, 2, 3) and (word >> 27 != 2 or (word >> 20) & 31 == 0), 'Unsupported software atomic instruction'
                     elif opcode == 115:
                         update = funct3 & 3 == 1 or (word >> 15) & 31 != 0
-                        assert word in (0x73, 0x30200073, 0x10500073) or (funct3 in (1, 2, 3, 5, 6, 7) and word >> 20 in implemented_csrs and (not update or word >> 30 != 3)), 'Unsupported software system instruction'
+                        assert word in (0x73, 0x00100073, 0x30200073, 0x10500073) or (funct3 in (1, 2, 3, 5, 6, 7) and word >> 20 in implemented_csrs and (not update or word >> 30 != 3)), 'Unsupported software system instruction'
         if kind == 'zephyr':
             stacks = layout['stacks']
             actual = {name for name, symbol in all_symbols.items() if symbol['st_size'] and name.endswith(('_stack', '_stacks'))
@@ -2850,6 +2862,7 @@ def verify_software(args):
         run(['build-ditdah-a1', '--trace', '--config', config_path, '--output', rtl], args.output / 'build.log')
     manifest = json.loads((rtl / 'ditdah_a1_config.json').read_text())
     assert manifest['top'] == 'DitDahA1' and manifest['validationScope'] == 'system'
+    assert set(software.get('requiredExtensions', [])) <= set(manifest['implementation']['extensions']), 'Software extension profile exceeds RTL capabilities'
     assert all(manifest['parameters'][key] == value for key, value in config.items() if key != 'enableTrace'), 'Stale software RTL configuration'
     assert all(hashlib.sha256(Path(name).read_bytes()).hexdigest() == digest for name, digest in manifest['sourceHashes'].items()), 'Stale software RTL sources'
     assert not args.burst_refill or config.get('enableBurstRefill'), 'Software configuration does not enable burst refill'
@@ -3047,6 +3060,8 @@ def verify_cache_matrix(args):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--width', type=int, choices=(64, 128, 256, 512), action='append')
+    parser.add_argument('--no-m', action='store_true')
+    parser.add_argument('--no-a', action='store_true')
     parser.add_argument('--issue-width', type=int, choices=(1, 2, 3), default=1)
     parser.add_argument('--load-queue-entries', type=int, choices=(1, 2), default=1)
     parser.add_argument('--fabric-read-slots', type=int, choices=(1, 2, 3, 4))
@@ -3165,7 +3180,7 @@ def main():
         directory = args.output / f'{"irq-" if interrupts else ""}{"pmp16-" if entries else ""}axi{width}'
         directory.mkdir(parents=True, exist_ok=True)
         config = configuration(width)
-        config.update(l2CacheBytes=args.l2_cache_bytes or 0, issueWidth=args.issue_width, loadQueueEntries=args.load_queue_entries, pmpEntries=entries, enableInterrupts=interrupts, iCacheBytes=args.icache_bytes, dCacheBytes=args.dcache_bytes, dCacheWays=args.dcache_ways, dCacheRefillBytes=args.dcache_refill_bytes, dCacheWriteback=args.dcache_writeback, tlbEntries=args.tlb_entries, iTlbEntries=args.i_tlb_entries, dTlbEntries=args.d_tlb_entries, asidBits=args.asid_bits, enableBurstRefill=args.burst_refill, enableBranchPrediction=args.branch_prediction, branchPredictorEntries=args.branch_predictor_entries)
+        config.update(enableM=not args.no_m, enableA=not args.no_a, l2CacheBytes=args.l2_cache_bytes or 0, issueWidth=args.issue_width, loadQueueEntries=args.load_queue_entries, pmpEntries=entries, enableInterrupts=interrupts, iCacheBytes=args.icache_bytes, dCacheBytes=args.dcache_bytes, dCacheWays=args.dcache_ways, dCacheRefillBytes=args.dcache_refill_bytes, dCacheWriteback=args.dcache_writeback, tlbEntries=args.tlb_entries, iTlbEntries=args.i_tlb_entries, dTlbEntries=args.d_tlb_entries, asidBits=args.asid_bits, enableBurstRefill=args.burst_refill, enableBranchPrediction=args.branch_prediction, branchPredictorEntries=args.branch_predictor_entries)
         if args.fabric_read_slots is not None:
             config['fabricReadSlots'] = args.fabric_read_slots
         config['memoryRegions'][0]['dataCacheable'] = bool(args.dcache_bytes)
@@ -3232,7 +3247,7 @@ def main():
                 continue
             directory = args.output / f'harts{harts}-axi{width}'
             directory.mkdir(parents=True, exist_ok=True)
-            config = dict(configuration(width), l2CacheBytes=args.l2_cache_bytes or 0, issueWidth=args.issue_width, loadQueueEntries=args.load_queue_entries, hartCount=harts, pmpEntries=entries, enableInterrupts=interrupts, iCacheBytes=args.icache_bytes, dCacheBytes=args.dcache_bytes, dCacheWays=args.dcache_ways, dCacheRefillBytes=args.dcache_refill_bytes, dCacheWriteback=args.dcache_writeback, tlbEntries=args.tlb_entries, iTlbEntries=args.i_tlb_entries, dTlbEntries=args.d_tlb_entries, asidBits=args.asid_bits, enableBurstRefill=args.burst_refill, enableBranchPrediction=args.branch_prediction, branchPredictorEntries=args.branch_predictor_entries)
+            config = dict(configuration(width), enableM=not args.no_m, enableA=not args.no_a, l2CacheBytes=args.l2_cache_bytes or 0, issueWidth=args.issue_width, loadQueueEntries=args.load_queue_entries, hartCount=harts, pmpEntries=entries, enableInterrupts=interrupts, iCacheBytes=args.icache_bytes, dCacheBytes=args.dcache_bytes, dCacheWays=args.dcache_ways, dCacheRefillBytes=args.dcache_refill_bytes, dCacheWriteback=args.dcache_writeback, tlbEntries=args.tlb_entries, iTlbEntries=args.i_tlb_entries, dTlbEntries=args.d_tlb_entries, asidBits=args.asid_bits, enableBurstRefill=args.burst_refill, enableBranchPrediction=args.branch_prediction, branchPredictorEntries=args.branch_predictor_entries)
             if args.fabric_read_slots is not None:
                 config['fabricReadSlots'] = args.fabric_read_slots
             config['memoryRegions'][0]['dataCacheable'] = bool(args.dcache_bytes)

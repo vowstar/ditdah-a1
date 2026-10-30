@@ -11,6 +11,7 @@ import subprocess
 
 
 def load_configuration(args):
+    issue_width = getattr(args, 'issue_width', None)
     sv39 = getattr(args, 'sv39', False)
     supervisor_mode = getattr(args, 'supervisor_mode', False) or sv39
     tlb_entries = getattr(args, 'tlb_entries', None)
@@ -23,8 +24,10 @@ def load_configuration(args):
     content = original.read_bytes()
     document = json.loads(content)
     config = document.get('parameters', document)
-    if args.harts is None and args.icache_bytes is None and args.dcache_bytes is None and not supervisor_mode and tlb_entries is None and burst_refill is None and data_refill is None and not translation:
+    if args.harts is None and args.icache_bytes is None and args.dcache_bytes is None and not supervisor_mode and tlb_entries is None and burst_refill is None and data_refill is None and not translation and issue_width is None:
         return config, {}
+    if issue_width is not None:
+        config['issueWidth'] = issue_width
     if args.harts is not None:
         config['hartCount'] = args.harts
     if args.icache_bytes is not None:
@@ -51,6 +54,8 @@ def load_configuration(args):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--config', type=Path, required=True)
+    parser.add_argument('--issue-width', type=int, choices=(1, 2, 3))
+    parser.add_argument('--isa', choices=('rv64i', 'rv64im', 'rv64ia', 'rv64ima'), default='rv64i')
     parser.add_argument('--program', type=Path, default=Path('software/tests/console.S'))
     parser.add_argument('--output', type=Path, default=Path('result/software/console'))
     parser.add_argument('--tool-prefix', default=os.environ.get('RISCV_PREFIX', 'riscv64-unknown-elf-'))
@@ -90,7 +95,10 @@ def main():
                        __stack_bytes=args.stack_bytes, __console_base=console)
     if config.get('localInterruptBase') is not None:
         definitions['__local_interrupt_base'] = int(config['localInterruptBase'])
-    command = [args.tool_prefix + 'gcc', '-march=rv64i_zicsr_zifencei',
+    required_extensions = [name for name in ('M', 'A') if name.lower() in args.isa[5:]]
+    assert all(config.get('enable' + name, True) for name in required_extensions), 'Software requires a disabled extension'
+    command = [args.tool_prefix + 'gcc', '-march=' + args.isa + '_zicsr_zifencei',
+               f'-DDITDAH_HART_COUNT={harts}',
                f'-DDITDAH_RAM_BASE={base}', f'-DDITDAH_RAM_BYTES={int(ram["size"])}',
                f'-DDITDAH_ASID_BITS={config.get("asidBits", 0)}',
                f'-DDITDAH_CONSOLE_BASE={console}', '-mabi=lp64', '-mcmodel=medany',
@@ -114,7 +122,7 @@ def main():
     assert args.config.read_bytes() == configuration_bytes, 'Configuration changed during build'
     manifest = dict(sourceHashes=hashes, configurationHash=hashlib.sha256(configuration_bytes).hexdigest(),
                     imageHash=hashlib.sha256(image.read_bytes()).hexdigest(), symbols=symbols, commands=[command],
-                    toolVersions=tool_versions,
+                    toolVersions=tool_versions, requiredExtensions=required_extensions,
                     target=subprocess.check_output([args.tool_prefix + 'gcc', '-dumpmachine'], text=True).strip(),
                     expectedInterruptCauses=args.expected_interrupt)
     (args.output / 'manifest.json').write_text(json.dumps(manifest, indent=2) + '\n')

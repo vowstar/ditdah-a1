@@ -16,10 +16,10 @@ DitDah-A1 targets a 64-bit RISC-V application processor with scalar execution.
 The executable RTL supports one to sixteen RV64 harts, M or optional M/U and M/S/U modes, shared AXI4 and precise synchronous exceptions.
 `issueWidth` selects one to three lanes in a fixed eight-stage pipeline; independent integer ALUs may follow one ordinary load/store, while other resources execute alone.
 PMP is configurable to zero or sixteen entries per hart; the default uncached configuration omits it.
-MUL uses an iterative resource; accepted operations retain their instruction owner through completion or cancellation draining.
+Optional M uses a shared iterative multiply/divide resource; accepted operations retain their instruction owner through completion or cancellation draining.
 Branches recover in EX while retaining older work; `enableBranchPrediction` enables static backward-branch and direct-jump prediction.
 `branchPredictorEntries` selects 0/8/16 direct-mapped entries with two-bit direction counters and last indirect targets; nonzero requires prediction enabled. This does not implement a return stack.
-The manifest lists implemented instructions; Sv48 remains a design target.
+The manifest lists complete I/Zicsr/Zifencei and optional M/A through `enableM`/`enableA`; C/F/D/B and Sv48 remain targets.
 Core composes Frontend and Backend; Frontend owns PC sequencing and Backend owns execution and retirement. Non-fault Backend packets contain four-byte instructions and word-aligned PCs; producers supply fetch faults.
 Core exposes separate instruction/data memory ports; the physical fabric owns shared arbitration and AXI.
 Instruction permissions apply before cache lookup and to the complete refill request; region checks also protect external accesses.
@@ -27,8 +27,8 @@ Instruction permissions apply before cache lookup and to the complete refill req
 The fabric permits one instruction read and the configured data-read count per hart through 1–4 `fabricReadSlots` (at most `hartCount * (1 + loadQueueEntries)`; default two for multiple harts, zero for the single-hart bridge); writes, atomics and devices wait for all response fragments and execute exclusively.
 Queued AXI read IDs identify transaction slots; serialized accesses retain hart IDs. An unexpected read ID blocks new fabric transactions until reset while known in-flight reads drain.
 AXI data width is configurable to 64/128/256/512 bits; scalar requests remain at most eight bytes.
-AMOADD.D, AMOOR.D and AMOSWAP.D use AXI exclusive retry and return the old value.
-LR.D/SC.D use per-hart reservations; ordered data completion covers all aq/rl combinations. This does not implement the complete A or Zaamo extension.
+The nine standard W/D AMOs use AXI exclusive retry and return the old value.
+W/D LR/SC pair the full physical address and width per hart; ordered data completion covers all aq/rl combinations.
 FENCE preserves ordered data completion; FENCE.I restarts local instruction fetching and invalidates the optional private instruction cache.
 
 ## Development
@@ -71,7 +71,7 @@ An optional `localInterruptBase` maps protected software-interrupt and 64-bit ti
 All harts share the reset vector and read their index from `mhartid`; standalone Core and Backend integrations must hold `hartId` constant.
 
 `make verify-signoff` checks standalone Core and AXI integration against the same instruction model, tests interface and component-configuration contracts, lints the five production tops, and proves execution/transaction safety.
-Formal checks cover Fetch cancellation, multiply ownership and zero/unit operands, and Backend ownership with an abstract resource.
+Formal checks cover Fetch cancellation, arithmetic ownership, bounded completion and word results, and Backend ownership with an abstract resource.
 Enabled configurations additionally check PMP decisions, CSR locks, and cancellation/ownership with abstract authorization.
 Interrupt checks cover CSR eligibility, saved PC, transaction ownership, and independently modeled architectural events.
 Multicore checks use per-hart instruction models and shared memory ordered by bus service; arbiter proofs check ownership and bounded overtaking.

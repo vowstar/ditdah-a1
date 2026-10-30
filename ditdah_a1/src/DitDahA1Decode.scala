@@ -50,7 +50,9 @@ object DitDahA1Decode extends Generator[DitDahA1Parameter, DitDahA1UnitLayers, D
     when((opcode === 0x1b.B(7)) & ((funct3 === 0.B(3)) | (wordShift & wordShiftEncoding))) { out.operation := AluWordImmediate.U(operationBits) }
     when((opcode === 0x3b.B(7)) & (((funct7 === 0.B(7)) & ((funct3 === 0.B(3)) | wordShift)) | subtractOrArithmetic)) { out.operation := AluWordRegister.U(operationBits) }
     when((opcode === 0x33.B(7)) & (funct3 === 0.B(3)) & (insn.bits(31, 25) === 0.B(7))) { out.operation := Add.U(operationBits) }
-    when((opcode === 0x33.B(7)) & (funct3 === 0.B(3)) & (insn.bits(31, 25) === 1.B(7))) { out.operation := Mul.U(operationBits) }
+    if parameter.enableM then
+      when(((opcode === 0x33.B(7)) | ((opcode === 0x3b.B(7)) & ((funct3 === 0.B(3)) | funct3.bit(2)))) &
+        (funct7 === 1.B(7))) { out.operation := MulDiv.U(operationBits) }
     when((opcode === 0x63.B(7)) & (funct3 === 0.B(3))) { out.operation := Beq.U(operationBits); out.immediate := immB }
     when((opcode === 0x63.B(7)) & ((funct3 === 1.B(3)) | funct3.bit(2))) { out.operation := Branch.U(operationBits); out.immediate := immB }
     when(opcode === 0x6f.B(7)) { out.operation := Jal.U(operationBits); out.immediate := immJ }
@@ -62,14 +64,17 @@ object DitDahA1Decode extends Generator[DitDahA1Parameter, DitDahA1UnitLayers, D
     when((opcode === 0x23.B(7)) & (funct3 === 3.B(3))) { out.operation := Sd.U(operationBits); out.immediate := immS }
     when((opcode === 0x23.B(7)) & (funct3 === 2.B(3))) { out.operation := Sw.U(operationBits); out.immediate := immS }
     when((opcode === 0x23.B(7)) & ((funct3 === 0.B(3)) | (funct3 === 1.B(3)))) { out.operation := Store.U(operationBits); out.immediate := immS }
-    when((opcode === 0x2f.B(7)) & (funct3 === 3.B(3)) & (insn.bits(31, 27) === 0.B(5))) { out.operation := AmoaddD.U(operationBits); out.immediate := 0.U(64) }
     val lr = atomicOperation === 2.B(5)
-    val supportedAtomic = (atomicOperation === 1.B(5)) | (atomicOperation === 3.B(5)) | (atomicOperation === 8.B(5)) | (lr & (out.rs2 === 0.U(5)))
-    when((opcode === 0x2f.B(7)) & (funct3 === 3.B(3)) & supportedAtomic) { out.operation := Atomic.U(operationBits); out.immediate := 0.U(64) }
+    if parameter.enableA then
+      val supportedAtomic = (DitDahA1Isa.atomicOperations :+ 3).map(op => atomicOperation === op.B(5)).reduce(_ | _) | (lr & (out.rs2 === 0.U(5)))
+      when((opcode === 0x2f.B(7)) & ((funct3 === 2.B(3)) | (funct3 === 3.B(3))) & supportedAtomic) {
+        out.operation := ((atomicOperation === 0.B(5)) & (funct3 === 3.B(3))).?(AmoaddD.U(operationBits), Atomic.U(operationBits))
+        out.immediate := 0.U(64)
+      }
     when((opcode === 0x73.B(7)) & (funct3 === 1.B(3))) { out.operation := Csrrw.U(operationBits) }
     when((opcode === 0x73.B(7)) & (funct3 === 2.B(3))) { out.operation := Csrrs.U(operationBits) }
     when((opcode === 0x73.B(7)) & ((funct3 === 3.B(3)) | funct3.bit(2) & (funct3 =/= 4.B(3)))) { out.operation := Csr.U(operationBits) }
-    when(insn === 0x00000073L.B(32)) { out.operation := Ecall.U(operationBits) }
+    when((insn === 0x00000073L.B(32)) | (insn === 0x00100073L.B(32))) { out.operation := Ecall.U(operationBits) }
     when(insn === 0x30200073L.B(32)) { out.operation := Mret.U(operationBits) }
     if parameter.enableSupervisorMode then
       when(insn === 0x10200073L.B(32)) { out.operation := Sret.U(operationBits) }
@@ -80,7 +85,7 @@ object DitDahA1Decode extends Generator[DitDahA1Parameter, DitDahA1UnitLayers, D
     val csr = (operation === Csrrw.U(operationBits)) | (operation === Csrrs.U(operationBits)) | (operation === Csr.U(operationBits))
     val branch = (operation === Beq.U(operationBits)) | (operation === Branch.U(operationBits))
     val store = (operation === Sd.U(operationBits)) | (operation === Sw.U(operationBits)) | (operation === Store.U(operationBits))
-    val both = (operation === Add.U(operationBits)) | (operation === Mul.U(operationBits)) | branch | store | (operation === AmoaddD.U(operationBits)) | (operation === AluRegister.U(operationBits)) | (operation === AluWordRegister.U(operationBits))
+    val both = (operation === Add.U(operationBits)) | (operation === MulDiv.U(operationBits)) | branch | store | (operation === AmoaddD.U(operationBits)) | (operation === AluRegister.U(operationBits)) | (operation === AluWordRegister.U(operationBits))
     out.usesRs1 := !in.fault & (both | (operation === Addi.U(operationBits)) | (operation === AluImmediate.U(operationBits)) | (operation === AluWordImmediate.U(operationBits)) | (operation === Jalr.U(operationBits)) | (operation === Ld.U(operationBits)) | (operation === Lw.U(operationBits)) | (operation === Lwu.U(operationBits)) | (operation === Load.U(operationBits)) | (csr & !funct3.bit(2)))
     out.usesRs2 := !in.fault & both
     when(operation === Atomic.U(operationBits)) {

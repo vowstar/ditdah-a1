@@ -14,7 +14,11 @@ def add(rd, a, b):
 
 
 def mul(rd, a, b):
-    return add(rd, a, b) | (1 << 25)
+    return muldiv(rd, a, b)
+
+
+def muldiv(rd, a, b, function=0, word=False):
+    return (1 << 25) | (b << 20) | (a << 15) | (function << 12) | (rd << 7) | (0x3b if word else 0x33)
 
 
 def ld(rd, base, offset=0):
@@ -51,8 +55,8 @@ def amoadd(rd, base, rs, aqrl=0):
     return (aqrl << 25) | (rs << 20) | (base << 15) | (3 << 12) | (rd << 7) | 0x2f
 
 
-def amo(operation, rd, base, rs=0, aqrl=0):
-    return (operation << 27) | amoadd(rd, base, rs, aqrl)
+def amo(operation, rd, base, rs=0, aqrl=0, size=3):
+    return ((operation << 27) | amoadd(rd, base, rs, aqrl)) ^ ((3 ^ size) << 12)
 
 
 def fence(instruction=False, reserved=0):
@@ -433,6 +437,7 @@ def sv39_cases(base, protection, writeback=False):
     yield 'sv39_integer_stream', p
     for name, flags, status, address, levels in (
             ('data', 0xcf, 0x20800, 0x40000100, 0),
+            ('atomic', 0xcf, 0x20800, 0x40000104, 0),
             ('reuse', 0xcf, 0x20800, 0x40000100, 0),
             ('protection', 0xcf, 0x20800, 0x40000100, 0),
             ('large', 0xcf, 0x20800, 0x40000100, 1),
@@ -464,12 +469,18 @@ def sv39_cases(base, protection, writeback=False):
         if name == 'reuse':
             p.emit(addi(4, 0, 32), ld(3, 11), addi(4, 4, -1), beq(4, 0, -8) ^ (1 << 12))
         else:
-            p.emit(ld(3, 11))
+            p.emit(load(3, 11, size=2) if name == 'atomic' else ld(3, 11))
+        if name == 'atomic':
+            p.emit(addi(4, 0, -1))
+            for operation in (0, 1, 4, 8, 12, 16, 20, 24, 28):
+                p.emit(amo(operation, 5, 11, 4, 3, 2))
+            p.emit(amo(2, 6, 11, aqrl=2, size=2), amo(3, 7, 11, 4, 1, 2))
         if name == 'protection':
             p.address(12, 0x1000)
             p.emit(csr(0, 0x300, 0), alu(12, 12, 2, 5, immediate=True), csr(0, 0x3b0, 12),
                    addi(12, 0, 0xf), csr(0, 0x3a0, 12), csr(0, 0x300, 2), ld(4, 11))
-        p.emit(sd(3, 11), csr(0, 0x300, 0))
+        p.emit(store(3, 11, size=2) if name == 'atomic' else sd(3, 11), csr(0, 0x300, 0))
+        if name == 'atomic': p.required_atomics = 11
         yield 'sv39_' + name, p.finish()
     p = Program(base)
     root, middle, leaf, virtual = base + 0x1000, base + 0x2000, base + 0x3000, 0x40000000
@@ -569,7 +580,7 @@ def supervisor_cases(base, protection=False):
         if protection:
             user_protection(p)
         p.address(1, 0x600)
-        p.emit(csr(0, 0x105, 1), addi(1, 0, 0x100), csr(0, 0x302, 1),
+        p.emit(csr(0, 0x105, 1), addi(1, 0, 0x108 if name == 'traps' else 0x100), csr(0, 0x302, 1),
                addi(1, 0, 0x222), csr(0, 0x303, 1))
         if name == 'mprv':
             p.emit(ld(6, 10, 8), addi(1, 0, 0x3ff), csr(0, 0x302, 1), addi(1, 0, 1), alu(1, 1, 17, 1, immediate=True),
@@ -583,6 +594,7 @@ def supervisor_cases(base, protection=False):
         p.offset = 0x200
         p.emit(csr(2, 0x100, 0, True), csr(3, 0x180, 10), csr(4, 0x180, 0, True),
                csr(5, 0x106, 10), csr(6, 0x10a, 10), addi(2, 0, 17), sd(2, 10), ld(3, 10))
+        p.emit(0x00100073)
         if name == 'csr':
             p.emit(addi(2, 0, 0x222), csr(0, 0x104, 2), csr(4, 0x104, 0, True),
                    csr(0, 0x104, 0), csr(0, 0x144, 2), csr(5, 0x144, 0, True),
@@ -590,7 +602,7 @@ def supervisor_cases(base, protection=False):
         p.address(1, 0x400)
         p.emit(csr(0, 0x141, 1), csr(0, 0x100, 0), 0x10200073)
         p.offset = 0x400
-        p.emit(csr(7, 0x100, 0, True), 0x10200073, 0x10500073, ld(8, 10),
+        p.emit(csr(7, 0x100, 0, True), 0x00100073, 0x10200073, 0x10500073, ld(8, 10),
                ld(9, 10, 8), 0x73, addi(11, 0, 23))
         p.stop = base + p.offset
         p.emit(jal(0, 0))
@@ -641,7 +653,7 @@ def user_cases(base, protection=False, interrupts=False, local_interrupt_base=No
         elif name == 'system':
             p.emit(csr(2, 0x300, 0, True), csr(0, 0x340, 10), csr(0, 0xf14, 0),
                    0x30200073, csr(3, 0x180, 0, True), csr(4, 0x306, 0, True), csr(0, 0x306, 10),
-                   csr(5, 0x30a, 0, True), csr(0, 0x30a, 10), csr(6, 0xf15, 0, True), fence(), fence(True))
+                   csr(5, 0x30a, 0, True), csr(0, 0x30a, 10), csr(6, 0xf15, 0, True), fence(), fence(True), 0x00100073)
         elif name == 'wait':
             p.emit(0x10500073)
         elif name == 'protection':
@@ -718,9 +730,46 @@ def integer_cases(base):
         p.emit(*(alu(6, 1, 2, function, word, upper=32) for function in (1, 2, 3, 4, 6, 7)))
     p.emit(*(alu(6, 1, 2, function, True) for function in (2, 3, 4, 6, 7)),
            *(alu(6, 1, 1, function, True, True) for function in (2, 3, 4, 6, 7)),
-           alu(6, 1, 2, 0, True, upper=1), alu(6, 1, 2, 4, upper=1),
-           beq(1, 2, 8) | (2 << 12), beq(1, 2, 8) | (3 << 12), 0x00100073)
+           alu(6, 1, 2, 0, True, upper=2), alu(6, 1, 2, 4, upper=2),
+           beq(1, 2, 8) | (2 << 12), beq(1, 2, 8) | (3 << 12), 0x00200073)
     yield 'integer_reserved', p.finish()
+    p = Program(base)
+    p.emit(0x00100073, addi(7, 0, 29))
+    yield 'integer_breakpoint', p.finish()
+    for word in (False, True):
+        for function in ((0, 4, 5, 6, 7) if word else range(8)):
+            p = Program(base)
+            p.address(10, 0x3000)
+            for index, value in enumerate(values):
+                other = (0, -1, 1, -1, 3, 0x80000000, 0xffffffff, 0)[index]
+                for offset, number in ((0, value), (8, other)):
+                    p.memory.update((base + 0x3000 + 16 * index + offset + byte, (number >> (8 * byte)) & 255) for byte in range(8))
+                p.emit(ld(1, 10, 16 * index), ld(2, 10, 16 * index + 8),
+                       muldiv(3, 1, 2, function, word), addi(4, 3, 1), muldiv(0, 1, 2, function, word))
+            yield f'muldiv_{function}{"w" if word else ""}', p.finish()
+    for size in (2, 3):
+        for operation in (0, 1, 4, 8, 12, 16, 20, 24, 28):
+            p = Program(base)
+            p.address(10, 0x1000 + (4 if size == 2 else 0))
+            p.address(11, 0x3000)
+            p.emit(addi(2, 0, -91), sd(2, 10, -4 if size == 2 else 8), sd(2, 10, 4 if size == 2 else 16))
+            for order, (old, operand) in enumerate(((0, -1), (0x80000000, 1), (0xffffffff, 0x80000000), (0x8000000000000000, -1))):
+                for offset, number in ((0, old), (8, operand)):
+                    for byte in range(8):
+                        p.memory[base + 0x3000 + 16 * order + offset + byte] = (number >> (8 * byte)) & 255
+                p.emit(ld(2, 11, 16 * order), ld(3, 11, 16 * order + 8), store(2, 10, size=size), amo(operation, 4, 10, 3, order, size),
+                       load(5, 10, size=size), amo(operation, 0, 10, 3, order, size))
+            p.emit(ld(6, 10, -4 if size == 2 else 8), ld(7, 10, 4 if size == 2 else 16))
+            yield f'atomic_{operation}_{size}', p.finish()
+    for size in (2, 3):
+        p = Program(base)
+        p.address(10, 0x1000)
+        p.emit(addi(2, 0, -1), sd(2, 10), sd(2, 10, 8))
+        for order in range(4):
+            p.emit(amo(2, 4, 10, aqrl=order, size=size), amo(3, 5, 10, 2, order, size), amo(3, 6, 10, 2, order, size),
+                   amo(2, 4, 10, size=size), amo(3, 5, 10, 2, size=5-size),
+                   amo(2, 4, 10, size=size), store(2, 10, size=size), amo(3, 5, 10, 2, size=size))
+        yield f'atomic_reservation_{size}', p.finish()
     p = Program(base)
     p.address(10, 0x1000)
     p.emit(addi(2, 0, -1), *(sd(2, 10, offset) for offset in range(0, 64, 8)))
@@ -908,7 +957,8 @@ def pmp_cases(base, writeback=False):
 def interrupt_cases(base, protection):
     names = ('priority', 'store_blocked', 'address_first', 'data_first', 'read_pending', 'fetch_pending',
              'multiply', 'pmp_restart', 'read_fault', 'write_fault', 'fetch_fault', 'branch', 'atomic', 'fence', 'fence_i')
-    for mode, name in enumerate(names):
+    for mode, name, function in ((mode, name, function) for mode, name in enumerate(names)
+                                 for function in ((0, 5) if name == 'multiply' else (0,))):
         if mode == 7 and not protection:
             continue
         p = Program(base)
@@ -932,7 +982,7 @@ def interrupt_cases(base, protection):
             p.faults['fetch'] = target
         if mode in (8, 9):
             p.faults['read' if mode == 8 else 'write'] = base + 0x5000
-        p.emit(sd(2, 10), ld(4, 10), mul(6, 2, 2), addi(7, 6, 3), jal(0, 8), sd(7, 10))
+        p.emit(sd(2, 10), ld(4, 10), muldiv(6, 2, 2, function), addi(7, 6, 3), jal(0, 8), sd(7, 10))
         p.emit(*[addi(8, 8, 1) for _ in range(16)])
         p.finish()
         p.offset = 0x800
@@ -944,7 +994,7 @@ def interrupt_cases(base, protection):
         if mode in (8, 9, 10):
             p.emit(addi(22, 22, 4), csr(0, 0x341, 22), 0x30200073)
         p.interrupts = dict(mode={8: 4, 9: 1, 10: 5, 11: 7, 12: 8, 13: 7, 14: 7}.get(mode, mode), mask=7 if mode == 0 else 1 << ((mode - 1) % 3), target=target)
-        yield 'interrupt_' + name, p
+        yield 'interrupt_' + ('divide' if function else name), p
 
 
 def multicore_cases(base, harts, protection=False, interrupts=False, user=False, writeback=False):
@@ -1308,20 +1358,22 @@ def synchronization_program(base, harts, writeback=False):
 
 
 def atomic_multicore_cases(base, harts, interrupts):
-    for shared in (True, False):
+    for size, shared in ((size, shared) for size in (2, 3) for shared in (True, False)):
         p = Program(base)
         p.emit(csr(2, 0xf14, 0, True))
-        p.address(10, 0x1800)
+        p.address(10, 0x1804 if size == 2 else 0x1800)
         if not shared:
             p.emit(alu(3, 2, 3, 1, immediate=True), add(10, 10, 3))
+        if size == 2:
+            p.emit(ld(5, 10, -4), addi(4, 0, 87), sw(4, 10, -4))
         p.address(11, 0x2000)
         p.emit(alu(3, 2, 5, 1, immediate=True), add(11, 11, 3))
         for iteration in range(2):
             loop = p.offset
-            p.emit(amo(2, 6, 10, aqrl=2), addi(7, 6, 1), amo(3, 8, 10, 7, 1),
+            p.emit(amo(2, 6, 10, aqrl=2, size=size), addi(7, 6, 1), amo(3, 8, 10, 7, 1, size),
                    beq(8, 0, 8), jal(0, loop - (p.offset + 16)), sd(6, 11, iteration * 8))
-        p.lrsc = dict(shared=shared, rounds=2, counter=base + 0x1800, witnesses=base + 0x2000, stride=32)
-        yield 'atomic_lrsc_' + ('shared' if shared else 'private'), p.finish()
+        p.lrsc = dict(shared=shared, rounds=2, counter=base + (0x1804 if size == 2 else 0x1800), size=1 << size, witnesses=base + 0x2000, stride=32)
+        yield 'atomic_lrsc_' + ('shared' if shared else 'private') + ('_word' if size == 2 else ''), p.finish()
     for name in ('atomic', *(('atomic_interrupt',) if interrupts else ())):
         p = Program(base)
         p.emit(csr(2, 0xf14, 0, True), addi(3, 0, 64), mul(3, 2, 3), addi(4, 2, 1), addi(5, 0, 1))

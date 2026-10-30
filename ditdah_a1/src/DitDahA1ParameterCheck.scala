@@ -11,6 +11,14 @@ object DitDahA1ParameterCheck:
 
   def run(): Unit =
     val baseline = DitDahA1Parameter()
+    for enabled <- Seq(false, true) do
+      val selected = baseline.copy(enableM = enabled)
+      assert(DitDahA1Config.parameter(DitDahA1Config.document(selected)) == selected)
+      assert(DitDahA1Isa.mulDivInstructions.forall(name => DitDahA1Isa.instructions(selected).contains(name) == enabled))
+    for enabled <- Seq(false, true) do
+      val selected = baseline.copy(enableA = enabled)
+      assert(DitDahA1Config.parameter(DitDahA1Config.document(selected)) == selected)
+      assert(DitDahA1Isa.atomicInstructions.forall(name => DitDahA1Isa.instructions(selected).contains(name) == enabled))
     val highAddress = baseline.copy(resetVector = (BigInt(1) << 40) + 2)
     val encoded = upickle.default.write(highAddress)
     assert(upickle.default.read[DitDahA1Parameter](encoded) == highAddress)

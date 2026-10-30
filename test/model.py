@@ -3,6 +3,7 @@
 """Instruction-level oracle for the implemented scalar operations."""
 
 MASK = (1 << 64) - 1
+ATOMIC_OPERATIONS = (0, 1, 4, 8, 12, 16, 20, 24, 28)
 
 
 def signed(value, bits):
@@ -10,8 +11,12 @@ def signed(value, bits):
 
 
 def atomic_value(operation, old, operand, size):
-    assert size == 8 and operation in (0, 1, 8)
-    return {0: old + operand, 1: operand, 8: old | operand}[operation] & MASK
+    assert size in (4, 8) and operation in ATOMIC_OPERATIONS
+    mask = (1 << (8 * size)) - 1
+    a, b = old & mask, operand & mask
+    less = signed(a, 8 * size) < signed(b, 8 * size)
+    return {0: a + b, 1: b, 4: a ^ b, 8: a | b, 12: a & b,
+            16: a if less else b, 20: b if less else a, 24: min(a, b), 28: max(a, b)}[operation] & mask
 
 
 class ExclusiveMonitor:
@@ -32,6 +37,27 @@ class ExclusiveMonitor:
         return success
 
 
+def muldiv_value(insn, a, b):
+    function, word = (insn >> 12) & 7, insn & 127 == 0x3b
+    width = 32 if word else 64
+    if word and function in (1, 2, 3):
+        raise Fault(2, insn)
+    if function < 4:
+        left = signed(a, 64) if function in (1, 2) else a
+        right = signed(b, 64) if function == 1 else b
+        value = left * right
+        if function:
+            value >>= 64
+    else:
+        left, right = a & ((1 << width) - 1), b & ((1 << width) - 1)
+        if not function & 1:
+            left, right = signed(left, width), signed(right, width)
+        quotient = ((abs(left) // abs(right)) * (-1 if (left < 0) != (right < 0) else 1)
+                    if right else (1 << width) - 1)
+        value = left - quotient * right if function & 2 else quotient
+    return signed(value, 32) if word else value & MASK
+
+
 def integer_value(insn, a, b):
     opcode, function, upper = insn & 127, (insn >> 12) & 7, insn >> 25
     word, immediate = opcode in (0x1b, 0x3b), opcode in (0x13, 0x1b)
@@ -40,8 +66,8 @@ def integer_value(insn, a, b):
     shift = (insn >> 20 if immediate else b) & (width - 1)
     if function == 0 and (immediate or upper in (0, 32)):
         value = left - right if not immediate and upper == 32 else left + right
-    elif not immediate and opcode == 0x33 and function == 0 and upper == 1:
-        value = a * b
+    elif not immediate and upper == 1:
+        return muldiv_value(insn, a, b)
     elif function in (1, 5):
         prefix = insn >> (25 if word or not immediate else 26)
         arithmetic = prefix == (32 if word or not immediate else 16)
@@ -394,6 +420,8 @@ class Model:
             elif opcode == 0x17:
                 value, write = pc + signed(insn & 0xfffff000, 32), True
             elif opcode in (0x13, 0x1b, 0x33, 0x3b):
+                if opcode in (0x33, 0x3b) and insn >> 25 == 1 and not self.config.get('enableM', True):
+                    raise Fault(2, insn)
                 value, write = integer_value(insn, a, b), True
             elif opcode == 0x63 and funct3 in (0, 1, 4, 5, 6, 7):
                 displacement = signed(((insn >> 31) << 12) | (((insn >> 7) & 1) << 11)
@@ -415,14 +443,14 @@ class Model:
             elif opcode == 0x23 and funct3 < 4:
                 offset = signed(((insn >> 25) << 5) | ((insn >> 7) & 31), 12)
                 self.access((a + offset) & MASK, 1 << funct3, 'write', b)
-            elif opcode == 0x2f and funct3 == 3 and insn >> 27 in (0, 1, 2, 3, 8) and (insn >> 27 != 2 or rs2 == 0):
+            elif opcode == 0x2f and self.config.get('enableA', True) and funct3 in (2, 3) and insn >> 27 in (*ATOMIC_OPERATIONS, 2, 3) and (insn >> 27 != 2 or rs2 == 0):
                 self.atomic_operation = insn >> 27
                 self.reservation_candidate = self.local_reservation
                 self.sc_eligible = False
                 self.local_reservation = None
-                value, write = self.access(a, 8, 'atomic', b), True
+                value, write = signed(self.access(a, 1 << funct3, 'atomic', b), 8 << funct3), True
                 if self.atomic_operation == 2:
-                    self.local_reservation = self.last_physical_address, 8
+                    self.local_reservation = self.last_physical_address, 1 << funct3
             elif opcode == 0x0f and funct3 in (0, 1):
                 pass
             elif insn & 0xfe007fff == 0x12000073 and self.config.get('virtualAddressBits') == 39:
@@ -444,6 +472,8 @@ class Model:
                     self.write_csr(address, data & MASK)
             elif insn == 0x73:
                 raise Fault({0: 8, 1: 9, 3: 11}[self.privilege], 0)
+            elif insn == 0x00100073:
+                raise Fault(3, pc)
             elif insn == 0x30200073:
                 if self.privilege != 3:
                     raise Fault(2, insn)

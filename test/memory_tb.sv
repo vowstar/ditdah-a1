@@ -58,7 +58,9 @@ module memory_tb;
 `else
     5: irq_activate = service[0].pending && service[0].captured.address == irq_target && `CORE_TRACE.pipelineOccupancy == 0;
 `endif
-    6: irq_activate = dut.backend.multiply.busy;
+`ifdef ENABLE_M
+    6: irq_activate = dut.backend.mulDiv.busy;
+`endif
     7: irq_activate = irq_retired;
     8: irq_activate = service[1].pending && service[1].captured.atomic;
     default: irq_activate = 0;
@@ -122,7 +124,7 @@ module memory_tb;
             (p == 0 ? (core_port[p].request.size != 2 && core_port[p].request.size != 6) : core_port[p].request.size > 3) ||
             core_port[p].request.mask != (core_port[p].request.write ? ((1 << (1 << core_port[p].request.size)) - 1) : 0) ||
             (p == 0 && (core_port[p].request.write || core_port[p].request.atomic)) ||
-            (core_port[p].request.atomic && (core_port[p].request.size != 3 ||
+            (core_port[p].request.atomic && ((core_port[p].request.size != 2 && core_port[p].request.size != 3) ||
              core_port[p].request.write != (core_port[p].request.atomicOperation != 2)))) $fatal(1, "Core request attributes");
         core_pending[p] <= 1;
         owner_tag <= core_port[p].request.tag;
@@ -156,9 +158,9 @@ module memory_tb;
           (p == 0 ? fault_fetch : fault_read) < physical_port[p].request.address + (64'd1 << physical_port[p].request.size);
         if (physical_port[p].request.atomic) begin
           case (physical_port[p].request.atomicOperation)
-            2: service_fault = (physical_port[p].request.address <= fault_read && fault_read < physical_port[p].request.address + 8) || physical_port[p].request.address == fault_exclusive;
+            2: service_fault = (physical_port[p].request.address <= fault_read && fault_read < physical_port[p].request.address + (1 << physical_port[p].request.size)) || physical_port[p].request.address == fault_exclusive;
             3: service_fault = physical_port[p].request.scEligible && physical_port[p].request.address == fault_write;
-            default: service_fault = service_fault || (physical_port[p].request.address <= fault_read && fault_read < physical_port[p].request.address + 8) || physical_port[p].request.address == fault_exclusive;
+            default: service_fault = service_fault || (physical_port[p].request.address <= fault_read && fault_read < physical_port[p].request.address + (1 << physical_port[p].request.size)) || physical_port[p].request.address == fault_exclusive;
           endcase
         end
         physical_port[p].response.fault <= service_fault;
@@ -167,7 +169,7 @@ module memory_tb;
           physical_port[p].request.write ? physical_port[p].request.data & access_mask(physical_port[p].request.size) : 64'b0);
         atomic_data = 0;
         if (physical_port[p].request.atomic)
-          for (integer i = 0; i < 8; i++) atomic_data[i*8 +: 8] = memory[integer'(physical_port[p].request.address - base_address) + i];
+          for (integer i = 0; i < (1 << physical_port[p].request.size); i++) atomic_data[i*8 +: 8] = memory[integer'(physical_port[p].request.address - base_address) + i];
         atomic_result = atomic_data;
         updated_data = physical_port[p].request.data;
         successful_write = physical_port[p].request.write && !service_fault;
@@ -175,7 +177,17 @@ module memory_tb;
           case (physical_port[p].request.atomicOperation)
             0: updated_data = atomic_data + physical_port[p].request.data;
             1: updated_data = physical_port[p].request.data;
+            4: updated_data = atomic_data ^ physical_port[p].request.data;
             8: updated_data = atomic_data | physical_port[p].request.data;
+            12: updated_data = atomic_data & physical_port[p].request.data;
+            16, 20, 24, 28: begin
+              logic [63:0] a, b;
+              logic less;
+              a = atomic_data; b = physical_port[p].request.data & access_mask(physical_port[p].request.size);
+              if (physical_port[p].request.size == 2) begin a = {{32{a[31]}}, a[31:0]}; b = {{32{b[31]}}, b[31:0]}; end
+              less = physical_port[p].request.atomicOperation[3] ? a < b : $signed(a) < $signed(b);
+              updated_data = (less ^ physical_port[p].request.atomicOperation[2]) ? a : b;
+            end
             2: if (!service_fault) begin
               reservation_valid <= 1;
               reservation_address <= physical_port[p].request.address;

@@ -110,7 +110,7 @@ object DitDahA1Execute extends Generator[DitDahA1Parameter, DitDahA1UnitLayers, 
     }
     val wordMemory = (op === Lw.U(operationBits)) | (op === Lwu.U(operationBits)) | (op === Sw.U(operationBits))
     out.memorySize := wordMemory.?(2.U(3), 3.U(3))
-    when((op === Load.U(operationBits)) | (op === Store.U(operationBits))) { out.memorySize := funct3.bits(1, 0).asUInt }
+    when((op === Load.U(operationBits)) | (op === Store.U(operationBits)) | (op === Atomic.U(operationBits))) { out.memorySize := funct3.bits(1, 0).asUInt }
     out.unsignedLoad := (op === Lwu.U(operationBits)) | ((op === Load.U(operationBits)) & funct3.bit(2))
     out.address := addImm
     out.storeData := b
@@ -149,10 +149,11 @@ object DitDahA1Execute extends Generator[DitDahA1Parameter, DitDahA1UnitLayers, 
         out.instruction.tval := insn.instruction
       }
       when(op === Ecall.U(operationBits)) {
+        val breakpoint = encoding === 0x00100073L.B(32)
         out.instruction.fault := true.B
-        out.instruction.cause := machine.?(11.U(64),
-          (parameter.enableSupervisorMode.B & (io.privilege === 1.U(2))).?(9.U(64), 8.U(64)))
-        out.instruction.tval := 0.U(64)
+        out.instruction.cause := breakpoint.?(3.U(64), machine.?(11.U(64),
+          (parameter.enableSupervisorMode.B & (io.privilege === 1.U(2))).?(9.U(64), 8.U(64))))
+        out.instruction.tval := breakpoint.?(insn.pc, 0.U(64))
       }
       when(taken & (target.asBits.bits(1, 0) =/= 0.B(2))) {
         out.instruction.fault := true.B

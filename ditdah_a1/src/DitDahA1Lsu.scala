@@ -58,10 +58,11 @@ object DitDahA1Lsu extends Generator[DitDahA1Parameter, DitDahA1UnitLayers, DitD
     val privilege = Option.when(parameter.enableTranslation || checkRefill)(Reg(UInt(2)))
     val physicalAddress = Option.when(parameter.enableTranslation)(Reg(UInt(64)))
     val refillSize = Option.when(parameter.dCacheBytes != 0)(RegInit(0.U(3)))
-    val reserved = RegInit(false.B)
-    val reservedWord = Reg(UInt(parameter.physicalAddressBits - 3))
-    val scEligible = Reg(Bool())
-    val reservedAddress = (0.B(64 - parameter.physicalAddressBits) ## reservedWord.asBits ## 0.B(3)).asUInt
+    val reserved = Option.when(parameter.enableA)(RegInit(false.B))
+    val reservedWord = Option.when(parameter.enableA)(Reg(UInt(parameter.physicalAddressBits - 2)))
+    val reservedDoubleword = Option.when(parameter.enableA)(Reg(Bool()))
+    val scEligible = Option.when(parameter.enableA)(Reg(Bool()))
+    val reservedAddress = reservedWord.map(word => (0.B(64 - parameter.physicalAddressBits) ## word.asBits ## 0.B(2)).asUInt).getOrElse(0.U(64))
     val inputOperation = io.input.bits.instruction.instruction.asBits.bits(31, 27).asUInt
     val operation = current.instruction.instruction.asBits.bits(31, 27).asUInt
     val request = io.memory.request
@@ -162,7 +163,7 @@ object DitDahA1Lsu extends Generator[DitDahA1Parameter, DitDahA1UnitLayers, DitD
     request.bits.atomic := current.atomic
     request.bits.atomicOperation := current.atomic.?(operation, 0.U(5))
     request.bits.cacheOperation := 0.U(2)
-    request.bits.scEligible := scEligible
+    request.bits.scEligible := scEligible.getOrElse(false.B)
     request.bits.refillSize := refillSize.getOrElse(0.U(3))
     response.ready := state === 2.U(stateBits)
     io.translation.foreach { t =>
@@ -175,7 +176,7 @@ object DitDahA1Lsu extends Generator[DitDahA1Parameter, DitDahA1UnitLayers, DitD
       when(t.request.valid & t.request.ready) { state := 5.U(stateBits) }
       when(t.response.valid & t.response.ready) {
         physicalAddress.get := t.response.bits.address
-        scEligible := scEligible & (t.response.bits.address === reservedAddress)
+        scEligible.foreach(value => value := value & (t.response.bits.address === reservedAddress))
         updated.instruction.fault := t.response.bits.fault
         updated.instruction.cause := t.response.bits.fault.?(t.response.bits.cause, 0.U(64))
         updated.instruction.tval := t.response.bits.fault.?(current.address, 0.U(64))
@@ -195,9 +196,10 @@ object DitDahA1Lsu extends Generator[DitDahA1Parameter, DitDahA1UnitLayers, DitD
       privilege.foreach(_ := io.privilege)
       updated :<= io.input.bits
       refillSize.foreach(_ := (if !parameter.enableTranslation then initialGrant else 0.U(3)))
-      scEligible := io.input.bits.atomic & (inputOperation === 3.U(5)) & reserved &
-        (if parameter.enableTranslation then true.B else io.input.bits.address === reservedAddress) & (io.input.bits.memorySize === 3.U(3))
-      when(io.input.bits.atomic) { reserved := false.B }
+      scEligible.foreach(_ := io.input.bits.atomic & (inputOperation === 3.U(5)) & reserved.get &
+        (if parameter.enableTranslation then true.B else io.input.bits.address === reservedAddress) &
+        (io.input.bits.memorySize === reservedDoubleword.get.?(3.U(3), 2.U(3))))
+      when(io.input.bits.atomic) { reserved.foreach(_ := false.B) }
       state := (if parameter.enableTranslation then 4.U(stateBits) else initialState)
       if parameter.pmpEntries != 0 && !parameter.enableTranslation then
         when(!io.input.bits.instruction.fault & denied) {
@@ -257,11 +259,12 @@ object DitDahA1Lsu extends Generator[DitDahA1Parameter, DitDahA1UnitLayers, DitD
           completed.instruction.cause := completed.store.?(7.U(64), 5.U(64))
           completed.instruction.tval := completed.address
         }
-        when(completed.atomic & (operation === 2.U(5)) & (completed.memorySize === 3.U(3)) &
+        when(completed.atomic & (operation === 2.U(5)) & ((completed.memorySize === 2.U(3)) | (completed.memorySize === 3.U(3))) &
           !response.bits.fault & (response.bits.tag === identity) &
           (if concurrent then response.bits.last & !completed.instruction.fault & !poisoned.get & !killed.get(n) & !io.cancel.get else true.B)) {
-          reserved := true.B
-          reservedWord := physicalAddress.getOrElse(completed.address).asBits.bits(parameter.physicalAddressBits - 1, 3).asUInt
+          reserved.foreach(_ := true.B)
+          reservedWord.foreach(_ := physicalAddress.getOrElse(completed.address).asBits.bits(parameter.physicalAddressBits - 1, 2).asUInt)
+          reservedDoubleword.foreach(_ := completed.memorySize === 3.U(3))
         }
         if !concurrent then state := 3.U(stateBits)
         else
@@ -270,4 +273,4 @@ object DitDahA1Lsu extends Generator[DitDahA1Parameter, DitDahA1UnitLayers, DitD
     if !concurrent then
       when(io.output.valid & io.output.ready) { state := 0.U(stateBits) }
     else
-      when(io.cancel.get) { reserved := false.B }
+      when(io.cancel.get) { reserved.foreach(_ := false.B) }

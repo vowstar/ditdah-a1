@@ -3,12 +3,15 @@
 package com.vowstar.ditdah.a1
 
 object DitDahA1Isa:
-  val instructions = Seq("lui", "auipc", "addi", "add", "beq", "jal", "jalr",
-    "ld", "sd", "csrrw", "csrrs", "ecall", "mret", "mul", "amoadd.d", "fence", "fence.i", "lw", "lwu", "sw",
+  val mulDivInstructions = Seq("mul", "mulh", "mulhsu", "mulhu", "div", "divu", "rem", "remu",
+    "mulw", "divw", "divuw", "remw", "remuw")
+  val atomicOperations = Seq(0, 1, 4, 8, 12, 16, 20, 24, 28)
+  val atomicInstructions = for size <- Seq("w", "d"); name <- Seq("lr", "sc", "amoadd", "amoswap", "amoxor", "amoor", "amoand", "amomin", "amomax", "amominu", "amomaxu") yield s"$name.$size"
+  def instructions(parameter: DitDahA1Parameter) = Seq("lui", "auipc", "addi", "add", "beq", "jal", "jalr",
+    "ld", "sd", "csrrw", "csrrs", "ecall", "ebreak", "mret", "fence", "fence.i", "lw", "lwu", "sw",
     "slli", "slti", "sltiu", "xori", "srli", "srai", "ori", "andi", "sub", "sll", "slt", "sltu", "xor", "srl", "sra", "or", "and",
     "addiw", "slliw", "srliw", "sraiw", "addw", "subw", "sllw", "srlw", "sraw", "bne", "blt", "bge", "bltu", "bgeu",
-    "lb", "lh", "lbu", "lhu", "sb", "sh", "csrrc", "csrrwi", "csrrsi", "csrrci", "wfi",
-    "amoor.d", "amoswap.d", "lr.d", "sc.d")
+    "lb", "lh", "lbu", "lhu", "sb", "sh", "csrrc", "csrrwi", "csrrsi", "csrrci", "wfi") ++ (if parameter.enableA then atomicInstructions else Seq.empty) ++ (if parameter.enableM then mulDivInstructions else Seq.empty)
   val supervisorInstructions = Seq("sret")
   val Illegal = 0
   val Lui = 1
@@ -24,7 +27,7 @@ object DitDahA1Isa:
   val Csrrs = 11
   val Ecall = 12
   val Mret = 13
-  val Mul = 14
+  val MulDiv = 14
   val AmoaddD = 15
   val Fence = 16
   val FenceI = 17

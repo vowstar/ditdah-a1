@@ -25,6 +25,8 @@ case class DitDahA1Parameter(
   pmpEntries: Int = 16,
   issueWidth: Int = 1,
   loadQueueEntries: Int = 1,
+  enableM: Boolean = true,
+  enableA: Boolean = true,
   enableInterrupts: Boolean = false,
   enableUserMode: Boolean = false,
   enableSupervisorMode: Boolean = false,

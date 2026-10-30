@@ -108,7 +108,7 @@ object DitDahA1Backend extends Generator[DitDahA1Parameter, DitDahA1Layers, DitD
     val extraPackets = Option.when(concurrent)(Reg(Vec(width, new ResultPacket)))
     val extraPending = Option.when(concurrent)(RegInit(false.B))
     val extraValid = extraCount.map(_ =/= 0.U).getOrElse(false.B)
-    val executePending = RegInit(false.B)
+    val executePending = Option.when(parameter.enableM)(RegInit(false.B))
     val resumePc = Option.when(parameter.enableInterrupts)(RegInit(parameter.resetVector.U(64)))
     val sleep = Option.when(parameter.enableInterrupts)(RegInit(false.B))
     val sleeping = if parameter.enableInterrupts then sleep.get else false.B
@@ -117,7 +117,7 @@ object DitDahA1Backend extends Generator[DitDahA1Parameter, DitDahA1Layers, DitD
     val issue = DitDahA1Issue.instantiate(parameter)
     val issues = issue +: Seq.fill(width - 1)(DitDahA1Issue.instantiate(parameter))
     val execute = DitDahA1Execute.instantiate(parameter)
-    val multiply = DitDahA1Multiply.instantiate(parameter)
+    val mulDiv = Option.when(parameter.enableM)(DitDahA1MulDiv.instantiate(parameter))
     val commit = DitDahA1Commit.instantiate(parameter)
     val gpr = DitDahA1Gpr.instantiate(parameter)
     val csr = DitDahA1Csr.instantiate(parameter)
@@ -133,10 +133,8 @@ object DitDahA1Backend extends Generator[DitDahA1Parameter, DitDahA1Layers, DitD
     if parameter.enableInterrupts then csr.io.interrupts.get :<= io.interrupts.get
     lsu.io.clock := io.clock
     lsu.io.reset := io.reset
-    multiply.io.clock := io.clock
-    multiply.io.reset := io.reset
+    mulDiv.foreach { resource => resource.io.clock := io.clock; resource.io.reset := io.reset }
     execute.io.input.bits :<= issuedPacket
-    multiply.io.input.bits :<= issuedPacket
     execute.io.csrValue := csr.io.readData
     execute.io.csrLegal := csr.io.legal
     execute.io.privilege := csr.io.privilege
@@ -206,15 +204,20 @@ object DitDahA1Backend extends Generator[DitDahA1Parameter, DitDahA1Layers, DitD
       resultPacket.load & !resultPacket.store & !resultPacket.atomic & !resultPacket.instruction.fault
     val resultAdvance = resultValid & ((!memoryValid | (memoryAdvance & !extraValid)) | append) &
       (!memoryOperation | (lsu.io.input.valid & lsu.io.input.ready)) & !redirect
-    val isMultiply = (issuedPacket.decoded.operation === DitDahA1Isa.Mul.U(DitDahA1Isa.operationBits)) & !issuedPacket.decoded.instruction.fault
-    multiply.io.input.valid := issuedValid & isMultiply & !executePending & !redirect
-    execute.io.input.valid := issuedValid & (!isMultiply | (executePending & multiply.io.output.valid)) & !redirect
+    val isMulDiv = parameter.enableM.B & (issuedPacket.decoded.operation === DitDahA1Isa.MulDiv.U(DitDahA1Isa.operationBits)) & !issuedPacket.decoded.instruction.fault
+    execute.io.input.valid := issuedValid & (!isMulDiv | (executePending.getOrElse(false.B) & mulDiv.map(_.io.output.valid).getOrElse(false.B))) & !redirect
     execute.io.output.ready := (!resultValid | resultAdvance) & !redirect
-    multiply.io.output.ready := !issuedValid | (isMultiply & execute.io.output.ready)
+    mulDiv.foreach { resource =>
+      resource.io.input.bits :<= issuedPacket
+      resource.io.input.valid := issuedValid & isMulDiv & !executePending.get & !redirect
+      resource.io.output.ready := !issuedValid | (isMulDiv & execute.io.output.ready)
+      when(resource.io.input.valid & resource.io.input.ready) { executePending.get := true.B }
+      when(resource.io.output.valid & resource.io.output.ready) { executePending.get := false.B }
+    }
     val executed = execute.io.output.valid & execute.io.output.ready
     val execution = Wire(Vec(width, new ResultPacket))
     execution(0) :<= execute.io.output.bits
-    when(isMultiply) { execution(0).value := multiply.io.output.bits }
+    mulDiv.foreach { resource => when(isMulDiv) { execution(0).value := resource.io.output.bits } }
     for lane <- 1 until width do DitDahA1Alu.result(issuedPackets(lane), execution(lane))
     val control = Seq(DitDahA1Isa.Beq, DitDahA1Isa.Branch, DitDahA1Isa.Jal, DitDahA1Isa.Jalr)
       .map(op => issuedPacket.decoded.operation === op.U(DitDahA1Isa.operationBits)).reduce(_ | _)
@@ -267,7 +270,7 @@ object DitDahA1Backend extends Generator[DitDahA1Parameter, DitDahA1Layers, DitD
         when(valid & (rd =/= 0.U(5)) & (address === rd)) { value := data; blocked := !ready }
       (value, blocked)
     val older = issuedValid | resultValid | memoryValid | commitValid
-    val available = (!issuedValid | executed) & !executePending & !flushYounger & !sleeping
+    val available = (!issuedValid | executed) & !executePending.getOrElse(false.B) & !flushYounger & !sleeping
     val prefix = Wire(Vec(width, Bool()))
     val simple = (0 until width).map { lane =>
       import DitDahA1Isa.*
@@ -377,8 +380,6 @@ object DitDahA1Backend extends Generator[DitDahA1Parameter, DitDahA1Layers, DitD
     }
     when(executed) { resultPackets :<= execution; resultResolved := resolved; resultCount := issuedCount; issuedCount := 0.U }
     // Accepted arithmetic drains before the issued group is reused.
-    when(multiply.io.input.valid & multiply.io.input.ready) { executePending := true.B }
-    when(multiply.io.output.valid & multiply.io.output.ready) { executePending := false.B }
     when(issued) {
       issuedCount := issueCount
       for lane <- 0 until width do issuedPackets(lane) :<= issues(lane).io.output.bits
