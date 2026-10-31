@@ -12,13 +12,13 @@ import org.llvm.mlir.scalalib.capi.ir.{Block, Context}
 class DitDahA1DataCacheIO(parameter: DitDahA1Parameter) extends HWBundle(parameter):
   val clock = Flipped(Clock())
   val reset = Flipped(Reset())
-  val upstream = Flipped(new MemoryPort)
-  val downstream = Aligned(new MemoryPort)
+  val upstream = Flipped(new MemoryPort(parameter))
+  val downstream = Aligned(new MemoryPort(parameter))
   val probe = Flipped(new CacheProbePort)
 
 class DataCacheContext(parameter: DitDahA1Parameter) extends Bundle:
   val way = Option.when(parameter.dCacheWays == 2)(Aligned(UInt(1)))
-  val request = Aligned(new MemoryRequest)
+  val request = Aligned(new MemoryRequest(parameter))
   val fault = Aligned(Bool())
   val invalidated = Aligned(Bool())
   val sameTag = Aligned(Bool())
@@ -61,7 +61,7 @@ object DitDahA1DataCache extends Generator[DitDahA1Parameter, DitDahA1Layers, Di
     probeSelection := probeWay.getOrElse(0.U(1))
     val tagBits = parameter.physicalAddressBits - indexBits - 6
     val state = RegInit(0.U(3))
-    val request = Reg(new MemoryRequest)
+    val request = Reg(new MemoryRequest(parameter))
     val data = Reg(UInt(64))
     val fault = Reg(Bool())
     val valid = RegInit(0.B(words))
@@ -119,7 +119,7 @@ object DitDahA1DataCache extends Generator[DitDahA1Parameter, DitDahA1Layers, Di
     val invalidateMask = if ways == 2 && !parameter.dCacheWriteback then
       probeLineMask | (probeLineMask.asUInt << wayWords).asBits.bits(words - 1, 0) else probeLineMask
     val collision = invalidating & (invalidateIndex === index)
-    val refill = Wire(new MemoryRequest)
+    val refill = Wire(new MemoryRequest(parameter))
     refill :<= request
     refill.address := (request.address.asBits.bits(63, 3) ## 0.B(3)).asUInt
     refill.size := 3.U(3)
@@ -267,7 +267,7 @@ object DitDahA1DataCache extends Generator[DitDahA1Parameter, DitDahA1Layers, Di
     up.response.bits.tag := request.tag
     up.response.bits.last := true.B
     val transmit = if !concurrent then request else
-      val selected = Wire(new MemoryRequest)
+      val selected = Wire(new MemoryRequest(parameter))
       selected :<= request
       when(offered.get & parkedValid.get & (offerTag.get === parked.get.request.tag)) { selected :<= parked.get.request }
       selected
@@ -294,6 +294,7 @@ object DitDahA1DataCache extends Generator[DitDahA1Parameter, DitDahA1Layers, Di
     acquiring.foreach(a => when(a & !transmitRelease) { down.request.bits.cacheOperation := 1.U(2) })
     if parameter.dCacheWriteback then
       when(transmitRelease) {
+        down.request.bits.debug.foreach(_ := false.B)
         down.request.bits.cacheOperation := 2.U(2)
         down.request.bits.address := transmitVictim
         down.request.bits.data := 0.U(64)

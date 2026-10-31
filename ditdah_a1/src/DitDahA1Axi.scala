@@ -13,7 +13,7 @@ class DitDahA1AxiIO(parameter: DitDahA1Parameter) extends HWBundle(parameter):
   val clock = Flipped(Clock())
   val reset = Flipped(Reset())
   val hartId = Flipped(UInt(4))
-  val memory = Flipped(new MemoryPort)
+  val memory = Flipped(new MemoryPort(parameter))
   val axi = Aligned(new AxiBundle(parameter))
 
 @generator
@@ -71,7 +71,7 @@ object DitDahA1Axi extends Generator[DitDahA1Parameter, DitDahA1UnitLayers, DitD
     given ClockScope = ClockScope.posedge(io.clock)
     given ResetScope = ResetScope.syncActiveHigh(io.reset)
     val state = RegInit(0.U(3))
-    val request = Reg(new MemoryRequest)
+    val request = Reg(new MemoryRequest(parameter))
     val idBits = parameter.axiIdBits
     val hartId = Reg(UInt(idBits))
     val lr = request.atomic & (request.atomicOperation === 2.U(5))

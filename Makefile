@@ -77,7 +77,7 @@ verify-zephyr: zephyr
 verify-zephyr-long:
 	for count in 1 2 16; do $(MAKE) verify-zephyr SOFTWARE_HARTS=$$count || exit $$?; done
 
-verify-signoff: verify-debug-core verify-writeback verify-formal
+verify-signoff: verify-debug-core verify-jtag verify-debug-module verify-debug-system verify-platform-system verify-writeback verify-formal
 	$(MAKE) verify-scalar-isa
 	$(MAKE) verify-compressed-isa
 	$(MAKE) verify-bitmanip-isa
@@ -92,6 +92,42 @@ verify-signoff: verify-debug-core verify-writeback verify-formal
 	$(MAKE) verify-translation-context SOFTWARE_CONFIG=$(SHARED_OUTPUT)/software/w3-h16/input.json
 
 .PHONY: verify-debug-core
+JTAG_OUTPUT ?= result/jtag-signoff
+.PHONY: verify-jtag
+verify-jtag:
+	python3 test/jtag.py --output $(JTAG_OUTPUT)
+	python3 test/formal.py --rtl $(JTAG_OUTPUT)/bridge --output $(JTAG_OUTPUT)/formal --modules DmiBridge
+
+DEBUG_MODULE_OUTPUT ?= result/debug-module-signoff
+DEBUG_SYSTEM_OUTPUT ?= result/debug-system-signoff
+DEBUG_SYSTEM_PROFILES ?= single pair compressed supervisor coherent shared float32 float64 smp
+OPENOCD ?= openocd
+RISCV_GDB ?= riscv64-none-elf-gdb
+PLATFORM_OUTPUT ?= result/platform-system
+.PHONY: verify-platform-system
+verify-platform-system:
+	python3 test/platform_system.py --output $(PLATFORM_OUTPUT)/endpoint
+	for count in 1 16; do \
+		python3 scripts/build_platform.py --config $(SOFTWARE_CONFIG) --harts $$count --clock-hz 10000000 --jtag-idcode 0xa126afff --output $(PLATFORM_OUTPUT)/h$$count/rtl || exit $$?; \
+		python3 test/platform_system.py --rtl $(PLATFORM_OUTPUT)/h$$count/rtl --output $(PLATFORM_OUTPUT)/h$$count/run --openocd $(OPENOCD) --gdb $(RISCV_GDB) || exit $$?; \
+		python3 test/formal.py --rtl $(PLATFORM_OUTPUT)/h$$count/rtl --output $(PLATFORM_OUTPUT)/h$$count/formal --modules PlatformMemory || exit $$?; \
+	done
+	python3 test/platform_system.py --rtl $(PLATFORM_OUTPUT)/h1/rtl --output $(PLATFORM_OUTPUT)/atomic-negative --mutation exclusive-read --openocd $(OPENOCD) --gdb $(RISCV_GDB)
+.PHONY: verify-debug-system
+verify-debug-system:
+	for profile in $(DEBUG_SYSTEM_PROFILES); do \
+		python3 test/debug_system.py --profile $$profile --output $(DEBUG_SYSTEM_OUTPUT)/$$profile --openocd $(OPENOCD) --gdb $(RISCV_GDB) || exit $$?; \
+		python3 test/formal.py --rtl $(DEBUG_SYSTEM_OUTPUT)/$$profile/rtl --output $(DEBUG_SYSTEM_OUTPUT)/$$profile/formal --modules DebugModule DmiBridge DebugCsr || exit $$?; \
+	done
+	python3 test/formal.py --rtl $(DEBUG_SYSTEM_OUTPUT)/single/rtl --output $(DEBUG_SYSTEM_OUTPUT)/origin --modules Fetch Lsu MemoryArbiter
+
+.PHONY: verify-debug-module
+verify-debug-module:
+	for count in 1 3 16; do \
+		python3 test/debug_module.py --harts $$count --output $(DEBUG_MODULE_OUTPUT)/h$$count || exit $$?; \
+		python3 test/formal.py --rtl $(DEBUG_MODULE_OUTPUT)/h$$count/module --output $(DEBUG_MODULE_OUTPUT)/h$$count/formal --modules DebugModule || exit $$?; \
+	done
+
 DEBUG_OUTPUT ?= result/debug-core-signoff
 DEBUG_PROFILES ?= single wide floating supervisor
 verify-debug-core:

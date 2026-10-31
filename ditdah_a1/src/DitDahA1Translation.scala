@@ -24,7 +24,7 @@ class DitDahA1TranslationIO(parameter: DitDahA1Parameter) extends HWBundle(param
   val invalidate = Option.when(parameter.hasTranslationCache)(Flipped(Bool()))
   val maintenance = Option.when(parameter.preciseTranslationMaintenance)(Flipped(new TranslationMaintenance(parameter)))
   val pmp = Option.when(parameter.pmpEntries != 0)(Flipped(new PmpState(parameter)))
-  val memory = Aligned(new MemoryPort)
+  val memory = Aligned(new MemoryPort(parameter))
 
 @generator
 object DitDahA1Translation extends Generator[DitDahA1Parameter, DitDahA1UnitLayers, DitDahA1TranslationIO, DitDahA1UnitProbe]:
@@ -204,6 +204,7 @@ object DitDahA1Translation extends Generator[DitDahA1Parameter, DitDahA1UnitLaye
     read.bits.atomic := false.B
     read.bits.atomicOperation := 0.U(5)
     read.bits.cacheOperation := 0.U(2)
+    read.bits.debug.foreach(_ := false.B)
     read.bits.scEligible := false.B
     read.bits.refillSize := 0.U(3)
     response.ready := state === 3.U(3)

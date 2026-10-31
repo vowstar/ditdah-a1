@@ -62,6 +62,9 @@ def main():
     parser.add_argument('--tool-prefix', default=os.environ.get('RISCV_PREFIX', 'riscv64-unknown-elf-'))
     parser.add_argument('--stack-bytes', type=int, default=1024)
     parser.add_argument('--console-base', type=lambda value: int(value, 0))
+    parser.add_argument('--ram-base', type=lambda value: int(value, 0))
+    parser.add_argument('--clock-hz', type=int, default=100000000)
+    parser.add_argument('--timebase-hz', type=int, default=100000000)
     parser.add_argument('--harts', type=int, choices=range(1, 17))
     parser.add_argument('--icache-bytes', type=int, choices=(0, 8192, 16384, 32768, 65536))
     parser.add_argument('--dcache-bytes', type=int, choices=(0, 8192, 16384, 32768, 65536))
@@ -74,11 +77,12 @@ def main():
     parser.add_argument('--burst-refill', action=argparse.BooleanOptionalAction, default=None)
     parser.add_argument('--expected-interrupt', type=int, choices=(1, 3, 5, 7, 9, 11), action='append', default=[])
     args = parser.parse_args()
+    assert 0 < args.timebase_hz <= args.clock_hz <= 1000000000 and args.clock_hz % args.timebase_hz == 0
     args.output.mkdir(parents=True, exist_ok=True)
     (args.output / 'manifest.json').unlink(missing_ok=True)
     config, configuration_sources = load_configuration(args)
     configuration_bytes = args.config.read_bytes()
-    base, harts = int(config['resetVector']), config['hartCount']
+    base, harts = int(config['resetVector']) if args.ram_base is None else args.ram_base, config['hartCount']
     ram = next(r for r in config['memoryRegions'] if int(r['base']) == base and r['readable'] and r['writable'] and r['executable'] and not r['device'])
     assert 1 <= harts <= 16 and args.stack_bytes >= 16 and args.stack_bytes % 16 == 0
     assert harts * args.stack_bytes <= int(ram['size']), 'Software stacks exceed RAM'
@@ -125,7 +129,8 @@ def main():
                     imageHash=hashlib.sha256(image.read_bytes()).hexdigest(), symbols=symbols, commands=[command],
                     toolVersions=tool_versions, requiredExtensions=required_extensions,
                     target=subprocess.check_output([args.tool_prefix + 'gcc', '-dumpmachine'], text=True).strip(),
-                    expectedInterruptCauses=args.expected_interrupt)
+                    expectedInterruptCauses=args.expected_interrupt, entryAddress=base,
+                    clockHz=args.clock_hz, timebaseHz=args.timebase_hz)
     (args.output / 'manifest.json').write_text(json.dumps(manifest, indent=2) + '\n')
     print(image)
 

@@ -47,7 +47,8 @@ class AxiBundle(parameter: DitDahA1Parameter) extends Bundle:
   val ar = Aligned(new Decoupled(new AxiAddress(parameter)))
   val r = Flipped(new Decoupled(new AxiRead(parameter)))
 
-class MemoryRequest extends Bundle:
+class MemoryRequest(parameter: DitDahA1Parameter) extends Bundle:
+  val debug = Option.when(parameter.enableDebugMemory)(Aligned(Bool()))
   val cacheOperation = Aligned(UInt(2))
   val address = Aligned(UInt(64))
   val data = Aligned(UInt(64))
@@ -67,8 +68,8 @@ class MemoryResponse(dataBits: Int = 64, countBits: Int = 0) extends Bundle:
   val tag = Aligned(UInt(8))
   val last = Aligned(Bool())
   val count = Option.when(countBits > 0)(Aligned(UInt(countBits)))
-class MemoryPort extends Bundle:
-  val request = Aligned(new Decoupled(new MemoryRequest))
+class MemoryPort(parameter: DitDahA1Parameter) extends Bundle:
+  val request = Aligned(new Decoupled(new MemoryRequest(parameter)))
   val response = Flipped(new Decoupled(new MemoryResponse))
 class CacheProbeRequest extends Bundle:
   val address = Aligned(UInt(64))
@@ -82,7 +83,7 @@ class CacheProbePort extends Bundle:
   val request = Aligned(new Decoupled(new CacheProbeRequest))
   val response = Flipped(new Decoupled(new CacheProbeResponse))
 class InstructionCachePort(parameter: DitDahA1Parameter) extends Bundle:
-  val request = Aligned(new Decoupled(new MemoryRequest))
+  val request = Aligned(new Decoupled(new MemoryRequest(parameter)))
   val response = Flipped(new Decoupled(new MemoryResponse(math.max(64, 32 * parameter.fetchWords),
     if parameter.fetchWords > 1 then parameter.fetchCountBits else 0)))
 
@@ -195,6 +196,10 @@ class DebugHartPort extends Bundle:
   val exceptionPc = Flipped(UInt(64))
   val mode = Aligned(Bool())
 class DitDahA1IO(parameter: DitDahA1Parameter) extends HWBundle(parameter):
+  val jtag = Option.when(parameter.enableJtag)(Aligned(new JtagPort))
+  val systemReset = Option.when(parameter.enableJtag)(Flipped(Bool()))
+  // Reset attached AXI peers with the same non-debug reset domain.
+  val systemResetActive = Option.when(parameter.enableJtag)(Aligned(Bool()))
   val timeTick = Option.when(parameter.localInterruptBase.nonEmpty)(Flipped(Bool()))
   val interrupts = Option.when(parameter.enableInterrupts)(Flipped(Vec(parameter.hartCount, new InterruptBundle)))
   val clock = Flipped(Clock())
@@ -227,11 +232,12 @@ class DitDahA1CoreIO(parameter: DitDahA1Parameter) extends HWBundle(parameter):
   val interrupts = Option.when(parameter.enableInterrupts)(Flipped(new InterruptBundle))
   val clock = Flipped(Clock())
   val reset = Flipped(Reset())
-  val instruction = Aligned(new MemoryPort)
-  val data = Aligned(new MemoryPort)
+  val instruction = Aligned(new MemoryPort(parameter))
+  val data = Aligned(new MemoryPort(parameter))
   val status = Aligned(new StatusBundle)
 
 class DitDahA1FrontendIO(parameter: DitDahA1Parameter) extends HWBundle(parameter):
+  val debugMode = Option.when(parameter.enableDebugMemory)(Flipped(Bool()))
   val prediction = Option.when(parameter.branchPredictorEntries != 0)(Flipped(new BranchUpdate))
   val translation = Option.when(parameter.enableTranslation)(Aligned(new TranslationPort))
   val privilege = Flipped(UInt(2))
@@ -243,16 +249,18 @@ class DitDahA1FrontendIO(parameter: DitDahA1Parameter) extends HWBundle(paramete
   val halt = Flipped(Bool())
   val redirectPc = Flipped(UInt(64))
   val output = Aligned(new Decoupled(new InstructionGroup(parameter.issueWidth)))
-  val memory = Aligned(new MemoryPort)
+  val memory = Aligned(new MemoryPort(parameter))
 
 class DitDahA1MemoryFabricIO(parameter: DitDahA1Parameter) extends HWBundle(parameter):
+  val debugMemory = Option.when(parameter.enableDebugMemory)(Aligned(new MemoryPort(parameter)))
+  val debugHart = Option.when(parameter.enableDebugMemory)(Aligned(UInt(4)))
   val probe = Option.when(parameter.dCacheBytes != 0)(Aligned(Vec(parameter.hartCount, new CacheProbePort)))
   val timeTick = Option.when(parameter.localInterruptBase.nonEmpty)(Flipped(Bool()))
   val localInterrupts = Option.when(parameter.localInterruptBase.nonEmpty)(Aligned(Vec(parameter.hartCount, new InterruptBundle)))
   val clock = Flipped(Clock())
   val reset = Flipped(Reset())
-  val instruction = Flipped(Vec(parameter.hartCount, new MemoryPort))
-  val data = Flipped(Vec(parameter.hartCount, new MemoryPort))
+  val instruction = Flipped(Vec(parameter.hartCount, new MemoryPort(parameter)))
+  val data = Flipped(Vec(parameter.hartCount, new MemoryPort(parameter)))
   val axi = Aligned(new AxiBundle(parameter))
 
 class DitDahA1BackendIO(parameter: DitDahA1Parameter) extends HWBundle(parameter):
@@ -272,5 +280,5 @@ class DitDahA1BackendIO(parameter: DitDahA1Parameter) extends HWBundle(parameter
   val instruction = Flipped(new Decoupled(new InstructionGroup(parameter.issueWidth)))
   val redirect = Aligned(Bool())
   val redirectPc = Aligned(UInt(64))
-  val data = Aligned(new MemoryPort)
+  val data = Aligned(new MemoryPort(parameter))
   val status = Aligned(new StatusBundle)

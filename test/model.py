@@ -333,6 +333,12 @@ class Model:
         self.csrs = {address: 0 for address in (0x300, 0x301, 0x304, 0x305, 0x340,
                                                0x341, 0x342, 0x343, 0x344,
                                                0xf11, 0xf12, 0xf13, 0xf14, 0xf15)}
+        if config.get('enableJtag'):
+            extensions = dict(I=True, A=config.get('enableA', True), M=config.get('enableM', True),
+                C=config.get('enableC', False), F=bool(self.fp_registers), D=config.get('floatingPointBits') == 64,
+                S=config.get('enableSupervisorMode', False), U=config.get('enableUserMode', False),
+                B=all(config.get('enable'+name) for name in ('Zba', 'Zbb', 'Zbs')))
+            self.csrs[0x301] = (2 << 62) | sum(1 << (ord(letter)-ord('A')) for letter, enabled in extensions.items() if enabled)
         if self.fp_registers:
             self.csrs.update({1: 0, 2: 0, 3: 0})
         if config.get('enableUserMode'):

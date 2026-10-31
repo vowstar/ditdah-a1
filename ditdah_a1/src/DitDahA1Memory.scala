@@ -12,12 +12,18 @@ import org.llvm.mlir.scalalib.capi.ir.{Block, Context}
 class DitDahA1MemoryIO(parameter: DitDahA1Parameter) extends HWBundle(parameter):
   val clock = Flipped(Clock())
   val reset = Flipped(Reset())
-  val upstream = Flipped(new MemoryPort)
-  val downstream = Aligned(new MemoryPort)
+  val upstream = Flipped(new MemoryPort(parameter))
+  val downstream = Aligned(new MemoryPort(parameter))
 
 @generator
 object DitDahA1Memory extends Generator[DitDahA1Parameter, DitDahA1UnitLayers, DitDahA1MemoryIO, DitDahA1UnitProbe]:
   override def moduleName(parameter: DitDahA1Parameter): String = "DitDahA1Memory"
+  def debugWindow(parameter: DitDahA1Parameter, address: Referable[UInt], size: Referable[UInt])
+    (using Arena, Context, Block, InstanceContext): Referable[Bool] =
+    if !parameter.enableDebugMemory then false.B else
+      val base = parameter.debugBase.get
+      (0 to 6).map(n => (size === n.U(3)) & (address >= base.U(64)) &
+        (address <= (base + 4096 - (1 << n)).U(64))).reduce(_ | _)
   def executable(parameter: DitDahA1Parameter, address: Referable[UInt], bytes: Int)(using Arena, Context, Block, InstanceContext): Referable[Bool] =
     parameter.memoryRegions.filter(r => r.executable && !r.device && r.size >= bytes).foldLeft[Referable[Bool]](false.B) { (allowed, region) =>
       allowed | ((address >= region.base.U(64)) & (address <= (region.base + region.size - bytes).U(64)))

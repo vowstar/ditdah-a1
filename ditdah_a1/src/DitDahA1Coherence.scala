@@ -11,8 +11,8 @@ class DitDahA1CoherenceIO(parameter: DitDahA1Parameter) extends HWBundle(paramet
   val clock = Flipped(Clock())
   val reset = Flipped(Reset())
   val hartId = Flipped(UInt(4))
-  val upstream = Flipped(new MemoryPort)
-  val downstream = Aligned(new MemoryPort)
+  val upstream = Flipped(new MemoryPort(parameter))
+  val downstream = Aligned(new MemoryPort(parameter))
   val probe = Aligned(Vec(parameter.hartCount, new CacheProbePort))
 
 @generator
@@ -84,6 +84,7 @@ object DitDahA1Coherence extends Generator[DitDahA1Parameter, DitDahA1UnitLayers
     down.request.bits :<= request
     down.request.bits.cacheOperation := 0.U(2)
     when(state === 2.U(3)) {
+      down.request.bits.debug.foreach(_ := false.B)
       down.request.bits.address := (request.address.asBits.bits(63, 6) ## frame.word.asBits ## 0.B(3)).asUInt
       down.request.bits.data := frame.data
       down.request.bits.mask := frame.mask

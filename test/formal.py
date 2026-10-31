@@ -13,6 +13,78 @@ import subprocess
 
 import click
 from contracts import backend_control_signals, __file__ as binding_helper_file
+from model import Model, __file__ as model_file
+
+
+DMI_BRIDGE = r'''
+  reg initialized = 0;
+  always @($global_clock) begin
+    initialized <= 1;
+    if (!initialized) assume(reset); else assume(!reset);
+  end
+  reg q_source_past = 0, q_system_past = 0;
+  reg q_owned = 0, q_epoch = 0, q_sent = 0, q_replied = 0;
+  reg [40:0] q_request;
+  reg [33:0] q_response;
+  reg q_stalled = 0, q_once = 0;
+  wire q_send = downstream_request_valid && downstream_request_ready;
+  wire q_reply = downstream_response_valid && downstream_response_ready;
+  always @(posedge tck) begin
+    q_source_past <= 1;
+    if (reset) begin q_owned <= 0; q_epoch <= 0; q_stalled <= 0; q_once <= 0; end
+    else begin
+      if (q_source_past && $past(!reset && upstream_request_valid && !upstream_request_ready)) begin
+        assume(upstream_request_valid);
+        assume($stable({upstream_request_bits_address, upstream_request_bits_data, upstream_request_bits_op}));
+      end
+      if (q_source_past && $past(!reset && upstream_response_valid && !upstream_response_ready)) begin
+        assert(upstream_response_valid);
+        assert($stable({upstream_response_bits_data, upstream_response_bits_status}));
+      end
+      if (upstream_request_valid && upstream_request_ready) begin
+        assert(!q_owned);
+        q_owned <= 1; q_epoch <= !q_epoch; q_stalled <= 0;
+        q_request <= {upstream_request_bits_address, upstream_request_bits_data, upstream_request_bits_op};
+      end
+      if (q_owned) assert(!upstream_request_ready);
+      if (upstream_response_valid) begin
+        assert(q_owned && q_replied == q_epoch);
+        assert({upstream_response_bits_data, upstream_response_bits_status} == q_response);
+        if (!upstream_response_ready) q_stalled <= 1;
+        else begin
+          q_owned <= 0; q_once <= 1;
+          cover(q_stalled && upstream_response_bits_status == 2);
+          cover(q_once && !q_epoch);
+        end
+      end
+    end
+  end
+  always @(posedge clock) begin
+    q_system_past <= 1;
+    if (reset) begin q_sent <= 0; q_replied <= 0; end
+    else begin
+      if (q_system_past && $past(!reset && downstream_request_valid && !downstream_request_ready)) begin
+        assert(downstream_request_valid);
+        assert($stable({downstream_request_bits_address, downstream_request_bits_data, downstream_request_bits_op}));
+      end
+      if (q_system_past && $past(!reset && downstream_response_valid && !downstream_response_ready)) begin
+        assume(downstream_response_valid);
+        assume($stable({downstream_response_bits_data, downstream_response_bits_status}));
+      end
+      assume(!downstream_response_valid || q_sent != q_replied || q_send);
+      assert(!downstream_response_ready || q_sent != q_replied || q_send);
+      if (downstream_request_valid) begin
+        assert(q_owned && q_sent != q_epoch);
+        assert({downstream_request_bits_address, downstream_request_bits_data, downstream_request_bits_op} == q_request);
+      end
+      if (q_send) q_sent <= q_epoch;
+      if (q_reply) begin
+        q_replied <= q_epoch;
+        q_response <= {downstream_response_bits_data, downstream_response_bits_status};
+      end
+    end
+  end
+'''
 
 
 FETCH = r'''
@@ -84,6 +156,91 @@ FETCH = r'''
     end
   end
 '''
+
+
+def debug_module_case(parameters):
+    count, base = parameters['hartCount'], int(parameters['debugBase'])
+    owner = 'owner' if count > 1 else '0'
+    selected_halt = ' || '.join(f'(selected == {n} && harts_{n}_mode)' if count > 1 else 'harts_0_mode' for n in range(count))
+    state = '{data, busy, started, error, command, autoexec' + (', selected, owner}' if count > 1 else '}')
+    body = f'''
+  reg q_past = 0, q_dmi = 0, q_memory = 0;
+  reg [1:0] q_status;
+  reg [7:0] q_tag;
+  reg q_denied;
+  reg q_auto = 0;
+  reg [31:0] q_read_data;
+  wire q_dmi_in = dmi_request_valid && dmi_request_ready;
+  wire q_dmi_out = dmi_response_valid && dmi_response_ready;
+  wire q_memory_in = memory_request_valid && memory_request_ready;
+  wire q_memory_out = memory_response_valid && memory_response_ready;
+  wire q_control_clear = q_dmi_in && dmi_request_bits_op == 2 && dmi_request_bits_address == 'h10 && !dmi_request_bits_data[0];
+  wire q_forbidden = !memory_request_bits_debug || memoryHart >= {count} || memory_request_bits_address < 64'h{base:x} ||
+    memory_request_bits_address >= 64'h{base+4096:x} || memory_request_bits_atomic || memory_request_bits_cacheOperation != 0 ||
+    (memory_request_bits_address >= 64'h{base+0x1a0:x} && memory_request_bits_address < 64'h{base+0x1a8:x} && (!busy || memoryHart != {owner}));
+  always @(posedge clock) begin
+    q_past <= 1;
+    if (!q_past) assume(reset); else assume(!reset);
+    if (reset) begin q_dmi <= 0; q_memory <= 0; q_auto <= 0; end
+    else begin
+      assert(autoexec == q_auto);
+      if (!active || q_control_clear) q_auto <= 0;
+      else if (q_dmi_in && dmi_request_bits_op == 2 && dmi_request_bits_address == 'h18 && !busy)
+        q_auto <= dmi_request_bits_data[0];
+      if (q_dmi_in && dmi_request_bits_op == 1) begin
+        if (dmi_request_bits_address == 4) q_read_data <= data[31:0];
+        if (dmi_request_bits_address == 'h18) q_read_data <= {{31'b0, q_auto}};
+      end
+      if (dmi_response_valid && q_past && $past(q_dmi_in && dmi_request_bits_op == 1 &&
+          (dmi_request_bits_address == 4 || dmi_request_bits_address == 'h18)))
+        assert(dmi_response_bits_data == q_read_data);
+      if (q_past && $past(!reset && active && busy && !hartsReset && !q_control_clear))
+        assert($stable({{command, autoexec}}));
+      if (q_past && $past(!reset && active && !busy && !hartsReset && !error && autoexec &&
+          q_dmi_in && (dmi_request_bits_op == 1 || dmi_request_bits_op == 2) && dmi_request_bits_address == 4 &&
+          command == 'h40000 && ({selected_halt})) && !hartsReset) begin
+        assert(busy && !started);
+        cover(busy);
+      end
+      assert(dmi_response_valid == q_dmi);
+      if (q_dmi_out) q_dmi <= 0;
+      if (q_dmi_in) begin
+        assert(!q_dmi || q_dmi_out); q_dmi <= 1;
+        q_status <= (dmi_request_bits_op == 1 || dmi_request_bits_op == 2) ? 0 : 2;
+      end
+      if (dmi_response_valid) assert(dmi_response_bits_status == q_status);
+      if (q_past && $past(!reset && dmi_response_valid && !dmi_response_ready)) begin
+        assert(dmi_response_valid);
+        assert($stable({{dmi_response_bits_data, dmi_response_bits_status}}));
+      end
+      if (hartsReset) q_memory <= 0;
+      else begin
+        assert(memory_response_valid == q_memory);
+        if (q_memory_out) q_memory <= 0;
+        if (q_memory_in) begin
+          assert(!q_memory || q_memory_out); q_memory <= 1;
+          q_tag <= memory_request_bits_tag; q_denied <= q_forbidden;
+        end
+        if (memory_response_valid) begin
+          assert(memory_response_bits_tag == q_tag && memory_response_bits_last);
+          if (q_denied) assert(memory_response_bits_fault);
+        end
+        if (q_past && $past(!reset && !hartsReset && memory_response_valid && !memory_response_ready)) begin
+          assert(memory_response_valid);
+          assert($stable({{memory_response_bits_data, memory_response_bits_fault, memory_response_bits_tag}}));
+        end
+      end
+      if (q_past && $past(!reset && !hartsReset && active && !q_dmi_in && q_memory_in && q_forbidden))
+        assert($stable({state}));
+      cover(dmi_response_valid && !dmi_response_ready && !active);
+      cover(memory_response_valid && q_denied && !memory_response_ready && !hartsReset);
+    end
+  end
+'''
+    if count > 1:
+        body += '''  always @(posedge clock) if (q_past && $past(!reset && active && busy && !hartsReset && !q_control_clear))
+    assert($stable({selected, owner}));\n'''
+    return ('DebugModule', body, 'assign memory_response_bits_tag = tag;', "assign memory_response_bits_tag = 8'h0;")
 
 def compressed_fetch_case(source, parameters):
     assert parameters.get('enableC') and not parameters['iCacheBytes'] and not parameters['pmpEntries'] and not parameters.get('enableUserMode') and parameters.get('virtualAddressBits') != 39
@@ -583,6 +740,84 @@ BACKEND = r'''
 
 def header(text):
     return text[text.index('module '):text.index(');') + 2]
+
+
+def platform_memory_case():
+    body = r'''
+  reg q_past = 0, q_read = 0, q_write = 0;
+  reg [ID_BITS-1:0] q_read_id, q_write_id;
+  reg [8:0] q_read_left, q_write_beats;
+  reg [9:0] q_data_beats = 0;
+  wire q_ar = axi_ar_valid && axi_ar_ready;
+  wire q_aw = axi_aw_valid && axi_aw_ready;
+  wire q_w = axi_w_valid && axi_w_ready;
+  wire q_r = axi_r_valid && axi_r_ready;
+  wire q_b = axi_b_valid && axi_b_ready;
+  always @(posedge clock) begin
+    q_past <= 1;
+    if (!q_past) assume(reset);
+    if (reset) begin q_read <= 0; q_write <= 0; q_data_beats <= 0; end
+    else begin
+      if (q_past && !$past(reset)) begin
+        if ($past(axi_ar_valid && !axi_ar_ready)) begin
+          assume(axi_ar_valid);
+          assume($stable({axi_ar_bits_addr,axi_ar_bits_id,axi_ar_bits_len,axi_ar_bits_size,axi_ar_bits_burst,axi_ar_bits_lock}));
+        end
+        if ($past(axi_aw_valid && !axi_aw_ready)) begin
+          assume(axi_aw_valid);
+          assume($stable({axi_aw_bits_addr,axi_aw_bits_id,axi_aw_bits_len,axi_aw_bits_size,axi_aw_bits_burst,axi_aw_bits_lock}));
+        end
+        if ($past(axi_w_valid && !axi_w_ready)) begin
+          assume(axi_w_valid);
+          assume($stable({axi_w_bits_data,axi_w_bits_strb,axi_w_bits_last}));
+        end
+        if ($past(axi_r_valid && !axi_r_ready)) begin
+          assert(axi_r_valid);
+          assert($stable({axi_r_bits_data,axi_r_bits_id,axi_r_bits_resp,axi_r_bits_last}));
+        end
+        if ($past(axi_b_valid && !axi_b_ready)) begin
+          assert(axi_b_valid);
+          assert($stable({axi_b_bits_id,axi_b_bits_resp}));
+        end
+      end
+      assert(q_read == (reading || axi_r_valid));
+      assert(q_write == (aw_held || axi_b_valid));
+      assert(!(aw_held && axi_b_valid));
+      if (axi_r_valid) assert(reading == !axi_r_bits_last);
+      if (q_read) begin
+        assert(q_read_id == read_id && q_read_left > 0 && q_read_left <= 256);
+      end
+      if (q_write) begin
+        assert(q_write_id == write_id && q_write_beats > 0 && q_write_beats <= 256);
+      end
+      assert(q_data_beats == (w_held ? 1 : 0) +
+          (q_write ? q_write_beats - (aw_held ? {1'b0,write_left}+1 : 0) : 0));
+      if (q_read) assert(q_read_left == {1'b0,read_left}+1 + (axi_r_valid && !axi_r_bits_last ? 1 : 0));
+      if (axi_r_valid) begin
+        assert(q_read && axi_r_bits_id == q_read_id);
+        assert(axi_r_bits_last == (q_read_left == 1));
+      end
+      if (axi_b_valid) begin
+        assert(q_write && q_data_beats >= q_write_beats);
+        assert(axi_b_bits_id == q_write_id);
+      end
+      q_data_beats <= q_data_beats + q_w - (q_b ? q_write_beats : 0);
+      if (q_ar) begin
+        assert(!q_read); q_read <= 1; q_read_id <= axi_ar_bits_id;
+        q_read_left <= {1'b0,axi_ar_bits_len}+1;
+      end
+      if (q_r) begin q_read_left <= q_read_left-1; if (axi_r_bits_last) q_read <= 0; end
+      if (q_aw) begin
+        assert(!q_write); q_write <= 1; q_write_id <= axi_aw_bits_id;
+        q_write_beats <= {1'b0,axi_aw_bits_len}+1;
+      end
+      if (q_b) q_write <= 0;
+      cover(axi_b_valid && !axi_b_ready && q_write_id == {ID_BITS{1'b1}});
+      cover(axi_r_valid && !axi_r_ready && !axi_r_bits_last);
+    end
+  end
+'''
+    return 'PlatformMemory', body, 'axi_b_bits_id <= write_id;', "axi_b_bits_id <= '0;"
 
 
 def module_ports(source):
@@ -2775,6 +3010,7 @@ def debug_csr_case(parameters):
         assert(readData[63:32]==0 && readData[31:28]==4);
         assert(readData[11:9]==0 && readData[4]);
       end
+      if(readAddress==12'h301) assert(legal==(privilege==3) && readData==64'h{Model(parameters, {}, {}).csrs[0x301]:016x});
       if($past(!reset && debug_enter)) begin
         assert(debug_mode);
         assert(dpc==($past(debug_pc) & 64'h{((1<<64)-(1<<alignment)):016x}));
@@ -2795,6 +3031,16 @@ def debug_csr_case(parameters):
       cover(!debug_mode && debug_step);
       cover(debug_mode && write && writeAddress==12'h7b0 && writeData[8:6]!=dcsr[8:6]);
     end
+  end
+'''
+    if parameters.get('debugBase') is not None:
+        body += r'''
+  reg [63:0] q_scratch1;
+  always @(posedge clock) begin
+    if (reset) q_scratch1 <= 0;
+    else if (debug_mode && write && writeAddress == 'h7b3) q_scratch1 <= writeData;
+    if (!reset) assert(dscratch1 == q_scratch1);
+    if (!reset && readAddress == 'h7b3) assert(legal == debug_mode && readData == q_scratch1);
   end
 '''
     return ('DebugCsr', body, 'assign debug_mode =', "assign debug_mode = 1'h0 &")
@@ -5180,6 +5426,7 @@ def verify(rtl, directory, modules=None, mutations=None, jobs=1):
     reports = []
     checker_hash = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
     helper_hash = hashlib.sha256(Path(binding_helper_file).read_bytes()).hexdigest()
+    model_hash = hashlib.sha256(Path(model_file).read_bytes()).hexdigest() if manifest['parameters'].get('enableJtag') else None
     regions = manifest['parameters']['memoryRegions']
     cache_routing_base = next((int(r['base']) & ~63 for r in regions if r.get('dataCacheable') and r['readable'] and not r['device'] and
         int(r['base']) % 64 and not any((p['device'] or p.get('dataCacheable') and p['readable']) and
@@ -5219,6 +5466,12 @@ def verify(rtl, directory, modules=None, mutations=None, jobs=1):
             cases.append(floating_backend_case(manifest['parameters'], sources['DitDahA1Backend.sv']))
     if manifest['parameters'].get('enableJtag'):
         cases.append(debug_csr_case(manifest['parameters']))
+    if 'DitDahA1DebugModule.sv' in sources:
+        cases.append(debug_module_case(manifest['parameters']))
+    if 'DitDahA1DmiBridge.sv' in sources:
+        cases.append(('DmiBridge', DMI_BRIDGE, 'assign downstream_request_bits_data =', "assign downstream_request_bits_data = 32'h1 ^"))
+    if 'DitDahA1PlatformMemory.sv' in sources:
+        cases.append(platform_memory_case())
     if manifest['parameters'].get('loadQueueEntries', 1) == 2 and not enabled and manifest['parameters'].get('virtualAddressBits') == 0:
         cases.append(lsu_reads_case(manifest['parameters']))
     if 'DitDahA1ReadQueue.sv' in sources:
@@ -5248,7 +5501,7 @@ def verify(rtl, directory, modules=None, mutations=None, jobs=1):
         cases.append(translation_case(manifest['parameters']))
     if manifest['parameters'].get('iCacheBytes') and manifest['parameters']['issueWidth'] > 1:
         cases = [wide_fetch_case(manifest['parameters']) if case[0] == 'Fetch' else case for case in cases]
-    if manifest['parameters'].get('enableC') and not manifest['parameters']['iCacheBytes'] and not enabled and not manifest['parameters'].get('enableUserMode') and manifest['parameters'].get('virtualAddressBits') != 39:
+    if 'DitDahA1Fetch.sv' in sources and manifest['parameters'].get('enableC') and not manifest['parameters']['iCacheBytes'] and not enabled and not manifest['parameters'].get('enableUserMode') and manifest['parameters'].get('virtualAddressBits') != 39:
         cases.append(compressed_fetch_case(sources['DitDahA1Fetch.sv'], manifest['parameters']))
     assert not modules or set(modules) <= {case[0] for case in cases}, 'Unsupported proof selection'
     for name, body, before, after in cases:
@@ -5259,8 +5512,35 @@ def verify(rtl, directory, modules=None, mutations=None, jobs=1):
         unit = name.removeprefix('Debug').removeprefix('Floating').removeprefix('BitManip').removeprefix('Compressed').removeprefix('Interrupt').removeprefix('Synchronization').removeprefix('Pipeline').removeprefix('Word').removeprefix('Integer').removeprefix('Wfi').removeprefix('User').removeprefix('Supervisor').removeprefix('Wide')
         if name in ('DataCacheWriteback', 'DataCacheAssociativity'):
             unit = 'DataCache'
+        if name == 'DebugModule':
+            unit = 'DebugModule'
         if name == 'LsuReads':
             unit = 'Lsu'
+        origin_contract = manifest['parameters'].get('enableJtag') and manifest['parameters'].get('debugBase') is not None and unit in ('Fetch', 'Lsu', 'MemoryArbiter')
+        if origin_contract:
+            output = 'downstream_request' if unit == 'MemoryArbiter' else 'memory_request'
+            captures = [(f'ports_{n}_request', f'ports_{n}_request_bits_debug')
+                        for n in range(2 * manifest['parameters']['hartCount'])] if unit == 'MemoryArbiter' else [
+                            ('request' if unit == 'Fetch' else 'input', 'debugMode')]
+            capture = '\n'.join(f'      if ({port}_valid && {port}_ready) begin q_origin <= {value}; q_origin_owned <= 1; end'
+                                for port, value in captures)
+            body += f'''
+  reg q_origin_past = 0, q_origin_owned = 0, q_origin;
+  always @(posedge clock) begin
+    q_origin_past <= 1;
+    if (!q_origin_past) assume(reset); else assume(!reset);
+    if (reset) q_origin_owned <= 0;
+    else begin
+{capture}
+      if ({output}_valid) begin
+        assert(q_origin_owned);
+        assert({output}_bits_debug == q_origin);
+        cover(q_origin);
+        cover(!q_origin);
+      end
+    end
+  end
+'''
         machine = 'privilege != 0' if manifest['parameters'].get('enableUserMode') else "1'b1"
         if name in ('Pmp', 'PmpDecode') and (manifest['parameters'].get('enableBurstRefill') or manifest['parameters'].get('dCacheRefillBytes', 8) == 64 or manifest['parameters'].get('iCacheBytes') and manifest['parameters']['issueWidth'] == 3):
             span = re.search(r'&\s+(\w+\[size\]) > base', sources['DitDahA1Pmp.sv']).group(1)
@@ -5455,6 +5735,12 @@ def verify(rtl, directory, modules=None, mutations=None, jobs=1):
             files = {module + '.sv': license + 'module formal_subset(input [64:0] low, high, input [7:0] config, input [63:0] address, input [1:0] privilege, input prior_whole, prior_subset);\nendmodule\n'}
         else:
             files = dict(sources) if unit in ('Backend', 'Frontend', 'InstructionCache', 'DataCache', 'SharedCache', 'MemoryFabric') or unit == 'Fetch' and manifest['parameters'].get('iCacheBytes') else {module + '.sv': sources[module + '.sv']}
+        if unit == 'PlatformMemory':
+            source = files[module + '.sv']
+            expression = 'axi_r_bits_data <= ram[(read_address-RAM_BASE)>>3];'
+            assert source.count(expression) == 1
+            files[module + '.sv'] = source.replace(expression, 'axi_r_bits_data <= q_ram_read;')
+            body += '\n  (* anyseq *) reg [63:0] q_ram_read;\n'
         if unit == 'Fpu':
             if manifest['parameters']['floatingPointBits'] == 32:
                 body = body.replace('!output_ready && fp_double', '!output_ready && !fp_double')
@@ -5671,7 +5957,7 @@ endmodule
                               and f'request_address{suffix} ' in expression]
                 assert len(candidates) == 1, 'Ambiguous read authorization driver'
                 body += f'\n  wire rq_dut_permission_{slot} = {candidates[0]};\n'
-        if unit in ('Backend', 'Frontend', 'Gpr', 'MulDiv', 'Fpu', 'Csr', 'MemoryArbiter', 'ReadQueue', 'MemoryFabric', 'Memory', 'Axi', 'InstructionCache', 'DataCache', 'Coherence', 'SharedCache', 'Lsu', 'LocalInterrupts', 'Translation') or (enabled and unit not in ('Decode', 'Execute')) or unit == 'Fetch' and manifest['parameters'].get('iCacheBytes'):
+        if unit in ('PlatformMemory', 'DebugModule', 'Backend', 'Frontend', 'Gpr', 'MulDiv', 'Fpu', 'Csr', 'MemoryArbiter', 'ReadQueue', 'MemoryFabric', 'Memory', 'Axi', 'InstructionCache', 'DataCache', 'Coherence', 'SharedCache', 'Lsu', 'LocalInterrupts', 'Translation') or (enabled and unit not in ('Decode', 'Execute')) or unit == 'Fetch' and manifest['parameters'].get('iCacheBytes'):
             if unit == 'Backend':
                 dual = manifest['parameters'].get('loadQueueEntries', 1) == 2
                 owned = '{1\'b0, contexts != 0} + {1\'b0, contexts_0 != 0}' if dual else 'state != 0'
@@ -5781,9 +6067,31 @@ endmodule''', 1)
             before = re.search(r': ~\w+ \| abort \| responseFault \| bypass \| ~complete', sources[module + '.sv']).group()
             after = before.replace(' | abort', '')
         checks = [('prove', before, after), ('cover', before, after), ('mutation', before, after)]
+        if origin_contract:
+            output = 'downstream_request' if unit == 'MemoryArbiter' else 'memory_request'
+            driver = re.search(rf'assign {output}_bits_debug\s*=\s*[^;]+;', sources[module + '.sv']).group()
+            mutated = driver.replace('debugOrigin', 'debugMode') if unit in ('Fetch', 'Lsu') else driver.replace('=', "= 1'h1 ^", 1)
+            assert mutated != driver
+            checks.append(('mutation-origin', driver, mutated))
         if name == 'DebugCsr':
             entry_pc = re.search(r'dpc <= \{debug_pc\[[^;]+;', sources[module + '.sv']).group()
             checks.append(('mutation-pc', entry_pc, "dpc <= 64'h0;"))
+            if manifest['parameters'].get('debugBase') is not None:
+                checks.append(('mutation-scratch', 'dscratch1 <= writeData;', "dscratch1 <= 64'h0;"))
+            misa = Model(manifest['parameters'], {}, {}).csrs[0x301]
+            literal = re.search(rf"\?\s*64'h{misa:x}\b", sources[module + '.sv'], re.I).group()
+            checks.append(('mutation-isa', literal, re.sub(r"64'h[0-9a-f]+", "64'h0", literal, flags=re.I)))
+        if name == 'DebugModule':
+            authorization = re.search(r'wire\s+authorized\s*=\s*memory_request_bits_debug', sources[module + '.sv']).group()
+            checks.append(('mutation-authorization', authorization, authorization.replace('memory_request_bits_debug', "1'h1")))
+            checks.append(('mutation-reset', 'assign dmi_response_valid = replyValid;', 'assign dmi_response_valid = replyValid & active;'))
+            autoexec = re.search(r'autoexec <=\s*[^;]*dmi_request_bits_data\[0\][^;]*;', sources[module + '.sv']).group()
+            checks.append(('mutation-autoexec', autoexec, "autoexec <= 1'h0;"))
+        if name == 'DmiBridge':
+            completion = re.search(r'if \([^()]+\) begin\s+ack <= requestSync;', sources[module + '.sv']).group()
+            checks.append(('mutation-early', completion, completion.replace('if (', 'if (accepted | ', 1)))
+            admission = re.search(r'assign upstream_request_ready\s*=[^;]+;', sources[module + '.sv']).group()
+            checks.append(('mutation-reset', admission, 'assign upstream_request_ready = ~busy;'))
         if name == 'FloatingBackend':
             checks[1:2] = [(f'cover-{n}', before, after) for n in range(3)]
         if unit == 'SharedCache':
@@ -7167,14 +7475,22 @@ endmodule''', 1)
                 timeout = 300 if port_modes else 120
             if unit == 'MemoryFabric' and mode.startswith('prove-stability-') and port_modes:
                 timeout = 120
+            if unit == 'PlatformMemory':
+                engine = 'smtbmc z3'
             witness_option = 'aigsmt z3\n' if engine == 'abc pdr' else ''
             preparation = (f'hierarchy -check -top {top}\nproc\nflatten\nopt_expr -keepdc\nopt_clean\nwreduce\nopt_clean\ncheck'
                            if name.startswith('Pmp') else f'prep -top {top} -flatten')
+            if unit == 'PlatformMemory':
+                platform = json.loads((rtl / 'manifest.json').read_text())
+                actual = platform['parameters']
+                preparation = 'chparam ' + ' '.join(f'-set {key} {value}' for key, value in actual.items()) + f' {module}\n' + preparation
             if unit == 'SharedCache':
                 timeout = 180
             depth = 2 if unit == 'Axi' and mode.startswith('prove-payload-output-') else 6 * manifest['parameters']['hartCount'] + 8 if unit == 'MemoryArbiter' else 72 if task == 'cover' or (unit == 'InstructionCache' and mode in ('mutation', 'mutation-invalidate', 'mutation-count')) else 1 if name.startswith('Pmp') or unit in ('Decode', 'Execute') else (3 if task == 'prove' else 8) if unit == 'Csr' else 6 if unit in ('DataCache', 'Coherence', 'SharedCache') and task == 'prove' else 4 if name in ('Gpr', 'MulDiv', 'Memory', 'Axi', 'SynchronizationBackend', 'WfiBackend', 'InstructionCache', 'LocalInterrupts') and task == 'prove' else 24
             if mode == 'mutation-buffer-stage' and manifest['parameters'].get('enableBurstRefill'):
                 depth = 40
+            if unit == 'PlatformMemory' and task == 'prove':
+                depth = 4
             if unit == 'ReadQueue' and task == 'prove':
                 depth = 1 if mode in ('prove-permission', 'prove-read-data') else 4
             if unit == 'MemoryFabric' and (mode == 'prove-control' or mode.startswith(('prove-ports-', 'prove-tags', 'prove-stability-'))):
@@ -7187,14 +7503,15 @@ endmodule''', 1)
                 depth = 6 if name == 'WideFetch' else 4
             if name in ('FloatingBackend', 'WfiBackend', 'InterruptBackend') and mutating:
                 depth = 32 if name == 'WfiBackend' else 40
+            multiclock = 'multiclock on\n' if name == 'DmiBridge' else ''
             config = f'''[options]
 mode {task}
 depth {depth}
 timeout {timeout}
-{witness_option}[engines]
+{multiclock}{witness_option}[engines]
 {engine}
 [script]
-read -formal -sv {'-noautowire ' if name in ('FloatingFpu', 'FloatingBackend', 'PipelineBackend', 'DataCacheAssociativity') else ''}{' '.join(files)}
+read -formal -sv {'-noautowire ' if name in ('DebugModule', 'DmiBridge', 'FloatingFpu', 'FloatingBackend', 'PipelineBackend', 'DataCacheAssociativity') else ''}{' '.join(files)}
 {preparation}
 [files]
 ''' + '\n'.join(files) + '\n'
@@ -7213,6 +7530,7 @@ read -formal -sv {'-noautowire ' if name in ('FloatingFpu', 'FloatingBackend', '
     assert all((rtl / p).read_text() == text for p, text in (sources | observation_sources).items()), 'RTL changed during proofs'
     assert checker_hash == hashlib.sha256(Path(__file__).read_bytes()).hexdigest(), 'Checker changed during proofs'
     assert helper_hash == hashlib.sha256(Path(binding_helper_file).read_bytes()).hexdigest(), 'Binding helper changed during proofs'
+    assert model_hash is None or model_hash == hashlib.sha256(Path(model_file).read_bytes()).hexdigest(), 'Instruction model changed during proofs'
     assert all(hashlib.sha256(Path(p).read_bytes()).hexdigest() == h for p, h in manifest['sourceHashes'].items())
     proved = {report['propertyGroup'] for report in reports if report['mode'].startswith('prove') and report['status'] == 'PASS'}
     if mutations is not None:
@@ -7279,6 +7597,9 @@ read -formal -sv {'-noautowire ' if name in ('FloatingFpu', 'FloatingBackend', '
     summary.write_text(json.dumps(dict(
         scope='selected negative controls only' if mutations is not None else 'module-level safety, cover reachability and mutation detection',
         selectedMutations=mutations, propertyGroups=sorted(proved),
+        platformMemory='accepted AXI IDs and beat accounting, held R/B replies; unrestricted request order and backpressure with stable blocked offers and initial reset; RAM read values abstracted, no stored-byte or physical progress claim' if 'PlatformMemory' in proved else None,
+        debugModule='single registered reply ownership on DMI and hart memory, captured tag/denial and blocked-payload stability, no effect from forbidden memory accesses and command-owner isolation; hart reset cancels only the hart-memory owner; initial power reset, unrestricted hart state and independent concurrent DMI/memory requests' if 'DebugModule' in proved else None,
+        debugTransport='independent source/system ownership and payload ledgers; arbitrary independent clocks and backpressure, initial global reset only, stable blocked inputs and responses to accepted requests; ideal digital CDC safety without service fairness or analogue timing/MTBF claims' if 'DmiBridge' in proved else None,
         floatingRetirement='actual backend FPR bank watched over every row and bit, retired fault/write/dirty gates and independent M/F accepted-owner ledgers; arithmetic replies abstracted with arbitrary latency and payload, no progress claim' if 'FloatingBackend' in proved else None,
         floatingTransport='actual shared service and selected FLEN; arithmetic format interfaces abstract numerical payloads and arbitrary completion delay, with a private accepted-request ledger per format; no progress or arithmetic-equivalence claim' if 'FloatingFpu' in proved else None,
         assumptions='initial reset, then no reset except CSR proofs; Fetch responses require accepted requests and stable blocked payloads; enabled control proofs abstract combinational authorization',
@@ -7342,7 +7663,7 @@ read -formal -sv {'-noautowire ' if name in ('FloatingFpu', 'FloatingBackend', '
         localInterrupts='independent request-driven MSIP, MTIME and MTIMECMP model; exact register widths, WARL bit, invalid-access isolation, read snapshots, write-once side effects, tag ownership and timer comparison; timeTick unrestricted' if 'LocalInterrupts' in proved else None,
         configurations=manifest['parameters'], sourceHashes=manifest['sourceHashes'],
         rtlHashes={p: hashlib.sha256(text.encode()).hexdigest() for p, text in (sources | observation_sources).items()},
-        checkerHash=checker_hash, bindingHelperHash=helper_hash, tools=tools, reports=reports), indent=2) + '\n')
+        checkerHash=checker_hash, bindingHelperHash=helper_hash, instructionModelHash=model_hash, tools=tools, reports=reports), indent=2) + '\n')
 
 
 if __name__ == '__main__':
@@ -7351,6 +7672,6 @@ if __name__ == '__main__':
     parser.add_argument('--output', type=Path, default=Path('result/formal'))
     parser.add_argument('--mutations', nargs='+')
     parser.add_argument('--jobs', type=int, default=1)
-    parser.add_argument('--modules', nargs='+', choices=('DebugCsr', 'FloatingBackend', 'FloatingFpu', 'Fetch', 'CompressedFetch', 'WideFetch', 'Gpr', 'MulDiv', 'Backend', 'PipelineBackend', 'Pmp', 'PmpDecode', 'PmpInterval', 'PmpSubset', 'Csr', 'FloatingCsr', 'UserCsr', 'UserExecute', 'SupervisorCsr', 'SupervisorExecute', 'SupervisorFetch', 'Lsu', 'LsuReads', 'InterruptCsr', 'InterruptBackend', 'SynchronizationBackend', 'SharedCache', 'InstructionCache', 'DataCache', 'DataCacheWriteback', 'DataCacheAssociativity', 'Coherence', 'MemoryArbiter', 'ReadQueue', 'MemoryFabric', 'Memory', 'Axi', 'WordDecode', 'WordExecute', 'BitManipDecode', 'BitManipExecute', 'IntegerDecode', 'IntegerExecute', 'WfiBackend', 'WfiFrontend', 'LocalInterrupts', 'Translation'))
+    parser.add_argument('--modules', nargs='+', choices=('PlatformMemory', 'DebugModule', 'DmiBridge', 'DebugCsr', 'FloatingBackend', 'FloatingFpu', 'Fetch', 'CompressedFetch', 'WideFetch', 'Gpr', 'MulDiv', 'Backend', 'PipelineBackend', 'Pmp', 'PmpDecode', 'PmpInterval', 'PmpSubset', 'Csr', 'FloatingCsr', 'UserCsr', 'UserExecute', 'SupervisorCsr', 'SupervisorExecute', 'SupervisorFetch', 'Lsu', 'LsuReads', 'InterruptCsr', 'InterruptBackend', 'SynchronizationBackend', 'SharedCache', 'InstructionCache', 'DataCache', 'DataCacheWriteback', 'DataCacheAssociativity', 'Coherence', 'MemoryArbiter', 'ReadQueue', 'MemoryFabric', 'Memory', 'Axi', 'WordDecode', 'WordExecute', 'BitManipDecode', 'BitManipExecute', 'IntegerDecode', 'IntegerExecute', 'WfiBackend', 'WfiFrontend', 'LocalInterrupts', 'Translation'))
     args = parser.parse_args()
     verify(args.rtl, args.output, args.modules, args.mutations, args.jobs)

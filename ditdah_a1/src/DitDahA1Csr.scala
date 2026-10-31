@@ -128,12 +128,13 @@ object DitDahA1Csr extends Generator[DitDahA1Parameter, DitDahA1UnitLayers, DitD
       val dcsr = RegInit(3.U(16))
       val dpc = RegInit(parameter.resetVector.U(64))
       val dscratch = RegInit(0.U(64))
+      val dscratch1 = Option.when(parameter.debugBase.nonEmpty)(RegInit(0.U(64)))
       debug.mode := debugging
       debug.step := dcsr.asBits.bit(2) & !debugging
       debug.ebreak := (savedPrivilege === 3.U(2)).?(dcsr.asBits.bit(15),
         (savedPrivilege === 1.U(2)).?(dcsr.asBits.bit(13), dcsr.asBits.bit(12)))
       Seq(0x7b0 -> ((BigInt("40000010", 16).B(64) | dcsr.asBits).asUInt),
-        0x7b1 -> dpc, 0x7b2 -> dscratch).foreach { (address, value) =>
+        0x7b1 -> dpc, 0x7b2 -> dscratch).concat(dscratch1.map(0x7b3 -> _)).foreach { (address, value) =>
         when(io.readAddress === address.U(12)) { io.readData := value; io.legal := debugging }
       }
       when(debugging & io.write) {
@@ -147,6 +148,7 @@ object DitDahA1Csr extends Generator[DitDahA1Parameter, DitDahA1UnitLayers, DitD
         }
         when(io.writeAddress === 0x7b1.U(12)) { dpc := (io.writeData.asBits.bits(63, alignment) ## 0.B(alignment)).asUInt }
         when(io.writeAddress === 0x7b2.U(12)) { dscratch := io.writeData }
+        dscratch1.foreach(value => when(io.writeAddress === 0x7b3.U(12)) { value := io.writeData })
       }
       when(debug.enter) {
         debugMode.get := true.B
@@ -163,6 +165,12 @@ object DitDahA1Csr extends Generator[DitDahA1Parameter, DitDahA1UnitLayers, DitD
     Seq(0x301, 0x304, 0x344, 0xf11, 0xf12, 0xf13, 0xf14, 0xf15).foreach { address =>
       when(io.readAddress === address.U(12)) { io.legal := true.B }
     }
+    if parameter.enableJtag then
+      val extensions = Seq(0 -> parameter.enableA, 1 -> (parameter.enableZba && parameter.enableZbb && parameter.enableZbs),
+        2 -> parameter.enableC, 3 -> (parameter.floatingPointBits == 64), 5 -> (parameter.floatingPointBits != 0),
+        8 -> true, 12 -> parameter.enableM, 18 -> parameter.enableSupervisorMode, 20 -> parameter.enableUserMode)
+      val misa = extensions.foldLeft(BigInt(2) << 62) { case (value, (bit, enabled)) => if enabled then value.setBit(bit) else value }
+      when(io.readAddress === 0x301.U(12)) { io.readData := misa.U(64) }
     when(io.readAddress === 0xf14.U(12)) { io.readData := io.hartId }
     val machineRegisters = Seq((0x305, mtvec), (0x340, mscratch), (0x341, mepc), (0x342, mcause), (0x343, mtval))
     val supervisorRegisters = if parameter.enableSupervisorMode then

@@ -18,9 +18,41 @@ object DitDahA1Module extends Generator[DitDahA1Parameter, DitDahA1Layers, DitDa
       DitDahA1Core.instantiate(parameter)
     }
     val fabric = DitDahA1MemoryFabric.instantiate(parameter)
+    val processorReset = if !parameter.enableJtag then io.reset else
+      val dtm = DitDahA1JtagDtm.instantiate(parameter)
+      val bridge = DitDahA1DmiBridge.instantiate(parameter)
+      val dm = DitDahA1DebugModule.instantiate(parameter)
+      val pins = io.jtag.get
+      dtm.io.tck := pins.tck
+      dtm.io.reset := io.reset
+      dtm.io.trstN := pins.trstN
+      dtm.io.tms := pins.tms
+      dtm.io.tdi := pins.tdi
+      pins.tdo := dtm.io.tdo
+      pins.tdoEnable := dtm.io.tdoEnable
+      bridge.io.clock := io.clock
+      bridge.io.tck := pins.tck
+      bridge.io.reset := io.reset
+      bridge.io.upstream :<>= dtm.io.dmi
+      dm.io.clock := io.clock
+      dm.io.reset := DebugReset.release(io.clock, io.reset)
+      dm.io.dmi :<>= bridge.io.downstream
+      dm.io.memory :<>= fabric.io.debugMemory.get
+      dm.io.memoryHart := fabric.io.debugHart.get
+      val requestedReset = Wire(new DebugReset.Signal)
+      requestedReset.value := (io.reset.asBool | io.systemReset.get | dm.io.ndmreset).asReset
+      val reset = DebugReset.release(io.clock, requestedReset.value)
+      dm.io.hartsReset := reset.asBool
+      io.systemResetActive.get := reset.asBool
+      for (core, hart) <- cores.zipWithIndex do
+        core.io.debug.get.haltReq := dm.io.harts(hart).haltReq
+        core.io.debug.get.entryPc := dm.io.harts(hart).entryPc
+        core.io.debug.get.exceptionPc := dm.io.harts(hart).exceptionPc
+        dm.io.harts(hart).mode := core.io.debug.get.mode
+      reset
     for (core, hart) <- cores.zipWithIndex do
       core.io.clock := io.clock
-      core.io.reset := io.reset
+      core.io.reset := processorReset
       core.io.hartId := hart.U(4)
       if parameter.enableInterrupts then
         core.io.interrupts.get :<= io.interrupts.get(hart)
@@ -33,18 +65,18 @@ object DitDahA1Module extends Generator[DitDahA1Parameter, DitDahA1Layers, DitDa
         given sourcecode.Name.Machine = sourcecode.Name.Machine(s"data_cache_$hart")
         val cache = DitDahA1DataCache.instantiate(parameter)
         cache.io.clock := io.clock
-        cache.io.reset := io.reset
+        cache.io.reset := processorReset
         cache.io.upstream :<>= core.io.data
         fabric.io.data(hart) :<>= cache.io.downstream
         cache.io.probe :<>= fabric.io.probe.get(hart)
     fabric.io.clock := io.clock
-    fabric.io.reset := io.reset
+    fabric.io.reset := processorReset
     if parameter.localInterruptBase.nonEmpty then fabric.io.timeTick.get := io.timeTick.get
     if parameter.l2CacheBytes == 0 then io.axi :<>= fabric.io.axi
     else
       val sharedCache = DitDahA1SharedCache.instantiate(parameter)
       sharedCache.io.clock := io.clock
-      sharedCache.io.reset := io.reset
+      sharedCache.io.reset := processorReset
       sharedCache.io.upstream :<>= fabric.io.axi
       io.axi :<>= sharedCache.io.downstream
     io.status.trap := cores.map[Referable[Bool]](_.io.status.trap).reduce(_ | _)
@@ -82,8 +114,9 @@ object DitDahA1MemoryFabric extends Generator[DitDahA1Parameter, DitDahA1UnitLay
           selected | ((request.address >= region.base.U(64)) & (request.address < (region.base + region.size).U(64)))
         }
         val coherent = if parameter.dCacheWriteback then DitDahA1Memory.dataCacheable(parameter, request.address, 1) else false.B
+        val debug = DitDahA1Memory.debugWindow(parameter, request.address, 0.U(3))
         (request.cacheOperation === 0.U(2)) & !request.write & !request.atomic &
-          ((request.size <= 3.U(3)) | DitDahA1Axi.lineRead(parameter, request)) & !device & !coherent
+          ((request.size <= 3.U(3)) | DitDahA1Axi.lineRead(parameter, request)) & !device & !coherent & !debug
       }
       val readWaiting = ports.indices.map(i => ports(i).request.valid & ordinary(i)).reduce(_ | _)
       val exclusiveWaiting = ports.indices.map(i => ports(i).request.valid & !ordinary(i)).reduce(_ | _)
@@ -115,8 +148,29 @@ object DitDahA1MemoryFabric extends Generator[DitDahA1Parameter, DitDahA1UnitLay
       for hart <- 0 until parameter.hartCount do
         arbiter.io.ports(2 * hart) :<>= io.instruction(hart)
         arbiter.io.ports(2 * hart + 1) :<>= io.data(hart)
+    val serialized = if !parameter.enableDebugMemory then arbiter.io.downstream else
+      given ClockScope = ClockScope.posedge(io.clock)
+      given ResetScope = ResetScope.syncActiveHigh(io.reset)
+      val up = arbiter.io.downstream
+      val down = Wire(new MemoryPort(parameter))
+      val debug = io.debugMemory.get
+      val selected = DitDahA1Memory.debugWindow(parameter, up.request.bits.address, 0.U(3))
+      val responseDebug = RegInit(false.B)
+      io.debugHart.get := arbiter.io.hartId
+      down.request.bits :<= up.request.bits
+      debug.request.bits :<= up.request.bits
+      down.request.valid := up.request.valid & !selected
+      debug.request.valid := up.request.valid & selected
+      up.request.ready := selected.?(debug.request.ready, down.request.ready)
+      when(up.request.valid & up.request.ready) { responseDebug := selected }
+      up.response.valid := responseDebug.?(debug.response.valid, down.response.valid)
+      up.response.bits :<= down.response.bits
+      when(responseDebug) { up.response.bits :<= debug.response.bits }
+      down.response.ready := up.response.ready & !responseDebug
+      debug.response.ready := up.response.ready & responseDebug
+      down
     val physical = if parameter.dCacheBytes == 0 then
-      memory.io.upstream :<>= arbiter.io.downstream
+      memory.io.upstream :<>= serialized
       memory.io.downstream
     else
       val coherence = DitDahA1Coherence.instantiate(parameter)
@@ -125,11 +179,11 @@ object DitDahA1MemoryFabric extends Generator[DitDahA1Parameter, DitDahA1UnitLay
       coherence.io.hartId := arbiter.io.hartId
       io.probe.get :<>= coherence.io.probe
       if parameter.dCacheWriteback then
-        coherence.io.upstream :<>= arbiter.io.downstream
+        coherence.io.upstream :<>= serialized
         memory.io.upstream :<>= coherence.io.downstream
         memory.io.downstream
       else
-        memory.io.upstream :<>= arbiter.io.downstream
+        memory.io.upstream :<>= serialized
         coherence.io.upstream :<>= memory.io.downstream
         coherence.io.downstream
     if parameter.localInterruptBase.isEmpty then axi.io.memory :<>= physical

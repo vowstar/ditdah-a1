@@ -8,6 +8,7 @@ import me.jiuyang.zaozi.reftpe.*
 import me.jiuyang.zaozi.valuetpe.*
 
 class DitDahA1FetchIO(parameter: DitDahA1Parameter) extends HWBundle(parameter):
+  val debugMode = Option.when(parameter.enableDebugMemory)(Flipped(Bool()))
   val pmp = Option.when(parameter.pmpEntries != 0)(Flipped(new PmpState(parameter)))
   val clock = Flipped(Clock())
   val reset = Flipped(Reset())
@@ -17,7 +18,7 @@ class DitDahA1FetchIO(parameter: DitDahA1Parameter) extends HWBundle(parameter):
   val cancel = Flipped(Bool())
   val invalidate = Option.when(parameter.iCacheBytes != 0)(Flipped(Bool()))
   val translation = Option.when(parameter.enableTranslation)(Aligned(new TranslationPort))
-  val memory = Aligned(new MemoryPort)
+  val memory = Aligned(new MemoryPort(parameter))
 
 @generator
 object DitDahA1Fetch extends Generator[DitDahA1Parameter, DitDahA1UnitLayers, DitDahA1FetchIO, DitDahA1UnitProbe]:
@@ -42,6 +43,8 @@ object DitDahA1Fetch extends Generator[DitDahA1Parameter, DitDahA1UnitLayers, Di
     val accepting = Wire(Bool())
     val wholeBlock = Option.when(wide)(Reg(Bool()))
     val privilege = Option.when(parameter.enableUserMode)(Reg(UInt(2)))
+    val debugOrigin = Option.when(parameter.enableDebugMemory)(Reg(Bool()))
+    val debugging = accepting.?(io.debugMode.getOrElse(false.B), debugOrigin.getOrElse(false.B))
     val physicalAddress = Option.when(parameter.enableTranslation)(Reg(UInt(64)))
     val cache = Option.when(parameter.iCacheBytes != 0)(DitDahA1InstructionCache.instantiate(parameter))
     val request = cache.map(_.io.upstream.request).getOrElse(io.memory.request)
@@ -54,7 +57,7 @@ object DitDahA1Fetch extends Generator[DitDahA1Parameter, DitDahA1UnitLayers, Di
     val checkedAddress = if wide then rechecking.?(demandAddress,
       (demandAddress.asBits.bits(63, bankBits + 2) ## 0.B(bankBits + 2)).asUInt) else demandAddress
     val checkedSize = if wide then rechecking.?(2.U(3), (bankBits + 2).U(3)) else demandSize.U(3)
-    val permitted = if parameter.pmpEntries == 0 then true.B else
+    val pmpPermitted = if parameter.pmpEntries == 0 then true.B else
       val pmp = DitDahA1Pmp.instantiate(parameter)
       pmp.io.state :<= io.pmp.get
       pmp.io.address := cache.map(c => checkingDemand.?(checkedAddress, c.io.checkAddress)).getOrElse(checkedAddress)
@@ -64,6 +67,7 @@ object DitDahA1Fetch extends Generator[DitDahA1Parameter, DitDahA1UnitLayers, Di
       pmp.io.atomic := false.B
       pmp.io.privilege := accepting.?(io.privilege, privilege.getOrElse(3.U(2)))
       pmp.io.allowed
+    val permitted = pmpPermitted | (debugging & DitDahA1Memory.debugWindow(parameter, checkedAddress, checkedSize))
     cache.foreach { c =>
       c.io.clock := io.clock
       c.io.reset := io.reset
@@ -73,13 +77,14 @@ object DitDahA1Fetch extends Generator[DitDahA1Parameter, DitDahA1UnitLayers, Di
         DitDahA1Memory.executable(parameter, c.io.checkAddress, 64), DitDahA1Memory.executable(parameter, c.io.checkAddress, 4))
       else DitDahA1Memory.executable(parameter, c.io.checkAddress, 4)
       val narrow = if parameter.enableC then (c.io.checkSize === 1.U(3)).?(DitDahA1Memory.executable(parameter, c.io.checkAddress, 2), ordinary) else ordinary
-      c.io.allowed := permitted & narrow
+      c.io.allowed := (pmpPermitted & narrow) | (debugging & DitDahA1Memory.debugWindow(parameter, c.io.checkAddress, c.io.checkSize))
       io.memory :<>= c.io.downstream
     }
     val ordinaryDemand = if wide then rechecking.?(DitDahA1Memory.executable(parameter, demandAddress, 4),
       DitDahA1Memory.executable(parameter, checkedAddress, 4 * parameter.fetchWords))
       else DitDahA1Memory.executable(parameter, demandAddress, 1 << demandSize)
-    val demandPermitted = if cache.isDefined then permitted & ordinaryDemand else permitted
+    val debugDemand = debugging & DitDahA1Memory.debugWindow(parameter, checkedAddress, checkedSize)
+    val demandPermitted = if cache.isDefined then (permitted & ordinaryDemand) | debugDemand else permitted
     val shortReturn = if wide then io.output.valid & (io.output.bits.count.get <
       (parameter.fetchWords.U(parameter.fetchCountBits) - packet.pc.asBits.bits(bankBits + 1, 2).asUInt)) else false.B
     accepting := (state === 0.U(stateBits)) | (if pipelined then io.output.valid & io.output.ready & !io.output.bits.fault & !shortReturn else false.B)
@@ -127,6 +132,7 @@ object DitDahA1Fetch extends Generator[DitDahA1Parameter, DitDahA1UnitLayers, Di
     request.bits.cacheOperation := 0.U(2)
     request.bits.scEligible := false.B
     request.bits.refillSize := 0.U(3)
+    request.bits.debug.foreach(_ := (if pipelined then debugging else debugOrigin.get))
     response.ready := (state === 2.U(stateBits)) & (if pipelined then killed | flush | io.output.ready else true.B)
     io.translation.foreach { t =>
       t.request.valid := ((accepting & io.request.valid & aligned) | (parcelCheck & !killed)) & !flush
@@ -185,6 +191,7 @@ object DitDahA1Fetch extends Generator[DitDahA1Parameter, DitDahA1UnitLayers, Di
     when((state === 3.U(stateBits)) & (killed | flush | io.output.ready)) { state := 0.U(stateBits) }
     when(io.request.valid & io.request.ready) {
       privilege.foreach(_ := io.privilege)
+      debugOrigin.foreach(_ := io.debugMode.get)
       packet.pc := io.request.bits.pc
       packet.tag := io.request.bits.tag
       packet.instruction := 0.U(32)

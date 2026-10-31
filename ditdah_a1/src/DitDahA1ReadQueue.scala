@@ -10,7 +10,7 @@ import me.jiuyang.zaozi.valuetpe.*
 class DitDahA1ReadQueueIO(parameter: DitDahA1Parameter) extends HWBundle(parameter):
   val clock = Flipped(Clock())
   val reset = Flipped(Reset())
-  val ports = Flipped(Vec(2 * parameter.hartCount, new MemoryPort))
+  val ports = Flipped(Vec(2 * parameter.hartCount, new MemoryPort(parameter)))
   val ar = Aligned(new Decoupled(new AxiAddress(parameter)))
   val r = Flipped(new Decoupled(new AxiRead(parameter)))
   val empty = Aligned(Bool())
@@ -30,7 +30,7 @@ object DitDahA1ReadQueue extends Generator[DitDahA1Parameter, DitDahA1UnitLayers
     val slotBits = math.max(1, 32 - Integer.numberOfLeadingZeros(depth - 1))
     val state = Seq.fill(depth)(RegInit(0.U(3)))
     val owner = Seq.fill(depth)(Reg(UInt(ownerBits)))
-    val request = Seq.fill(depth)(Reg(new MemoryRequest))
+    val request = Seq.fill(depth)(Reg(new MemoryRequest(parameter)))
     val data = Seq.fill(depth)(Reg(UInt(64)))
     val fault = Seq.fill(depth)(RegInit(false.B))
     val poisoned = RegInit(false.B)
@@ -57,7 +57,7 @@ object DitDahA1ReadQueue extends Generator[DitDahA1Parameter, DitDahA1UnitLayers
     }
     val valid = (0 until count).map(i => io.ports(i).request.valid & available(i))
     val selected = DitDahA1MemoryArbiter.select(valid, next)
-    val captured = Wire(new MemoryRequest)
+    val captured = Wire(new MemoryRequest(parameter))
     captured :<= io.ports(0).request.bits
     for i <- 1 until count do
       when(selected === i.U(ownerBits)) { captured :<= io.ports(i).request.bits }
@@ -117,7 +117,7 @@ object DitDahA1ReadQueue extends Generator[DitDahA1Parameter, DitDahA1UnitLayers
     val addressSlot = state.zipWithIndex.foldLeft[Referable[UInt]](0.U(slotBits)) {
       case (selected, (value, index)) => (value === 2.U(3)).?(index.U(slotBits), selected)
     }
-    val addressRequest = Wire(new MemoryRequest)
+    val addressRequest = Wire(new MemoryRequest(parameter))
     addressRequest :<= request(0)
     for n <- 1 until depth do
       when(state(n) === 2.U(3)) { addressRequest :<= request(n) }

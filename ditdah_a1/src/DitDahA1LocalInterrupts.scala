@@ -11,7 +11,7 @@ class DitDahA1LocalInterruptsIO(parameter: DitDahA1Parameter) extends HWBundle(p
   val clock = Flipped(Clock())
   val reset = Flipped(Reset())
   val timeTick = Flipped(Bool())
-  val memory = Flipped(new MemoryPort)
+  val memory = Flipped(new MemoryPort(parameter))
   val interrupts = Aligned(Vec(parameter.hartCount, new InterruptBundle))
 
 @generator

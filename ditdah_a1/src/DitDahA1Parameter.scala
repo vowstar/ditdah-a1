@@ -40,12 +40,19 @@ case class DitDahA1Parameter(
   branchPredictorEntries: Int = 0,
   enableTrace: Boolean = false,
   enableJtag: Boolean = false,
+  jtagIdcode: Option[Long] = None,
+  debugBase: Option[BigInt] = None,
   localInterruptBase: Option[BigInt] = None,
   memoryRegions: Seq[MemoryRegion] = Seq(MemoryRegion())
 ) extends Parameter:
   private def powerOfTwo(value: Int): Boolean = value > 0 && (value & (value - 1)) == 0
 
   require(hartCount >= 1 && hartCount <= 16, "hartCount must be between 1 and 16")
+  require(jtagIdcode.forall(id => id > 0 && id <= 0xffffffffL && (id & 1) == 1), "JTAG IDCODE must be an odd unsigned 32-bit value")
+  debugBase.foreach { base =>
+    require(base >= 0 && (base & 4095) == 0 && base + 4096 <= (BigInt(1) << physicalAddressBits), "Debug window must be a physical aligned page")
+    require(memoryRegions.forall(r => base + 4096 <= r.base || base >= r.base + r.size), "Debug window must not overlap ordinary memory")
+  }
   require(fabricReadSlots.forall(n => n >= 0 && n <= 4), "fabricReadSlots must be between zero and four")
   require(physicalAddressBits >= 32 && physicalAddressBits <= 56, "physicalAddressBits must be between 32 and 56")
   require(Set(0, 39, 48).contains(virtualAddressBits), "virtualAddressBits must select Bare, Sv39 or Sv48")
@@ -98,7 +105,7 @@ case class DitDahA1Parameter(
     require(!enableSupervisorMode || (enableUserMode && enableInterrupts), "Supervisor mode requires user mode and interrupts")
 
   def validateRtl(): Unit =
-    require(!enableJtag, "JTAG requires the debug transport integration")
+    require(!enableJtag || (debugBase.nonEmpty && jtagIdcode.nonEmpty), "JTAG requires a debug window and explicit IDCODE")
     validateCore()
     validateFabric()
     validateDataCache()
@@ -130,6 +137,7 @@ case class DitDahA1Parameter(
     }
 
   def enableTranslation: Boolean = virtualAddressBits == 39 && enableSupervisorMode
+  def enableDebugMemory: Boolean = enableJtag && debugBase.nonEmpty
   def preciseTranslationMaintenance: Boolean = hasTranslationCache && (asidBits != 0 || iTlbEntries != 0 || dTlbEntries != 0)
   def hasTranslationCache: Boolean = tlbEntries != 0 || iTlbEntries != 0 || dTlbEntries != 0
   def enableDataBurstRefill: Boolean = dCacheRefillBytes == 64

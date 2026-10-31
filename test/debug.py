@@ -210,7 +210,7 @@ def main():
     parser.add_argument('--mutations', action='store_true')
     parser.add_argument('--quiet-only', action='store_true')
     args = parser.parse_args()
-    inputs = [Path(__file__), Path('test/debug_driver.svh'), Path('test/memory_tb.sv'), Path('test/verify.py'),
+    inputs = [Path(__file__), Path('test/debug_driver.svh'), Path('test/memory_tb.sv'), Path('test/memory_port.svh'), Path('test/verify.py'),
               Path('test/programs.py'), Path('test/formal.py'), Path('test/contracts.py'), Path('test/core_tb.sv'), Path('test/model.py')]
     test_hashes = {str(p): hashlib.sha256(p.read_bytes()).hexdigest() for p in inputs}
     output = args.output

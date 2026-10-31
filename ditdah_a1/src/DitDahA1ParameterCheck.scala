@@ -11,6 +11,17 @@ object DitDahA1ParameterCheck:
 
   def run(): Unit =
     val baseline = DitDahA1Parameter()
+    val debugWindow = DitDahA1Parameter.uncached.copy(debugBase = Some(65536))
+    assert(DitDahA1Config.parameter(DitDahA1Config.document(debugWindow)) == debugWindow)
+    debugWindow.copy(enableJtag = true, jtagIdcode = Some(1L)).validateRtl()
+    rejects { debugWindow.copy(enableJtag = true).validateRtl() }
+    for base <- Seq(BigInt(-4096), BigInt(1), BigInt(0), BigInt(1) << 56) do
+      rejects { baseline.copy(debugBase = Some(base)); () }
+    for id <- Seq(1L, 0x12345679L, 0xffffffffL) do
+      val selected = baseline.copy(jtagIdcode = Some(id))
+      assert(DitDahA1Config.parameter(DitDahA1Config.document(selected)) == selected)
+    for id <- Seq(-1L, 0L, 2L, 0x100000001L) do
+      rejects { baseline.copy(jtagIdcode = Some(id)); () }
     for enabled <- Seq(false, true) do
       val selected = DitDahA1Parameter.uncached.copy(enableJtag = enabled)
       selected.validateCore()

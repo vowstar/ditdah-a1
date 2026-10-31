@@ -12,8 +12,8 @@ import org.llvm.mlir.scalalib.capi.ir.{Block, Context}
 class DitDahA1MemoryArbiterIO(parameter: DitDahA1Parameter) extends HWBundle(parameter):
   val clock = Flipped(Clock())
   val reset = Flipped(Reset())
-  val ports = Flipped(Vec(2 * parameter.hartCount, new MemoryPort))
-  val downstream = Aligned(new MemoryPort)
+  val ports = Flipped(Vec(2 * parameter.hartCount, new MemoryPort(parameter)))
+  val downstream = Aligned(new MemoryPort(parameter))
   val hartId = Aligned(UInt(4))
 
 @generator
@@ -23,17 +23,17 @@ object DitDahA1MemoryArbiter extends Generator[DitDahA1Parameter, DitDahA1UnitLa
     val io = summon[Interface[DitDahA1MemoryArbiterIO]]
     given ClockScope = ClockScope.posedge(io.clock)
     given ResetScope = ResetScope.syncActiveHigh(io.reset)
-    val owner = arbitrate((0 until 2 * parameter.hartCount).map(io.ports(_)), io.downstream)
+    val owner = arbitrate(parameter, (0 until 2 * parameter.hartCount).map(io.ports(_)), io.downstream)
     io.hartId := (if parameter.hartCount == 1 then 0.U(4) else owner.asBits.bits(32 - Integer.numberOfLeadingZeros(2 * parameter.hartCount - 1) - 1, 1).asUInt)
 
-  def arbitrate(ports: Seq[Referable[MemoryPort]], down: Referable[MemoryPort])
+  def arbitrate(parameter: DitDahA1Parameter, ports: Seq[Referable[MemoryPort]], down: Referable[MemoryPort])
     (using Arena, Context, Block, InstanceContext, ClockScope, ResetScope): Referable[UInt] =
     val state = RegInit(0.U(2))
     val count = ports.size
     val bits = 32 - Integer.numberOfLeadingZeros(count - 1)
     val owner = Reg(UInt(bits))
     val next = RegInit(0.U(bits))
-    val request = Reg(new MemoryRequest)
+    val request = Reg(new MemoryRequest(parameter))
     val idle = state === 0.U(2)
     val valid = (0 until count).map(i => ports(i).request.valid)
     val selected = select(valid, next)

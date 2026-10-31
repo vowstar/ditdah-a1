@@ -125,7 +125,8 @@
           buildInputs = [
             configure elaborate build pkgs.scala-cli pkgs.circt-install pkgs.mlir-install
             pkgs.jextract pkgs.verilator pkgs.iverilog pkgs.yosys pkgs.sby pkgs.z3
-            (pkgs.python313.withPackages (ps: [ ps.pytest ps.click ps.pyelftools ]))
+            pkgs.pkgsCross.riscv64-embedded.buildPackages.gdb
+            (pkgs.python313.withPackages (ps: [ ps.pytest ps.click ps.pyelftools ps.cocotb ]))
           ];
           env = {
             ZAOZI_JAR = jar;

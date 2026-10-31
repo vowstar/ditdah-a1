@@ -47,6 +47,7 @@ make verify-signoff
 Use `--top DitDahA1Core`, `DitDahA1Frontend`, `DitDahA1Backend`, or `DitDahA1MemoryFabric` for independent generation; `--trace` retains the separate DV bind files.
 Component builds validate their domain; system builds reject unimplemented features, and the manifest records the selected top and scope.
 The default physical map is 64 KiB of RAM at zero; configure regions for the intended system.
+`python3 scripts/build_platform.py --clock-hz "$CLOCK_HZ" --jtag-idcode "$JTAG_IDCODE" --output result/platform` generates a boot-ROM, RAM and UART-TX platform from `software/platform.json`.
 Set a region's `atomic` flag only for readable, writable, non-device memory with end-to-end exclusive monitoring of every competing writer.
 The flag defaults to false; unsupported exclusive reads and bus errors fault without rollback guarantees.
 Failed AMO writes retry; SC returns a status without retry. AMO completion requires eventual bus responses and successful exclusive access; contention can delay all harts on the shared fabric.
@@ -65,9 +66,9 @@ Set `enableUserMode` for Bare M/U execution and effective data privilege via MPR
 Set `enableSupervisorMode` with user mode and interrupts for M/S/U, standard trap delegation and SRET.
 Set `virtualAddressBits` to 39 for Sv39/Svade with 4 KiB/2 MiB/1 GiB pages; zero selects Bare. `asidBits` selects zero or four implemented ASID bits. PTE reads share the data path under S-mode PMP/PMA.
 `iTlbEntries`, `dTlbEntries` and shared `tlbEntries` independently select 0/2/4 entries per hart with one walker. Local entries clear on satp writes; ASID-tagged shared entries survive context changes. With local banks or ASIDs, SFENCE.VMA selects VA/ASID ranges and handles global mappings; PMP maintenance clears all layers, and maintenance excludes stale refills while accepted reads drain.
-Set `enableInterrupts` for precise entry and return from synchronous machine software/timer/external interrupt levels; platform logic owns the sources.
-System interrupt inputs are indexed by hart; each hart has independent CSR and PMP state.
+`enableInterrupts` enables per-hart software/timer/external interrupt levels; each hart retains independent CSR and PMP state.
 An optional `localInterruptBase` maps protected software-interrupt and 64-bit timer registers; `timeTick` supplies the synchronous timebase.
+`enableJtag` adds precise per-hart external debugging; system builds require `jtagIdcode` and a dedicated `debugBase`.
 All harts share the reset vector and read their index from `mhartid`; standalone Core and Backend integrations must hold `hartId` constant.
 
 `make verify-signoff` checks standalone Core and AXI integration against the same instruction model, tests interface and component-configuration contracts, lints the five production tops, and proves execution/transaction safety.
@@ -83,8 +84,7 @@ Burst checks cover all bus widths, retained ownership through last, beat data, f
 Platform checks execute shared work, software interrupts and timer interrupts on 1/2/3/16 harts.
 ELF checks build freestanding software with `RISCV_PREFIX` (default `riscv64-unknown-elf-`) and validate actual console writes and per-hart results.
 `make verify-width-software` checks identical loaded software across 1/2/3 issue for each of 1/2/16 harts; `make verify-zephyr-long SOFTWARE_JOBS=3` uses the pinned `ZEPHYR_BASE` checkout.
-Reachability and mutation checks exercise the properties; general multiply results are checked by simulation.
-This checks the implemented instruction subset, not full ISA compliance or physical signoff.
+Reachability and mutation checks exercise properties; simulation checks general multiplication. These checks do not establish full ISA compliance or physical signoff.
 `make verify-memory-concurrency`, `make verify-prediction` and `make verify-cache-configuration` cover overlapped reads, prediction and cache geometry/coherence. `FORMAL_JOBS` controls independent proof partitions.
 
 ## Credits

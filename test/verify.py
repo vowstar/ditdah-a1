@@ -472,7 +472,7 @@ def compile_tb(rtl, directory, width, pa, top='core_tb', source=None, extra_file
          f'-DAXI_BITS={width}', f'-DPA_BITS={pa}', f'-DHARTS={harts}',
          f'-DFABRIC_READ_SLOTS={parameters.get("fabricReadSlots") or (2 if harts > 1 else 0)}',
          f'-DLOAD_QUEUE_ENTRIES={parameters.get("loadQueueEntries", 1)}', f'-DCOMPRESSED={int(parameters.get("enableC", False))}',
-         '-I' + str(directory.resolve()), *(['-DENABLE_M'] if parameters.get('enableM', True) else []), *(['-DENABLE_INTERRUPTS'] if interrupts else []), '-I' + str(rtl.resolve()),
+         '-I' + str(directory.resolve()), '-I' + str(Path('test').resolve()), *(['-DENABLE_M'] if parameters.get('enableM', True) else []), *(['-DENABLE_INTERRUPTS'] if interrupts else []), '-I' + str(rtl.resolve()),
          *(['-DICACHE'] if parameters['iCacheBytes'] else []),
          *(['-DLOCAL_INTERRUPTS'] if local_base is not None else []),
          *(['-DSOFTWARE'] if software else []),
@@ -482,6 +482,8 @@ def compile_tb(rtl, directory, width, pa, top='core_tb', source=None, extra_file
          '--Mdir', str((directory / 'obj').resolve()), *files, *extra_files, source]
     binary, stamp = (directory / 'obj' / ('V' + top)).resolve(), directory / 'compile-inputs.json'
     inputs = [*files, *extra_files, source, rtl / 'filelist.f', rtl / 'ditdah_a1_config.json', *directory.glob('*.svh')]
+    if source.name == 'memory_tb.sv':
+        inputs.append(Path('test/memory_port.svh').resolve())
     if parameters.get('enableJtag'):
         inputs.append(Path('test/debug_driver.svh').resolve())
     hashes = {str(path): hashlib.sha256(Path(path).read_bytes()).hexdigest() for path in inputs}
@@ -2712,7 +2714,7 @@ def load_software(image, config_path):
     assert all(hashlib.sha256(Path(name).read_bytes()).hexdigest() == digest for name, digest in manifest['sourceHashes'].items()), 'Stale software sources'
     required = manifest.get('requiredExtensions', [])
     assert set(required) <= {'M', 'A', 'C', 'F', 'D', 'Zba', 'Zbb', 'Zbs'} and all((config.get('floatingPointBits', 0) >= (64 if name == 'D' else 32) if name in ('F', 'D') else config.get('enable' + name, name in ('M', 'A'))) for name in required), 'Software requires disabled extensions'
-    base, harts, memory, spans, payloads = int(config['resetVector']), config['hartCount'], {}, [], []
+    base, harts, memory, spans, payloads = manifest.get('entryAddress', int(config['resetVector'])), config['hartCount'], {}, [], []
     ram = next(r for r in config['memoryRegions'] if int(r['base']) == base and r['readable'] and r['writable'] and r['executable'] and not r['device'])
     memory_bytes = max(65536, int(ram['size']))
     assert memory_bytes <= 1048576, 'Software RAM exceeds supported test profile'
@@ -2831,14 +2833,15 @@ def load_software(image, config_path):
     interrupt_causes = manifest.get('expectedInterruptCauses', [])
     assert isinstance(interrupt_causes, list) and all(type(cause) is int and 0 <= cause < 64 for cause in interrupt_causes), 'Invalid expected software interrupt causes'
     frequency = manifest.get('timebaseHz', 100000000)
-    assert 0 < frequency <= 100000000 and 100000000 % frequency == 0, 'Unsupported software timebase'
+    clock = manifest.get('clockHz', 100000000)
+    assert 0 < frequency <= clock <= 1000000000 and clock % frequency == 0, 'Unsupported software timebase'
     if kind == 'zephyr':
         assert frequency == 10000000 and local_interrupt_base(config) is not None and config['enableInterrupts']
         assert all(hashlib.sha256(image.with_name(name).read_bytes()).hexdigest() == digest for name, digest in manifest['generatedHashes'].items()), 'Generated software configuration changed'
-    return config, SimpleNamespace(memory=memory, faults={}, stop=symbols['__test_halt'],
+    return config, SimpleNamespace(memory=memory, faults={}, entry=base, stop=symbols['__test_halt'],
         software=dict(kind=kind, console=console, results=symbols['__test_results'], bss=bss, expectedConsole=expected, expectedInterruptCauses=interrupt_causes, requiredExtensions=required, testInstruction=manifest.get('testInstruction'),
-                      memoryBytes=memory_bytes, timebaseHz=frequency, timeTickCycles=100000000 // frequency,
-                      idleCycles=4 * 100000000 // 100 if kind == 'zephyr' else 0)), manifest
+                      memoryBytes=memory_bytes, clockHz=clock, timebaseHz=frequency, timeTickCycles=clock // frequency,
+                      idleCycles=4 * clock // 100 if kind == 'zephyr' else 0)), manifest
 
 
 def test_source_hashes():
@@ -2956,6 +2959,7 @@ def verify_software(args):
     summary_path = args.output / 'summary.json'
     summary_path.unlink(missing_ok=True)
     config, program, software = load_software(args.elf, args.config)
+    assert program.software['clockHz'] == 100000000, 'Use the platform harness for this software clock'
     software_manifest_hash = hashlib.sha256(args.elf.with_name('manifest.json').read_bytes()).hexdigest()
     if args.poison_bss:
         program.memory.update((address, 0xa5) for address in range(*program.software['bss']))

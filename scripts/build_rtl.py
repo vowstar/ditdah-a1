@@ -25,7 +25,7 @@ def main():
     trace_options = parser.add_mutually_exclusive_group()
     trace_options.add_argument("--trace", action="store_true", default=None)
     trace_options.add_argument("--no-trace", action="store_false", dest="trace")
-    parser.add_argument("--top", choices=["DitDahA1", "DitDahA1Core", "DitDahA1Backend", "DitDahA1Gpr", "DitDahA1Frontend", "DitDahA1MemoryFabric", "DitDahA1ReadQueue", "DitDahA1Fetch", "DitDahA1Lsu", "DitDahA1Translation", "DitDahA1LocalInterrupts", "DitDahA1DataCache", "DitDahA1Coherence", "DitDahA1SharedCache"], default="DitDahA1")
+    parser.add_argument("--top", choices=["DitDahA1", "DitDahA1Core", "DitDahA1Backend", "DitDahA1Gpr", "DitDahA1Frontend", "DitDahA1MemoryFabric", "DitDahA1MemoryArbiter", "DitDahA1ReadQueue", "DitDahA1Fetch", "DitDahA1Lsu", "DitDahA1Translation", "DitDahA1LocalInterrupts", "DitDahA1DataCache", "DitDahA1Coherence", "DitDahA1SharedCache", "DitDahA1JtagDtm", "DitDahA1DmiBridge", "DitDahA1DebugModule"], default="DitDahA1")
     args = parser.parse_args()
     hashes = source_hashes()
     output = args.output.resolve()
@@ -34,7 +34,11 @@ def main():
     scratch = scratch if scratch.is_dir() and os.access(scratch, os.W_OK) else None
     with tempfile.TemporaryDirectory(prefix="ditdah-a1-", dir=scratch) as directory:
         work = Path(directory)
-        scope = {"DitDahA1Core": "core", "DitDahA1Backend": "backend", "DitDahA1Gpr": "gpr", "DitDahA1Frontend": "frontend", "DitDahA1MemoryFabric": "fabric", "DitDahA1ReadQueue": "fabric", "DitDahA1LocalInterrupts": "localInterrupts", "DitDahA1DataCache": "dataCache", "DitDahA1Coherence": "coherence", "DitDahA1SharedCache": "sharedCache"}.get(args.top, "system")
+        scope = {"DitDahA1Core": "core", "DitDahA1Backend": "backend", "DitDahA1Gpr": "gpr", "DitDahA1Frontend": "frontend", "DitDahA1MemoryFabric": "fabric", "DitDahA1MemoryArbiter": "fabric", "DitDahA1ReadQueue": "fabric", "DitDahA1LocalInterrupts": "localInterrupts", "DitDahA1DataCache": "dataCache", "DitDahA1Coherence": "coherence", "DitDahA1SharedCache": "sharedCache"}.get(args.top, "system")
+        if args.top in ("DitDahA1JtagDtm", "DitDahA1DmiBridge"):
+            scope = "debugTransport"
+        if args.top == "DitDahA1DebugModule":
+            scope = "debugModule"
         command = ["configure-ditdah-a1", "--output", str(work / "manifest.json")]
         if scope == "system":
             command += ["--rtl"]
@@ -47,7 +51,7 @@ def main():
         manifest["top"] = args.top
         manifest["validationScope"] = scope
         manifest["implementation"]["hartCount"] = manifest["parameters"]["hartCount"] if args.top == "DitDahA1" else int(args.top == "DitDahA1Core")
-        manifest["implementation"]["fabricRequesters"] = 2 * manifest["parameters"]["hartCount"] if args.top in ("DitDahA1", "DitDahA1MemoryFabric", "DitDahA1ReadQueue") else 0
+        manifest["implementation"]["fabricRequesters"] = 2 * manifest["parameters"]["hartCount"] if args.top in ("DitDahA1", "DitDahA1MemoryFabric", "DitDahA1MemoryArbiter", "DitDahA1ReadQueue") else 0
         if args.top not in ("DitDahA1", "DitDahA1MemoryFabric", "DitDahA1ReadQueue"):
             manifest["implementation"]["fabricReadSlots"] = 0
         manifest["implementation"]["enableBranchPrediction"] = bool(manifest["parameters"]["enableBranchPrediction"] and args.top in ("DitDahA1", "DitDahA1Core", "DitDahA1Frontend"))
@@ -70,6 +74,10 @@ def main():
         has_gpr = args.top in ("DitDahA1", "DitDahA1Core", "DitDahA1Backend", "DitDahA1Gpr")
         manifest["implementation"]["gprReadPorts"] = 2 * manifest["parameters"]["issueWidth"] if has_gpr else 0
         manifest["implementation"]["gprWritePorts"] = manifest["parameters"]["issueWidth"] if has_gpr else 0
+        if scope in ("debugTransport", "debugModule") or args.top == "DitDahA1MemoryArbiter":
+            for field in ("extensions", "instructions"):
+                manifest["implementation"][field] = []
+            manifest["implementation"]["pmpEntries"] = 0
         manifest["sourceHashes"] = hashes
         parameter = work / "parameter.json"
         parameter.write_text(json.dumps(manifest["parameters"]))

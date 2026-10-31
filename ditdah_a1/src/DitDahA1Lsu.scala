@@ -8,6 +8,7 @@ import me.jiuyang.zaozi.reftpe.*
 import me.jiuyang.zaozi.valuetpe.*
 
 class DitDahA1LsuIO(parameter: DitDahA1Parameter) extends HWBundle(parameter):
+  val debugMode = Option.when(parameter.enableDebugMemory)(Flipped(Bool()))
   val idle = Option.when(parameter.enableJtag)(Aligned(Bool()))
   val pmp = Option.when(parameter.pmpEntries != 0)(Flipped(new PmpState(parameter)))
   val clock = Flipped(Clock())
@@ -18,7 +19,7 @@ class DitDahA1LsuIO(parameter: DitDahA1Parameter) extends HWBundle(parameter):
   val storeAllowed = Flipped(Bool())
   val cancel = Option.when(parameter.loadQueueEntries == 2)(Flipped(Bool()))
   val translation = Option.when(parameter.enableTranslation)(Aligned(new TranslationPort))
-  val memory = Aligned(new MemoryPort)
+  val memory = Aligned(new MemoryPort(parameter))
 
 @generator
 object DitDahA1Lsu extends Generator[DitDahA1Parameter, DitDahA1UnitLayers, DitDahA1LsuIO, DitDahA1UnitProbe]:
@@ -58,6 +59,7 @@ object DitDahA1Lsu extends Generator[DitDahA1Parameter, DitDahA1UnitLayers, DitD
       next
     val privileged = Option.when(parameter.enableUserMode && !parameter.enableTranslation && !checkRefill)(Reg(Bool()))
     val privilege = Option.when(parameter.enableTranslation || checkRefill)(Reg(UInt(2)))
+    val debugOrigin = Option.when(parameter.enableDebugMemory)(Reg(Bool()))
     val physicalAddress = Option.when(parameter.enableTranslation)(Reg(UInt(64)))
     val refillSize = Option.when(parameter.dCacheBytes != 0)(RegInit(0.U(3)))
     val reserved = Option.when(parameter.enableA)(RegInit(false.B))
@@ -89,17 +91,23 @@ object DitDahA1Lsu extends Generator[DitDahA1Parameter, DitDahA1UnitLayers, DitD
       (demandAddress.asBits.bits(63, 6) ## 0.B(6)).asUInt,
       refillCandidate.?((demandAddress.asBits.bits(63, 3) ## 0.B(3)).asUInt, demandAddress)) else demandAddress
     val heldAddress = physicalAddress.getOrElse(current.address)
-    val permitted = if parameter.pmpEntries == 0 then true.B else
+    val checkedAddress = refilling.?((heldAddress.asBits.bits(63, 3) ## 0.B(3)).asUInt, exact.?(heldAddress, initialAddress))
+    val checkedSize = refilling.?(3.U(3), exact.?(current.memorySize, initialSize))
+    val pmpPermitted = if parameter.pmpEntries == 0 then true.B else
       val pmp = DitDahA1Pmp.instantiate(parameter)
       pmp.io.state :<= io.pmp.get
-      pmp.io.address := refilling.?((heldAddress.asBits.bits(63, 3) ## 0.B(3)).asUInt, exact.?(heldAddress, initialAddress))
-      pmp.io.size := refilling.?(3.U(3), exact.?(current.memorySize, initialSize))
+      pmp.io.address := checkedAddress
+      pmp.io.size := checkedSize
       pmp.io.write := !refilling & !exact & demandStore
       pmp.io.fetch := false.B
       pmp.io.atomic := !refilling & !exact & demandLoad & demandStore
       pmp.io.privilege := (if parameter.enableTranslation then privilege.get
         else if checkRefill then (refilling | exact).?(privilege.get, io.privilege) else io.privilege)
       pmp.io.allowed
+    val debugging = if parameter.enableTranslation then debugOrigin.getOrElse(false.B)
+      else if checkRefill then (refilling | exact).?(debugOrigin.getOrElse(false.B), io.debugMode.getOrElse(false.B))
+      else io.debugMode.getOrElse(false.B)
+    val permitted = pmpPermitted | (debugging & DitDahA1Memory.debugWindow(parameter, checkedAddress, checkedSize))
     val initialState = if checkRefill && lineRefill then
       permitted.?(1.U(stateBits), (lineCandidate & refillCandidate).?(6.U(stateBits), 7.U(stateBits)))
     else if checkRefill then refillCandidate.?(6.U(stateBits), 1.U(stateBits)) else 1.U(stateBits)
@@ -167,6 +175,7 @@ object DitDahA1Lsu extends Generator[DitDahA1Parameter, DitDahA1UnitLayers, DitD
     request.bits.cacheOperation := 0.U(2)
     request.bits.scEligible := scEligible.getOrElse(false.B)
     request.bits.refillSize := refillSize.getOrElse(0.U(3))
+    request.bits.debug.foreach(_ := debugOrigin.get)
     response.ready := state === 2.U(stateBits)
     io.translation.foreach { t =>
       t.request.valid := state === 4.U(stateBits)
@@ -195,6 +204,7 @@ object DitDahA1Lsu extends Generator[DitDahA1Parameter, DitDahA1UnitLayers, DitD
     }
     when(io.input.valid & io.input.ready) {
       privileged.foreach(_ := (io.privilege =/= 0.U(2)))
+      debugOrigin.foreach(_ := io.debugMode.get)
       privilege.foreach(_ := io.privilege)
       updated :<= io.input.bits
       refillSize.foreach(_ := (if !parameter.enableTranslation then initialGrant else 0.U(3)))

@@ -37,6 +37,7 @@ object DitDahA1Core extends Generator[DitDahA1Parameter, DitDahA1Layers, DitDahA
     frontend.io.halt := backend.io.status.sleep
     if parameter.enableJtag then frontend.io.halt := backend.io.status.sleep | (io.debug.get.haltReq & !backend.io.debug.get.mode)
     frontend.io.privilege := backend.io.privilege
+    frontend.io.debugMode.foreach(_ := backend.io.debug.get.mode)
     io.instruction :<>= frontend.io.memory
     if !parameter.enableTranslation then io.data :<>= backend.io.data
     else
@@ -53,7 +54,7 @@ object DitDahA1Core extends Generator[DitDahA1Parameter, DitDahA1Layers, DitDahA
       translation.io.ports(0) :<>= frontend.io.translation.get
       translation.io.ports(1) :<>= backend.io.translation.get
       if parameter.loadQueueEntries == 1 then
-        DitDahA1MemoryArbiter.arbitrate(Seq(backend.io.data, translation.io.memory), io.data)
+        DitDahA1MemoryArbiter.arbitrate(parameter, Seq(backend.io.data, translation.io.memory), io.data)
       else DitDahA1MemoryArbiter.dataTranslation(backend.io.data, translation.io.memory, io.data)
     io.status :<= backend.io.status
     layer("DV"):
@@ -140,6 +141,7 @@ object DitDahA1Backend extends Generator[DitDahA1Parameter, DitDahA1Layers, DitD
       !commitValid & !extraValid & !executePending.getOrElse(false.B) & lsu.io.idle.get else false.B
     io.debug.foreach(_.mode := debugging)
     execute.io.debugMode.foreach(_ := debugging)
+    lsu.io.debugMode.foreach(_ := debugging)
     if parameter.pmpEntries != 0 then
       io.pmp.get :<= csr.io.pmp.get
       lsu.io.pmp.get :<= csr.io.pmp.get
@@ -578,6 +580,7 @@ object DitDahA1Frontend extends Generator[DitDahA1Parameter, DitDahA1UnitLayers,
     fetch.io.clock := io.clock
     fetch.io.reset := io.reset
     fetch.io.privilege := io.privilege
+    fetch.io.debugMode.foreach(_ := io.debugMode.get)
     if parameter.enableTranslation then io.translation.get :<>= fetch.io.translation.get
     fetch.io.request.valid := !io.redirect & !io.halt
     fetch.io.request.bits.pc := requestPc
