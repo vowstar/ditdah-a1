@@ -476,10 +476,14 @@ def compile_tb(rtl, directory, width, pa, top='core_tb', source=None, extra_file
          *(['-DICACHE'] if parameters['iCacheBytes'] else []),
          *(['-DLOCAL_INTERRUPTS'] if local_base is not None else []),
          *(['-DSOFTWARE'] if software else []),
+         *(['-DENABLE_DEBUG', '-I' + str(Path('test').resolve())] if parameters.get('enableJtag') else []),
+         *(['-DENABLE_FLOATING'] if parameters.get('floatingPointBits') else []),
          *([f'-DMEMORY_BYTES={software["memoryBytes"]}', f'-DTIME_TICK_CYCLES={software["timeTickCycles"]}'] if software else []),
          '--Mdir', str((directory / 'obj').resolve()), *files, *extra_files, source]
     binary, stamp = (directory / 'obj' / ('V' + top)).resolve(), directory / 'compile-inputs.json'
     inputs = [*files, *extra_files, source, rtl / 'filelist.f', rtl / 'ditdah_a1_config.json', *directory.glob('*.svh')]
+    if parameters.get('enableJtag'):
+        inputs.append(Path('test/debug_driver.svh').resolve())
     hashes = {str(path): hashlib.sha256(Path(path).read_bytes()).hexdigest() for path in inputs}
     tools = {name: subprocess.check_output([name, '--version'], text=True).splitlines()[0]
              for name in ('verilator', os.environ.get('CXX', 'g++'), 'make')}

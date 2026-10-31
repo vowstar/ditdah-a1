@@ -39,6 +39,7 @@ case class DitDahA1Parameter(
   enableBranchPrediction: Boolean = false,
   branchPredictorEntries: Int = 0,
   enableTrace: Boolean = false,
+  enableJtag: Boolean = false,
   localInterruptBase: Option[BigInt] = None,
   memoryRegions: Seq[MemoryRegion] = Seq(MemoryRegion())
 ) extends Parameter:
@@ -97,6 +98,7 @@ case class DitDahA1Parameter(
     require(!enableSupervisorMode || (enableUserMode && enableInterrupts), "Supervisor mode requires user mode and interrupts")
 
   def validateRtl(): Unit =
+    require(!enableJtag, "JTAG requires the debug transport integration")
     validateCore()
     validateFabric()
     validateDataCache()

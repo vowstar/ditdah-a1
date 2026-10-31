@@ -21,6 +21,12 @@ object DitDahA1Core extends Generator[DitDahA1Parameter, DitDahA1Layers, DitDahA
     backend.io.clock := io.clock
     backend.io.reset := io.reset
     backend.io.hartId := io.hartId
+    backend.io.debug.foreach { debug =>
+      debug.haltReq := io.debug.get.haltReq
+      debug.entryPc := io.debug.get.entryPc
+      debug.exceptionPc := io.debug.get.exceptionPc
+      io.debug.get.mode := debug.mode
+    }
     if parameter.enableInterrupts then backend.io.interrupts.get :<= io.interrupts.get
     if parameter.pmpEntries != 0 then frontend.io.pmp.get :<= backend.io.pmp.get
     backend.io.instruction :<>= frontend.io.output
@@ -29,6 +35,7 @@ object DitDahA1Core extends Generator[DitDahA1Parameter, DitDahA1Layers, DitDahA
     frontend.io.redirectPc := backend.io.redirectPc
     frontend.io.prediction.foreach(_ :<= backend.io.prediction.get)
     frontend.io.halt := backend.io.status.sleep
+    if parameter.enableJtag then frontend.io.halt := backend.io.status.sleep | (io.debug.get.haltReq & !backend.io.debug.get.mode)
     frontend.io.privilege := backend.io.privilege
     io.instruction :<>= frontend.io.memory
     if !parameter.enableTranslation then io.data :<>= backend.io.data
@@ -109,7 +116,9 @@ object DitDahA1Backend extends Generator[DitDahA1Parameter, DitDahA1Layers, DitD
     val extraPending = Option.when(concurrent)(RegInit(false.B))
     val extraValid = extraCount.map(_ =/= 0.U).getOrElse(false.B)
     val executePending = Option.when(parameter.enableM || parameter.floatingPointBits != 0)(RegInit(false.B))
-    val resumePc = Option.when(parameter.enableInterrupts)(RegInit(parameter.resetVector.U(64)))
+    val resumePc = Option.when(parameter.enableInterrupts || parameter.enableJtag)(RegInit(parameter.resetVector.U(64)))
+    val debugBreakPending = Option.when(parameter.enableJtag)(RegInit(false.B))
+    val stepIssued = Option.when(parameter.enableJtag)(RegInit(false.B))
     val sleep = Option.when(parameter.enableInterrupts)(RegInit(false.B))
     val sleeping = if parameter.enableInterrupts then sleep.get else false.B
     val decode = DitDahA1Decode.instantiate(parameter)
@@ -123,6 +132,14 @@ object DitDahA1Backend extends Generator[DitDahA1Parameter, DitDahA1Layers, DitD
     val gpr = DitDahA1Gpr.instantiate(parameter)
     val csr = DitDahA1Csr.instantiate(parameter)
     val lsu = DitDahA1Lsu.instantiate(parameter)
+    val debugging = csr.io.debug.map(_.mode).getOrElse(false.B)
+    val stepping = csr.io.debug.map(_.step).getOrElse(false.B)
+    val haltReq = io.debug.map(_.haltReq).getOrElse(false.B)
+    val stopDispatch = if parameter.enableJtag then !debugging & (haltReq | debugBreakPending.get | stepIssued.get) else false.B
+    val enterDebug = if parameter.enableJtag then stopDispatch & !issuedValid & !resultValid & !memoryValid &
+      !commitValid & !extraValid & !executePending.getOrElse(false.B) & lsu.io.idle.get else false.B
+    io.debug.foreach(_.mode := debugging)
+    execute.io.debugMode.foreach(_ := debugging)
     if parameter.pmpEntries != 0 then
       io.pmp.get :<= csr.io.pmp.get
       lsu.io.pmp.get :<= csr.io.pmp.get
@@ -153,7 +170,7 @@ object DitDahA1Backend extends Generator[DitDahA1Parameter, DitDahA1Layers, DitD
     csr.io.readAddress := execute.io.csrAddress
     // Completed data operations keep ownership until their architectural event.
     val takeInterrupt = if parameter.enableInterrupts then
-      csr.io.interruptPending.get & !memoryPending &
+      csr.io.interruptPending.get & !debugging & !stepping & !stopDispatch & !memoryPending &
         (if concurrent then !extraValid & !(memoryValid & (memoryPacket.load | memoryPacket.store)) else true.B) &
         !(commitValid & (commitPacket.load | commitPacket.store | commitPacket.instruction.fault))
     else false.B
@@ -171,6 +188,19 @@ object DitDahA1Backend extends Generator[DitDahA1Parameter, DitDahA1Layers, DitD
     for lane <- 1 until width do
       retirement(lane) :<= commitPackets(lane)
       retirement(lane).rdWrite := commitPackets(lane).rdWrite & (commitPackets(lane).rd =/= 0.U(5))
+    val breakpoint = retired & retire.bits.instruction.fault & (retire.bits.instruction.cause === 3.U(64))
+    val debugBreak = parameter.enableJtag.B & breakpoint & !debugging & csr.io.debug.map(_.ebreak).getOrElse(false.B)
+    val debugReturn = parameter.enableJtag.B & retired & retire.bits.mret & !retire.bits.instruction.fault &
+      (retire.bits.instruction.instruction === 0x7b200073L.U(32))
+    csr.io.debug.foreach { debug =>
+      debug.enter := enterDebug
+      debug.pc := resumePc.get
+      debug.cause := haltReq.?(3.U(3), debugBreakPending.get.?(1.U(3), 4.U(3)))
+      debug.dret := debugReturn
+      when(debugBreak) { debugBreakPending.get := true.B }
+      when(enterDebug) { debugBreakPending.get := false.B }
+      when(debugging) { stepIssued.get := false.B }
+    }
     val floatingOperands = Option.when(parameter.floatingPointBits != 0) {
       val packet = decodedPackets(0)
       val write = retired & !retire.bits.instruction.fault & retire.bits.fpWrite.get
@@ -181,7 +211,7 @@ object DitDahA1Backend extends Generator[DitDahA1Parameter, DitDahA1Layers, DitD
         Seq((write, retire.bits.rd, retire.bits.value)))
     }
     val sequentialPc = (retire.bits.instruction.pc + retire.bits.instruction.length).asBits.bits(63, 0).asUInt
-    val enterWfi = retired & retire.bits.wfi & !retire.bits.instruction.fault
+    val enterWfi = retired & retire.bits.wfi & !retire.bits.instruction.fault & !debugging & !stepping
     val pmpUpdate = if parameter.pmpEntries == 0 then false.B else
       retire.bits.csrWrite & (((retire.bits.csrAddress >= 0x3a0.U(12)) & (retire.bits.csrAddress <= 0x3ae.U(12))) |
         ((retire.bits.csrAddress >= 0x3b0.U(12)) & (retire.bits.csrAddress <= 0x3ef.U(12))))
@@ -199,7 +229,7 @@ object DitDahA1Backend extends Generator[DitDahA1Parameter, DitDahA1Layers, DitD
       maintenance.asid := (if parameter.asidBits == 0 then 0.U(1) else retire.bits.storeData.asBits.bits(parameter.asidBits - 1, 0).asUInt)
     }
     val redirect = takeInterrupt | (retired & (retire.bits.instruction.fault | retire.bits.mret | retire.bits.sret |
-      pmpUpdate | translationUpdate | retire.bits.fenceI | (!commitResolved & (retire.bits.nextPc =/= sequentialPc)))) | enterWfi
+      pmpUpdate | translationUpdate | retire.bits.fenceI | (!commitResolved & (retire.bits.nextPc =/= sequentialPc)))) | enterWfi | enterDebug
     if parameter.iCacheBytes != 0 then io.invalidate.get := retired & (retire.bits.fenceI | pmpUpdate | translationUpdate)
     val commitReady = !commitValid | retired
     val memoryOperation = (resultPacket.load | resultPacket.store) & !resultPacket.instruction.fault
@@ -301,7 +331,8 @@ object DitDahA1Backend extends Generator[DitDahA1Parameter, DitDahA1Layers, DitD
         when(valid & (rd =/= 0.U(5)) & (address === rd)) { value := data; blocked := !ready }
       (value, blocked)
     val older = issuedValid | resultValid | memoryValid | commitValid
-    val available = (!issuedValid | executed) & !executePending.getOrElse(false.B) & !flushYounger & !sleeping
+    val available = (!issuedValid | executed) & !executePending.getOrElse(false.B) & !flushYounger & !sleeping & !stopDispatch &
+      (if parameter.enableJtag then !debugging | !older else true.B)
     val prefix = Wire(Vec(width, Bool()))
     val simple = (0 until width).map { lane =>
       import DitDahA1Isa.*
@@ -337,7 +368,7 @@ object DitDahA1Backend extends Generator[DitDahA1Parameter, DitDahA1Layers, DitD
             (packet.writesRd & (writer.rd === packet.rd)))
       }.foldLeft[Referable[Bool]](false.B)(_ | _)
       prefix(lane) := (lane.U < decodedCount) & !blocked &
-        (if lane == 0 then true.B else prefix(lane - 1) & groupedHead & simple(lane) & !conflict)
+        (if lane == 0 then true.B else prefix(lane - 1) & groupedHead & simple(lane) & !conflict & !stepping & !debugging)
       unit.io.input.valid := prefix(lane) & !flushYounger & !sleeping
       unit.io.output.ready := available
       blocked
@@ -348,7 +379,7 @@ object DitDahA1Backend extends Generator[DitDahA1Parameter, DitDahA1Layers, DitD
       .asBits.bits(countBits - 1, 0).asUInt, 0.U(countBits))
     val issued = issueCount =/= 0.U
     val decodedFree = width.U(countBits) - (decodedCount - issueCount)
-    val decodeCount = (!flushYounger & !sleeping).?((instructionCount <= decodedFree).?(instructionCount, decodedFree), 0.U(countBits))
+    val decodeCount = (!flushYounger & !sleeping & !stopDispatch).?((instructionCount <= decodedFree).?(instructionCount, decodedFree), 0.U(countBits))
       .asBits.bits(countBits - 1, 0).asUInt
     val decodedInput = Wire(Vec(width, new DecodedPacket(parameter)))
     for lane <- 0 until width do
@@ -356,15 +387,21 @@ object DitDahA1Backend extends Generator[DitDahA1Parameter, DitDahA1Layers, DitD
       decodes(lane).io.input.valid := (lane.U < instructionCount) & !flushYounger & !sleeping
       decodes(lane).io.output.ready := lane.U < decodeCount
       decodedInput(lane) :<= decodes(lane).io.output.bits
-    io.instruction.ready := !flushYounger & !sleeping & (io.instruction.bits.count <= width.U - (instructionCount - decodeCount))
+    io.instruction.ready := !flushYounger & !sleeping & !stopDispatch & (io.instruction.bits.count <= width.U - (instructionCount - decodeCount))
     val received = io.instruction.valid & io.instruction.ready
     io.redirect := flushYounger
     io.redirectPc := earlyRedirect.?(execution(0).nextPc, retire.bits.nextPc)
+    io.debug.foreach { debug =>
+      when(debugging & retired & retire.bits.instruction.fault) { io.redirectPc := breakpoint.?(debug.entryPc, debug.exceptionPc) }
+      when(enterDebug) { io.redirectPc := debug.entryPc }
+    }
     lsu.io.input.valid := resultValid & memoryOperation & !commitValid & !redirect &
       (if concurrent then ((!memoryValid & !extraValid) | append) & !memoryFault else !memoryPending & !memoryValid)
     lsu.io.input.bits :<= resultPacket
     lsu.io.storeAllowed := (if concurrent then !memoryValid | memoryPending else !memoryValid) & !commitValid & !redirect & !memoryFault
     lsu.io.output.ready := (if concurrent then memoryPending | extraPending.get else memoryValid & memoryPending & commitReady) & !redirect
+    if parameter.enableJtag then
+      when((debugging | stopDispatch) & !memoryPending & !extraPending.getOrElse(false.B) & !redirect) { lsu.io.output.ready := true.B }
     lsu.io.cancel.foreach(_ := memoryFault | redirect)
     for lane <- 0 until width do
       gpr.io.we(lane) := (lane.U < retireCount) & retirement(lane).rdWrite
@@ -373,16 +410,21 @@ object DitDahA1Backend extends Generator[DitDahA1Parameter, DitDahA1Layers, DitD
     csr.io.write := retired & retire.bits.csrWrite
     csr.io.writeAddress := retire.bits.csrAddress
     csr.io.writeData := retire.bits.csrData
-    csr.io.trap := retired & retire.bits.instruction.fault
+    csr.io.trap := retired & retire.bits.instruction.fault & !debugging & !debugBreak
     csr.io.trapPc := retire.bits.instruction.pc
     csr.io.trapCause := retire.bits.instruction.cause
     csr.io.trapValue := retire.bits.instruction.tval
-    csr.io.mret := retired & retire.bits.mret
+    csr.io.mret := retired & retire.bits.mret & !debugReturn
     csr.io.sret := retired & retire.bits.sret
+    if parameter.enableInterrupts || parameter.enableJtag then
+      for lane <- 0 until width do
+        when(retired & !debugging & (retireCount === (lane + 1).U)) { resumePc.get := debugBreak.?(retire.bits.instruction.pc, retirement(lane).nextPc) }
+      when(debugReturn) { resumePc.get := retire.bits.nextPc }
+    if parameter.enableJtag then
+      when(issued & stepping) { stepIssued.get := true.B }
     if parameter.enableInterrupts then
       sleep.get := (sleep.get | enterWfi) & !csr.io.wakeup.get & !csr.io.trap
-      for lane <- 0 until width do
-        when(retired & (retireCount === (lane + 1).U)) { resumePc.get := retirement(lane).nextPc }
+      when(enterDebug) { sleep.get := false.B }
       when(takeInterrupt) {
         resumePc.get := csr.io.trapVector
         io.redirectPc := csr.io.trapVector
@@ -455,7 +497,7 @@ object DitDahA1Backend extends Generator[DitDahA1Parameter, DitDahA1Layers, DitD
     }
     layer("DV"):
       val traceCount = Wire(UInt(countBits))
-      traceCount := takeInterrupt.?(1.U(countBits), retireCount)
+      traceCount := (debugging | debugBreak).?(0.U(countBits), takeInterrupt.?(1.U(countBits), retireCount))
       val traceValid = traceCount =/= 0.U
       val traceIssueCount = Wire(UInt(countBits))
       traceIssueCount := issueCount

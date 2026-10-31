@@ -20,6 +20,7 @@ object DitDahA1Isa:
     "addiw", "slliw", "srliw", "sraiw", "addw", "subw", "sllw", "srlw", "sraw", "bne", "blt", "bge", "bltu", "bgeu",
     "lb", "lh", "lbu", "lhu", "sb", "sh", "csrrc", "csrrwi", "csrrsi", "csrrci", "wfi") ++ (if parameter.enableA then atomicInstructions else Seq.empty) ++ (if parameter.enableM then mulDivInstructions else Seq.empty) ++ (if parameter.enableC then compressedInstructions else Seq.empty) ++ DitDahA1BitManip.encodings(parameter).map(_._1) ++ floatingInstructions(parameter.floatingPointBits) ++ (if parameter.enableC && parameter.floatingPointBits == 64 then Seq("c.fld", "c.fsd", "c.fldsp", "c.fsdsp") else Seq.empty)
   val supervisorInstructions = Seq("sret")
+  val debugInstructions = Seq("dret")
   val Illegal = 0
   val Lui = 1
   val Auipc = 2

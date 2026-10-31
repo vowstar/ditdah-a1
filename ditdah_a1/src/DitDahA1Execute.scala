@@ -74,6 +74,7 @@ object DitDahA1Alu:
     (addImm, pcImm, sequential)
 
 class DitDahA1ExecuteIO(parameter: DitDahA1Parameter) extends HWBundle(parameter):
+  val debugMode = Option.when(parameter.enableJtag)(Flipped(Bool()))
   val input = Flipped(new Decoupled(new IssuedPacket(parameter)))
   val output = Aligned(new Decoupled(new ResultPacket(parameter)))
   val fpEnabled = Option.when(parameter.floatingPointBits != 0)(Flipped(Bool()))
@@ -152,7 +153,9 @@ object DitDahA1Execute extends Generator[DitDahA1Parameter, DitDahA1UnitLayers, 
       d.floating.get & (!io.fpEnabled.get | ((op === Arithmetic.U(operationBits)) & rounded &
         (funct3 === 7.B(3)) & (io.roundingMode.get > 4.U(3))))
     when(!insn.fault) {
-      when((op === Illegal.U(operationBits)) | fpIllegal | (out.sfenceVma & !io.sfenceLegal) | ((op === Mret.U(operationBits)) & !machine) |
+      val returnLegal = if parameter.enableJtag then
+        (encoding === 0x7b200073L.B(32)).?(io.debugMode.get, machine) else machine
+      when((op === Illegal.U(operationBits)) | fpIllegal | (out.sfenceVma & !io.sfenceLegal) | ((op === Mret.U(operationBits)) & !returnLegal) |
         ((op === Wfi.U(operationBits)) & !wfiLegal) |
         ((op === Sret.U(operationBits)) & !io.sretLegal) |
         (csr & (!io.csrLegal | (out.csrWrite & (io.csrAddress.asBits.bits(11, 10) === 3.B(2)))))) {

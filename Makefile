@@ -77,7 +77,7 @@ verify-zephyr: zephyr
 verify-zephyr-long:
 	for count in 1 2 16; do $(MAKE) verify-zephyr SOFTWARE_HARTS=$$count || exit $$?; done
 
-verify-signoff: verify-writeback verify-formal
+verify-signoff: verify-debug-core verify-writeback verify-formal
 	$(MAKE) verify-scalar-isa
 	$(MAKE) verify-compressed-isa
 	$(MAKE) verify-bitmanip-isa
@@ -90,6 +90,15 @@ verify-signoff: verify-writeback verify-formal
 	$(MAKE) verify-cache-configuration
 	$(MAKE) verify-shared-cache
 	$(MAKE) verify-translation-context SOFTWARE_CONFIG=$(SHARED_OUTPUT)/software/w3-h16/input.json
+
+.PHONY: verify-debug-core
+DEBUG_OUTPUT ?= result/debug-core-signoff
+DEBUG_PROFILES ?= single wide floating supervisor
+verify-debug-core:
+	for profile in $(DEBUG_PROFILES); do \
+		python3 test/debug.py --profile $$profile --output $(DEBUG_OUTPUT)/$$profile $$(test $$profile != wide || echo --mutations) || exit $$?; \
+		python3 test/formal.py --rtl $(DEBUG_OUTPUT)/$$profile/rtl --output $(DEBUG_OUTPUT)/$$profile/formal --modules DebugCsr --jobs 2 || exit $$?; \
+	done
 
 .PHONY: verify-shared-cache
 SHARED_OUTPUT ?= result/shared-cache-signoff

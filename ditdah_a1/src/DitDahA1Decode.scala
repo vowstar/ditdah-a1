@@ -79,6 +79,8 @@ object DitDahA1Decode extends Generator[DitDahA1Parameter, DitDahA1UnitLayers, D
     when((opcode === 0x73.B(7)) & ((funct3 === 3.B(3)) | funct3.bit(2) & (funct3 =/= 4.B(3)))) { out.operation := Csr.U(operationBits) }
     when((insn === 0x00000073L.B(32)) | (insn === 0x00100073L.B(32))) { out.operation := Ecall.U(operationBits) }
     when(insn === 0x30200073L.B(32)) { out.operation := Mret.U(operationBits) }
+    if parameter.enableJtag then
+      when(insn === 0x7b200073L.B(32)) { out.operation := Mret.U(operationBits) }
     if parameter.enableSupervisorMode then
       when(insn === 0x10200073L.B(32)) { out.operation := Sret.U(operationBits) }
     when(insn === 0x10500073L.B(32)) { out.operation := Wfi.U(operationBits) }

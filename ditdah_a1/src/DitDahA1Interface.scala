@@ -189,6 +189,11 @@ class InterruptBundle extends Bundle:
   val software = Aligned(Bool())
   val timer = Aligned(Bool())
   val external = Aligned(Bool())
+class DebugHartPort extends Bundle:
+  val haltReq = Flipped(Bool())
+  val entryPc = Flipped(UInt(64))
+  val exceptionPc = Flipped(UInt(64))
+  val mode = Aligned(Bool())
 class DitDahA1IO(parameter: DitDahA1Parameter) extends HWBundle(parameter):
   val timeTick = Option.when(parameter.localInterruptBase.nonEmpty)(Flipped(Bool()))
   val interrupts = Option.when(parameter.enableInterrupts)(Flipped(Vec(parameter.hartCount, new InterruptBundle)))
@@ -217,6 +222,7 @@ class DitDahA1Probe(parameter: DitDahA1Parameter) extends DVBundle[DitDahA1Param
   val pipelineStall = ProbeRead(Bool(), dv)
 
 class DitDahA1CoreIO(parameter: DitDahA1Parameter) extends HWBundle(parameter):
+  val debug = Option.when(parameter.enableJtag)(Aligned(new DebugHartPort))
   val hartId = Flipped(UInt(4))
   val interrupts = Option.when(parameter.enableInterrupts)(Flipped(new InterruptBundle))
   val clock = Flipped(Clock())
@@ -250,6 +256,7 @@ class DitDahA1MemoryFabricIO(parameter: DitDahA1Parameter) extends HWBundle(para
   val axi = Aligned(new AxiBundle(parameter))
 
 class DitDahA1BackendIO(parameter: DitDahA1Parameter) extends HWBundle(parameter):
+  val debug = Option.when(parameter.enableJtag)(Aligned(new DebugHartPort))
   val prediction = Option.when(parameter.branchPredictorEntries != 0)(Aligned(new BranchUpdate))
   val translation = Option.when(parameter.enableTranslation)(Aligned(new TranslationPort))
   val translationState = Option.when(parameter.enableTranslation)(Aligned(new TranslationState))

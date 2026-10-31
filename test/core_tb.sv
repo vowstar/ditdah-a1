@@ -604,12 +604,13 @@ endmodule
 `ifdef ENABLE_INTERRUPTS
 module interrupt_driver(input logic clock, reset, activate, acknowledge,
   output logic [2:0] levels = 0, output integer mode, output logic [63:0] target);
-  integer mask, waited = 0;
+  integer mask, waited = 0, wait_limit;
   logic started = 0;
   initial begin
     if (!$value$plusargs("IRQ_MASK=%d", mask)) mask = 0;
     if (!$value$plusargs("IRQ_MODE=%d", mode)) mode = -1;
     if (!$value$plusargs("IRQ_TARGET=%h", target)) target = 0;
+    if (!$value$plusargs("IRQ_WAIT_LIMIT=%d", wait_limit)) wait_limit = 1000 * `HARTS;
   end
   always @(negedge clock) if (!reset) begin
     if (!started && activate && mask != 0) begin
@@ -623,7 +624,7 @@ module interrupt_driver(input logic clock, reset, activate, acknowledge,
       waited = 0;
     end
     if (levels != 0) waited = waited + 1;
-    if (waited > 1000 * `HARTS) $fatal(1, "Held interrupt was not acknowledged");
+    if (waited > wait_limit) $fatal(1, "Held interrupt was not acknowledged");
   end
 endmodule
 `endif

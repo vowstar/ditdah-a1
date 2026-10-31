@@ -12,6 +12,12 @@ object DitDahA1ParameterCheck:
   def run(): Unit =
     val baseline = DitDahA1Parameter()
     for enabled <- Seq(false, true) do
+      val selected = DitDahA1Parameter.uncached.copy(enableJtag = enabled)
+      selected.validateCore()
+      assert(DitDahA1Config.parameter(DitDahA1Config.document(selected)) == selected)
+      assert(DitDahA1Config.document(selected)("implementation")("instructions").arr.exists(_.str == "dret") == enabled)
+      if enabled then rejects { selected.validateRtl() }
+    for enabled <- Seq(false, true) do
       val selected = baseline.copy(enableM = enabled)
       assert(DitDahA1Config.parameter(DitDahA1Config.document(selected)) == selected)
       assert(DitDahA1Isa.mulDivInstructions.forall(name => DitDahA1Isa.instructions(selected).contains(name) == enabled))

@@ -2751,6 +2751,55 @@ def integer_cases(parameters):
 
 
 
+def debug_csr_case(parameters):
+    alignment = 1 if parameters.get('enableC') else 2
+    modes = [3] + ([0] if parameters.get('enableUserMode') else []) + ([1] if parameters.get('enableSupervisorMode') else [])
+    valid = lambda field: '(' + ' || '.join(f"{field}==2'd{mode}" for mode in modes) + ')'
+    body = f'''
+  reg debug_past=0;
+  always @(posedge clock) begin
+    debug_past<=1;
+    if(!debug_past) assume(reset); else assume(!reset);
+    assume(!debug_enter || !debug_mode);
+    assume(!debug_dret || debug_mode);
+    assume(!(debug_enter && debug_dret));
+    if(debug_mode) assume(!trap && !mret && !sret);
+    if(debug_enter || debug_dret) assume(!trap && !write && !mret && !sret);
+    if(debug_past && !reset) begin
+      assert(dcsr[11:9]==0);
+      assert({valid('dcsr[1:0]')} && {valid('privilege')});
+      {"assert(" + valid('status[12:11]') + ");" if parameters.get('enableUserMode') else ''}
+      if(debug_mode) assert(privilege==3 && !debug_step);
+      if(readAddress>=12'h7b0 && readAddress<=12'h7b2) assert(legal==debug_mode);
+      if(readAddress==12'h7b0) begin
+        assert(readData[63:32]==0 && readData[31:28]==4);
+        assert(readData[11:9]==0 && readData[4]);
+      end
+      if($past(!reset && debug_enter)) begin
+        assert(debug_mode);
+        assert(dpc==($past(debug_pc) & 64'h{((1<<64)-(1<<alignment)):016x}));
+        assert(dcsr[8:6]==$past(debug_cause) && dcsr[1:0]==$past(privilege));
+      end
+      if($past(!reset && debug_dret)) begin
+        assert(!debug_mode && privilege==$past(dcsr[1:0]));
+        if($past(dcsr[1:0])!=3) assert(!status[17]);
+      end
+      if($past(!reset && !debug_enter)) begin
+        assert(dcsr[8:6]==$past(dcsr[8:6]));
+        if(!$past(debug_mode && write && writeAddress==12'h7b1)) assert(dpc==$past(dpc));
+      end
+      if($past(!reset && !debug_enter && debug_mode && write && writeAddress==12'h7b1))
+        assert(dpc==($past(writeData) & 64'h{((1<<64)-(1<<alignment)):016x}));
+      cover(debug_mode && readAddress==12'h7b1 && legal && readData[40]);
+      cover(debug_dret && dcsr[1:0]=={0 if parameters.get('enableUserMode') else 3});
+      cover(!debug_mode && debug_step);
+      cover(debug_mode && write && writeAddress==12'h7b0 && writeData[8:6]!=dcsr[8:6]);
+    end
+  end
+'''
+    return ('DebugCsr', body, 'assign debug_mode =', "assign debug_mode = 1'h0 &")
+
+
 def floating_csr_case(parameters):
     supervisor = int(parameters.get('enableSupervisorMode', False))
     body = f"""
@@ -5168,6 +5217,8 @@ def verify(rtl, directory, modules=None, mutations=None, jobs=1):
         cases += [floating_csr_case(manifest['parameters']), floating_fpu_case(manifest['parameters'])]
         if 'DitDahA1Backend.sv' in sources and manifest['parameters'].get('enableM', True):
             cases.append(floating_backend_case(manifest['parameters'], sources['DitDahA1Backend.sv']))
+    if manifest['parameters'].get('enableJtag'):
+        cases.append(debug_csr_case(manifest['parameters']))
     if manifest['parameters'].get('loadQueueEntries', 1) == 2 and not enabled and manifest['parameters'].get('virtualAddressBits') == 0:
         cases.append(lsu_reads_case(manifest['parameters']))
     if 'DitDahA1ReadQueue.sv' in sources:
@@ -5205,7 +5256,7 @@ def verify(rtl, directory, modules=None, mutations=None, jobs=1):
             continue
         if modules and name not in modules and not (name.startswith('Pmp') and 'Pmp' in modules):
             continue
-        unit = name.removeprefix('Floating').removeprefix('BitManip').removeprefix('Compressed').removeprefix('Interrupt').removeprefix('Synchronization').removeprefix('Pipeline').removeprefix('Word').removeprefix('Integer').removeprefix('Wfi').removeprefix('User').removeprefix('Supervisor').removeprefix('Wide')
+        unit = name.removeprefix('Debug').removeprefix('Floating').removeprefix('BitManip').removeprefix('Compressed').removeprefix('Interrupt').removeprefix('Synchronization').removeprefix('Pipeline').removeprefix('Word').removeprefix('Integer').removeprefix('Wfi').removeprefix('User').removeprefix('Supervisor').removeprefix('Wide')
         if name in ('DataCacheWriteback', 'DataCacheAssociativity'):
             unit = 'DataCache'
         if name == 'LsuReads':
@@ -5730,6 +5781,9 @@ endmodule''', 1)
             before = re.search(r': ~\w+ \| abort \| responseFault \| bypass \| ~complete', sources[module + '.sv']).group()
             after = before.replace(' | abort', '')
         checks = [('prove', before, after), ('cover', before, after), ('mutation', before, after)]
+        if name == 'DebugCsr':
+            entry_pc = re.search(r'dpc <= \{debug_pc\[[^;]+;', sources[module + '.sv']).group()
+            checks.append(('mutation-pc', entry_pc, "dpc <= 64'h0;"))
         if name == 'FloatingBackend':
             checks[1:2] = [(f'cover-{n}', before, after) for n in range(3)]
         if unit == 'SharedCache':
@@ -7297,6 +7351,6 @@ if __name__ == '__main__':
     parser.add_argument('--output', type=Path, default=Path('result/formal'))
     parser.add_argument('--mutations', nargs='+')
     parser.add_argument('--jobs', type=int, default=1)
-    parser.add_argument('--modules', nargs='+', choices=('FloatingBackend', 'FloatingFpu', 'Fetch', 'CompressedFetch', 'WideFetch', 'Gpr', 'MulDiv', 'Backend', 'PipelineBackend', 'Pmp', 'PmpDecode', 'PmpInterval', 'PmpSubset', 'Csr', 'FloatingCsr', 'UserCsr', 'UserExecute', 'SupervisorCsr', 'SupervisorExecute', 'SupervisorFetch', 'Lsu', 'LsuReads', 'InterruptCsr', 'InterruptBackend', 'SynchronizationBackend', 'SharedCache', 'InstructionCache', 'DataCache', 'DataCacheWriteback', 'DataCacheAssociativity', 'Coherence', 'MemoryArbiter', 'ReadQueue', 'MemoryFabric', 'Memory', 'Axi', 'WordDecode', 'WordExecute', 'BitManipDecode', 'BitManipExecute', 'IntegerDecode', 'IntegerExecute', 'WfiBackend', 'WfiFrontend', 'LocalInterrupts', 'Translation'))
+    parser.add_argument('--modules', nargs='+', choices=('DebugCsr', 'FloatingBackend', 'FloatingFpu', 'Fetch', 'CompressedFetch', 'WideFetch', 'Gpr', 'MulDiv', 'Backend', 'PipelineBackend', 'Pmp', 'PmpDecode', 'PmpInterval', 'PmpSubset', 'Csr', 'FloatingCsr', 'UserCsr', 'UserExecute', 'SupervisorCsr', 'SupervisorExecute', 'SupervisorFetch', 'Lsu', 'LsuReads', 'InterruptCsr', 'InterruptBackend', 'SynchronizationBackend', 'SharedCache', 'InstructionCache', 'DataCache', 'DataCacheWriteback', 'DataCacheAssociativity', 'Coherence', 'MemoryArbiter', 'ReadQueue', 'MemoryFabric', 'Memory', 'Axi', 'WordDecode', 'WordExecute', 'BitManipDecode', 'BitManipExecute', 'IntegerDecode', 'IntegerExecute', 'WfiBackend', 'WfiFrontend', 'LocalInterrupts', 'Translation'))
     args = parser.parse_args()
     verify(args.rtl, args.output, args.modules, args.mutations, args.jobs)

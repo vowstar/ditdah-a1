@@ -36,8 +36,15 @@ module memory_tb;
   always #5 clock = ~clock;
   memory_port core_port[2](), physical_port[2]();
   logic status_trap, status_busy, status_sleep;
+`ifdef ENABLE_DEBUG
+  logic debug_halt_req, debug_mode;
+`endif
   DitDahA1Core dut(.clock(clock), .reset(reset), .hartId(4'b0), `PORT(instruction, core_port[0]),
     `PORT(data, core_port[1]),
+`ifdef ENABLE_DEBUG
+    .debug_haltReq(debug_halt_req), .debug_entryPc(base_address + 64'h1000),
+    .debug_exceptionPc(base_address + 64'h1800), .debug_mode(debug_mode),
+`endif
 `ifdef ENABLE_INTERRUPTS
     .interrupts_software(irq_levels[0]), .interrupts_timer(irq_levels[1]), .interrupts_external(irq_levels[2]),
 `endif
@@ -76,6 +83,9 @@ module memory_tb;
   logic [1:0] core_pending = 0;
   integer cycles = 0, overlap = 0, pipeline_max = 0, dependency_stalls = 0;
   integer issue_run = 0, retire_run = 0, issue_max = 0, retire_max = 0;
+`ifdef ENABLE_DEBUG
+  `include "debug_driver.svh"
+`endif
   function automatic logic [63:0] access_mask(input logic [2:0] size);
     return 64'hffffffffffffffff >> (64 - (8 << size));
   endfunction

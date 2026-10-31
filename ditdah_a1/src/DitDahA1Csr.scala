@@ -7,7 +7,17 @@ import me.jiuyang.zaozi.default.{*, given}
 import me.jiuyang.zaozi.reftpe.*
 import me.jiuyang.zaozi.valuetpe.*
 
+class DebugCsrPort extends Bundle:
+  val enter = Flipped(Bool())
+  val pc = Flipped(UInt(64))
+  val cause = Flipped(UInt(3))
+  val dret = Flipped(Bool())
+  val mode = Aligned(Bool())
+  val step = Aligned(Bool())
+  val ebreak = Aligned(Bool())
+
 class DitDahA1CsrIO(parameter: DitDahA1Parameter) extends HWBundle(parameter):
+  val debug = Option.when(parameter.enableJtag)(Aligned(new DebugCsrPort))
   val fpEnabled = Option.when(parameter.floatingPointBits != 0)(Aligned(Bool()))
   val roundingMode = Option.when(parameter.floatingPointBits != 0)(Aligned(UInt(3)))
   val fpDirty = Option.when(parameter.floatingPointBits != 0)(Flipped(Bool()))
@@ -50,6 +60,8 @@ object DitDahA1Csr extends Generator[DitDahA1Parameter, DitDahA1UnitLayers, DitD
     given ClockScope = ClockScope.posedge(io.clock)
     given ResetScope = ResetScope.syncActiveHigh(io.reset)
     val status = RegInit(0.U(64))
+    val debugMode = Option.when(parameter.enableJtag)(RegInit(false.B))
+    val debugging = debugMode.getOrElse(false.B)
     io.readData := 0.U(64)
     io.legal := false.B
     val fpStatus = Wire(UInt(64))
@@ -78,7 +90,8 @@ object DitDahA1Csr extends Generator[DitDahA1Parameter, DitDahA1UnitLayers, DitD
       io.translationState.get.mxr := status.asBits.bit(19)
     val mode = Option.when(parameter.enableSupervisorMode)(RegInit(3.U(2)))
     val user = Option.when(parameter.enableUserMode && !parameter.enableSupervisorMode)(RegInit(false.B))
-    val privilege = mode.getOrElse(user.map(_.?(0.U(2), 3.U(2))).getOrElse(3.U(2)))
+    val savedPrivilege = mode.getOrElse(user.map(_.?(0.U(2), 3.U(2))).getOrElse(3.U(2)))
+    val privilege = if parameter.enableJtag then debugging.?(3.U(2), savedPrivilege) else savedPrivilege
     io.privilege := privilege
     io.dataPrivilege := (if parameter.enableUserMode then
       ((privilege === 3.U(2)) & status.asBits.bit(17)).?(status.asBits.bits(12, 11).asUInt, privilege)
@@ -110,6 +123,43 @@ object DitDahA1Csr extends Generator[DitDahA1Parameter, DitDahA1UnitLayers, DitD
     else false.B
     io.trapVector := (if parameter.enableSupervisorMode then supervisorTrap.?(stvec.get, mtvec) else mtvec)
     io.returnPc := (if parameter.enableSupervisorMode then io.sret.?(sepc.get, mepc) else mepc)
+    if parameter.enableJtag then
+      val debug = io.debug.get
+      val dcsr = RegInit(3.U(16))
+      val dpc = RegInit(parameter.resetVector.U(64))
+      val dscratch = RegInit(0.U(64))
+      debug.mode := debugging
+      debug.step := dcsr.asBits.bit(2) & !debugging
+      debug.ebreak := (savedPrivilege === 3.U(2)).?(dcsr.asBits.bit(15),
+        (savedPrivilege === 1.U(2)).?(dcsr.asBits.bit(13), dcsr.asBits.bit(12)))
+      Seq(0x7b0 -> ((BigInt("40000010", 16).B(64) | dcsr.asBits).asUInt),
+        0x7b1 -> dpc, 0x7b2 -> dscratch).foreach { (address, value) =>
+        when(io.readAddress === address.U(12)) { io.readData := value; io.legal := debugging }
+      }
+      when(debugging & io.write) {
+        when(io.writeAddress === 0x7b0.U(12)) {
+          val prv = io.writeData.asBits.bits(1, 0)
+          val legalPrv = (prv === 3.B(2)) | (parameter.enableUserMode.B & (prv === 0.B(2))) |
+            (parameter.enableSupervisorMode.B & (prv === 1.B(2)))
+          val mask = 0x8004 | (if parameter.enableUserMode then 0x1000 else 0) | (if parameter.enableSupervisorMode then 0x2000 else 0)
+          dcsr := ((dcsr.asBits & 0x1c0.B(16)) | (io.writeData.asBits.bits(15, 0) & mask.B(16)) |
+            legalPrv.?(prv, 3.B(2))).asUInt
+        }
+        when(io.writeAddress === 0x7b1.U(12)) { dpc := (io.writeData.asBits.bits(63, alignment) ## 0.B(alignment)).asUInt }
+        when(io.writeAddress === 0x7b2.U(12)) { dscratch := io.writeData }
+      }
+      when(debug.enter) {
+        debugMode.get := true.B
+        dpc := (debug.pc.asBits.bits(63, alignment) ## 0.B(alignment)).asUInt
+        dcsr := ((dcsr.asBits & 0xfe3c.B(16)) | (debug.cause.asBits ## 0.B(6)) | savedPrivilege.asBits).asUInt
+      }
+      when(debug.dret) {
+        debugMode.get := false.B
+        io.returnPc := dpc
+        mode.foreach(_ := dcsr.asBits.bits(1, 0).asUInt)
+        user.foreach(_ := dcsr.asBits.bits(1, 0) === 0.B(2))
+        when(dcsr.asBits.bits(1, 0) =/= 3.B(2)) { status := (status.asBits & BigInt("fffffffffffdffff", 16).B(64)).asUInt }
+      }
     Seq(0x301, 0x304, 0x344, 0xf11, 0xf12, 0xf13, 0xf14, 0xf15).foreach { address =>
       when(io.readAddress === address.U(12)) { io.legal := true.B }
     }

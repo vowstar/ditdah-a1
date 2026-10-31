@@ -8,6 +8,7 @@ import me.jiuyang.zaozi.reftpe.*
 import me.jiuyang.zaozi.valuetpe.*
 
 class DitDahA1LsuIO(parameter: DitDahA1Parameter) extends HWBundle(parameter):
+  val idle = Option.when(parameter.enableJtag)(Aligned(Bool()))
   val pmp = Option.when(parameter.pmpEntries != 0)(Flipped(new PmpState(parameter)))
   val clock = Flipped(Clock())
   val reset = Flipped(Reset())
@@ -38,6 +39,7 @@ object DitDahA1Lsu extends Generator[DitDahA1Parameter, DitDahA1UnitLayers, DitD
     val tail = Option.when(concurrent)(RegInit(0.U(1)))
     val contexts = Option.when(concurrent)(Seq.fill(2)(RegInit(0.U(2))))
     val live = contexts.map(_.map(_ =/= 0.U(2)))
+    io.idle.foreach(_ := (state === 0.U(stateBits)) & !live.map(_.reduce(_ | _)).getOrElse(false.B))
     val pending = contexts.map(_.map(_ === 2.U(2)))
     val done = contexts.map(_.map(_ === 3.U(2)))
     val killed = Option.when(concurrent)(Seq.fill(2)(RegInit(false.B)))
