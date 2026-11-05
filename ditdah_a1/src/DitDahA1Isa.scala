@@ -12,13 +12,25 @@ object DitDahA1Isa:
       Seq("w", "wu", "l", "lu").flatMap(integer => Seq(s"fcvt.$integer.$format", s"fcvt.$format.$integer")) ++
       (if format == "s" then Seq("flw", "fsw", "fmv.x.w", "fmv.w.x") else Seq("fld", "fsd", "fmv.x.d", "fmv.d.x", "fcvt.s.d", "fcvt.d.s"))
   })
+  def additionalInstructions(p: DitDahA1Parameter) = Seq("pause", "ntl.p1", "ntl.pall", "ntl.s1", "ntl.all") ++
+    (if p.enableC then Seq("c.ntl.p1", "c.ntl.pall", "c.ntl.s1", "c.ntl.all") else Seq.empty) ++
+    (if p.enableZimop then (0 until 32).map(n => s"mop.r.$n") ++ (0 until 8).map(n => s"mop.rr.$n") else Seq.empty) ++
+    (if p.enableZcmop then (1 to 15 by 2).map(n => s"c.mop.$n") else Seq.empty) ++
+    (if p.enableZcb then Seq("c.lbu", "c.lh", "c.lhu", "c.sb", "c.sh", "c.zext.b", "c.not") ++
+      (if p.enableM then Seq("c.mul") else Seq.empty) ++ (if p.enableZbb then Seq("c.sext.b", "c.sext.h", "c.zext.h") else Seq.empty) ++
+      (if p.enableZba then Seq("c.zext.w") else Seq.empty) else Seq.empty) ++
+    (if p.enableZfa then (if p.floatingPointBits == 64 then Seq("s", "d") else Seq("s")).flatMap(f =>
+      Seq("fli", "fminm", "fmaxm", "fround", "froundnx", "fleq", "fltq").map(_ + "." + f)) ++
+      (if p.floatingPointBits == 64 then Seq("fcvtmod.w.d") else Seq.empty) else Seq.empty) ++
+    (if p.enableZfhmin then Seq("flh", "fsh", "fmv.x.h", "fmv.h.x", "fcvt.s.h", "fcvt.h.s") ++
+      (if p.floatingPointBits == 64 then Seq("fcvt.d.h", "fcvt.h.d") else Seq.empty) else Seq.empty)
   val atomicOperations = Seq(0, 1, 4, 8, 12, 16, 20, 24, 28)
   val atomicInstructions = for size <- Seq("w", "d"); name <- Seq("lr", "sc", "amoadd", "amoswap", "amoxor", "amoor", "amoand", "amomin", "amomax", "amominu", "amomaxu") yield s"$name.$size"
   def instructions(parameter: DitDahA1Parameter) = Seq("lui", "auipc", "addi", "add", "beq", "jal", "jalr",
     "ld", "sd", "csrrw", "csrrs", "ecall", "ebreak", "mret", "fence", "fence.i", "lw", "lwu", "sw",
     "slli", "slti", "sltiu", "xori", "srli", "srai", "ori", "andi", "sub", "sll", "slt", "sltu", "xor", "srl", "sra", "or", "and",
     "addiw", "slliw", "srliw", "sraiw", "addw", "subw", "sllw", "srlw", "sraw", "bne", "blt", "bge", "bltu", "bgeu",
-    "lb", "lh", "lbu", "lhu", "sb", "sh", "csrrc", "csrrwi", "csrrsi", "csrrci", "wfi") ++ (if parameter.enableA then atomicInstructions else Seq.empty) ++ (if parameter.enableM then mulDivInstructions else Seq.empty) ++ (if parameter.enableC then compressedInstructions else Seq.empty) ++ DitDahA1BitManip.encodings(parameter).map(_._1) ++ floatingInstructions(parameter.floatingPointBits) ++ (if parameter.enableC && parameter.floatingPointBits == 64 then Seq("c.fld", "c.fsd", "c.fldsp", "c.fsdsp") else Seq.empty)
+    "lb", "lh", "lbu", "lhu", "sb", "sh", "csrrc", "csrrwi", "csrrsi", "csrrci", "wfi") ++ (if parameter.enableA then atomicInstructions else Seq.empty) ++ (if parameter.enableM then mulDivInstructions else Seq.empty) ++ (if parameter.enableC then compressedInstructions else Seq.empty) ++ DitDahA1BitManip.encodings(parameter).map(_._1) ++ floatingInstructions(parameter.floatingPointBits) ++ additionalInstructions(parameter) ++ (if parameter.enableC && parameter.floatingPointBits == 64 then Seq("c.fld", "c.fsd", "c.fldsp", "c.fsdsp") else Seq.empty)
   val supervisorInstructions = Seq("sret")
   val debugInstructions = Seq("dret")
   val Illegal = 0

@@ -11,6 +11,7 @@ object DitDahA1ParameterCheck:
 
   def run(): Unit =
     val baseline = DitDahA1Parameter()
+    assert(DitDahA1Config.document(baseline)("implementation")("extensions").arr.exists(_.str == "Zkt"))
     val debugWindow = DitDahA1Parameter.uncached.copy(debugBase = Some(65536))
     assert(DitDahA1Config.parameter(DitDahA1Config.document(debugWindow)) == debugWindow)
     debugWindow.copy(enableJtag = true, jtagIdcode = Some(1L)).validateRtl()
@@ -28,6 +29,21 @@ object DitDahA1ParameterCheck:
       assert(DitDahA1Config.parameter(DitDahA1Config.document(selected)) == selected)
       assert(DitDahA1Config.document(selected)("implementation")("instructions").arr.exists(_.str == "dret") == enabled)
       if enabled then rejects { selected.validateRtl() }
+    val scalar = DitDahA1Parameter.uncached.copy(enableC = true, floatingPointBits = 64)
+    for (selected, name, instruction) <- Seq(
+      (scalar.copy(enableZicond = true), "Zicond", "czero.eqz"),
+      (scalar.copy(enableZimop = true), "Zimop", "mop.rr.7"),
+      (scalar.copy(enableZcb = true), "Zcb", "c.mul"),
+      (scalar.copy(enableZcmop = true), "Zcmop", "c.mop.15"),
+      (scalar.copy(enableZfa = true), "Zfa", "fcvtmod.w.d"),
+      (scalar.copy(enableZfhmin = true), "Zfhmin", "fcvt.h.d")) do
+      assert(DitDahA1Config.parameter(DitDahA1Config.document(selected)) == selected)
+      assert(DitDahA1Config.document(selected)("implementation")("extensions").arr.exists(_.str == name))
+      assert(DitDahA1Isa.instructions(selected).contains(instruction))
+    rejects { baseline.copy(enableZcb = true); () }
+    rejects { baseline.copy(enableZcmop = true); () }
+    rejects { baseline.copy(enableZfa = true); () }
+    rejects { baseline.copy(enableZfhmin = true); () }
     for enabled <- Seq(false, true) do
       val selected = baseline.copy(enableM = enabled)
       assert(DitDahA1Config.parameter(DitDahA1Config.document(selected)) == selected)

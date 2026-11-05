@@ -19,7 +19,7 @@ object DitDahA1Decode extends Generator[DitDahA1Parameter, DitDahA1UnitLayers, D
     val io = summon[Interface[DitDahA1DecodeIO]]
     val in = io.input.bits
     val out = io.output.bits
-    val insn = if parameter.enableC then (in.length === 2.U(3)).?(DitDahA1Compressed(in.instruction, parameter.floatingPointBits == 64), in.instruction.asBits) else in.instruction.asBits
+    val insn = if parameter.enableC then (in.length === 2.U(3)).?(DitDahA1Compressed(in.instruction, parameter), in.instruction.asBits) else in.instruction.asBits
     out.floating.foreach(_ := false.B)
     out.fpWrite.foreach(_ := false.B)
     out.functionCode.foreach(_ := (insn.bits(30, 30) ## insn.bits(14, 12)).asUInt)
@@ -104,15 +104,32 @@ object DitDahA1Decode extends Generator[DitDahA1Parameter, DitDahA1UnitLayers, D
         ((function === 5.B(5)) & (funct3.asUInt <= 1.U(3))) | conversion | formatConversion |
         ((function === 28.B(5)) & unary & (funct3.asUInt <= 1.U(3))) | ((function === 30.B(5)) & unary & (funct3 === 0.B(3)))
       val fused = Seq(0x43, 0x47, 0x4b, 0x4f).map(op => opcode === op.B(7)).reduce(_ | _)
-      val arithmetic = format & (((opcode === 0x53.B(7)) & supported) | (fused & rounding))
-      val memory = ((funct3 === 2.B(3)) | ((parameter.floatingPointBits == 64).B & (funct3 === 3.B(3))))
+      val halfFormat = insn.bits(26, 25) === 2.B(2)
+      val halfConversion = parameter.enableZfhmin.B & (function === 8.B(5)) & rounding &
+        ((format & (out.rs2 === 2.U(5))) | (halfFormat & ((out.rs2 === 0.U(5)) | ((parameter.floatingPointBits == 64).B & (out.rs2 === 1.U(5))))))
+      val halfMove = parameter.enableZfhmin.B & halfFormat & unary & (funct3 === 0.B(3)) &
+        ((function === 28.B(5)) | (function === 30.B(5)))
+      val additional = parameter.enableZfa.B & format & (
+        ((function === 30.B(5)) & (out.rs2 === 1.U(5)) & (funct3 === 0.B(3))) |
+        ((function === 5.B(5)) & ((funct3 === 2.B(3)) | (funct3 === 3.B(3)))) |
+        ((function === 20.B(5)) & ((funct3 === 4.B(3)) | (funct3 === 5.B(3)))) |
+        ((function === 8.B(5)) & ((out.rs2 === 4.U(5)) | (out.rs2 === 5.U(5))) & rounding) |
+        ((function === 24.B(5)) & insn.bit(25) & (out.rs2 === 8.U(5)) & (funct3 === 1.B(3))))
+      val arithmetic = (format & (((opcode === 0x53.B(7)) & supported) | (fused & rounding))) |
+        ((opcode === 0x53.B(7)) & (halfConversion | halfMove | additional))
+      val memory = ((funct3 === 2.B(3)) | ((parameter.floatingPointBits == 64).B & (funct3 === 3.B(3)))) | (parameter.enableZfhmin.B & (funct3 === 1.B(3)))
       val load = (opcode === 0x07.B(7)) & memory
       val store = (opcode === 0x27.B(7)) & memory
       out.floating.get := arithmetic | load | store
       out.fpWrite.get := !in.fault & (load | (arithmetic & (fused | !Seq(20, 24, 28).map(f => function === f.B(5)).reduce(_ | _))))
       when(arithmetic) { out.operation := Arithmetic.U(operationBits) }
-      when(load) { out.operation := (funct3 === 2.B(3)).?(Lw.U(operationBits), Ld.U(operationBits)) }
-      when(store) { out.operation := (funct3 === 2.B(3)).?(Sw.U(operationBits), Sd.U(operationBits)); out.immediate := immS }
+      when(load) { out.operation := (funct3 === 1.B(3)).?(Load.U(operationBits), (funct3 === 2.B(3)).?(Lw.U(operationBits), Ld.U(operationBits))) }
+      when(store) { out.operation := (funct3 === 1.B(3)).?(Store.U(operationBits), (funct3 === 2.B(3)).?(Sw.U(operationBits), Sd.U(operationBits))); out.immediate := immS }
+    if parameter.enableZimop then
+      when(((insn & BigInt("b3c0707f", 16).B(32)) === BigInt("81c04073", 16).B(32)) |
+        ((insn & BigInt("b200707f", 16).B(32)) === BigInt("82004073", 16).B(32))) {
+        out.operation := Addi.U(operationBits); out.rs1 := 0.U(5); out.immediate := 0.U(64)
+      }
     val operation = out.operation
     val csr = (operation === Csrrw.U(operationBits)) | (operation === Csrrs.U(operationBits)) | (operation === Csr.U(operationBits))
     val branch = (operation === Beq.U(operationBits)) | (operation === Branch.U(operationBits))
@@ -137,7 +154,7 @@ object DitDahA1Decode extends Generator[DitDahA1Parameter, DitDahA1UnitLayers, D
       when(out.floating.get) {
         val arithmetic = operation === Arithmetic.U(operationBits)
         out.usesRs2 := false.B
-        when(arithmetic) { out.usesRs1 := !in.fault & ((insn.bits(31, 27) === 26.B(5)) | (insn.bits(31, 27) === 30.B(5))) & (opcode === 0x53.B(7)) }
+        when(arithmetic) { out.usesRs1 := !in.fault & ((insn.bits(31, 27) === 26.B(5)) | ((insn.bits(31, 27) === 30.B(5)) & (insn.bits(24, 20) === 0.B(5)))) & (opcode === 0x53.B(7)) }
         out.writesRd := !in.fault & arithmetic & !out.fpWrite.get
         out.serializing := !in.fault
       }

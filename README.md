@@ -16,10 +16,10 @@ DitDah-A1 targets a 64-bit RISC-V application processor with scalar execution.
 The executable RTL supports one to sixteen RV64 harts, M or optional M/U and M/S/U modes, shared AXI4 and precise synchronous exceptions.
 `issueWidth` selects one to three lanes in a fixed eight-stage pipeline; independent integer ALUs may follow one ordinary load/store, while other resources execute alone.
 PMP is configurable to zero or sixteen entries per hart; the default uncached configuration omits it.
-Optional M uses a shared iterative multiply/divide resource; accepted operations retain their instruction owner through completion or cancellation draining.
+Optional M uses shared iterative multiplication and division with retained instruction ownership through completion or cancellation draining. Multiplication takes 64 iterations, or 32 for MULW.
 Branches recover in EX while retaining older work; `enableBranchPrediction` enables static backward-branch and direct-jump prediction.
 `branchPredictorEntries` selects 0/8/16 direct-mapped entries with two-bit direction counters and last indirect targets; nonzero requires prediction enabled. This does not implement a return stack.
-The manifest lists I/Zicsr/Zifencei and optional M/A/C, F/D and Zba/Zbb/Zbs. `floatingPointBits` selects 0/32/64; FPRs and FCSR/FS are updated at retirement, and Sv48 remains a target.
+The manifest lists I/Zicsr/Zifencei, Zihintpause/Zihintntl/Zkt and optional M/A/C, F/D, Zba/Zbb/Zbs, Zicond/Zimop/Zcb/Zcmop and Zfa/Zfhmin. `floatingPointBits` selects 0/32/64. FPRs and FCSR/FS update at retirement. Sv48 remains a target.
 Core composes Frontend and Backend; Frontend owns PC sequencing and Backend owns execution and retirement. `enableC` adds serial halfword fetch and two/four-byte packets with halfword-aligned PCs; raw encodings survive retirement and each parcel receives its own translation and permission check.
 Core exposes separate instruction/data memory ports; the physical fabric owns shared arbitration and AXI.
 Instruction permissions apply before cache lookup and to the complete refill request; region checks also protect external accesses.
@@ -72,7 +72,7 @@ An optional `localInterruptBase` maps protected software-interrupt and 64-bit ti
 All harts share the reset vector and read their index from `mhartid`; standalone Core and Backend integrations must hold `hartId` constant.
 
 `make verify-signoff` checks standalone Core and AXI integration against the same instruction model, tests interface and component-configuration contracts, lints the five production tops, and proves execution/transaction safety.
-Formal checks cover Fetch cancellation, arithmetic ownership, bounded completion and word results, and Backend ownership with an abstract resource.
+Formal checks cover Fetch cancellation, arithmetic ownership and Backend ownership with an abstract resource. Paired execution-control proofs and selected RVFI instruction models supplement numeric simulation.
 Enabled configurations additionally check PMP decisions, CSR locks, and cancellation/ownership with abstract authorization.
 Interrupt checks cover CSR eligibility, saved PC, transaction ownership, and independently modeled architectural events.
 Multicore checks use per-hart instruction models and shared memory ordered by bus service; arbiter proofs check ownership and bounded overtaking.
@@ -96,5 +96,5 @@ Reachability and mutation checks exercise properties; simulation checks general 
 - [RISC-V specifications](https://riscv.org/specifications/ratified/): instruction and privilege contracts.
 - [LLVM](https://github.com/llvm/llvm-project), [CIRCT](https://github.com/llvm/circt) and [YosysHQ](https://github.com/YosysHQ): compiler and verification tools.
 - [Berkeley HardFloat](https://www.jhauser.us/arithmetic/HardFloat.html): IEEE 754 arithmetic.
-- [RISC-V architectural tests](https://github.com/riscv-non-isa/riscv-arch-test) and [Sail](https://github.com/riscv/sail-riscv): executable architectural checks.
+- [RISC-V architectural tests](https://github.com/riscv-non-isa/riscv-arch-test), [Sail](https://github.com/riscv/sail-riscv) and [RVFI instruction models](https://github.com/YosysHQ/riscv-formal): executable architectural checks.
 - [Zephyr](https://github.com/zephyrproject-rtos/zephyr): multicore software tests.

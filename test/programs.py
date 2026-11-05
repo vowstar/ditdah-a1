@@ -3,6 +3,7 @@
 """Generate instruction streams and memory images at test runtime."""
 
 import random
+from copy import deepcopy
 
 
 def addi(rd, rs, imm):
@@ -205,7 +206,7 @@ def load_window_program(base, harts=1, cancel=False):
     return p.finish()
 
 
-def cases(base, protection=False, interrupts=False, user=False, local_interrupt_base=None, supervisor=False, sv39=False, writeback=False, compressed=False, floating_point_bits=None):
+def cases(base, protection=False, interrupts=False, user=False, local_interrupt_base=None, supervisor=False, sv39=False, writeback=False, compressed=False, floating_point_bits=None, scalar=None):
     if not sv39:
         yield 'load_window', load_window_program(base)
         yield 'load_cancel', load_window_program(base, cancel=True)
@@ -411,26 +412,38 @@ def cases(base, protection=False, interrupts=False, user=False, local_interrupt_
     if floating_point_bits is not None:
         yield from floating_cases(base, floating_point_bits)
         yield from floating_state_cases(base, floating_point_bits)
+        yield from floating_extension_cases(base, floating_point_bits, scalar or {})
         if sv39 and floating_point_bits:
-            for name, p in sv39_cases(base, protection, writeback):
-                if name not in ('sv39_data', 'sv39_protection', 'sv39_sum', 'sv39_mxr'):
-                    continue
-                for byte in range(8):
-                    p.memory[base + 0x610 + byte] = p.memory.get(base + 0x610 + byte, 0) | ((0x2000 >> (byte*8)) & 255)
-                for pc in range(base, p.stop, 4):
-                    word = sum(p.memory.get(pc+i, 0) << (8*i) for i in range(4))
-                    if (word >> 15) & 31 == 11 and word & 127 in (3, 0x23):
-                        word = (word | 4) & ~(7 << 12) | ((2 if floating_point_bits == 32 else 3) << 12)
-                        p.memory.update((pc+i, (word >> (8*i)) & 255) for i in range(4))
-                p.floating_memory = (1, 2) if name == 'sv39_protection' else (1, 1) if name == 'sv39_mxr' else (2, 0)
-                yield 'floating_' + name, p
+            widths = (16, floating_point_bits) if (scalar or {}).get('enableZfhmin') else (floating_point_bits,)
+            for width in widths:
+                for name, p in sv39_cases(base, protection, writeback):
+                    if name not in ('sv39_data', 'sv39_protection', 'sv39_sum', 'sv39_mxr'):
+                        continue
+                    for byte in range(8):
+                        p.memory[base + 0x610 + byte] = p.memory.get(base + 0x610 + byte, 0) | ((0x2000 >> (byte*8)) & 255)
+                    for pc in range(base, p.stop, 4):
+                        word = sum(p.memory.get(pc+i, 0) << (8*i) for i in range(4))
+                        if (word >> 15) & 31 == 11 and word & 127 in (3, 0x23):
+                            word = (word | 4) & ~(7 << 12) | ({16: 1, 32: 2, 64: 3}[width] << 12)
+                            p.memory.update((pc+i, (word >> (8*i)) & 255) for i in range(4))
+                    p.floating_memory = (1, 2) if name == 'sv39_protection' else (1, 1) if name == 'sv39_mxr' else (2, 0)
+                    if width == 16:
+                        pc = p.stop - 4
+                        p.memory.update((pc + byte, (0xe4000053 | (3 << 15) | (7 << 7)) >> (8 * byte) & 255) for byte in range(4))
+                        p.offset = p.stop - base
+                        p.emit(csr(0, 0x300, 0), jal(0, 0))
+                        p.stop += 4
+                        p.expected_registers = {7: 0x5678}
+                    yield ('floating_half_' if width == 16 else 'floating_') + name, p
     if compressed:
-        yield from compressed_cases(base, protection, sv39)
+        yield from compressed_cases(base, protection, sv39, scalar or {})
 
     yield from synchronization_cases(base, writeback)
     yield 'data_cache', data_cache_program(base)
     yield from data_cache_access_cases(base, protection)
     yield from atomic_cases(base, protection)
+    if scalar is not None:
+        yield from scalar_cases(base, scalar)
     if protection:
         yield from pmp_cases(base, writeback)
     if interrupts:
@@ -725,7 +738,7 @@ def user_cases(base, protection=False, interrupts=False, local_interrupt_base=No
         yield 'user_mprv', p.finish()
 
 
-def compressed_cases(base, protection=False, sv39=False):
+def compressed_cases(base, protection=False, sv39=False, config=None):
     p = Program(base)
     p.address(2, 0x1800)
     p.half(0x4485, 0x0495, 0x8526, 0x9526, 0x157d, 0x0505)
@@ -804,12 +817,18 @@ def compressed_cases(base, protection=False, sv39=False):
                                     21: 0 if kind=='success' else virtual+0x1000, 25: virtual+(0x1004 if kind=='success' else 0xffe), 23: 1}
             p.required_fetch = (virtual+0xffc, 0x4485)
             yield 'compressed_page_' + kind, p
+            if (config or {}).get('enableZcb'):
+                q = deepcopy(p)
+                q.memory.update((base + 0x4ffc + byte, (0x9d61 >> (8 * byte)) & 255) for byte in range(2))
+                q.required_fetch = (virtual + 0xffc, 0x9d61)
+                q.expected_registers.update({9: 0, 10: 8 if kind == 'success' else 0})
+                yield 'zcb_page_' + kind, q
 
 
 
 
 def floating_cases(base, flen):
-    from floating import FLOATING_ENCODINGS
+    from floating import FLOATING_ENCODINGS, FLOATING_FEATURES
     for width in ((32,) if flen == 32 else (32, 64)):
         for seed in (range(3) if not flen else (-1,)):
             p = Program(base)
@@ -829,7 +848,7 @@ def floating_cases(base, flen):
                     p.emit((offset << 20) | (10 << 15) | (size << 12) | (source << 7) | 7)
                 p.emit(ld(1, 10, index * 32))
                 for name, (encoding, mask, rounding, fp_write, integer_source, minimum) in FLOATING_ENCODINGS.items():
-                    if minimum > (flen or 64) or encoding & 127 in (7, 0x27) or ((encoding >> 25) & 1) != int(width == 64):
+                    if name in FLOATING_FEATURES or minimum > (flen or 64) or encoding & 127 in (7, 0x27) or ((encoding >> 25) & 1) != int(width == 64):
                         continue
                     word = encoding | (1 << 15) | ((2 << 20) & ~mask) | ((3 << 27) & ~mask) | ((0 if fp_write else 6) << 7)
                     p.emit(word, csr(8, 3, 0, True))
@@ -881,6 +900,137 @@ def floating_state_cases(base, flen):
            0x04000053, 0x00005053, 0x00006053)
     p.expected_registers = {23: 6}
     yield 'floating_state', p.finish()
+
+
+def floating_extension_cases(base, flen, config):
+    from floating import FLOATING_ENCODINGS, FLOATING_FEATURES
+    for extension in ('Zfa', 'Zfhmin'):
+        names = [name for name, feature in FLOATING_FEATURES.items() if feature == extension and FLOATING_ENCODINGS[name][5] <= (flen or 32)]
+        if not flen or not config.get('enable' + extension):
+            p = Program(base)
+            p.emit(0x000020b7, csr(0, 0x300, 1, True))
+            raw = FLOATING_ENCODINGS[names[0]][0]
+            p.required_traps = [(base + p.offset, raw)]
+            p.emit(raw)
+            p.expected_registers = {20: 2, 21: raw, 23: 1}
+            yield 'floating_disabled_' + extension.lower(), p.finish()
+            continue
+        for fmt in (0, 1, 2):
+            selected = [name for name in names if (FLOATING_ENCODINGS[name][0] >> 25) & 3 == fmt and FLOATING_ENCODINGS[name][0] & 127 == 0x53]
+            if not selected:
+                continue
+            p = Program(base)
+            p.emit(0x000020b7, csr(0, 0x300, 1, True), csr(0, 2, 3, function=5))
+            p.address(10, 0x3000); p.address(11, 0x2800)
+            offset = 0
+            for name in selected:
+                encoding, mask, rounding, fp_write, integer_source, _ = FLOATING_ENCODINGS[name]
+                source_fmt = (encoding >> 20) & 31 if name.startswith('fcvt.') else fmt
+                source_width = {0: 32, 1: 64, 2: 16}[source_fmt]
+                values = {16: (0x3e00, 0x7c01, 0x8000), 32: (0x3fc00000, 0x7f800001, 0x80000000), 64: (0x3ff8000000000000, 0x7ff0000000000001, 0x8000000000000000)}[source_width]
+                for index in (range(32) if name.startswith('fli.') else range(3)):
+                    if not name.startswith('fli.'):
+                        raw = values[index] | (((1 << flen) - (1 << source_width)) if source_width < flen else 0)
+                        for byte in range(8):
+                            p.memory[base + 0x3000 + offset + byte] = (raw >> (8 * byte)) & 255
+                        p.emit(ld(1, 10, offset) if integer_source else load(1, 10, offset, 2 if flen == 32 else 3) | 4,
+                               load(2, 10, offset, 2 if flen == 32 else 3) | 4)
+                        offset += 8
+                    word = encoding | (5 << 7) | ((index if name.startswith('fli.') else 1) << 15) | ((2 << 20) & ~mask)
+                    word |= (0, 1, 7)[index % 3] << 12 if rounding else 0
+                    p.emit(csr(0, 1, 0, function=5), word, csr(6, 3, 0, True))
+                    if fp_write:
+                        p.emit(store(5, 11, 0, 2 if flen == 32 else 3) | 4, load(7, 11, 0, 2 if flen == 32 else 3, flen == 32))
+            assert p.offset < 0x800
+            yield f'floating_{extension.lower()}_{fmt}', p.finish()
+    if config.get('enableZfhmin'):
+        p = Program(base)
+        p.emit(0x000020b7, csr(0, 0x300, 1, True))
+        p.address(10, 0x3000); p.address(11, 0x2800)
+        p.memory.update((base + 0x2802 + byte, 0x5a) for byte in range(6))
+        for index, value in enumerate((0x7d01, 0x8000, 0x0001, 0x3c00)):
+            p.memory.update((base + 0x3000 + 2 * index + byte, (value >> (8 * byte)) & 255) for byte in range(2))
+            p.emit(load(1, 10, 2 * index, 1) | 4, store(1, 11, 0, 1) | 4,
+                   ld(7, 11), 0xe4008453, csr(6, 3, 0, True))
+            p.emit(0x40208153 | (int(flen == 64) << 25), 0xe00104d3 | (int(flen == 64) << 25))
+        p.expected_registers = {6: 16, 7: 0x5a5a5a5a5a5a3c00, 8: 0x3c00, 9: 0x3f800000 if flen == 32 else 0x3ff0000000000000}
+        yield 'floating_half_memory', p.finish()
+        for fault in ('read', 'write'):
+            p = Program(base)
+            p.emit(0x000020b7, csr(0, 0x300, 1, True))
+            p.address(10, 0x3000)
+            p.memory.update({base + 0x3000: 1, base + 0x3001: 0x7d})
+            p.emit(load(0, 10, 0, 1) | 4, 0x00004fb7, csr(0, 0x300, 31),
+                   (load(0, 10, 256, 1) if fault == 'read' else store(0, 10, 256, 1)) | 4,
+                   0xe40003d3, csr(8, 0x300, 0, True))
+            p.faults[fault] = base + 0x3100
+            p.expected_registers = {7: 0x7d01, 23: 1}
+            yield 'floating_half_' + fault + '_fault', p.finish()
+        p = Program(base)
+        p.emit(0x000020b7, csr(0, 0x300, 1, True))
+        p.address(10, 0x3000)
+        p.memory.update({base + 0x3000: 0, base + 0x3001: 0x3c})
+        p.emit(load(1, 10, 0, 1) | 4, 0x00008137, addi(2, 2, -767),
+               0x3f800a37, 0xf00a0053, 0xf00a0153, 0x182001d3)
+        wrong = 0xf40100d3
+        p.cancelled_value = (base + p.offset + 4, wrong, base + p.offset + 8)
+        p.emit(jal(0, 8), wrong, 0xe40083d3, csr(8, 3, 0, True))
+        p.expected_registers = {7: 0x3c00, 8: 0, 23: 0}
+        yield 'floating_half_cancel', p.finish()
+
+
+def scalar_cases(base, config):
+    from model import SCALAR_ENCODINGS
+    for extension in ('Zicond', 'Zimop', 'Zcb', 'Zcmop', 'Zihintpause', 'Zihintntl'):
+        if extension not in ('Zihintpause', 'Zihintntl') and not config.get('enable' + extension):
+            raw = next(encoding for owner, encoding, _ in SCALAR_ENCODINGS.values() if owner == extension)
+            p = Program(base)
+            p.required_traps = [(base + p.offset, raw)]
+            p.emit(raw)
+            p.expected_registers = {20: 2, 21: raw, 23: 1}
+            yield 'scalar_' + extension.lower() + '_disabled', p.finish()
+            continue
+        p = Program(base)
+        p.address(8, 0x2800)
+        p.emit(addi(9, 0, -128), sd(9, 8))
+        for name, (owner, encoding, mask) in SCALAR_ENCODINGS.items():
+            if owner != extension or name.startswith('c.') and not config.get('enableC'):
+                continue
+            dependency = 'M' if name == 'c.mul' else 'Zba' if name == 'c.zext.w' else 'Zbb' if name in ('c.sext.b', 'c.sext.h', 'c.zext.h') else None
+            if dependency and not config.get('enable' + dependency, dependency == 'M'):
+                continue
+            if extension == 'Zicond':
+                for condition in (0, 1, -1):
+                    p.emit(addi(3, 0, -17), addi(4, 0, condition), encoding | (3 << 15) | (4 << 20) | (6 << 7), add(7, 6, 6))
+            elif extension == 'Zimop':
+                p.emit(addi(6, 0, 17), encoding | (3 << 15) | ((4 << 20) & ~mask) | (6 << 7), addi(7, 6, 1))
+            elif extension == 'Zcb':
+                if name in ('c.lbu', 'c.lhu', 'c.lh', 'c.sb', 'c.sh'):
+                    p.half(encoding | (1 << 2))
+                else:
+                    p.emit(addi(8, 0, -128), addi(9, 0, 7))
+                    p.half(encoding | ((1 << 2) if name == 'c.mul' else 0))
+            elif extension == 'Zcmop':
+                register = (encoding >> 7) & 31
+                p.emit(addi(register, 0, 17))
+                p.half(encoding)
+            elif name.startswith('c.'):
+                p.half(encoding)
+            else:
+                p.emit(encoding)
+        yield 'scalar_' + extension.lower(), p.finish()
+        if extension == 'Zcb':
+            for dependency, names in (('M', ('c.mul',)), ('Zba', ('c.zext.w',)), ('Zbb', ('c.sext.b', 'c.sext.h', 'c.zext.h'))):
+                if config.get('enable' + dependency, dependency == 'M'):
+                    continue
+                p = Program(base)
+                p.required_traps = []
+                for name in names:
+                    raw = SCALAR_ENCODINGS[name][1]
+                    p.required_traps.append((base + p.offset, raw))
+                    p.half(raw, 1)
+                p.expected_registers = {20: 2, 21: raw, 23: len(names)}
+                yield 'scalar_zcb_requires_' + dependency.lower(), p.finish()
 
 
 def bitmanip_cases(base):

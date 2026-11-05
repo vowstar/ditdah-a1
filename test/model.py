@@ -12,14 +12,56 @@ def signed(value, bits):
     return (value & ((1 << (bits - 1)) - 1)) - (value & (1 << (bits - 1)))
 
 
-def compressed_instruction(c, double_precision=False):
-    from programs import add, addi, alu, beq, jal, jalr, ld, lw, sd, store, sw
+SCALAR_ENCODINGS = {
+    'czero.eqz': ('Zicond', 0x0e005033, 0xfe00707f),
+    'czero.nez': ('Zicond', 0x0e007033, 0xfe00707f),
+    'pause': ('Zihintpause', 0x0100000f, 0xffffffff),
+    **{f'mop.r.{n}': ('Zimop', 0x81c04073 | ((n & 3) << 20) | ((n & 12) << 24) | ((n & 16) << 26), 0xfff0707f) for n in range(32)},
+    **{f'mop.rr.{n}': ('Zimop', 0x82004073 | ((n & 3) << 26) | ((n & 4) << 28), 0xfe00707f) for n in range(8)},
+    **{f'ntl.{name}': ('Zihintntl', (n << 20) | 0x33, 0xffffffff) for n, name in enumerate(('p1', 'pall', 's1', 'all'), 2)},
+    **{f'c.ntl.{name}': ('Zihintntl', 0x9002 | (n << 2), 0xffff) for n, name in enumerate(('p1', 'pall', 's1', 'all'), 2)},
+    **{f'c.mop.{n}': ('Zcmop', 0x6001 | (n << 7), 0xffff) for n in range(1, 16, 2)},
+    **{name: ('Zcb', value, mask) for name, value, mask in (
+        ('c.lbu', 0x8000, 0xfc03), ('c.lhu', 0x8400, 0xfc43), ('c.lh', 0x8440, 0xfc43),
+        ('c.sb', 0x8800, 0xfc03), ('c.sh', 0x8c00, 0xfc43), ('c.mul', 0x9c41, 0xfc63),
+        ('c.zext.b', 0x9c61, 0xfc7f), ('c.sext.b', 0x9c65, 0xfc7f), ('c.zext.h', 0x9c69, 0xfc7f),
+        ('c.sext.h', 0x9c6d, 0xfc7f), ('c.zext.w', 0x9c71, 0xfc7f), ('c.not', 0x9c75, 0xfc7f))}
+}
+
+
+def is_mop(instruction):
+    return instruction & 0xb3c0707f == 0x81c04073 or instruction & 0xb200707f == 0x82004073
+
+
+def compressed_instruction(c, double_precision=False, config=None):
+    from programs import add, addi, alu, beq, jal, jalr, ld, load, lw, mul, sd, store, sw
+    config = config or {}
     quadrant, function = c & 3, c >> 13
     rd, rs2, a, b = (c >> 7) & 31, (c >> 2) & 31, 8 + ((c >> 7) & 7), 8 + ((c >> 2) & 7)
     bit = lambda n: (c >> n) & 1
     field = lambda low, width: (c >> low) & ((1 << width) - 1)
     immediate = signed((bit(12) << 5) | rs2, 6)
     shift = (bit(12) << 5) | rs2
+    if config.get('enableZcmop') and c & 0xf8ff == 0x6081:
+        return addi(0, 0, 0)
+    if config.get('enableZcb'):
+        if c & 0xfc03 == 0x8000:
+            return load(b, a, (bit(5) << 1) | bit(6), 0, True)
+        if c & 0xfc03 == 0x8400:
+            return load(b, a, bit(5) << 1, 1, not bit(6))
+        if c & 0xfc03 == 0x8800:
+            return store(b, a, (bit(5) << 1) | bit(6), 0)
+        if c & 0xfc43 == 0x8c00:
+            return store(b, a, bit(5) << 1, 1)
+        if c & 0xfc63 == 0x9c41:
+            return mul(a, a, b) if config.get('enableM', True) else 0
+        unary = c & 0xfc7f
+        if unary in (0x9c61, 0x9c75):
+            return alu(a, a, 255 if unary == 0x9c61 else -1, 7 if unary == 0x9c61 else 4, immediate=True)
+        if unary in (0x9c65, 0x9c69, 0x9c6d) and config.get('enableZbb'):
+            return {0x9c65: 0x60401013, 0x9c69: 0x0800403b, 0x9c6d: 0x60501013}[unary] | (a << 15) | (a << 7)
+        if unary == 0x9c71 and config.get('enableZba'):
+            return 0x0800003b | (a << 15) | (a << 7)
     if double_precision and quadrant in (0, 2) and function in (1, 5):
         if quadrant == 0:
             offset = (field(5, 2) << 6) | (field(10, 3) << 3)
@@ -191,6 +233,11 @@ def bitmanip_value(insn, a, b, config):
 
 
 def integer_value(insn, a, b, config=None):
+    config = config or {}
+    if insn & 0xfe00707f in (0x0e005033, 0x0e007033):
+        if not config.get('enableZicond'):
+            raise Fault(2, insn)
+        return (0 if (b == 0) == ((insn >> 12) & 7 == 5) else a) & MASK
     bitmanip = bitmanip_value(insn, a, b, config or {})
     if bitmanip is not None:
         return bitmanip
@@ -573,7 +620,7 @@ class Model:
                 first = self.access(pc, 2, 'fetch')
                 length = 4 if first & 3 == 3 else 2
                 raw = first | (self.access((pc + 2) & MASK, 2, 'fetch') << 16) if length == 4 else first
-                insn = compressed_instruction(raw, self.config.get("floatingPointBits") == 64) if length == 2 else raw
+                insn = compressed_instruction(raw, self.config.get("floatingPointBits") == 64, self.config) if length == 2 else raw
             else:
                 raw = insn = self.access(pc, 4, 'fetch')
             next_pc = (pc + length) & MASK
@@ -590,7 +637,7 @@ class Model:
                     raise Fault(2, insn)
                 value, write = integer_value(insn, a, b, self.config), True
             elif opcode in (7, 0x27, 0x43, 0x47, 0x4b, 0x4f, 0x53):
-                decoded = floating_decode(insn, self.config.get('floatingPointBits', 0))
+                decoded = floating_decode(insn, self.config.get('floatingPointBits', 0), self.config)
                 if decoded is None or not self.fp_state:
                     raise Fault(2, insn)
                 fp_write, integer_source = decoded[3:5]
@@ -598,8 +645,9 @@ class Model:
                     displacement = immediate if opcode == 7 else signed(((insn >> 25) << 5) | ((insn >> 7) & 31), 12)
                     if opcode == 7:
                         fp_value = self.access((a + displacement) & MASK, 1 << funct3, 'read')
-                        if funct3 == 2 and self.config['floatingPointBits'] == 64:
-                            fp_value |= 0xffffffff00000000
+                        width = 8 << funct3
+                        if width < self.config['floatingPointBits']:
+                            fp_value |= (1 << self.config['floatingPointBits']) - (1 << width)
                     else:
                         self.access((a + displacement) & MASK, 1 << funct3, 'write', self.fp_registers[rs2])
                 else:
@@ -647,6 +695,10 @@ class Model:
                 if (self.config.get('enableSupervisorMode') and self.privilege == 0 or
                         self.privilege < 3 and self.csrs[0x300] & (1 << 21)):
                     raise Fault(2, insn)
+            elif is_mop(insn):
+                if not self.config.get('enableZimop'):
+                    raise Fault(2, insn)
+                value, write = 0, True
             elif opcode == 0x73 and funct3 in (1, 2, 3, 5, 6, 7):
                 address = insn >> 20
                 update = funct3 & 3 == 1 or rs1 != 0

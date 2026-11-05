@@ -644,7 +644,7 @@ object DitDahA1Frontend extends Generator[DitDahA1Parameter, DitDahA1UnitLayers,
     predicted := false.B
     if parameter.enableBranchPrediction then
       for i <- (0 until words).reverse do
-        val insn = if parameter.enableC then (incoming(i).length === 2.U(3)).?(DitDahA1Compressed(incoming(i).instruction), incoming(i).instruction.asBits) else incoming(i).instruction.asBits
+        val insn = if parameter.enableC then (incoming(i).length === 2.U(3)).?(DitDahA1Compressed(incoming(i).instruction, parameter), incoming(i).instruction.asBits) else incoming(i).instruction.asBits
         val jump = insn.bits(6, 0) === 0x6f.B(7)
         val branch = (insn.bits(6, 0) === 0x63.B(7)) &
           ((insn.bits(14, 12) === 0.B(3)) | (insn.bits(14, 12) === 1.B(3)) | insn.bit(14))

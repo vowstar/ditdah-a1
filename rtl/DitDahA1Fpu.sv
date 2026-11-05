@@ -1,6 +1,6 @@
 // SPDX-FileCopyrightText: 2026 Huang Rui <vowstar@gmail.com>
 // SPDX-License-Identifier: MIT
-module DitDahA1FloatFormat #(parameter W=32, FLEN=64)(
+module DitDahA1FloatFormat #(parameter W=32, FLEN=64, ZFA=0, ZFHMIN=0)(
   input clock, reset, divideValid,
   input [31:0] instruction,
   input [63:0] a,b,c,
@@ -16,6 +16,9 @@ module DitDahA1FloatFormat #(parameter W=32, FLEN=64)(
   wire [W-1:0] bv=W==32 && FLEN==64 && b[63:32]!=32'hffffffff ? NAN : b[W-1:0];
   wire [W-1:0] cv=W==32 && FLEN==64 && c[63:32]!=32'hffffffff ? NAN : c[W-1:0];
   wire [4:0] operation=instruction[31:27];
+  wire roundInteger=ZFA && operation==8 && instruction[24:21]==2 && !instruction[26];
+  wire modularInteger=ZFA && W==64 && operation==24 && instruction[24:20]==8;
+  wire [2:0] integerRounding=modularInteger?3'd1:roundingMode;
   wire fused=instruction[6:0]!=7'h53;
   wire add=operation<=1 && !fused, multiply=operation==2 && !fused;
   wire [W-1:0] ma=av, mb=add?ONE:bv;
@@ -36,10 +39,10 @@ module DitDahA1FloatFormat #(parameter W=32, FLEN=64)(
   wire [31:0] wordInteger;
   wire [63:0] longInteger;
   wire [2:0] wordFlags,longFlags;
-  recFNToIN #(E,S,32) toWord(1'b1,ar,roundingMode,!instruction[20],wordInteger,wordFlags);
-  recFNToIN #(E,S,64) toLong(1'b1,ar,roundingMode,!instruction[20],longInteger,longFlags);
+  recFNToIN #(E,S,32) toWord(1'b1,ar,integerRounding,!instruction[20],wordInteger,wordFlags);
+  recFNToIN #(E,S,64) toLong(1'b1,ar,roundingMode,roundInteger||!instruction[20],longInteger,longFlags);
   wire less,equal,greater,unordered;
-  compareRecFN #(E,S) compare(ar,br,operation==20 && instruction[14:12]!=2,less,equal,greater,unordered,compareFlags);
+  compareRecFN #(E,S) compare(ar,br,operation==20 && instruction[14:12]!=2 && !(ZFA && instruction[14]),less,equal,greater,unordered,compareFlags);
   wire [W-1:0] convertedRaw;
   wire [4:0] conversionFlags;
   generate if(FLEN==64) begin
@@ -54,6 +57,55 @@ module DitDahA1FloatFormat #(parameter W=32, FLEN=64)(
     assign convertedRaw=0;
     assign conversionFlags=0;
   end endgenerate
+  wire [W-1:0] roundedRaw,halfWidened;
+  wire [15:0] halfNarrowed;
+  wire [4:0] halfWidenFlags,halfNarrowFlags;
+  generate if(ZFA) begin
+    wire [W:0] roundedRecoded;
+    iNToRecFN #(64,E,S) roundedInteger(1'b1,1'b1,longInteger,roundingMode,roundedRecoded,);
+    recFNToFN #(E,S) decodeRounded(roundedRecoded,roundedRaw);
+  end else assign roundedRaw=0;
+  if(ZFHMIN) begin
+    wire [15:0] halfOperand=(FLEN==64 ? a[63:16]!=48'hffffffffffff : a[31:16]!=16'hffff)?16'h7e00:a[15:0];
+    wire [16:0] halfRecoded,narrowRecoded;
+    wire [W:0] wideRecoded;
+    fNToRecFN #(5,11) encodeHalf(halfOperand,halfRecoded);
+    recFNToRecFN #(5,11,E,S) widenHalf(1'b1,halfRecoded,roundingMode,wideRecoded,halfWidenFlags);
+    recFNToFN #(E,S) decodeWidened(wideRecoded,halfWidened);
+    recFNToRecFN #(E,S,5,11) narrowHalf(1'b1,ar,roundingMode,narrowRecoded,halfNarrowFlags);
+    recFNToFN #(5,11) decodeNarrowed(narrowRecoded,halfNarrowed);
+  end else begin
+    assign halfWidened=0; assign halfNarrowed=0; assign halfWidenFlags=0; assign halfNarrowFlags=0;
+  end endgenerate
+  function automatic [W-1:0] immediateValue(input [4:0] index);
+    integer exponent;
+    reg [1:0] fraction;
+    begin
+      exponent=(1<<(E-1))-1; fraction=0;
+      case(index)
+        1: exponent=1;
+        2: exponent=exponent-16; 3: exponent=exponent-15;
+        4: exponent=exponent-8; 5: exponent=exponent-7;
+        6: exponent=exponent-4; 7: exponent=exponent-3;
+        8,9,10,11,12,13,14,15,16,17,18,19,20,21,22: begin exponent=exponent-2+(({27'b0,index}-8)>>2); fraction=index[1:0]; end
+        23: exponent=exponent+2; 24: exponent=exponent+3; 25: exponent=exponent+4;
+        26: exponent=exponent+7; 27: exponent=exponent+8;
+        28: exponent=exponent+15; 29: exponent=exponent+16;
+        30,31: begin exponent=(1<<E)-1; fraction=index==31?2:0; end
+      endcase
+      immediateValue=0;
+      immediateValue[W-1]=index==0;
+      immediateValue[W-2:S-1]=exponent[E-1:0];
+      immediateValue[S-2 -: 2]=fraction;
+    end
+  endfunction
+  localparam BIAS=(1<<(E-1))-1;
+  wire integralMagnitude=av[W-2:S-1]>=BIAS+S-1;
+  wire signed [E:0] exponent=$signed({1'b0,av[W-2:S-1]})-BIAS;
+  wire [63:0] significand={{(64-S){1'b0}},1'b1,av[S-2:0]};
+  wire [63:0] modularMagnitude=exponent<0 || exponent>=S-1+32 ? 0 :
+    exponent>=S-1 ? significand<<(exponent-(S-1)) : significand>>((S-1)-exponent);
+  wire [31:0] modularWord=av[W-1]?-modularMagnitude[31:0]:modularMagnitude[31:0];
   wire nanA=&av[W-2:S-1] && |av[S-2:0], nanB=&bv[W-2:S-1] && |bv[S-2:0];
   wire zeroA=av[W-2:0]==0, zeroB=bv[W-2:0]==0;
   wire [W-1:0] minimum=nanA?(nanB?NAN:bv):nanB?av:zeroA&&zeroB?{av[W-1]|bv[W-1],{(W-1){1'b0}}}:less?av:bv;
@@ -71,13 +123,25 @@ module DitDahA1FloatFormat #(parameter W=32, FLEN=64)(
     floating=fmaRaw; selected=0; exceptions=fmaFlags;
     if(!fused) case(operation)
       4: begin floating=injected; exceptions=0; end
-      5: begin floating=instruction[12]?maximum:minimum; exceptions=compareFlags; end
-      8: begin floating=convertedRaw; exceptions=conversionFlags; end
-      20: begin selected=instruction[14:12]==2?equal:instruction[14:12]==1?less:less||equal; exceptions=compareFlags; end
-      24: begin selected=instruction[21]?longInteger:{{32{wordInteger[31]}},wordInteger}; exceptions={|integerFlags[2:1],3'b0,integerFlags[0]&&!(|integerFlags[2:1])}; end
+      5: begin floating=ZFA && instruction[13] && (nanA||nanB)?NAN:instruction[12]?maximum:minimum; exceptions=compareFlags; end
+      8: begin
+        floating=convertedRaw; exceptions=conversionFlags;
+        if(ZFHMIN && instruction[26:25]==2) begin floating={{(W-16){1'b1}},halfNarrowed}; exceptions=halfNarrowFlags; end
+        else if(ZFHMIN && instruction[24:20]==2) begin floating=halfWidened; exceptions=halfWidenFlags; end
+        else if(roundInteger) begin
+          floating=nanA?NAN:integralMagnitude?av:roundedRaw[W-2:0]==0?{av[W-1],{(W-1){1'b0}}}:roundedRaw;
+          exceptions={nanA&&!av[S-2],3'b0,instruction[20]&&!integralMagnitude&&longFlags[0]};
+        end
+      end
+      20: begin selected=instruction[14:12]==2?equal:instruction[12]?less:less||equal; exceptions=compareFlags; end
+      24: begin
+        selected=instruction[21]?longInteger:{{32{wordInteger[31]}},wordInteger};
+        if(modularInteger) selected=expOnes?0:{{32{modularWord[31]}},modularWord};
+        exceptions={|integerFlags[2:1],3'b0,integerFlags[0]&&!(|integerFlags[2:1])};
+      end
       26: begin floating=integerFloatRaw; exceptions=integerFloatFlags; end
-      28: begin selected=instruction[12]?{54'b0,classification}:W==32?{{32{a[31]}},a[31:0]}:a; exceptions=0; end
-      30: begin floating=a[W-1:0]; exceptions=0; end
+      28: begin selected=instruction[12]?{54'b0,classification}:ZFHMIN&&instruction[26:25]==2?{{48{a[15]}},a[15:0]}:W==32?{{32{a[31]}},a[31:0]}:a; exceptions=0; end
+      30: begin floating=ZFA&&instruction[24:20]==1?immediateValue(instruction[19:15]):ZFHMIN&&instruction[26:25]==2?{{(W-16){1'b1}},a[15:0]}:a[W-1:0]; exceptions=0; end
       default: begin end
     endcase
     if(fused || !(operation==20 || operation==24 || operation==28))
@@ -88,7 +152,7 @@ module DitDahA1FloatFormat #(parameter W=32, FLEN=64)(
   assign divideResult=W==32 && FLEN==64?{32'hffffffff,divideRaw}:divideRaw;
 endmodule
 
-module DitDahA1Fpu #(parameter FLEN=64)(
+module DitDahA1Fpu #(parameter FLEN=64, ZFA=0, ZFHMIN=0)(
   input clock, reset, input_valid,
   output input_ready,
   input [31:0] input_bits_instruction,
@@ -102,16 +166,16 @@ module DitDahA1Fpu #(parameter FLEN=64)(
   reg busy,valid;
   reg [63:0] value;
   reg [4:0] flags;
-  wire doublePrecision=input_bits_instruction[25];
+  wire doublePrecision=input_bits_instruction[26:25]==1 || (ZFHMIN && input_bits_instruction[26:25]==2 && input_bits_instruction[31:27]==8 && input_bits_instruction[24:20]==1);
   wire division=input_bits_instruction[6:0]==7'h53 && (input_bits_instruction[31:27]==3 || input_bits_instruction[31:27]==11);
   wire [63:0] singleResult,doubleResult,singleDivide,doubleDivide;
   wire [4:0] singleFlags,doubleFlags,singleDivideFlags,doubleDivideFlags;
   wire singleReady,doubleReady,singleDone,doubleDone;
   wire accept=input_valid&&input_ready;
-  DitDahA1FloatFormat #(32,FLEN) singleUnit(clock,reset,accept&&division&&!doublePrecision,input_bits_instruction,input_bits_a,input_bits_b,input_bits_c,input_bits_roundingMode,
+  DitDahA1FloatFormat #(32,FLEN,ZFA,ZFHMIN) singleUnit(clock,reset,accept&&division&&!doublePrecision,input_bits_instruction,input_bits_a,input_bits_b,input_bits_c,input_bits_roundingMode,
     singleResult,singleDivide,singleFlags,singleDivideFlags,singleReady,singleDone);
   generate if(FLEN==64) begin
-    DitDahA1FloatFormat #(64,FLEN) doubleUnit(clock,reset,accept&&division&&doublePrecision,input_bits_instruction,input_bits_a,input_bits_b,input_bits_c,input_bits_roundingMode,
+    DitDahA1FloatFormat #(64,FLEN,ZFA,ZFHMIN) doubleUnit(clock,reset,accept&&division&&doublePrecision,input_bits_instruction,input_bits_a,input_bits_b,input_bits_c,input_bits_roundingMode,
       doubleResult,doubleDivide,doubleFlags,doubleDivideFlags,doubleReady,doubleDone);
   end else begin
     assign doubleResult=0; assign doubleDivide=0; assign doubleFlags=0; assign doubleDivideFlags=0; assign doubleReady=0; assign doubleDone=0;

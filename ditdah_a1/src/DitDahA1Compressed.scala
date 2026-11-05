@@ -10,7 +10,8 @@ import java.lang.foreign.Arena
 import org.llvm.mlir.scalalib.capi.ir.{Block, Context}
 
 object DitDahA1Compressed:
-  def apply(raw: Referable[UInt], doublePrecision: Boolean = false)(using Arena, Context, Block, InstanceContext): Referable[Bits] =
+  def apply(raw: Referable[UInt], parameter: DitDahA1Parameter)(using Arena, Context, Block, InstanceContext): Referable[Bits] =
+    val doublePrecision = parameter.floatingPointBits == 64
     val c = raw.asBits
     val rd = c.bits(11, 7)
     val rs2 = c.bits(6, 2)
@@ -93,4 +94,21 @@ object DitDahA1Compressed:
         when(c.bit(12) & (rs2 === 0.B(5)) & (rd === 0.B(5))) { out := 0x00100073.B(32) }
       }
     }
+    if parameter.enableZcb then
+      val byteOffset = 0.B(10) ## c.bits(5, 5) ## c.bits(6, 6)
+      val halfOffset = 0.B(10) ## c.bits(5, 5) ## 0.B(1)
+      def matches(mask: Int, value: Int)(using Block) = (c.bits(15, 0) & mask.B(16)) === value.B(16)
+      when(matches(0xfc03, 0x8000)) { out := load(target, compact, byteOffset, 4) }
+      when(matches(0xfc03, 0x8400)) { out := load(target, compact, halfOffset, 5); when(c.bit(6)) { out := load(target, compact, halfOffset, 1) } }
+      when(matches(0xfc03, 0x8800)) { out := store(compact, target, byteOffset, 0) }
+      when(matches(0xfc43, 0x8c00)) { out := store(compact, target, halfOffset, 1) }
+      if parameter.enableM then when(matches(0xfc63, 0x9c41)) { out := r(compact, compact, target, 0.B(3), 1) }
+      when(matches(0xfc7f, 0x9c61)) { out := i(compact, compact, 255.B(12), 7) }
+      when(matches(0xfc7f, 0x9c75)) { out := i(compact, compact, 4095.B(12), 4) }
+      if parameter.enableZbb then
+        for (encoding, immediate) <- Seq(0x9c65 -> 0x604, 0x9c6d -> 0x605) do
+          when(matches(0xfc7f, encoding)) { out := i(compact, compact, immediate.B(12), 1) }
+        when(matches(0xfc7f, 0x9c69)) { out := r(compact, compact, 0.B(5), 4.B(3), 4, true) }
+      if parameter.enableZba then when(matches(0xfc7f, 0x9c71)) { out := r(compact, compact, 0.B(5), 0.B(3), 4, true) }
+    if parameter.enableZcmop then when((c.bits(15, 0) & 0xf8ff.B(16)) === 0x6081.B(16)) { out := i(0.B(5), 0.B(5), 0.B(12)) }
     out

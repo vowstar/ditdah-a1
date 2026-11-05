@@ -57,6 +57,7 @@ def main():
     parser.add_argument('--issue-width', type=int, choices=(1, 2, 3))
     parser.add_argument('--isa', choices=tuple('rv64i' + m + a + fp + c for m in ('', 'm') for a in ('', 'a') for fp in ('', 'f', 'fd') for c in ('', 'c')), default='rv64i')
     parser.add_argument('--bitmanip', nargs='+', choices=('Zba', 'Zbb', 'Zbs'), default=[])
+    parser.add_argument('--scalar', nargs='+', choices=('Zicond', 'Zimop', 'Zcb', 'Zcmop', 'Zfa', 'Zfhmin'), default=[])
     parser.add_argument('--program', type=Path, default=Path('software/tests/console.S'))
     parser.add_argument('--output', type=Path, default=Path('result/software/console'))
     parser.add_argument('--tool-prefix', default=os.environ.get('RISCV_PREFIX', 'riscv64-unknown-elf-'))
@@ -100,9 +101,11 @@ def main():
                        __stack_bytes=args.stack_bytes, __console_base=console)
     if config.get('localInterruptBase') is not None:
         definitions['__local_interrupt_base'] = int(config['localInterruptBase'])
-    required_extensions = [name for name in ('M', 'A', 'F', 'D', 'C') if name.lower() in args.isa[5:]] + sorted(set(args.bitmanip))
+    required_extensions = [name for name in ('M', 'A', 'F', 'D', 'C') if name.lower() in args.isa[5:]] + sorted(set(args.bitmanip) | set(args.scalar))
     assert all((config.get('floatingPointBits', 0) >= (64 if name == 'D' else 32) if name in ('F', 'D') else config.get('enable' + name, name in ('M', 'A'))) for name in required_extensions), 'Software requires a disabled extension'
-    command = [args.tool_prefix + 'gcc', '-march=' + args.isa + '_zicsr_zifencei' + ''.join('_' + name.lower() for name in sorted(set(args.bitmanip))),
+    assert not set(args.scalar) & {'Zcb', 'Zcmop'} or 'c' in args.isa[5:], 'Compressed scalar instructions require C'
+    assert not set(args.scalar) & {'Zfa', 'Zfhmin'} or 'f' in args.isa[5:], 'Floating scalar instructions require F'
+    command = [args.tool_prefix + 'gcc', '-march=' + args.isa + '_zicsr_zifencei' + ''.join('_' + name.lower() for name in sorted(set(args.bitmanip) | set(args.scalar))),
                f'-DDITDAH_HART_COUNT={harts}',
                f'-DDITDAH_RAM_BASE={base}', f'-DDITDAH_RAM_BYTES={int(ram["size"])}',
                f'-DDITDAH_ASID_BITS={config.get("asidBits", 0)}',
@@ -125,9 +128,17 @@ def main():
     assert base <= symbols['__bss_end'] <= symbols['__stack_bottom'] < symbols['__stack_top'] <= base + int(ram['size'])
     assert all(hashlib.sha256(Path(name).read_bytes()).hexdigest() == expected for name, expected in hashes.items()), 'Software sources changed during build'
     assert args.config.read_bytes() == configuration_bytes, 'Configuration changed during build'
+    required_instructions = []
+    if args.program.resolve() == Path('software/tests/atomic.c').resolve():
+        witnesses = {'Zicond': ('czero.eqz', 'czero.nez', 'pause', 'ntl.p1'), 'Zimop': ('mop.r.0', 'mop.rr.0'),
+                     'Zcb': ('c.zext.b', 'c.mul'), 'Zcmop': ('c.mop.7',), 'Zfa': ('fli.s', 'froundnx.s'),
+                     'Zfhmin': ('flh', 'fsh', 'fmv.x.h', 'fmv.h.x')}
+        required_instructions = [name for extension in args.scalar for name in witnesses[extension]]
+        if 'D' in required_extensions:
+            required_instructions += (['fcvtmod.w.d'] if 'Zfa' in args.scalar else []) + (['fcvt.h.d', 'fcvt.d.h'] if 'Zfhmin' in args.scalar else [])
     manifest = dict(sourceHashes=hashes, configurationHash=hashlib.sha256(configuration_bytes).hexdigest(),
                     imageHash=hashlib.sha256(image.read_bytes()).hexdigest(), symbols=symbols, commands=[command],
-                    toolVersions=tool_versions, requiredExtensions=required_extensions,
+                    toolVersions=tool_versions, requiredExtensions=required_extensions, requiredInstructions=required_instructions,
                     target=subprocess.check_output([args.tool_prefix + 'gcc', '-dumpmachine'], text=True).strip(),
                     expectedInterruptCauses=args.expected_interrupt, entryAddress=base,
                     clockHz=args.clock_hz, timebaseHz=args.timebase_hz)

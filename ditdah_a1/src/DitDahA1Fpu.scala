@@ -21,9 +21,9 @@ class DitDahA1FpuIO(parameter: DitDahA1Parameter) extends HWBundle(parameter):
   val reset = Flipped(Reset())
   val input = Flipped(new Decoupled(new FloatingRequest))
   val output = Aligned(new Decoupled(new FloatingResult))
-case class DitDahA1FpuParameters(FLEN: Int) extends VerilogParameter
+case class DitDahA1FpuParameters(FLEN: Int, ZFA: Int = 0, ZFHMIN: Int = 0) extends VerilogParameter
 
 @generator
 object DitDahA1Fpu extends VerilogWrapper[DitDahA1Parameter, DitDahA1UnitLayers, DitDahA1FpuIO, DitDahA1UnitProbe, DitDahA1FpuParameters]:
   def verilogModuleName(parameter: DitDahA1Parameter) = "DitDahA1Fpu"
-  def verilogParameter(parameter: DitDahA1Parameter) = DitDahA1FpuParameters(parameter.floatingPointBits)
+  def verilogParameter(parameter: DitDahA1Parameter) = DitDahA1FpuParameters(parameter.floatingPointBits, if parameter.enableZfa then 1 else 0, if parameter.enableZfhmin then 1 else 0)

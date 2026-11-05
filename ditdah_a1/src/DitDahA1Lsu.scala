@@ -263,7 +263,7 @@ object DitDahA1Lsu extends Generator[DitDahA1Parameter, DitDahA1UnitLayers, DitD
           for size <- 0 to 2 do
             val bits = 8 << size
             val low = response.bits.data.asBits.bits(bits - 1, 0)
-            val high = ((if parameter.floatingPointBits == 64 && size == 2 then completed.fpWrite.get else false.B) | (!completed.unsignedLoad & low.bit(bits - 1))).?(((BigInt(1) << (64 - bits)) - 1).B(64 - bits), 0.B(64 - bits))
+            val high = ((if parameter.floatingPointBits > bits then completed.fpWrite.get else false.B) | (!completed.unsignedLoad & low.bit(bits - 1))).?(((BigInt(1) << (64 - bits)) - 1).B(64 - bits), 0.B(64 - bits))
             when(completed.memorySize === size.U(3)) { completed.value := (high ## low).asUInt }
         }
         when(response.bits.fault | poisoned.getOrElse(false.B) | (if concurrent then !response.bits.last else false.B) | (response.bits.tag =/= identity)) {

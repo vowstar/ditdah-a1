@@ -9,9 +9,9 @@ import re
 import random
 import subprocess
 
-from floating import FLOATING_ENCODINGS, floating_decode, floating_value
+from floating import FLOATING_ENCODINGS, FLOATING_FEATURES, floating_decode, floating_value
 from programs import addi, alu, amo, beq, csr, sd, mul, muldiv, ld, lw, sw, load, store, fence
-from model import BITMANIP_ENCODINGS, ATOMIC_OPERATIONS, Fault, LocalInterrupts, Model, MASK, atomic_value, compressed_instruction, muldiv_value, pmp_allowed, signed, sv39_walk
+from model import BITMANIP_ENCODINGS, SCALAR_ENCODINGS, ATOMIC_OPERATIONS, Fault, LocalInterrupts, Model, MASK, atomic_value, compressed_instruction, is_mop, muldiv_value, pmp_allowed, signed, sv39_walk
 
 
 def backend_control_signals(source):
@@ -643,13 +643,16 @@ def compressed_decode_contract(directory, parameters):
     table = directory / 'compressed.hex'
     values = []
     for raw in range(65536):
-        insn = compressed_instruction(raw, parameters.get("floatingPointBits") == 64)
+        insn = compressed_instruction(raw, parameters.get("floatingPointBits") == 64, parameters)
         opcode, f = insn & 127, (insn >> 12) & 7
         rs1, rs2, rd = (insn >> 15) & 31, (insn >> 20) & 31, (insn >> 7) & 31
         op = {0x37: 1, 0x13: 3 if f == 0 else 21, 0x1b: 23,
-              0x33: 4 if f == 0 and insn >> 25 == 0 else 22, 0x3b: 24,
-              0x03: 18 if f == 2 else 8, 0x23: 20 if f == 2 else 9, 7: 8, 0x27: 9,
+              0x33: 14 if insn >> 25 == 1 else 4 if f == 0 and insn >> 25 == 0 else 22, 0x3b: 24,
+              0x03: {2: 18, 3: 8, 6: 19}.get(f, 26), 0x23: {2: 20, 3: 9}.get(f, 27), 7: 8, 0x27: 9,
               0x63: 5 if f == 0 else 25, 0x6f: 6, 0x67: 7, 0x73: 12}.get(opcode, 0)
+        for extension, encoding, mask in BITMANIP_ENCODINGS.values():
+            if parameters.get('enable' + extension) and insn & mask == encoding:
+                op = 21 if insn & 127 in (0x13, 0x1b) or mask == 0xfff0707f else 22
         immediate = signed(insn >> 20, 12)
         if opcode == 0x37:
             immediate = signed(insn & ~4095, 32)
@@ -659,10 +662,10 @@ def compressed_decode_contract(directory, parameters):
             immediate = signed(((insn >> 31) << 12) | (((insn >> 7) & 1) << 11) | (((insn >> 25) & 63) << 5) | (((insn >> 8) & 15) << 1), 13)
         elif opcode == 0x6f:
             immediate = signed(((insn >> 31) << 20) | (((insn >> 12) & 255) << 12) | (((insn >> 20) & 1) << 11) | (((insn >> 21) & 1023) << 1), 21)
-        use1 = op in (3, 4, 5, 7, 8, 9, 18, 20, 21, 22, 23, 24, 25)
+        use1 = op in (3, 4, 5, 7, 8, 9, 14, 18, 20, 21, 22, 23, 24, 25, 26, 27)
         floating = opcode in (7, 0x27)
-        use2 = op in (4, 5, 9, 20, 22, 24, 25) and not floating
-        write = op not in (0, 5, 9, 12, 20, 25) and not floating
+        use2 = op in (4, 5, 9, 14, 20, 22, 24, 25, 27) and not floating
+        write = op not in (0, 5, 9, 12, 20, 25, 27) and not floating
         value = 0
         for field, bits in ((op, 5), (rs1, 5), (rs2, 5), (rd, 5), (immediate & MASK, 64),
                             (((insn >> 30) & 1) * 8 + f, 4), (int(use1), 1), (int(use2), 1), (int(write), 1)):
@@ -732,6 +735,13 @@ def decode_contract(parameters, directory):
             register = word & 127 in (0x33, 0x3b) and mask != 0xfff0707f
             extra[word] = (22 if register else 21) if enabled else 0
             cases += ((word, int(enabled), int(enabled and register), int(enabled)),)
+    for name, (extension, encoding, mask) in SCALAR_ENCODINGS.items():
+        if extension not in ('Zicond', 'Zimop'):
+            continue
+        word = encoding | (6 << 7) | (5 << 15) | ((7 << 20) & ~mask)
+        enabled = parameters.get('enable' + extension, False)
+        extra[word] = (3 if extension == 'Zimop' else 22) if enabled else 0
+        cases += ((word, int(enabled), int(enabled and extension == 'Zicond'), int(enabled)),)
     invalid.update((0x69805013, 0x6200501b, 0x08004033, 0x60801013, 0x2a001033))
     cases += tuple((word, 0, 0, 0) for word in (0x69805013, 0x6200501b, 0x08004033, 0x60801013, 0x2a001033))
     body = '    input_valid = 1; output_ready = 1;\n'
@@ -747,6 +757,8 @@ def decode_contract(parameters, directory):
                  f'    check(output_valid && input_ready && output_bits_usesRs1 == {rs1} && output_bits_usesRs2 == {rs2} && output_bits_writesRd == {rd} && output_bits_serializing == {serial}, "Decode dependency metadata {word:08x}");\n')
         if word in extra or word in invalid:
             body += f'    check(output_bits_operation == {extra.get(word, 0)}, "Scalar operation class {word:08x}");\n'
+        if is_mop(word) and parameters.get('enableZimop'):
+            body += '    check(output_bits_rs1==0 && output_bits_immediate==0, "MOP has a zero source and immediate");\n'
         if word in (0x00000073, 0x00100073):
             body += '    check(output_bits_operation == 12, "Environment exception operation class");\n'
     if parameters.get('virtualAddressBits') == 39:
@@ -774,9 +786,9 @@ def floating_decode_contract(parameters):
     for name, (encoding, mask, rounding, fp_write, integer_source, minimum) in FLOATING_ENCODINGS.items():
         for mode in (range(8) if rounding else (0,)):
             instruction = encoding | (6 << 7) | (5 << 15) | ((7 << 20) & ~mask) | ((mode << 12) if rounding else 0)
-            decoded = floating_decode(instruction, parameters.get('floatingPointBits', 0))
+            decoded = floating_decode(instruction, parameters.get('floatingPointBits', 0), parameters)
             opcode, function = instruction & 127, (instruction >> 12) & 7
-            op = (18 if function == 2 else 8) if opcode == 7 else (20 if function == 2 else 9) if opcode == 0x27 else 14
+            op = (26 if function == 1 else 18 if function == 2 else 8) if opcode == 7 else (27 if function == 1 else 20 if function == 2 else 9) if opcode == 0x27 else 14
             valid = decoded is not None
             use1, write = valid and integer_source, valid and not fp_write and opcode != 0x27
             body += f"    input_bits_instruction=32'h{instruction:08x}; input_bits_length=4;\n"
@@ -820,13 +832,14 @@ def floating_execute_contract(parameters):
         return ''
     body = ''
     for word, operation in ((0x00007053, 14), (0x10000053, 14), (0x00002007, 26), (0x00002027, 27)):
+        metadata = f'input_bits_decoded_functionCode={(word >> 12) & 7};' if parameters.get('enableC') else ''
         for enabled in (0, 1):
             for mode in range(8):
                 for fault in (0, 1):
                     illegal = not enabled or word == 0x00007053 and mode > 4
                     body += f'''    input_valid=1; input_bits_decoded_floating=1; input_bits_decoded_fpWrite=1;
     input_bits_decoded_operation={operation}; input_bits_decoded_instruction_instruction='h{word:x};
-    input_bits_decoded_functionCode={(word >> 12) & 7};
+    {metadata}
     input_bits_decoded_instruction_fault={fault}; input_bits_decoded_instruction_cause=1;
     input_bits_decoded_instruction_tval='h1234; fpEnabled={enabled}; roundingMode={mode};
     check(output_bits_instruction_fault=={int(bool(fault or illegal))}, "Floating context legality");
@@ -839,30 +852,31 @@ def floating_execute_contract(parameters):
 def floating_contract(parameters, directory):
     flen, rows = parameters['floatingPointBits'], []
     rng = random.Random(2026)
-    for name, (encoding, mask, rounding, fp_write, integer_source, minimum) in FLOATING_ENCODINGS.items():
-        if minimum > flen or encoding & 127 in (7, 0x27):
-            continue
-        width = 32 if not encoding & (1 << 25) else 64
-        fraction = 23 if width == 32 else 52
+    def edges(width):
+        fraction = {16: 10, 32: 23, 64: 52}[width]
         infinity = ((1 << (width - fraction - 1)) - 1) << fraction
-        edges = (0, 1 << (width - 1), 1, 1 << fraction, infinity, infinity | (1 << (width - 1)), infinity | 1, infinity | (1 << (fraction - 1)), (1 << width) - 1)
+        return (0, 1 << (width - 1), 1, 1 << fraction, infinity, infinity | (1 << (width - 1)), infinity | 1, infinity | (1 << (fraction - 1)), (1 << width) - 1)
+    for name, (encoding, mask, rounding, fp_write, integer_source, minimum) in FLOATING_ENCODINGS.items():
+        if minimum > flen or encoding & 127 in (7, 0x27) or name in FLOATING_FEATURES and not parameters.get('enable' + FLOATING_FEATURES[name]):
+            continue
+        width = {0: 32, 1: 64, 2: 16}[(encoding >> 25) & 3]
+        kind = (encoding >> 20) & 31
+        source_width = {0: 32, 1: 64, 2: 16}[kind] if encoding >> 27 == 8 and kind in (0, 1, 2) else width
+        fraction = {16: 10, 32: 23, 64: 52}[width]
         for mode in (range(5) if rounding else (0,)):
-            instruction = encoding | ((mode << 12) if rounding else 0)
-            for index in range(13 if encoding & 127 != 0x53 else 12):
-                values = [edges[(index + offset) % len(edges)] if index < len(edges) else rng.getrandbits(width) for offset in (0, 3, 5)]
-                if index == 12:
+            for index in range(32 if name.startswith('fli.') else 13 if encoding & 127 != 0x53 else 12):
+                instruction = encoding | ((mode << 12) if rounding else 0) | ((index << 15) if name.startswith('fli.') else 0)
+                widths = (source_width, width, width)
+                values = [edges(w)[(index + offset) % len(edges(w))] if index < len(edges(w)) else rng.getrandbits(w) for w, offset in zip(widths, (0, 3, 5))]
+                if index == 12 and not name.startswith('fli.'):
                     values = [1 << fraction, 1 << fraction, (1 << fraction) - 1]
                 if integer_source:
                     values[0] = (0, 1, MASK, 1 << 63, (1 << 63) - 1, 0x80000000, 0xffffffff)[index % 7]
-                for operand in range(3):
-                    if width == 32 and flen == 64 and not (operand == 0 and integer_source):
-                        values[operand] |= 0xffffffff00000000
-                if name == 'fcvt.s.d':
-                    values[0] = rng.getrandbits(64)
-                elif name == 'fcvt.d.s':
-                    values[0] = 0xffffffff00000000 | rng.getrandbits(32)
-                if width == 32 and flen == 64 and index == 11 and not integer_source:
-                    values[0] &= 0xffffffff
+                for operand, w in enumerate(widths):
+                    if w < flen and not (operand == 0 and integer_source):
+                        values[operand] |= (1 << flen) - (1 << w)
+                if source_width < flen and index == 11 and not integer_source:
+                    values[0] &= (1 << source_width) - 1
                 value, flags = floating_value(instruction, *values, mode, flen)
                 packed = 0
                 for field, bits in ((instruction, 32), *((v, 64) for v in values), (mode, 3), (value, 64), (flags, 5)):
@@ -894,7 +908,7 @@ def floating_contract(parameters, directory):
 
 
 def execute_contract(parameters):
-    config = dict(resetVector='0', physicalAddressBits=56, pmpEntries=0, enableInterrupts=True, enableC=parameters.get('enableC', False), **{key: parameters.get(key, False) for key in ('enableZba', 'enableZbb', 'enableZbs')},
+    config = dict(resetVector='0', physicalAddressBits=56, pmpEntries=0, enableInterrupts=True, enableC=parameters.get('enableC', False), **{key: parameters.get(key, False) for key in ('enableZba', 'enableZbb', 'enableZbs', 'enableZicond', 'enableZimop')},
                   memoryRegions=[dict(base='0', size=str(1 << 56), readable=True, writable=True, executable=True, device=False, atomic=True)])
     body = ''
 
@@ -906,7 +920,7 @@ def execute_contract(parameters):
         csr_value, legal = model.csrs.get(address, 0), address in model.csrs
         record = model.step()
         opcode, function = word & 127, (word >> 12) & 7
-        csr_write = opcode == 0x73 and (function & 3 == 1 or (word >> 15) & 31 != 0)
+        csr_write = opcode == 0x73 and function in (1, 2, 3, 5, 6, 7) and (function & 3 == 1 or (word >> 15) & 31 != 0)
         checks = [f'output_bits_instruction_fault == {record[7]}', f'output_bits_load == {int(opcode == 3)}',
                   f'output_bits_store == {int(opcode == 0x23)}', 'output_bits_atomic == 0', f'output_bits_csrWrite == {int(csr_write)}']
         if record[7]:
@@ -915,14 +929,14 @@ def execute_contract(parameters):
             checks += [f'output_bits_nextPc == 64\'h{record[3]:x}']
             if opcode not in (3, 0x23):
                 checks += [f'output_bits_value == 64\'h{record[6]:x}']
-            if opcode == 0x73:
+            if opcode == 0x73 and not is_mop(word):
                 checks += [f'output_bits_csrData == 64\'h{model.csrs[address]:x}']
             if opcode in (3, 0x23):
                 checks += [f'output_bits_memorySize == {function & 3}', f'output_bits_unsignedLoad == {int(opcode == 3 and function >= 4)}',
                            f'output_bits_address == 64\'h{a + (signed(word >> 20, 12) if opcode == 3 else immediate):x}']
         value = signed(word >> 20, 12) if immediate is None else immediate
         body += f'''    input_valid = 1; input_bits_decoded_instruction_instruction = 32'h{word:08x}; input_bits_decoded_instruction_length = 4;
-    input_bits_decoded_operation = {operation}; input_bits_decoded_rd = {(word >> 7) & 31}; input_bits_decoded_rs1 = {(word >> 15) & 31};
+    input_bits_decoded_operation = {operation}; input_bits_decoded_rd = {(word >> 7) & 31}; input_bits_decoded_rs1 = {0 if is_mop(word) and parameters.get('enableZimop') else (word >> 15) & 31};
     input_bits_decoded_writesRd = {int(opcode not in (0x23, 0x63))}; input_bits_decoded_immediate = 64'h{value & MASK:x};
     input_bits_operand1 = 64'h{a & MASK:x}; input_bits_operand2 = 64'h{b & MASK:x}; csrValue = 64'h{csr_value:x}; csrLegal = {int(legal)};
 '''
@@ -952,6 +966,14 @@ def execute_contract(parameters):
                 rs2 = amount if mask == 0xfc00707f or name == 'roriw' else 0 if mask == 0xfff0707f else 2
                 instruction = encoding | (1 << 15) | (6 << 7) | (rs2 << 20)
                 check_instruction(instruction, operation, a, b)
+    for name, (extension, encoding, mask) in SCALAR_ENCODINGS.items():
+        if extension not in ('Zicond', 'Zimop'):
+            continue
+        instruction = encoding | (1 << 15) | (6 << 7) | ((2 << 20) & ~mask)
+        enabled = parameters.get('enable' + extension, False)
+        for a, b in pairs:
+            check_instruction(instruction, (3 if extension == 'Zimop' else 22) if enabled else 0,
+                              0 if extension == 'Zimop' else a, b, 0 if extension == 'Zimop' else None)
     for function in (1, 4, 5, 6, 7):
         for a, b in pairs:
             for offset in (2, 8):
@@ -3108,16 +3130,20 @@ def fabric_exclusive_contract(parameters):
     return body + '    end\n'
 
 
-def muldiv_contract():
+def muldiv_contract(parameters):
     edges = (0, 1, 2, (1 << 64) - 1, 1 << 63, (1 << 63) - 1, 1 << 32, 0x80000000, 0x80000001, 0xaaaaaaaa55555555)
     rng = random.Random(2026)
     pairs = [(a, b) for a in edges for b in edges]
     pairs += [(rng.getrandbits(64), rng.getrandbits(64)) for _ in range(32)]
+    cases = [(word, word, a, b) for word in (muldiv(6, 1, 2, function, narrow) for narrow in (False, True)
+             for function in ((0, 4, 5, 6, 7) if narrow else range(8))) for a, b in pairs]
+    if parameters.get('enableC') and parameters.get('enableZcb'):
+        cases += [(0x9c45, mul(8, 8, 9), a, b) for a, b in pairs]
     body = ''
-    for instruction, a, b in ((muldiv(6, 1, 2, function, word), a, b) for word in (False, True)
-                              for function in ((0, 4, 5, 6, 7) if word else range(8)) for a, b in pairs):
+    for raw, instruction, a, b in cases:
+        metadata = f' input_bits_decoded_functionCode={(instruction >> 12) & 7}; input_bits_decoded_instruction_length={2 if raw != instruction else 4}; input_bits_decoded_operation=14; input_bits_decoded_rs1={(instruction >> 15) & 31}; input_bits_decoded_rs2={(instruction >> 20) & 31}; input_bits_decoded_rd={(instruction >> 7) & 31}; input_bits_decoded_usesRs1=1; input_bits_decoded_usesRs2=1; input_bits_decoded_writesRd=1;' if parameters.get('enableC') else ''
         body += f'''
-    input_bits_decoded_instruction_instruction = 32'h{instruction:x};
+    input_bits_decoded_instruction_instruction = 32'h{raw:x};{metadata}
     input_bits_operand1 = 64'h{a:x}; input_bits_operand2 = 64'h{b:x}; input_valid = 1;
     check(input_ready && !output_valid, "MulDiv resource reuse"); tick();
     input_bits_operand1 = ~input_bits_operand1; input_bits_operand2 = ~input_bits_operand2;
@@ -4873,7 +4899,7 @@ def verify(rtl, directory, modules=None):
     suites = (('DitDahA1Fetch', (burst_fetch_contract(parameters) if parameters.get('enableBurstRefill') else cached_fetch_contract(parameters)) if cached else FETCH + (protection_contract(True) if enabled else '')),
                        ('DitDahA1Lsu', lsu_queue_contract(parameters) if parameters.get('loadQueueEntries', 1) == 2 else
                         LSU + (lsu_reservation_contract(parameters) if parameters.get('enableA', True) else '') + (protection_contract(False) if enabled else '') + lsu_refill_contract(parameters)),
-                       ('DitDahA1MulDiv', muldiv_contract()),
+                       ('DitDahA1MulDiv', muldiv_contract(parameters)),
                        ('DitDahA1Frontend', (burst_fetch_contract(parameters, True) if parameters.get('enableBurstRefill') else cached_fetch_contract(parameters, True)) if cached else frontend_contract(parameters)),
                        ('DitDahA1Decode', decode_contract(parameters, directory)),
                        ('DitDahA1Execute', execute_contract(parameters)),
@@ -4967,7 +4993,7 @@ def verify(rtl, directory, modules=None):
 '''
             source = source.replace('  initial begin', paired + '\n  initial begin', 1)
         if name == 'DitDahA1Fpu':
-            source = bench(module, body, 150 * (directory / 'floating.hex').read_text().count('\n')).replace('DitDahA1Fpu dut(', f"DitDahA1Fpu #(.FLEN({parameters['floatingPointBits']})) dut(")
+            source = bench(module, body, 150 * (directory / 'floating.hex').read_text().count('\n')).replace('DitDahA1Fpu dut(', f"DitDahA1Fpu #(.FLEN({parameters['floatingPointBits']}),.ZFA({int(parameters.get('enableZfa', False))}),.ZFHMIN({int(parameters.get('enableZfhmin', False))})) dut(")
 
         if name in ('DitDahA1Axi', 'DitDahA1ReadQueue'):
             prefix = 'axi_' if name == 'DitDahA1Axi' else ''

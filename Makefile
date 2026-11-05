@@ -16,6 +16,8 @@ COMPRESSED_ARGS = $(foreach name,$(COMPRESSED_CASES),--case $(name))
 MULDIV_CASES := $(addprefix muldiv_,0 1 2 3 4 5 6 7 0w 4w 5w 6w 7w)
 ATOMIC_CASES := $(foreach size,2 3,$(addsuffix _$(size),$(addprefix atomic_,0 1 4 8 12 16 20 24 28) atomic_reservation))
 SCALAR_CASES := $(MULDIV_CASES) $(ATOMIC_CASES) integer_reserved integer_breakpoint
+SCALAR_EXTENSION_CASES := $(addprefix scalar_,zicond zimop zihintpause zihintntl)
+FLOATING_HALF_CASES := $(addprefix floating_half_,memory read_fault write_fault)
 SCALAR_CACHE := --icache-bytes 8192 --dcache-bytes 8192 --dcache-writeback --l2-cache-bytes 131072
 ICACHE_CASES := pipeline_reuse pipeline_integer_stream pipeline_dependency_stream pipeline_dependency_chain cache_replacement fence_ordering fence_i_prefetch synchronization atomic_ordering atomic_denied atomic_retry bus_fetch pipeline_redirect pmp_fetch pmp_update interrupt_fence interrupt_fence_i interrupt_fetch_fault
 PIPELINE_CASES := memory_groups memory_group_alignment memory_group_bus_read memory_group_bus_write pipeline_recovery pipeline_recovery_fault
@@ -464,10 +466,10 @@ clean:
 	rm -rf result
 
 verify-scalar-isa:
-	python3 test/verify.py --interrupts --issue-width 3 --width 64 --pmp-entries 0 $(foreach name,$(SCALAR_CASES) interrupt_divide,--case $(name)) --output $(SCALAR_OUTPUT)/enabled
-	python3 test/formal.py --rtl $(SCALAR_OUTPUT)/enabled/irq-axi64/rtl --output $(SCALAR_OUTPUT)/formal --modules MulDiv IntegerDecode WordExecute Lsu Memory Axi InterruptBackend --jobs 2
-	python3 test/verify.py --no-m --no-a --issue-width 2 --width 64 --pmp-entries 0 $(foreach name,$(SCALAR_CASES),--case $(name)) --output $(SCALAR_OUTPUT)/disabled
-	python3 test/formal.py --rtl $(SCALAR_OUTPUT)/disabled/axi64/rtl --output $(SCALAR_OUTPUT)/disabled-formal --modules IntegerDecode Memory --jobs 2
+	python3 test/verify.py --scalar Zicond Zimop --interrupts --issue-width 3 --width 64 --pmp-entries 0 $(foreach name,$(SCALAR_CASES) $(SCALAR_EXTENSION_CASES) interrupt_divide,--case $(name)) --output $(SCALAR_OUTPUT)/enabled
+	python3 test/formal.py --rtl $(SCALAR_OUTPUT)/enabled/irq-axi64/rtl --output $(SCALAR_OUTPUT)/formal --modules MulDiv IntegerDecode WordExecute RvfiExecute ZktControl Lsu Memory Axi InterruptBackend --jobs 2
+	python3 test/verify.py --no-m --no-a --issue-width 2 --width 64 --pmp-entries 0 $(foreach name,$(SCALAR_CASES) scalar_zicond_disabled scalar_zimop_disabled scalar_zcb_disabled scalar_zcmop_disabled scalar_zihintpause scalar_zihintntl,--case $(name)) --output $(SCALAR_OUTPUT)/disabled
+	python3 test/formal.py --rtl $(SCALAR_OUTPUT)/disabled/axi64/rtl --output $(SCALAR_OUTPUT)/disabled-formal --modules IntegerDecode RvfiExecute Memory --jobs 2
 	python3 test/verify.py $(SCALAR_CACHE) --issue-width 3 --load-queue-entries 2 --fabric-read-slots 4 --multicore-only --harts 2 --width 64 --pmp-entries 0 --case atomic_lrsc_shared_word --case atomic_lrsc_private_word --case atomic_lrsc_shared --case atomic_lrsc_private --case atomic --output $(SCALAR_OUTPUT)/coherent
 	python3 test/verify.py $(SCALAR_CACHE) --sv39 --issue-width 2 --load-queue-entries 2 --width 512 --pmp-entries 16 --tlb-entries 4 --i-tlb-entries 4 --d-tlb-entries 4 --asid-bits 4 --case sv39_atomic --case sv39_protection --output $(SCALAR_OUTPUT)/translated
 	for count in 1 2 16; do \
@@ -476,11 +478,12 @@ verify-scalar-isa:
 	done
 
 verify-compressed-isa:
-	python3 test/verify.py --compressed --width 64 --pmp-entries 0 $(COMPRESSED_ARGS) --output $(COMPRESSED_OUTPUT)/bare
-	python3 test/formal.py --rtl $(COMPRESSED_OUTPUT)/bare/axi64/rtl --output $(COMPRESSED_OUTPUT)/formal --modules CompressedFetch
-	python3 test/verify.py --compressed --width 128 --pmp-entries 0 --issue-width 3 --icache-bytes 8192 --branch-prediction --branch-predictor-entries 8 $(COMPRESSED_ARGS) --output $(COMPRESSED_OUTPUT)/cached
-	python3 test/formal.py --rtl $(COMPRESSED_OUTPUT)/cached/axi128/rtl --output $(COMPRESSED_OUTPUT)/cache-formal --modules InstructionCache
-	python3 test/verify.py --compressed $(SCALAR_CACHE) --burst-refill --sv39 --tlb-entries 4 --i-tlb-entries 4 --d-tlb-entries 2 --width 512 --pmp-entries 16 --issue-width 2 $(foreach kind,page success pma pmp,--case compressed_page_$(kind)) --output $(COMPRESSED_OUTPUT)/translated
+	python3 test/verify.py --compressed --scalar Zcb Zcmop --width 64 --pmp-entries 0 $(COMPRESSED_ARGS) --case scalar_zcb --case scalar_zcmop --output $(COMPRESSED_OUTPUT)/bare
+	python3 test/formal.py --rtl $(COMPRESSED_OUTPUT)/bare/axi64/rtl --output $(COMPRESSED_OUTPUT)/formal --modules CompressedFetch ZktControl MulDiv
+	python3 test/verify.py --compressed --scalar Zicond Zimop Zcb Zcmop --bitmanip Zba Zbb Zbs --width 128 --pmp-entries 0 --issue-width 3 --icache-bytes 8192 --branch-prediction --branch-predictor-entries 8 $(COMPRESSED_ARGS) --case scalar_zcb --case scalar_zcmop --output $(COMPRESSED_OUTPUT)/cached
+	python3 test/formal.py --rtl $(COMPRESSED_OUTPUT)/cached/axi128/rtl --output $(COMPRESSED_OUTPUT)/cache-formal --modules InstructionCache ZktControl PipelineBackend --jobs $(FORMAL_JOBS)
+	python3 test/verify.py --compressed --scalar Zcb --no-m --no-a --width 256 --pmp-entries 0 --issue-width 2 $(foreach name,scalar_zcb scalar_zcmop_disabled scalar_zcb_requires_m scalar_zcb_requires_zba scalar_zcb_requires_zbb,--case $(name)) --output $(COMPRESSED_OUTPUT)/conditional
+	python3 test/verify.py --compressed --scalar Zcb Zcmop $(SCALAR_CACHE) --burst-refill --sv39 --tlb-entries 4 --i-tlb-entries 4 --d-tlb-entries 2 --width 512 --pmp-entries 16 --issue-width 2 $(foreach kind,page success pma pmp,--case compressed_page_$(kind) --case zcb_page_$(kind)) --output $(COMPRESSED_OUTPUT)/translated
 	python3 test/formal.py --rtl $(COMPRESSED_OUTPUT)/translated/irq-pmp16-axi512/rtl --output $(COMPRESSED_OUTPUT)/burst-formal --modules InstructionCache
 	python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); d=d.get("parameters",d); d["enableC"]=True; json.dump(d,open(sys.argv[2],"w"))' "$(SOFTWARE_CONFIG)" "$(COMPRESSED_OUTPUT)/software.json"
 	for count in 1 2 16; do \
@@ -490,16 +493,23 @@ verify-compressed-isa:
 	done
 
 verify-floating-isa:
-	python3 test/verify.py --floating-point-bits 64 --compressed --interrupts --width 64 --pmp-entries 0 --issue-width 3 $(foreach name,floating_32 floating_64 floating_state floating_rounding_32 floating_rounding_64 floating_read_fault_32 floating_read_fault_64 floating_write_fault_32 floating_write_fault_64,--case $(name)) --output $(FLOATING_OUTPUT)/double
+	python3 test/verify.py --floating-point-bits 64 --scalar Zfa Zfhmin --compressed --interrupts --width 64 --pmp-entries 0 --issue-width 3 $(foreach name,floating_32 floating_64 floating_state floating_rounding_32 floating_rounding_64 floating_read_fault_32 floating_read_fault_64 floating_write_fault_32 floating_write_fault_64 floating_zfa_0 floating_zfa_1 floating_zfhmin_0 floating_zfhmin_1 floating_zfhmin_2 $(FLOATING_HALF_CASES),--case $(name)) --output $(FLOATING_OUTPUT)/double
 	python3 test/formal.py --rtl $(FLOATING_OUTPUT)/double/irq-axi64/rtl --output $(FLOATING_OUTPUT)/formal --modules FloatingCsr FloatingFpu FloatingBackend
-	python3 test/verify.py --floating-point-bits 32 --no-m --compressed --width 256 --pmp-entries 0 --issue-width 1 $(foreach name,floating_32 floating_state floating_rounding_32 floating_read_fault_32 floating_write_fault_32,--case $(name)) --output $(FLOATING_OUTPUT)/single
+	python3 test/verify.py --floating-point-bits 32 --scalar Zfa Zfhmin --no-m --compressed --width 256 --pmp-entries 0 --issue-width 1 $(foreach name,floating_32 floating_state floating_rounding_32 floating_read_fault_32 floating_write_fault_32 floating_zfa_0 floating_zfhmin_0 floating_zfhmin_2 $(FLOATING_HALF_CASES),--case $(name)) --output $(FLOATING_OUTPUT)/single
 	python3 test/formal.py --rtl $(FLOATING_OUTPUT)/single/axi256/rtl --output $(FLOATING_OUTPUT)/single-formal --modules FloatingCsr FloatingFpu
-	python3 test/verify.py --compressed --no-m --no-a --width 512 --pmp-entries 0 --issue-width 2 $(foreach width,32 64,$(foreach n,0 1 2,--case floating_$(width)_disabled_$(n))) --output $(FLOATING_OUTPUT)/disabled
-	python3 test/verify.py --floating-point-bits 64 --compressed $(SCALAR_CACHE) --sv39 --tlb-entries 4 --i-tlb-entries 4 --d-tlb-entries 2 --width 512 --pmp-entries 16 --issue-width 2 $(foreach name,data protection sum mxr,--case floating_sv39_$(name)) $(foreach name,floating floating_off floating_s floating_s_off,--case user_$(name)) --output $(FLOATING_OUTPUT)/translated
-	python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); d=d.get("parameters",d); d.update(floatingPointBits=64,enableC=True,**{"enable"+n:True for n in ("Zba","Zbb","Zbs")}); json.dump(d,open(sys.argv[2],"w"))' "$(SOFTWARE_CONFIG)" "$(FLOATING_OUTPUT)/software.json"
+	python3 test/verify.py --floating-point-bits 32 --scalar Zfa Zfhmin --no-m --compressed --width 256 --pmp-entries 0 --issue-width 1 --icache-bytes 8192 --case floating_half_cancel --output $(FLOATING_OUTPUT)/single-cancel
+	for bits in 32 64; do \
+		python3 test/verify.py --floating-point-bits $$bits --scalar Zfhmin --compressed --interrupts --width 64 --pmp-entries 0 --issue-width 2 --load-queue-entries 2 $(foreach name,$(FLOATING_HALF_CASES),--case $(name)) --output $(FLOATING_OUTPUT)/queued$$bits && \
+		python3 test/formal.py --rtl $(FLOATING_OUTPUT)/queued$$bits/irq-axi64/rtl --output $(FLOATING_OUTPUT)/queued-formal$$bits --modules LsuReads --jobs $(FORMAL_JOBS) || exit $$?; \
+	done
+	python3 test/verify.py --floating-point-bits 64 --scalar Zfhmin --compressed --interrupts --width 64 --pmp-entries 0 --issue-width 2 --load-queue-entries 2 --icache-bytes 8192 --case floating_half_cancel --output $(FLOATING_OUTPUT)/queued-cancel
+	python3 test/verify.py --compressed --no-m --no-a --width 512 --pmp-entries 0 --issue-width 2 $(foreach width,32 64,$(foreach n,0 1 2,--case floating_$(width)_disabled_$(n))) --case floating_disabled_zfa --case floating_disabled_zfhmin --output $(FLOATING_OUTPUT)/disabled
+	python3 test/verify.py --floating-point-bits 32 --compressed --no-m --width 128 --pmp-entries 0 --issue-width 2 --case floating_disabled_zfa --case floating_disabled_zfhmin --output $(FLOATING_OUTPUT)/extensions-disabled
+	python3 test/verify.py --floating-point-bits 64 --scalar Zfa Zfhmin --compressed $(SCALAR_CACHE) --sv39 --tlb-entries 4 --i-tlb-entries 4 --d-tlb-entries 2 --width 512 --pmp-entries 16 --issue-width 2 $(foreach name,data protection sum mxr,--case floating_sv39_$(name) --case floating_half_sv39_$(name)) $(foreach name,floating floating_off floating_s floating_s_off,--case user_$(name)) --output $(FLOATING_OUTPUT)/translated
+	python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); d=d.get("parameters",d); d.update(floatingPointBits=64,enableC=True,**{"enable"+n:True for n in ("Zba","Zbb","Zbs","Zicond","Zimop","Zcb","Zcmop","Zfa","Zfhmin")}); json.dump(d,open(sys.argv[2],"w"))' "$(SOFTWARE_CONFIG)" "$(FLOATING_OUTPUT)/software.json"
 	for count in 1 2 16; do \
 		image=$(FLOATING_OUTPUT)/software/harts$$count; \
-		python3 scripts/build_software.py --config $(FLOATING_OUTPUT)/software.json --isa rv64imafdc --bitmanip Zba Zbb Zbs --program software/tests/atomic.c --harts $$count --issue-width $$((count < 3 ? count : 3)) --icache-bytes 8192 --dcache-bytes 8192 --stack-bytes 512 --console-base 0x10000000 --output $$image && \
+		python3 scripts/build_software.py --config $(FLOATING_OUTPUT)/software.json --isa rv64imafdc --bitmanip Zba Zbb Zbs --scalar Zicond Zimop Zcb Zcmop Zfa Zfhmin --program software/tests/atomic.c --harts $$count --issue-width $$((count < 3 ? count : 3)) --icache-bytes 8192 --dcache-bytes 8192 --stack-bytes 512 --console-base 0x10000000 --output $$image && \
 		python3 test/verify.py --elf $$image/software.elf --config $$image/input.json --output $$image/verification --jobs $(SOFTWARE_JOBS) || exit $$?; \
 	done
 	python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); d.update(virtualAddressBits=39,enableUserMode=True,enableSupervisorMode=True,enableInterrupts=True,iCacheBytes=65536,dCacheBytes=65536,dCacheWays=2,dCacheWriteback=True,dCacheRefillBytes=64,l2CacheBytes=131072,axiDataBits=512,loadQueueEntries=2,fabricReadSlots=4,enableBurstRefill=True,enableBranchPrediction=True,branchPredictorEntries=16,tlbEntries=4,iTlbEntries=4,dTlbEntries=4,asidBits=4); json.dump(d,open(sys.argv[2],"w"))' "$(FLOATING_OUTPUT)/software.json" "$(FLOATING_OUTPUT)/maximum.json"
@@ -508,7 +518,7 @@ verify-floating-isa:
 
 verify-bitmanip-isa:
 	python3 test/verify.py --bitmanip Zba Zbb Zbs --width 64 --pmp-entries 0 --issue-width 3 $(foreach name,zba zbb zbs,--case bitmanip_$(name)) --output $(BITMANIP_OUTPUT)/enabled
-	python3 test/formal.py --rtl $(BITMANIP_OUTPUT)/enabled/axi64/rtl --output $(BITMANIP_OUTPUT)/formal --modules BitManipDecode BitManipExecute --jobs 2
+	python3 test/formal.py --rtl $(BITMANIP_OUTPUT)/enabled/axi64/rtl --output $(BITMANIP_OUTPUT)/formal --modules BitManipDecode BitManipExecute RvfiExecute ZktControl --jobs 2
 	python3 test/verify.py --width 512 --pmp-entries 0 --issue-width 2 $(foreach name,zba zbb zbs,--case bitmanip_$(name)) --output $(BITMANIP_OUTPUT)/disabled
 	python3 test/formal.py --rtl $(BITMANIP_OUTPUT)/disabled/axi512/rtl --output $(BITMANIP_OUTPUT)/disabled-formal --modules BitManipDecode
 	python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); d=d.get("parameters",d); d.update({"enable"+n:True for n in ("Zba","Zbb","Zbs")}); json.dump(d,open(sys.argv[2],"w"))' "$(SOFTWARE_CONFIG)" "$(BITMANIP_OUTPUT)/software.json"

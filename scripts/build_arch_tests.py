@@ -21,6 +21,39 @@ B_ARCHITECTURES = {name: ARCHITECTURE + '_' + name.lower() + '1p0' for name in (
 FP_ARCHITECTURES = {'F': 'rv64i2p1_f2p2_zicsr2p0_zifencei2p0', 'D': 'rv64i2p1_f2p2_d2p2_zicsr2p0_zifencei2p0',
                     'Zcd': 'rv64i2p1_f2p2_d2p2_zicsr2p0_zifencei2p0_zca1p0_zcd1p0'}
 
+SCALAR_GROUPS = {
+    'Zicond': (('Zicond',), 2),
+    'Zimop': (('Zimop',), 40),
+    'Zihintpause': (('Zihintpause',), 1),
+    'Zihintntl': (('Zihintntl',), 4),
+    'ZihintntlZca': (('Zihintntl', 'Zca'), 4),
+    'Zcb': (('Zcb', 'Zca'), 7),
+    'ZcbM': (('Zcb', 'Zca', 'M', 'Zmmul'), 1),
+    'ZcbZba': (('Zcb', 'Zca', 'Zba'), 1),
+    'ZcbZbb': (('Zcb', 'Zca', 'Zbb'), 3),
+    'Zcmop': (('Zcmop', 'Zca'), 8),
+    'ZfaF': (('F', 'Zfa'), 7),
+    'ZfaD': (('F', 'D', 'Zfa'), 15),
+    'Zfhmin': (('F', 'Zfhmin'), 6),
+    'ZfhminD': (('F', 'D', 'Zfhmin'), 6),
+}
+SCALAR_ARCHITECTURES = {
+    'Zicond': 'rv64i2p1_zicond1p0_zicsr2p0_zifencei2p0',
+    'Zimop': 'rv64i2p1_zicsr2p0_zifencei2p0_zimop1p0',
+    'Zihintpause': 'rv64i2p1_zicsr2p0_zifencei2p0_zihintpause2p0',
+    'Zihintntl': 'rv64i2p1_zicsr2p0_zifencei2p0_zihintntl1p0',
+    'ZihintntlZca': 'rv64i2p1_c2p0_zicsr2p0_zifencei2p0_zihintntl1p0_zca1p0',
+    'Zcb': 'rv64i2p1_zicsr2p0_zifencei2p0_zca1p0_zcb1p0',
+    'ZcbM': 'rv64i2p1_m2p0_zicsr2p0_zifencei2p0_zmmul1p0_zca1p0_zcb1p0',
+    'ZcbZba': 'rv64i2p1_zicsr2p0_zifencei2p0_zca1p0_zcb1p0_zba1p0',
+    'ZcbZbb': 'rv64i2p1_zicsr2p0_zifencei2p0_zca1p0_zcb1p0_zbb1p0',
+    'Zcmop': 'rv64i2p1_zicsr2p0_zifencei2p0_zca1p0_zcmop1p0',
+    'ZfaF': 'rv64i2p1_f2p2_zicsr2p0_zifencei2p0_zfa1p0',
+    'ZfaD': 'rv64i2p1_f2p2_d2p2_zicsr2p0_zifencei2p0_zfa1p0',
+    'Zfhmin': 'rv64i2p1_f2p2_zicsr2p0_zifencei2p0_zfhmin1p0',
+    'ZfhminD': 'rv64i2p1_f2p2_d2p2_zicsr2p0_zifencei2p0_zfhmin1p0',
+}
+
 
 def digest(path):
     return hashlib.sha256(path.read_bytes()).hexdigest()
@@ -41,7 +74,14 @@ def code_spans(elf, architecture=ARCHITECTURE, mapped_architectures=()):
     architectures = [a.value for sub in attributes.iter_subsections() for group in sub.iter_subsubsections()
                      for a in group.iter_attributes() if a.tag == 'TAG_ARCH']
     assert architectures == [architecture], 'Unsupported instruction architecture'
-    mapping_profiles = (('rv64i2p1_f2p2_zicsr2p0',) if architecture in FP_ARCHITECTURES.values() else ()) + ((FP_ARCHITECTURES['D'],) if architecture == FP_ARCHITECTURES['Zcd'] else ())
+    mapping_profiles = {SCALAR_ARCHITECTURES['ZcbM']: (M_ARCHITECTURE,),
+                        SCALAR_ARCHITECTURES['ZcbZba']: (B_ARCHITECTURES['Zba'],),
+                        SCALAR_ARCHITECTURES['ZcbZbb']: (B_ARCHITECTURES['Zbb'],),
+                        SCALAR_ARCHITECTURES['ZihintntlZca']: (SCALAR_ARCHITECTURES['Zihintntl'],)}.get(architecture, ())
+    if architecture in (*FP_ARCHITECTURES.values(), *(SCALAR_ARCHITECTURES[name] for name in ('ZfaF', 'ZfaD', 'Zfhmin', 'ZfhminD'))):
+        mapping_profiles += ('rv64i2p1_f2p2_zicsr2p0',)
+    if architecture == FP_ARCHITECTURES['Zcd']:
+        mapping_profiles += (FP_ARCHITECTURES['D'],)
     table, spans = elf.get_section_by_name('.symtab'), []
     assert table is not None, 'Missing code mapping symbols'
     for index, section in enumerate(elf.iter_sections()):
@@ -60,7 +100,7 @@ def code_spans(elf, architecture=ARCHITECTURE, mapped_architectures=()):
             words = [word for _, word in instructions(data, address - start, end - start, compressed)]
             if '_zca1p0' not in name and '_c2p0' not in name:
                 assert all(word & 3 == 3 or compressed and word == 1 for word in words), 'Compressed encoding in an uncompressed code mapping'
-            assert name[2:] in (architecture, *mapped_architectures, *mapping_profiles, *((ARCHITECTURE,) if architecture == C_ARCHITECTURE or architecture == FP_ARCHITECTURES['Zcd'] else ())) or all(word == 0x13 or compressed and word == 1 for word in words), 'Unsupported code mapping architecture'
+            assert name[2:] in (architecture, *mapped_architectures, *mapping_profiles, *((ARCHITECTURE,) if architecture in (C_ARCHITECTURE, FP_ARCHITECTURES['Zcd'], *SCALAR_ARCHITECTURES.values()) else ())) or all(word == 0x13 or compressed and word == 1 for word in words), 'Unsupported code mapping architecture'
             spans.append(dict(section=section.name, start=address, end=end, architecture=name[2:]))
     assert spans, 'Missing executable code mappings'
     return spans
@@ -72,7 +112,7 @@ def main():
     from ruamel.yaml import YAML
 
     parser = argparse.ArgumentParser()
-    parser.add_argument('--extensions', nargs='+', choices=('I', 'M', 'Zaamo', 'Zalrsc', 'Zca', *B_ARCHITECTURES, *FP_ARCHITECTURES), default=['I'])
+    parser.add_argument('--extensions', nargs='+', choices=('I', 'M', 'Zaamo', 'Zalrsc', 'Zca', *B_ARCHITECTURES, *FP_ARCHITECTURES, *SCALAR_GROUPS), default=['I'])
     parser.add_argument('--config', type=Path, required=True)
     parser.add_argument('--output', type=Path, default=Path('result/arch-test'))
     parser.add_argument('--arch-test-dir', type=Path, default=os.environ.get('ARCH_TEST_DIR'))
@@ -99,16 +139,20 @@ def main():
     base, console = int(config['resetVector']), args.console_base
     extensions = tuple(sorted(set(args.extensions)))
     assert len(extensions) == len(args.extensions), 'Duplicate extension selection'
+    effective = set(extensions) | {name for group in extensions if group in SCALAR_GROUPS for name in SCALAR_GROUPS[group][0]}
+    if {'Zca', 'D'} <= effective:
+        effective.add('Zcd')
     platform_name = 'ditdah-a1-' + hashlib.sha256(configuration + ','.join(extensions).encode()).hexdigest()[:12]
-    assert 'M' not in extensions or config.get('enableM', True), 'M tests require enabled arithmetic'
-    atomic = bool(set(extensions) & A_ARCHITECTURES.keys())
+    assert 'M' not in effective or config.get('enableM', True), 'M tests require enabled arithmetic'
+    atomic = bool(effective & A_ARCHITECTURES.keys())
     assert not atomic or config.get('enableA', True), 'Atomic tests require enabled A'
-    assert 'Zca' not in extensions or config.get('enableC'), 'Compressed tests require enabled C'
-    fp = bool(set(extensions) & FP_ARCHITECTURES.keys())
-    double = bool(set(extensions) & {'D', 'Zcd'})
+    assert 'Zca' not in effective or config.get('enableC'), 'Compressed tests require enabled C'
+    fp = bool(effective & FP_ARCHITECTURES.keys())
+    double = bool(effective & {'D', 'Zcd'})
     assert not fp or config.get('floatingPointBits', 0) >= (64 if double else 32), 'Floating tests require enabled precision'
-    assert 'Zcd' not in extensions or config.get('enableC'), 'Compressed floating tests require C'
-    assert all(config.get('enable' + name) for name in set(extensions) & B_ARCHITECTURES.keys()), 'Bit manipulation tests require enabled extensions'
+    assert 'Zcd' not in effective or config.get('enableC'), 'Compressed floating tests require C'
+    assert all(config.get('enable' + name) for name in effective & B_ARCHITECTURES.keys()), 'Bit manipulation tests require enabled extensions'
+    assert all(config.get('enable' + name) for name in effective & {'Zicond', 'Zimop', 'Zcb', 'Zcmop', 'Zfa', 'Zfhmin'}), 'Scalar tests require enabled extensions'
     assert config['hartCount'] == 1 and config['pmpEntries'] == 0 and not config['virtualAddressBits']
     ram = next(r for r in config['memoryRegions'] if int(r['base']) == base and r['readable'] and r['writable'] and r['executable'] and not r['device'])
     assert int(ram['size']) >= 0x80000 and not base <= console < base + int(ram['size'])
@@ -124,22 +168,24 @@ def main():
     udb = YAML(typ='safe').load((source / 'rv64-integer.yaml').read_text())
     udb['name'] = platform_name
     udb['params']['PHYS_ADDR_WIDTH'] = config['physicalAddressBits']
-    if 'M' in extensions:
+    if 'M' in effective:
         udb['implemented_extensions'] += [dict(name='M', version='= 2.0'), dict(name='Zmmul', version='= 1.0')]
         udb['params']['MUTABLE_MISA_M'] = False
     if atomic:
         udb['implemented_extensions'] += [dict(name=name, version=version) for name, version in (('A', '= 2.1'), ('Zaamo', '= 1.0'), ('Zalrsc', '= 1.0'))]
         udb['params'].update(MISALIGNED_AMO=False, MUTABLE_MISA_A=False, LRSC_FAIL_ON_VA_SYNONYM=False, LRSC_FAIL_ON_NON_EXACT_LRSC=True,
                              LRSC_RESERVATION_STRATEGY='reserve exactly enough to cover the access', LRSC_MISALIGNED_BEHAVIOR='always raise misaligned exception')
-    if set(extensions) & {'Zca', 'Zcd'}:
+    if effective & {'Zca', 'Zcd'}:
         udb['implemented_extensions'] += [dict(name='C', version='= 2.0'), dict(name='Zca', version='= 1.0')]
         udb['params']['MUTABLE_MISA_C'] = False
-    udb['implemented_extensions'] += [dict(name=name, version='= 1.0') for name in extensions if name in B_ARCHITECTURES]
+    udb['implemented_extensions'] += [dict(name=name, version='= 1.0') for name in effective if name in B_ARCHITECTURES]
     if fp:
         udb['implemented_extensions'] += [dict(name='F', version='= 2.2')] + ([dict(name='D', version='= 2.2')] if double else [])
         udb['params'].update(MUTABLE_MISA_F=False, HW_MSTATUS_FS_DIRTY_UPDATE='precise', MSTATUS_FS_LEGAL_VALUES=[0, 1, 2, 3])
         if double: udb['params']['MUTABLE_MISA_D'] = False
-        if 'Zcd' in extensions: udb['implemented_extensions'] += [dict(name='Zcd', version='= 1.0')]
+        if 'Zcd' in effective: udb['implemented_extensions'] += [dict(name='Zcd', version='= 1.0')]
+    additions = effective & {'Zicond', 'Zimop', 'Zcb', 'Zcmop', 'Zfa', 'Zfhmin', 'Zihintpause', 'Zihintntl'}
+    udb['implemented_extensions'] += [dict(name=name, version='= 2.0' if name == 'Zihintpause' else '= 1.0') for name in sorted(additions)]
     (platform / 'udb.json').write_text(json.dumps(udb, indent=2) + '\n')
     sail = pyjson5.loads(subprocess.check_output([args.sail, '--print-default-config'], text=True))
     def disable(node):
@@ -150,20 +196,21 @@ def main():
                 else: disable(value)
     disable(sail['extensions'])
     for name in ('Zicsr', 'Zifencei'): sail['extensions'][name]['supported'] = True
-    if 'M' in extensions:
+    if 'M' in effective:
         sail['extensions']['M']['supported'] = True
         sail['extensions']['Zmmul']['supported'] = True
     if atomic:
         for name in ('A', 'Zaamo', 'Zalrsc'): sail['extensions'][name]['supported'] = True
         sail['memory']['misaligned']['exceptions'].update(amo=dict(Some='AlignmentException'), lrsc='AlignmentException')
         sail['platform']['reservation'].update(require_exact_reservation_addr=True, invalidate_on_same_hart_store=True)
-    if set(extensions) & {'Zca', 'Zcd'}:
+    if effective & {'Zca', 'Zcd'}:
         sail['extensions']['Zca']['supported'] = True
-    for name in set(extensions) & B_ARCHITECTURES.keys(): sail['extensions'][name]['supported'] = True
+    for name in effective & B_ARCHITECTURES.keys(): sail['extensions'][name]['supported'] = True
     if fp:
         sail['extensions']['F']['supported'] = True
         if double: sail['extensions']['D']['supported'] = True
-        if 'Zcd' in extensions: sail['extensions']['Zcd']['supported'] = True
+        if 'Zcd' in effective: sail['extensions']['Zcd']['supported'] = True
+    for name in additions: sail['extensions'][name]['supported'] = True
     sail['base']['writable_misa'] = False
     sail['base']['mtvec']['vectored']['supported'] = False
     sail['base']['privileged_isa_version'] = 'Privileged_ISA_1_12'
@@ -191,7 +238,7 @@ def main():
     generated = {str(p.relative_to(output)): digest(p) for p in [*platform.iterdir(), *(output / f'act/{platform_name}').glob('*.h')] if p.is_file()}
     reports, manifests = [], []
     for image in sorted(p for extension in extensions for p in (output / f'act/{platform_name}/elfs/rv64i' / extension).glob('*.elf')):
-        architecture = C_ARCHITECTURE if image.parent.name == 'Zca' else M_ARCHITECTURE if image.parent.name == 'M' else (A_ARCHITECTURES | B_ARCHITECTURES | FP_ARCHITECTURES).get(image.parent.name, ARCHITECTURE)
+        architecture = C_ARCHITECTURE if image.parent.name == 'Zca' else M_ARCHITECTURE if image.parent.name == 'M' else (A_ARCHITECTURES | B_ARCHITECTURES | FP_ARCHITECTURES | SCALAR_ARCHITECTURES).get(image.parent.name, ARCHITECTURE)
         target = output / image.stem
         target.mkdir(exist_ok=True)
         shutil.copyfile(image, target / 'software.elf')
@@ -200,7 +247,7 @@ def main():
             table = elf.get_section_by_name('.symtab')
             symbols = {s.name: s['st_value'] for s in table.iter_symbols() if s['st_info']['bind'] in ('STB_GLOBAL', 'STB_WEAK') and s['st_shndx'] != 'SHN_UNDEF'}
             all_symbols = {s.name: s['st_value'] for s in table.iter_symbols()}
-            spans, table_hash = code_spans(elf, architecture), hashlib.sha256(table.data()).hexdigest()
+            spans, table_hash = code_spans(elf, architecture, ('rv64i2p1_f2p2_zicsr2p0',) if fp else ()), hashlib.sha256(table.data()).hexdigest()
         assert base <= symbols['__bss_start'] <= symbols['__test_results'] < symbols['__bss_end'] <= symbols['__stack_bottom'] < symbols['__stack_top'] <= base + int(ram['size'])
         reference = output / f'act/{platform_name}/build/rv64i' / image.parent.name / image.stem
         assert 'SUCCESS' in Path(str(reference) + '.sig.log').read_text()
@@ -215,8 +262,10 @@ def main():
             console=dict(transport='word', base=console), expectedConsole=[f'\nRVCP-SUMMARY: TEST PASSED - Test File "{image.stem}.S"\n\n'],
             layout=dict(kind='arch-test', entrySymbol='rvtest_entry_point', entryAlias='_start', bssStart=symbols['__bss_start'], bssEnd=symbols['__bss_end'],
                         stacks=[dict(symbol='__stack_bottom', address=symbols['__stack_bottom'], size=symbols['__stack_bytes'], count=1, stride=symbols['__stack_bytes'])]))
+        if image.parent.name in SCALAR_GROUPS:
+            manifest['requiredExtensions'] = sorted({'C' if name == 'Zca' else name for name in SCALAR_GROUPS[image.parent.name][0] if name != 'Zmmul'})
         manifests.append((target, manifest))
-    assert len(manifests) == sum({'I': 51, 'M': 13, 'Zaamo': 18, 'Zalrsc': 4, 'Zca': 32, 'Zba': 8, 'Zbb': 24, 'Zbs': 8, 'F': 82, 'D': 114, 'Zcd': 4}[extension] for extension in extensions), 'Unexpected architecture test selection'
+    assert len(manifests) == sum({'I': 51, 'M': 13, 'Zaamo': 18, 'Zalrsc': 4, 'Zca': 32, 'Zba': 8, 'Zbb': 24, 'Zbs': 8, 'F': 82, 'D': 114, 'Zcd': 4, **{name: count for name, (_, count) in SCALAR_GROUPS.items()}}[extension] for extension in extensions), 'Unexpected architecture test selection'
     assert args.config.read_bytes() == configuration and all(digest(Path(p)) == h for p, h in hashes.items()), 'Build inputs changed'
     clean_revision()
     for target, manifest in manifests:

@@ -56,7 +56,7 @@ object DitDahA1MulDiv extends Generator[DitDahA1Parameter, DitDahA1UnitLayers, D
     }
     when(io.input.valid & io.input.ready) {
       val encoding = io.input.bits.decoded.instruction.instruction.asBits
-      val function = encoding.bits(14, 12).asUInt
+      val function = if parameter.enableC then io.input.bits.decoded.functionCode.get.asBits.bits(2, 0).asUInt else encoding.bits(14, 12).asUInt
       val division = function.asBits.bit(2)
       val signed = division & !function.asBits.bit(0)
       val word = encoding.bits(6, 0) === 0x3b.B(7)

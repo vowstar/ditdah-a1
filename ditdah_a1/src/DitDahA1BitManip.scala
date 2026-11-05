@@ -28,12 +28,14 @@ object DitDahA1BitManip:
   val zbs = for immediate <- Seq(false, true); (name, upper, function) <- Seq(("bclr", 0x24, 1), ("bext", 0x24, 5), ("binv", 0x34, 1), ("bset", 0x14, 1)) yield
     if immediate then shift(name + "i", 0x13, function, upper / 2) else register(name, 0x33, function, upper)
   def encodings(p: DitDahA1Parameter) =
-    (if p.enableZba then zba else Seq.empty) ++ (if p.enableZbb then zbb else Seq.empty) ++ (if p.enableZbs then zbs else Seq.empty)
+    (if p.enableZba then zba else Seq.empty) ++ (if p.enableZbb then zbb else Seq.empty) ++ (if p.enableZbs then zbs else Seq.empty) ++
+    (if p.enableZicond then Seq(register("czero.eqz", 0x33, 5, 7), register("czero.nez", 0x33, 7, 7)) else Seq.empty)
 
   def result(p: DitDahA1Parameter, in: Referable[IssuedPacket], default: Referable[UInt])(using Arena, Context, Block, InstanceContext): Referable[UInt] =
     val value = Wire(UInt(64))
     value := default
-    val instruction = in.decoded.instruction.instruction.asBits
+    val raw = in.decoded.instruction.instruction
+    val instruction = if p.enableC then (in.decoded.instruction.length === 2.U(3)).?(DitDahA1Compressed(raw, p), raw.asBits) else raw.asBits
     val a = in.operand1.asBits
     val b = in.operand2.asBits
     def extend(x: Referable[Bits], sign: Boolean = false)(using Block) =
@@ -54,6 +56,8 @@ object DitDahA1BitManip:
       when(((in.decoded.operation === DitDahA1Isa.AluImmediate.U(5)) | (in.decoded.operation === DitDahA1Isa.AluRegister.U(5))) &
         ((instruction & BigInt(mask).B(32)) === BigInt(encoding).B(32))) {
         val result: Referable[UInt] = name match
+          case "czero.eqz" => (b =/= 0.B(64)).?(a, 0.B(64)).asUInt
+          case "czero.nez" => (b === 0.B(64)).?(a, 0.B(64)).asUInt
           case "add.uw" => (narrow + b.asUInt).asBits.bits(63, 0).asUInt
           case "slli.uw" => (narrow << amount).asBits.bits(63, 0).asUInt
           case n if n.startsWith("sh") =>

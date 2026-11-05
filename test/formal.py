@@ -13,7 +13,7 @@ import subprocess
 
 import click
 from contracts import backend_control_signals, __file__ as binding_helper_file
-from model import Model, __file__ as model_file
+from model import BITMANIP_ENCODINGS, SCALAR_ENCODINGS, Model, __file__ as model_file
 
 
 DMI_BRIDGE = r'''
@@ -400,7 +400,7 @@ MULDIV = r'''
 '''
 
 
-def muldiv_latency(source, mode):
+def muldiv_latency(source, mode, compressed=False):
     source = source.replace(');', ', output formal_busy, output [9:0] formal_control);', 1).replace(
         'endmodule', 'assign formal_busy=busy;\nassign formal_control={iteration,wordOperation,functionCode};\nendmodule', 1)
     text, connections = 'module formal_muldiv_pair(input clock, reset);\n', [[], []]
@@ -414,21 +414,23 @@ def muldiv_latency(source, mode):
             connections[index].append(f'.{name}({"paired_" if index and separate else ""}{name})')
     text += '\n'.join(f'  DitDahA1MulDiv dut{index}({", ".join(pins)});' for index, pins in enumerate(connections))
     text += r'''
-  reg past_valid=0, distinct_pair, word_pair;
+  reg past_valid=0, distinct_pair, word_pair, compressed_pair;
   wire word_operation=input_bits_decoded_instruction_instruction[6:0]==7'h3b;
   always @(posedge clock) begin
     past_valid<=1;
     if(!past_valid) assume(reset); else assume(!reset);
-    if(reset) begin distinct_pair<=0;word_pair<=0;end
+    if(reset) begin distinct_pair<=0;word_pair<=0;compressed_pair<=0;end
     else begin
-      assume(input_bits_decoded_instruction_instruction[31:25]==1);
-      assume((!word_operation && input_bits_decoded_instruction_instruction[6:0]==7'h33 &&
+      assume((input_bits_decoded_instruction_length==4 && input_bits_decoded_instruction_instruction[31:25]==1 && ((!word_operation && input_bits_decoded_instruction_instruction[6:0]==7'h33 &&
         input_bits_decoded_instruction_instruction[14:12]<4) ||
-        (word_operation && input_bits_decoded_instruction_instruction[14:12]==0));
+        (word_operation && input_bits_decoded_instruction_instruction[14:12]==0))) ||
+        (COMPRESSED && input_bits_decoded_instruction_length==2 &&
+         (input_bits_decoded_instruction_instruction & 32'hfc63)==32'h9c41));
       assert(input_ready==paired_input_ready && output_valid==paired_output_valid && formal_busy==paired_formal_busy);
       if(!input_ready) assert(formal_control==paired_formal_control && !formal_control[2]);
       if(input_valid && input_ready) begin
         word_pair<=word_operation;
+        compressed_pair<=input_bits_decoded_instruction_length==2;
         distinct_pair<=input_bits_operand2==1 && paired_input_bits_operand2==
           (word_operation ? 64'h80000000 : 64'h8000000000000000);
       end
@@ -437,9 +439,15 @@ def muldiv_latency(source, mode):
     end
   end
 '''
+    text = text.replace('COMPRESSED', str(int(compressed)))
+    if compressed:
+        text += '  always @(posedge clock) if(!reset) cover(output_valid && distinct_pair && compressed_pair);\n'
+    if any(pin == 'input_bits_decoded_functionCode' for _, _, pin in module_ports(source)):
+        text += "  always @* assume(input_bits_decoded_operation==14 && input_bits_decoded_functionCode==(input_bits_decoded_instruction_length==2 ? 4'd0 : {input_bits_decoded_instruction_instruction[30],input_bits_decoded_instruction_instruction[14:12]}));\n"
     if mode.startswith('mutation'):
         word = mode.endswith('-word')
-        text += f"  always @* assume(input_valid && input_bits_decoded_instruction_instruction==32'h{0x0220833b if word else 0x02208333:x} && input_bits_operand2==1 && paired_input_bits_operand2==64'h{1 << (31 if word else 63):x});\n"
+        instruction = 0x9c45 if mode.endswith('-compressed') else 0x0220833b if word else 0x02208333
+        text += f"  always @* assume(input_valid && input_bits_decoded_instruction_length=={2 if mode.endswith('-compressed') else 4} && input_bits_decoded_instruction_instruction==32'h{instruction:x} && input_bits_operand2==1 && paired_input_bits_operand2==64'h{1 << (31 if word else 63):x});\n"
     return source, text + 'endmodule\n'
 
 
@@ -490,8 +498,28 @@ def pipeline_case(source, parameters):
 '''
     for lane in range(width):
         body += f'  assign pipeline_input[{lane}] = {identity(f"instruction_bits_packets_{lane}")};\n'
-    def control_encoding(word):
-        return f"({word}[6:0] == 7'h6f || ({word}[6:0] == 7'h67 && {word}[14:12] == 0) || ({word}[6:0] == 7'h63 && ({word}[14:12] == 0 || {word}[14:12] == 1 || {word}[14])))"
+    def control_encoding(word, length):
+        ordinary = f"({word}[6:0] == 7'h6f || ({word}[6:0] == 7'h67 && {word}[14:12] == 0) || ({word}[6:0] == 7'h63 && ({word}[14:12] == 0 || {word}[14:12] == 1 || {word}[14])))"
+        if not parameters.get('enableC'):
+            return ordinary
+        compact = f"(({word}[1:0]==1 && ({word}[15:13]==5 || {word}[15:13]>=6)) || (({word} & 32'he07f)==32'h8002 && {word}[11:7]!=0))"
+        return f"({length}==2 ? {compact} : {ordinary})"
+    def memory_encoding(word, length, opcode):
+        ordinary = f"{word}[6:0] == 7'h{opcode}"
+        if int(opcode, 16) not in (3, 0x23):
+            return ordinary
+        store = int(opcode, 16)==0x23
+        if parameters.get('floatingPointBits'):
+            ordinary = f"({ordinary} || {word}[6:0]==7'h{int(opcode, 16)+4:x})"
+        if not parameters.get('enableC'):
+            return ordinary
+        stack = "1'b1" if store else f"{word}[11:7]!=0"
+        compact = f"(({word}[1:0]==0 || ({word}[1:0]==2 && ({stack}))) && ({word}[15:13]=={6 if store else 2} || {word}[15:13]=={7 if store else 3}))"
+        if parameters.get('floatingPointBits')==64:
+            compact += f" || (({word}[1:0]==0 || {word}[1:0]==2) && {word}[15:13]=={5 if store else 1})"
+        if parameters.get('enableZcb'):
+            compact += f" || (({word} & 32'hfc03)==32'h{0x8800 if store else 0x8000:x}) || (({word} & 32'h{0xfc43 if store else 0xfc03:x})==32'h{0x8c00 if store else 0x8400:x})"
+        return f"({length}==2 ? ({compact}) : ({ordinary}))"
     older = '0'
     for stage in stages:
         suffix = '_decoded_instruction' if stage == 'issued' else '' if stage == 'instruction' else '_instruction'
@@ -537,7 +565,7 @@ def pipeline_case(source, parameters):
     if width > 1:
         body += f'      cover(issueCount > 0 && issueCount < {width} && decodedCount == {width});\n'
     if dual:
-        body += '''      assert(!extraPending || extraCount != 0);
+        body += f'''      assert(!extraPending || extraCount != 0);
       if (commitCount != 0 && (memoryPending || extraPending))
         assert(commitPackets_0_load && !commitPackets_0_store && !commitPackets_0_atomic && !commitPackets_0_instruction_fault);
       if (memoryPending) assert((memoryPackets_0_load || memoryPackets_0_store) && !memoryPackets_0_instruction_fault);
@@ -545,7 +573,7 @@ def pipeline_case(source, parameters):
       if (extraCount != 0) begin
         assert(memoryCount != 0 && memoryPackets_0_load && !memoryPackets_0_store && !memoryPackets_0_atomic);
         assert(extraPackets_0_load && !extraPackets_0_store && !extraPackets_0_atomic && !extraPackets_0_csrWrite);
-        assert(extraPackets_0_instruction_instruction[6:0] == 7'h03);
+        assert({memory_encoding('extraPackets_0_instruction_instruction', 'extraPackets_0_instruction_length', '03')});
       end
       if (memoryFault) begin
         assert(!lsu_input_valid);
@@ -570,7 +598,7 @@ def pipeline_case(source, parameters):
         body += f'  always @(posedge clock) if (!reset && {stage}Count > 1) assert(!({effects}));\n'
     for stage in ('result', 'memory', 'commit'):
         p = f'{stage}Packets_0_instruction'
-        control = control_encoding(p + '_instruction')
+        control = control_encoding(p + '_instruction', p + '_length')
         body += f'  always @(posedge clock) if (!reset && {stage}Count != 0) assert({stage}Resolved == (!{p}_fault && {control}));\n'
         effects = ' || '.join(f'{stage}Packets_0_{field}' for field in ('load', 'store', 'atomic', 'csrWrite', 'mret', 'sret', 'wfi', 'fenceI', 'sfenceVma')
                              if re.search(rf'\b{stage}Packets_0_{field}\b', source))
@@ -578,8 +606,8 @@ def pipeline_case(source, parameters):
         if dual:
             p = f'{stage}Packets_0'
             body += f'''  always @(posedge clock) if (!reset && {stage}Count != 0 && !{p}_atomic) begin
-    if ({p}_load) assert({p}_instruction_instruction[6:0] == 7'h03);
-    if ({p}_store) assert({p}_instruction_instruction[6:0] == 7'h23);
+    if ({p}_load) assert({memory_encoding(p + '_instruction_instruction', p + '_instruction_length', '03')});
+    if ({p}_store) assert({memory_encoding(p + '_instruction_instruction', p + '_instruction_length', '23')});
   end
 '''
     if dual:
@@ -610,16 +638,17 @@ def pipeline_case(source, parameters):
             simple = ' || '.join(f'{packet}_operation == {op}' for op in (1, 2, 3, 4, 21, 22, 23, 24))
             body += f'  wire pipeline_simple_{stage}_{lane} = !{packet}_instruction_fault && ({simple});\n'
             control = ' || '.join(f'{packet}_operation == {op}' for op in (5, 6, 7, 25))
-            body += f'  always @(posedge clock) if (!reset && {stage}Count > {lane}) assert(({control}) == {control_encoding(packet + "_instruction_instruction")});\n'
+            body += f'  always @(posedge clock) if (!reset && {stage}Count > {lane}) assert(({control}) == {control_encoding(packet + "_instruction_instruction", packet + "_instruction_length")});\n'
             if dual and lane == 0:
                 for operations, opcode in (((8, 18, 19, 26), 3), ((9, 20, 27), 0x23), ((15, 30), 0x2f)):
                     selected = ' || '.join(f'{packet}_operation == {op}' for op in operations)
-                    body += f"  always @(posedge clock) if (!reset && {stage}Count != 0 && ({selected})) assert({packet}_instruction_instruction[6:0] == 7'h{opcode:x});\n"
+                    body += f"  always @(posedge clock) if (!reset && {stage}Count != 0 && ({selected})) assert({memory_encoding(packet + '_instruction_instruction', packet + '_instruction_length', f'{opcode:x}')});\n"
 
         if lane == 0:
             for stage, packet in (('decoded', d), ('issued', 'issuedPackets_0_decoded')):
                 memory = ' || '.join(f'{packet}_operation == {op}' for op in (8, 9, 18, 19, 20, 26, 27))
-                body += f'  wire pipeline_head_{stage} = pipeline_simple_{stage}_0 || (!{packet}_instruction_fault && ({memory}));\n'
+                floating = f'!{packet}_floating && ' if parameters.get('floatingPointBits') else ''
+                body += f'  wire pipeline_head_{stage} = pipeline_simple_{stage}_0 || (!{packet}_instruction_fault && {floating}({memory}));\n'
         body += f'  always @(posedge clock) if (!reset && issuedCount > 1 && issuedCount > {lane}) assert({"pipeline_head_issued" if lane == 0 else f"pipeline_simple_issued_{lane}"});\n'
         blocked = []
         for operand in (1, 2):
@@ -631,6 +660,8 @@ def pipeline_case(source, parameters):
                         p += '_decoded'
                         ready = '_execute_output_valid && !_execute_output_bits_instruction_fault && !_execute_output_bits_load && !_execute_output_bits_store' if previous == 0 else '_execute_output_valid && !' + p + '_instruction_fault'
                         value = 'isMulDiv ? _mulDiv_output_bits : _execute_output_bits_value' if previous == 0 else f'pipeline_execution_{previous}'
+                        if previous == 0 and parameters.get('floatingPointBits'):
+                            value = f"isFloating ? ({instance_ports(source, 'DitDahA1Fpu')[0][1]['output_bits_value']}) : ({value})"
                     else:
                         ready = ('!memoryOperation && ' if stage == 'result' and previous == 0 else
                                  '(!memoryPending || _lsu_output_valid) && ' if dual and stage == 'memory' and previous == 0 else
@@ -646,9 +677,10 @@ def pipeline_case(source, parameters):
             body += f'    if ({d}_usesRs{operand} && {d}_rs{operand} != 0) begin\n'
             for index, (present, ready, value) in enumerate(writers):
                 body += f'      {"else " if index else ""}if ({present}) begin {stem} = {value}; {stem}_blocked = !({ready}); end\n'
+            integer_operand = (f' && (!{d}_floating || {d}_usesRs1)' if operand == 1 else f' && !{d}_floating') if parameters.get('floatingPointBits') else ''
             body += f'''    end
   end
-  always @(posedge clock) if (!reset && issueCount > {lane}) begin
+  always @(posedge clock) if (!reset && issueCount > {lane}{integer_operand}) begin
     assert(!{stem}_blocked && ({issues[lane][f'output_bits_operand{operand}']}) == {stem});
   end
 '''
@@ -712,7 +744,7 @@ def pipeline_case(source, parameters):
   end
 '''
     lsu = instance_ports(source, 'DitDahA1Lsu')[0][1]
-    for field in ('load', 'store', 'atomic', 'csrWrite', 'mret', 'sret', 'wfi', 'fenceI', 'sfenceVma', 'instruction_predictedTaken', *(('nextPc', 'instruction_length') if dual else ())):
+    for field in ('load', 'store', 'atomic', 'csrWrite', 'mret', 'sret', 'wfi', 'fenceI', 'sfenceVma', 'instruction_predictedTaken', 'fpWrite', 'fpFlags', *(('nextPc', 'instruction_length') if dual else ('instruction_length',) if parameters.get('enableC') else ())):
         if not re.search(rf'\b_lsu_output_bits_{field}\b', source):
             continue
         expected = f'memoryPackets_0_{field}'
@@ -2746,6 +2778,7 @@ def word_cases(parameters):
 
 def lsu_reads_case(parameters):
     assert parameters.get('loadQueueEntries') == 2 and not parameters.get('pmpEntries') and parameters.get('virtualAddressBits') == 0
+    floating = parameters.get('floatingPointBits') and parameters.get('enableZfhmin')
     ranges = ' || '.join(f"(input_bits_address >= 64'd{int(r['base'])} && input_bits_address <= 64'd{int(r['base']) + int(r['size']) - 8})"
                          for r in parameters['memoryRegions'] if r['readable'] and not r['device'] and int(r['size']) >= 8)
     body = r'''
@@ -2829,8 +2862,30 @@ def lsu_reads_case(parameters):
       cover(q_poison && q_pending == 0 && q_live == 0);
     end
   end
-'''.replace('RANGES', ranges)
-    return 'LsuReads', body, 'assign memory_request_bits_tag =', "assign memory_request_bits_tag = 8'h1 ^"
+'''
+    if floating:
+        ranges = ' || '.join(f"(input_bits_address >= 64'd{int(r['base'])} && input_bits_address <= 64'd{int(r['base']) + int(r['size'])} - (64'd1 << input_bits_memorySize))"
+                             for r in parameters['memoryRegions'] if r['readable'] and not r['device'] and int(r['size']) >= 8)
+        body = body.replace('reg [7:0] q_tag[2];', 'reg [7:0] q_tag[2];\n  reg [2:0] q_size[2];\n'
+                            '  reg q_unsigned[2], q_fp[2], q_rdwrite[2];\n  reg [4:0] q_flags[2], q_rd[2];')
+        body = body.replace('assume(input_bits_memorySize == 3 && !input_bits_address[2:0] && (RANGES));',
+                            f"assume(input_bits_memorySize <= 3 && (!input_bits_fpWrite || (input_bits_memorySize >= 1 && input_bits_memorySize <= {2 if parameters['floatingPointBits'] == 32 else 3})));\n    assume((input_bits_address & ((64'd1 << input_bits_memorySize) - 1)) == 0 && (RANGES));")
+        body = body.replace('memory_request_bits_size == 3', 'memory_request_bits_size == q_size[memory_request_bits_tag[0]]')
+        body = body.replace('q_address[n] <= input_bits_address;', 'q_address[n] <= input_bits_address;\n'
+                            '          q_size[n] <= input_bits_memorySize; q_unsigned[n] <= input_bits_unsignedLoad; q_fp[n] <= input_bits_fpWrite;\n'
+                            '          q_flags[n] <= input_bits_fpFlags; q_rd[n] <= input_bits_rd; q_rdwrite[n] <= input_bits_rdWrite;')
+        body = body.replace('q_value[n] <= memory_response_bits_data[q_bit];',
+                            f"q_value[n] <= q_bit < (7'd8 << q_size[n]) ? memory_response_bits_data[q_bit] : q_fp[n] && (7'd8 << q_size[n]) < {parameters['floatingPointBits']} ? 1'b1 : q_unsigned[n] ? 1'b0 : memory_response_bits_data[(7'd8 << q_size[n]) - 1];")
+        body = body.replace('assert(output_bits_address == q_address[q_head]);',
+                            'assert(output_bits_address == q_address[q_head]);\n'
+                            '        assert({output_bits_memorySize, output_bits_unsignedLoad, output_bits_fpWrite, output_bits_fpFlags, output_bits_rd, output_bits_rdWrite}'
+                            ' == {q_size[q_head], q_unsigned[q_head], q_fp[q_head], q_flags[q_head], q_rd[q_head], q_rdwrite[q_head]});')
+        body = body.replace('output_bits_instruction_cause, output_bits_instruction_tval}', 'output_bits_instruction_cause, output_bits_instruction_tval,'
+                            ' output_bits_memorySize, output_bits_unsignedLoad, output_bits_fpWrite, output_bits_fpFlags, output_bits_rd, output_bits_rdWrite}')
+        body = body.replace('cover(q_pending == 3);', 'cover(q_pending == 3);\n      cover(q_pending == 3 && q_fp[0] && q_fp[1] && q_size[0] == 1 && q_size[1] == 1);')
+        for slot in range(2):
+            body = body.replace('cover(q_poison && q_pending == 0 && q_live == 0);', f"cover(q_poison && q_pending == 0 && q_live == 0);\n      cover(output_valid && !output_bits_instruction_fault && !q_killed[q_head] && q_done[q_head] && !q_poison && !cancel && q_head == {slot} && q_fp[q_head] && q_size[q_head] == 1 && (q_address[q_head] & 6) != 0 && q_bit == 16);")
+    return 'LsuReads', body.replace('RANGES', ranges), 'assign memory_request_bits_tag =', "assign memory_request_bits_tag = 8'h1 ^"
 
 
 def integer_cases(parameters):
@@ -3028,10 +3083,170 @@ def integer_cases(parameters):
     if parameters.get('enableUserMode'):
         execute = execute.replace('i_sequential && output_bits_instruction_fault == input_bits_decoded_instruction_fault',
                                   'i_sequential && output_bits_instruction_fault == (input_bits_decoded_instruction_fault || !wfiLegal)')
+    if parameters.get('enableC'):
+        execute = execute.replace('i_target[1:0] != 0', 'i_target[0] != 0')
+    extended = dict(BITMANIP_ENCODINGS, **{name: entry for name, entry in SCALAR_ENCODINGS.items() if entry[0] == 'Zicond'})
+    excluded, classification = [], ''
+    for extension, encoding, mask in extended.values():
+        if not parameters.get('enable' + extension):
+            continue
+        predicate = f"(i_word & 32'h{mask:x}) == 32'h{encoding:x}"
+        register = encoding & 127 in (0x33, 0x3b) and mask != 0xfff0707f
+        classification += f'    if ({predicate}) begin i_operation={22 if register else 21}; i_registers={int(register)}; i_checked=1; end\n'
+        excluded.append(predicate)
+    mop = "((i_word & 32'hb3c0707f)==32'h81c04073 || (i_word & 32'hb200707f)==32'h82004073)"
+    if parameters.get('enableZimop'):
+        classification += f'    if ({mop}) begin i_operation=3; i_registers=0; i_csr=0; i_immediate=0; end\n'
+        decode = decode.replace('output_bits_rs1 == i_word[19:15]', f'output_bits_rs1 == ({mop} ? 0 : i_word[19:15])')
+    decode = decode.replace('    if (i_checked) begin', classification + '    if (i_checked) begin')
+    if excluded:
+        execute = execute.replace('if (i_op >= 21', 'if (!(' + ' || '.join(excluded) + ') && i_op >= 21')
     return [('IntegerDecode', decode, 'assign output_bits_usesRs1 =', "assign output_bits_usesRs1 = 1'h0 &"),
             ('IntegerExecute', execute, 'assign output_bits_csrData =', "assign output_bits_csrData = 64'h0 &")]
 
 
+
+
+def zkt_inventory(parameters):
+    entries = [('lui', 0x37, 0x7f, 4, '1'), ('auipc', 0x17, 0x7f, 4, '1')]
+    for opcode, names in ((0x13, 'addi slli slti sltiu xori srli ori andi'), (0x33, 'add sll slt sltu xor srl or and')):
+        for function, name in enumerate(names.split()):
+            entries.append((name, opcode | function << 12, 0xfc00707f if opcode == 0x13 and function in (1, 5) else 0xfe00707f if opcode == 0x33 else 0x707f, 4, '1'))
+    entries += [('srai', 0x40005013, 0xfc00707f, 4, '1'), ('sub', 0x40000033, 0xfe00707f, 4, '1'), ('sra', 0x40005033, 0xfe00707f, 4, '1')]
+    for opcode, names in ((0x1b, ('addiw', 'slliw', 'srliw', 'sraiw')), (0x3b, ('addw', 'sllw', 'srlw', 'subw', 'sraw'))):
+        for name in names:
+            function = 1 if name.startswith('sll') else 5 if name.startswith(('srl', 'sra')) else 0
+            entries.append((name, opcode | function << 12 | (0x40000000 if name.startswith(('sub', 'sra')) else 0), 0x707f if name == 'addiw' else 0xfe00707f, 4, '1'))
+    if parameters.get('enableM', True):
+        entries += [(name, 0x33 | 0x2000000 | function << 12, 0xfe00707f, 4, '1') for function, name in enumerate(('mul', 'mulh', 'mulhsu', 'mulhu'))]
+        entries += [ ('mulw', 0x200003b, 0xfe00707f, 4, '1')]
+    for name, (extension, encoding, mask) in dict(BITMANIP_ENCODINGS, **SCALAR_ENCODINGS).items():
+        if name in {'andn', 'orn', 'xnor', 'rol', 'ror', 'rori', 'rolw', 'rorw', 'roriw', 'rev8', 'czero.eqz', 'czero.nez'} and parameters.get('enable' + extension):
+            entries.append((name, encoding, mask, 4, '1'))
+    if parameters.get('enableC'):
+        immediate = '(|{raw[12],raw[6:2]})'
+        entries += [(name, encoding, mask, 2, guard) for name, encoding, mask, guard in (
+            ('c.addi', 0x0001, 0xe003, f'raw[11:7]!=0 && {immediate}'), ('c.addiw', 0x2001, 0xe003, 'raw[11:7]!=0'),
+            ('c.lui', 0x6001, 0xe003, f'raw[11:7]!=0 && raw[11:7]!=2 && {immediate}'),
+            ('c.srli', 0x8001, 0xec03, immediate), ('c.srai', 0x8401, 0xec03, immediate), ('c.andi', 0x8801, 0xec03, '1'),
+            ('c.sub', 0x8c01, 0xfc63, '1'), ('c.xor', 0x8c21, 0xfc63, '1'), ('c.or', 0x8c41, 0xfc63, '1'), ('c.and', 0x8c61, 0xfc63, '1'),
+            ('c.subw', 0x9c01, 0xfc63, '1'), ('c.addw', 0x9c21, 0xfc63, '1'), ('c.slli', 0x0002, 0xe003, f'raw[11:7]!=0 && {immediate}'),
+            ('c.mv', 0x8002, 0xf003, 'raw[11:7]!=0 && raw[6:2]!=0'), ('c.add', 0x9002, 0xf003, 'raw[11:7]!=0 && raw[6:2]!=0'))]
+        if parameters.get('enableZcb'):
+            entries += [('c.not', 0x9c75, 0xfc7f, 2, '1'), ('c.zext.b', 0x9c61, 0xfc7f, 2, '1')]
+            if parameters.get('enableM', True):
+                entries += [('c.mul', 0x9c41, 0xfc63, 2, '1')]
+    return entries
+
+
+def zkt_control_case(sources, parameters):
+    entries = zkt_inventory(parameters)
+    text = 'module formal_zkt_control(input clock,reset);\n'
+    text += '  (* anyseq *) reg [31:0] raw;\n  (* anyseq *) reg [63:0] pc,a0,b0,a1,b1;\n  (* anyseq *) reg input_valid,sink_ready;\n  (* anyseq *) reg [2:0] length;\n  (* anyseq *) reg [6:0] selected;\n'
+    text += f'  always @* begin assume(selected<{len(entries)}); assume(pc[{0 if parameters.get("enableC") else 1}:0]==0);\n'
+    for index, (_, encoding, mask, length, guard) in enumerate(entries):
+        text += f"    if(selected=={index}) assume(length=={length} && (raw & 32'h{mask:x})==32'h{encoding:x} && ({guard}));\n"
+    text += '  end\n'
+    observations = {}
+    for copy in range(2):
+        for module, stage in (('Decode', 'd'), ('Issue', 'i'), ('Execute', 'e')):
+            pins = []
+            for direction, width, pin in module_ports(sources['DitDahA1' + module + '.sv']):
+                if direction == 'output':
+                    value = f'{stage}{copy}_{pin}'
+                    text += f'  wire {width} {value};\n'
+                    if not copy:
+                        observations[stage, pin] = value
+                elif pin in ('clock', 'reset'):
+                    value = pin
+                elif pin == 'output_ready':
+                    value = {'d': f'i{copy}_input_ready', 'i': f'e{copy}_input_ready', 'e': 'sink_ready'}[stage]
+                elif pin == 'input_valid':
+                    value = {'d': 'input_valid', 'i': f'd{copy}_output_valid', 'e': f'i{copy}_output_valid'}[stage]
+                elif pin.startswith('input_bits_') and stage != 'd':
+                    value = f'{"d" if stage == "i" else "i"}{copy}_output_bits_' + pin.removeprefix('input_bits_')
+                else:
+                    value = dict(input_bits_instruction='raw', input_bits_pc='pc', input_bits_length='length', rdata1=f'read{copy}_1', rdata2=f'read{copy}_2', privilege="2'd3", csrLegal="1'b1", fpEnabled="1'b1", wfiLegal="1'b1", sretLegal="1'b1", sfenceLegal="1'b1").get(pin, "'0")
+                pins.append(f'.{pin}({value})')
+            text += f'  DitDahA1{module} {stage}{copy}({", ".join(pins)});\n'
+        text += f'  wire [63:0] read{copy}_1=i{copy}_raddr1==0?0:a{copy};\n  wire [63:0] read{copy}_2=i{copy}_raddr2==0?0:i{copy}_raddr2==i{copy}_raddr1?read{copy}_1:b{copy};\n'
+    text += '  always @* begin\n'
+    for (stage, pin), value in observations.items():
+        if pin not in ('output_bits_value', 'output_bits_address', 'output_bits_storeData', 'output_bits_csrData', 'output_bits_operand1', 'output_bits_operand2', 'output_bits_operand3'):
+            text += f'    assert({value}=={stage}1_{pin});\n'
+    text += '    assert(d0_input_ready==sink_ready && e0_output_valid==input_valid);\n'
+    text += '    assert(!e0_output_bits_instruction_fault && e0_output_bits_rdWrite && e0_output_bits_nextPc==pc+length);\n'
+    for field in ('load', 'store', 'atomic', 'csrWrite', 'mret', 'sret', 'wfi', 'fenceI', 'sfenceVma', 'fpWrite', 'fpFlags'):
+        if ('e', 'output_bits_' + field) in observations:
+            text += f'    assert(e0_output_bits_{field}==0);\n'
+    if ('d', 'output_bits_floating') in observations:
+        text += '    assert(!d0_output_bits_floating);\n'
+    if parameters.get('enableC') and parameters.get('enableZcb') and parameters.get('enableM', True):
+        text += "    if(length==2 && (raw & 32'hfc63)==32'h9c41) assert(d0_output_bits_operation==14 && d0_output_bits_functionCode==0 && d0_output_bits_usesRs1 && d0_output_bits_usesRs2 && !d0_output_bits_serializing && i0_output_bits_decoded_functionCode==0);\n"
+    for index, (name, *_fields) in enumerate(entries):
+        text += f'    cover(input_valid && sink_ready && selected=={index});\n'
+        if name.startswith('czero.'):
+            text += f'    cover(input_valid && sink_ready && selected=={index} && i0_raddr1!=0 && i0_raddr2!=0 && i0_raddr1!=i0_raddr2 && read0_1!=read1_1 && read0_2==0 && read1_2!=0);\n'
+    text += '    cover(input_valid && !sink_ready && read0_1!=read1_1);\n  end\nendmodule\n'
+    return 'ZktControl', text, 'assign output_valid = input_valid;', 'assign output_valid = input_valid & ~input_bits_operand1[0];'
+
+
+def rvfi_execute_case(sources):
+    text = 'module formal_rvfi_execute(input clock,reset);\n'
+    text += "  (* anyseq *) reg [31:0] raw_fields;\n  wire [31:0] raw=(raw_fields & ~32'hfe00707f)|32'hRVFI_ENCODING;\n  (* anyseq *) reg [63:0] pc,source1,source2;\n  (* anyseq *) reg sink_ready;\n"
+    stages = (('Decode', 'd'), ('Issue', 'i'), ('Execute', 'e'))
+    for module, stage in stages:
+        pins = []
+        for direction, width, pin in module_ports(sources['DitDahA1' + module + '.sv']):
+            if direction == 'output':
+                value = stage + '_' + pin
+                text += f'  wire {width} {value};\n'
+            elif pin in ('clock', 'reset'):
+                value = pin
+            elif pin == 'output_ready':
+                value = {'d': 'i_input_ready', 'i': 'e_input_ready', 'e': 'sink_ready'}[stage]
+            elif pin == 'input_valid':
+                value = {'d': "1'b1", 'i': 'd_output_valid', 'e': 'i_output_valid'}[stage]
+            elif pin.startswith('input_bits_') and stage != 'd':
+                value = ('d' if stage == 'i' else 'i') + '_output_bits_' + pin.removeprefix('input_bits_')
+            else:
+                value = dict(input_bits_instruction='raw', input_bits_pc='pc', input_bits_length="3'd4",
+                             rdata1='read1', rdata2='read2', privilege="2'd3", csrLegal="1'b1",
+                             fpEnabled="1'b1", wfiLegal="1'b1", sretLegal="1'b1", sfenceLegal="1'b1").get(pin, "'0")
+            pins.append(f'.{pin}({value})')
+        text += f'  DitDahA1{module} {stage}({", ".join(pins)});\n'
+    text += r"""
+  wire [63:0] read1=i_raddr1==0?0:source1;
+  wire [63:0] read2=i_raddr2==0?0:i_raddr2==i_raddr1?read1:source2;
+  wire spec_valid,spec_trap;
+  wire [4:0] spec_rs1,spec_rs2,spec_rd;
+  wire [63:0] spec_value,spec_pc;
+  rvfi_insn_RVFI_MODEL spec(.rvfi_valid(1'b1),.rvfi_insn(raw),.rvfi_pc_rdata(pc),
+    .rvfi_rs1_rdata(read1),.rvfi_rs2_rdata(read2),.rvfi_mem_rdata(64'd0),
+    .spec_valid(spec_valid),.spec_trap(spec_trap),.spec_rs1_addr(spec_rs1),.spec_rs2_addr(spec_rs2),
+    .spec_rd_addr(spec_rd),.spec_rd_wdata(spec_value),.spec_pc_wdata(spec_pc),
+    .spec_mem_addr(),.spec_mem_rmask(),.spec_mem_wmask(),.spec_mem_wdata());
+  always @* begin
+    assume(pc[1:0]==0);
+    assert(spec_valid);
+    assert(i_raddr1==spec_rs1 && i_raddr2==spec_rs2);
+    assert(i_output_bits_operand1==read1 && i_output_bits_operand2==read2);
+    assert(d_input_ready==sink_ready && e_output_valid);
+    assert(e_output_bits_instruction_instruction==raw && e_output_bits_instruction_pc==pc);
+    assert(!spec_trap && !e_output_bits_instruction_fault);
+    assert(e_output_bits_rd==spec_rd && e_output_bits_rdWrite);
+    if(spec_rd!=0) assert(e_output_bits_value==spec_value);
+    assert(e_output_bits_nextPc==spec_pc);
+    assert(!e_output_bits_load && !e_output_bits_store && !e_output_bits_atomic && !e_output_bits_csrWrite &&
+      !e_output_bits_mret && !e_output_bits_sret && !e_output_bits_fenceI && !e_output_bits_sfenceVma && !e_output_bits_wfi);
+    cover(e_output_valid && spec_rd!=0 && source1!=source2 && sink_ready);
+    cover(e_output_valid && spec_rd==0 && source1[63] && !sink_ready);
+    cover(e_output_valid && spec_rs1==0 && spec_rs2!=0);
+    cover(e_output_valid && spec_rs1==spec_rs2 && spec_rs1!=0);
+  end
+endmodule
+"""
+    return 'RvfiExecute', text, 'assign output_bits_value =', "assign output_bits_value = 64'h1 ^"
 
 
 def debug_csr_case(parameters):
@@ -3220,7 +3435,6 @@ def floating_backend_case(parameters, source):
 
 
 def bitmanip_cases(parameters):
-    from model import BITMANIP_ENCODINGS
     decode, execute = '', r"""
   wire [31:0] bm_instruction = input_bits_decoded_instruction_instruction;
   wire [63:0] bm_a = input_bits_operand1, bm_b = input_bits_operand2;
@@ -3237,7 +3451,7 @@ def bitmanip_cases(parameters):
     end
   endfunction
 """
-    for index, (name, (extension, encoding, mask)) in enumerate(BITMANIP_ENCODINGS.items()):
+    for index, (name, (extension, encoding, mask)) in enumerate(dict(BITMANIP_ENCODINGS, **{n: e for n, e in SCALAR_ENCODINGS.items() if e[0] == 'Zicond'}).items()):
         enabled = parameters.get('enable' + extension, False)
         register = encoding & 127 in (0x33, 0x3b) and mask != 0xfff0707f
         operation = 22 if register else 21
@@ -3254,7 +3468,9 @@ def bitmanip_cases(parameters):
         width = 32 if word else 64
         a = "{32'd0, bm_a[31:0]}" if word else 'bm_a'
         shift = 'bm_shift[4:0]' if word else 'bm_shift'
-        if name.startswith('sh'):
+        if name.startswith('czero.'):
+            expression = f"bm_b {'!=' if name == 'czero.eqz' else '=='} 0 ? bm_a : 0"
+        elif name.startswith('sh'):
             left = "{32'd0, bm_a[31:0]}" if name.endswith('.uw') else a
             expression = f'({left} << {name[2]}) + bm_b'
         elif name in ('add.uw', 'slli.uw'):
@@ -3285,10 +3501,10 @@ def bitmanip_cases(parameters):
         execute += f'  always @* if ({condition}) assert(output_bits_value == {expected});\n'
         witness = 'bm_a[63]' if mask == 0xfff0707f else f'bm_a[63] && bm_shift == {31 if name == "roriw" else 63}'
         execute += f'  always @* cover(input_valid && ({condition}) && {witness});\n'
-    mutation = ('assign output_bits_writesRd =', "assign output_bits_writesRd = 1'h0 &") if any(parameters.get('enable' + name) for name in ('Zba', 'Zbb', 'Zbs')) else (
+    mutation = ('assign output_bits_writesRd =', "assign output_bits_writesRd = 1'h0 &") if any(parameters.get('enable' + name) for name in ('Zba', 'Zbb', 'Zbs', 'Zicond')) else (
         'assign output_bits_operation =', "assign output_bits_operation = input_bits_instruction == 32'h0800003b ? 5'd21 :")
     return [('BitManipDecode', decode, *mutation)] + (
-        [('BitManipExecute', execute, 'assign output_bits_value =', "assign output_bits_value = 64'h1 ^")] if any(parameters.get('enable' + name) for name in ('Zba', 'Zbb', 'Zbs')) else [])
+        [('BitManipExecute', execute, 'assign output_bits_value =', "assign output_bits_value = 64'h1 ^")] if any(parameters.get('enable' + name) for name in ('Zba', 'Zbb', 'Zbs', 'Zicond')) else [])
 
 
 def local_interrupt_case(parameters):
@@ -5456,7 +5672,7 @@ def partition_covers(text, selected, count):
     return re.sub(pattern, lambda match: match[0] if next(positions) in selected else 'begin end', text)
 
 
-def verify(rtl, directory, modules=None, mutations=None, jobs=1):
+def verify(rtl, directory, modules=None, mutations=None, jobs=1, rvfi_dir=None):
     assert jobs >= 1
     assert mutations is None or modules and all(mode.startswith('mutation') for mode in mutations), 'Select modules and negative controls'
     directory.mkdir(parents=True, exist_ok=True)
@@ -5468,6 +5684,12 @@ def verify(rtl, directory, modules=None, mutations=None, jobs=1):
     read_suffixes = tuple('' if n == 0 else f'_{n-1}' for n in range(read_slots))
     assert all(hashlib.sha256(Path(p).read_bytes()).hexdigest() == h for p, h in manifest['sourceHashes'].items())
     sources = {p.name: p.read_text() for p in rtl.glob('*.sv') if 'DV' not in p.name and not p.name.startswith('ref_')}
+    rvfi_models, rvfi_sources = [], {}
+    if not modules or 'RvfiExecute' in modules:
+        rvfi_dir = rvfi_dir or os.environ.get('RISCV_FORMAL_DIR')
+        assert rvfi_dir, 'Set RISCV_FORMAL_DIR or --instruction-model-dir'
+        rvfi_models = ['add', 'sub'] + (['andn'] if manifest['parameters'].get('enableZbb') else [])
+        rvfi_sources = {f'rvfi_insn_{name}.sv': (Path(rvfi_dir) / 'insns' / f'insn_{name}.v').read_text() for name in rvfi_models}
     backend_dv = rtl / 'DitDahA1Backend_DV.sv'
     observation_sources = {backend_dv.name: backend_dv.read_text()} if backend_dv.exists() else {}
     license = '\n'.join(line.replace('#', '//', 1) for line in Path(__file__).read_text().splitlines()[:2]) + '\n'
@@ -5508,6 +5730,10 @@ def verify(rtl, directory, modules=None, mutations=None, jobs=1):
             ('Backend', BACKEND, '(~issuedValid | executed) & ~executePending & ~redirect_0', '(~issuedValid | executed) & ~redirect_0'))
     cases = [*cases, gpr_case(manifest['parameters']), *word_cases(manifest['parameters']), *integer_cases(manifest['parameters']), *bitmanip_cases(manifest['parameters']), *wfi_cases(manifest['parameters']), synchronization_case(manifest['parameters']),
              arbiter_case(manifest['parameters']), memory_case(manifest['parameters']), axi_case(manifest['parameters'])]
+    if rvfi_models:
+        cases.append(rvfi_execute_case(sources))
+    if not modules or 'ZktControl' in modules:
+        cases.append(zkt_control_case(sources, manifest['parameters']))
     if manifest['parameters'].get('floatingPointBits'):
         cases += [floating_csr_case(manifest['parameters']), floating_fpu_case(manifest['parameters'])]
         if 'DitDahA1Backend.sv' in sources and manifest['parameters'].get('enableM', True):
@@ -5524,7 +5750,8 @@ def verify(rtl, directory, modules=None, mutations=None, jobs=1):
         cases.append(lsu_reads_case(manifest['parameters']))
     if 'DitDahA1ReadQueue.sv' in sources:
         cases.append(read_queue_case(manifest['parameters']))
-    if 'DitDahA1Backend.sv' in sources:
+    if 'DitDahA1Backend.sv' in sources and not manifest['parameters'].get('floatingPointBits') and (
+            manifest['parameters'].get('loadQueueEntries', 1) == 1 or manifest['parameters']['issueWidth'] == 1):
         cases.append(pipeline_case(sources['DitDahA1Backend.sv'], manifest['parameters']))
     if 'DitDahA1ReadQueue.sv' in sources and 'DitDahA1MemoryFabric.sv' in sources:
         cases.append(fabric_case(manifest['parameters']))
@@ -5558,6 +5785,8 @@ def verify(rtl, directory, modules=None, mutations=None, jobs=1):
         if modules and name not in modules and not (name.startswith('Pmp') and 'Pmp' in modules):
             continue
         unit = name.removeprefix('Debug').removeprefix('Floating').removeprefix('BitManip').removeprefix('Compressed').removeprefix('Interrupt').removeprefix('Synchronization').removeprefix('Pipeline').removeprefix('Word').removeprefix('Integer').removeprefix('Wfi').removeprefix('User').removeprefix('Supervisor').removeprefix('Wide')
+        if name in ('RvfiExecute', 'ZktControl'):
+            unit = 'Execute'
         if name in ('DataCacheWriteback', 'DataCacheAssociativity'):
             unit = 'DataCache'
         if name == 'DebugModule':
@@ -5774,6 +6003,14 @@ def verify(rtl, directory, modules=None, mutations=None, jobs=1):
                 body += '\n  always @* begin assume(!mret || privilege == 3); assume(!write || privilege == 3); end\n'
             if not manifest['parameters'].get('enableSupervisorMode'):
                 body += '\n  always @* assume(!sret);\n'
+        if manifest['parameters'].get('enableC') and name not in ('RvfiExecute', 'ZktControl'):
+            if unit == 'Decode':
+                body += '\n  always @* assume(input_bits_length==4);\n'
+            if unit in ('Execute', 'MulDiv'):
+                metadata = '{input_bits_decoded_instruction_instruction[30],input_bits_decoded_instruction_instruction[14:12]}'
+                body += f'\n  always @* assume(input_bits_decoded_instruction_length==4 && input_bits_decoded_functionCode=={metadata});\n'
+                if unit == 'MulDiv':
+                    body += "  always @* assume(input_bits_decoded_operation==14 && input_bits_decoded_instruction_instruction[31:25]==1 && (input_bits_decoded_instruction_instruction[6:0]==7'h33 || (input_bits_decoded_instruction_instruction[6:0]==7'h3b && (input_bits_decoded_instruction_instruction[14:12]==0 || input_bits_decoded_instruction_instruction[14:12]>=4))));\n"
         module = 'DitDahA1' + ('Pmp' if name == 'PmpDecode' else unit)
         if name == 'PmpInterval':
             module = 'formal_interval'
@@ -5792,7 +6029,9 @@ def verify(rtl, directory, modules=None, mutations=None, jobs=1):
         if unit == 'Fpu':
             if manifest['parameters']['floatingPointBits'] == 32:
                 body = body.replace('!output_ready && fp_double', '!output_ready && !fp_double')
-                files[module + '.sv'] = files[module + '.sv'].replace('module DitDahA1Fpu #(parameter FLEN=64)', 'module DitDahA1Fpu #(parameter FLEN=32)')
+            parameters = manifest['parameters']
+            files[module + '.sv'], configured = re.subn(r'module DitDahA1Fpu #\(parameter [^)]*\)', f"module DitDahA1Fpu #(parameter FLEN={parameters['floatingPointBits']}, ZFA={int(parameters.get('enableZfa', False))}, ZFHMIN={int(parameters.get('enableZfhmin', False))})", files[module + '.sv'])
+            assert configured == 1
             abstract = header(sources[module + '.sv']) + r'''
   reg pending;
   (* anyseq *) reg finish;
@@ -6088,6 +6327,12 @@ endmodule''', 1)
             else:
                 files[module + '.sv'] = files[module + '.sv'].replace('endmodule', body + '\nendmodule', 1)
             top = module
+        elif name in ('RvfiExecute', 'ZktControl'):
+            top = 'formal_rvfi_execute' if name == 'RvfiExecute' else 'formal_zkt_control'
+            files.update({n: sources[n] for n in ('DitDahA1Decode.sv', 'DitDahA1Issue.sv')})
+            if name == 'RvfiExecute':
+                files.update(rvfi_sources)
+            files['wrapper.sv'] = license + body
         else:
             top = 'formal_top'
             files['wrapper.sv'] = license + header(files[module + '.sv']).replace(module, top, 1) + f'\n  {module} dut (.*);\n' + body + 'endmodule\n'
@@ -6115,6 +6360,11 @@ endmodule''', 1)
             before = re.search(r': ~\w+ \| abort \| responseFault \| bypass \| ~complete', sources[module + '.sv']).group()
             after = before.replace(' | abort', '')
         checks = [('prove', before, after), ('cover', before, after), ('mutation', before, after)]
+        if name == 'RvfiExecute':
+            checks = [(mode + '-' + insn, before, after) if mode != 'mutation-decode' else
+                      (mode + '-' + insn, 'assign output_bits_operation =', "assign output_bits_operation = 5'h0 &", 'DitDahA1Decode.sv')
+                      for insn in rvfi_models for mode in ('prove', 'cover', 'mutation-value', 'mutation-decode')]
+
         if origin_contract:
             output = 'downstream_request' if unit == 'MemoryArbiter' else 'memory_request'
             driver = re.search(rf'assign {output}_bits_debug\s*=\s*[^;]+;', sources[module + '.sv']).group()
@@ -6167,6 +6417,10 @@ endmodule''', 1)
         if name == 'LsuReads':
             checks += [('mutation-value', 'assign output_bits_value =', "assign output_bits_value = 64'h1 ^"),
                        ('mutation-cancel', 'assign memory_request_valid =', 'assign memory_request_valid = ~cancel &')]
+            if manifest['parameters'].get('floatingPointBits') and manifest['parameters'].get('enableZfhmin'):
+                boxing = re.findall(r"packet_memorySize == 3'h1\s*\?\s*\{\{48\{packet_fpWrite\s*\|", sources[module + '.sv'])
+                assert len(boxing) == 1, 'Unknown half load boxing expression'
+                checks.append(('mutation-boxing', boxing[0], boxing[0].replace('packet_fpWrite', "1'h0", 1)))
         if unit == 'MemoryFabric':
             original = sources[module + '.sv']
             tag_modes = [f'prove-tags-{bit}' for bit in range(8)] if read_slots > 2 else ['prove-tags']
@@ -6271,7 +6525,7 @@ endmodule''', 1)
                 ('mutation-wfi', re.search(r'assign output_bits_wfi\s*=\s*[^;]+;', sources[module + '.sv']).group(), 'assign output_bits_wfi = 0;')]
             if unit == 'Decode':
                 if manifest['parameters'].get('enableA', True):
-                    shape = re.search(r"input_bits_instruction\[6:0\] == 7'h2F & \([^)]*\)", sources[module + '.sv']).group()
+                    shape = re.search(r"(?:input_bits_instruction|insn)\[6:0\] == 7'h2F & \([^)]*\)", sources[module + '.sv']).group()
                     checks += [('mutation-atomic-width', shape, "input_bits_instruction[6:0] == 7'h2F"),
                                ('mutation-lr-source', "input_bits_instruction[24:20] == 5'h0", "1'h1"),
                                ('mutation-atomic-operation', "input_bits_instruction[31:27] == 5'h8", "1'h1")]
@@ -6280,6 +6534,10 @@ endmodule''', 1)
             else:
                 atomic_assignment = re.search(r'assign output_bits_atomic\s*=\s*[^;]+;', sources[module + '.sv']).group()
                 checks += [('mutation-atomic', atomic_assignment, 'assign output_bits_atomic = 0;')]
+        if name == 'IntegerDecode' and manifest['parameters'].get('enableC'):
+            assert re.search(r'wire\s+\[31:0\]\s+insn\s*=', sources[module + '.sv'])
+            checks = [(mode, before.replace('input_bits_instruction', 'insn'), after.replace('input_bits_instruction', 'insn'), *target)
+                      for mode, before, after, *target in checks]
         if name == 'IntegerExecute':
             value = re.search(r'assign output_bits_value\s*=\s*[^;]+;', sources[module + '.sv']).group(0)
             branch = re.search(r'assign output_bits_nextPc\s*=\s*[^;]+;', sources[module + '.sv']).group(0)
@@ -6337,11 +6595,13 @@ endmodule''', 1)
         if unit == 'MulDiv':
             assert body.count('cover(') == 8
             checks[1:2] = [('cover-short', before, after), ('cover-long', before, after)]
-            checks += [('mutation-mode', 'functionCode <= input_bits_decoded_instruction_instruction[14:12];', "functionCode <= 3'h0;"),
+            checks += [('mutation-mode', re.search(r'functionCode <= [^;]+;', sources[module + '.sv']).group(), "functionCode <= 3'h0;"),
                        ('mutation-word', '{{32{value[31]}}, value[31:0]}', "{32'h0, value[31:0]}")]
             completion, = re.findall(r"\biteration == \{~wordOperation,\s*5'h1[fF]\}", sources[module + '.sv'])
             checks += [(mode, completion, "remaining <= 64'h1") for mode in
                        ('prove-latency', 'cover-latency', 'mutation-latency', 'mutation-latency-word')]
+            if all(manifest['parameters'].get(key) for key in ('enableC', 'enableZcb', 'enableM')):
+                checks.append(('mutation-latency-compressed', completion, "remaining <= 64'h1"))
         if name == 'UserExecute':
             checks += [('mutation-return', 'assign output_bits_instruction_fault =', 'assign output_bits_instruction_fault = 0 &')]
         if name in ('UserExecute', 'SupervisorExecute'):
@@ -6631,6 +6891,9 @@ endmodule''', 1)
             work = directory / f'{name.lower()}-{mode}'
             work.mkdir(exist_ok=True)
             for filename, text in files.items():
+                if name == 'RvfiExecute' and filename == 'wrapper.sv':
+                    insn = mode.rsplit('-', 1)[-1]
+                    text = text.replace('RVFI_MODEL', insn).replace('RVFI_ENCODING', {'add':'00000033','sub':'40000033','andn':'40007033'}[insn])
                 if name == 'WfiFrontend' and mode.startswith('cover-') and filename == module + '.sv':
                     text = partition_covers(text, int(mode.rsplit('-', 1)[1]), body.count('cover('))
                 if name == 'WfiFrontend' and filename == module + '.sv' and manifest['parameters'].get('branchPredictorEntries'):
@@ -7111,6 +7374,11 @@ endmodule''', 1)
   end
 '''
                     text = text.replace('endmodule', guidance + '\nendmodule', 1)
+                if name == 'LsuReads' and manifest['parameters'].get('floatingPointBits') and manifest['parameters'].get('enableZfhmin') and mutating and filename == module + '.sv':
+                    text = text.replace('endmodule', "  always @* assume(input_bits_fpWrite && input_bits_memorySize == 1 && !input_bits_unsignedLoad && input_bits_instruction_instruction == 32'h11087"
+                                        ' && input_bits_instruction_length == 4 && input_bits_rd == 1 && !input_bits_rdWrite && input_bits_fpFlags == 0);\nendmodule', 1)
+                    if mode == 'mutation-boxing':
+                        text = text.replace('endmodule', '  always @* assume(q_bit == 16 && !memory_response_bits_data[15]);\nendmodule', 1)
                 if unit == 'Lsu' and name != 'LsuReads' and mutating and filename == module + '.sv':
                     load = mode == 'mutation-extension'
                     atomic = mode in ('mutation-consume', 'mutation-pair', 'mutation-alias', 'mutation-lr-fault', 'mutation-pmp-direction')
@@ -7465,7 +7733,7 @@ endmodule''', 1)
                         text = text.replace('endmodule', "  assign formal_events = {(issuedCount != 0 && issuedPackets_0_decoded_instruction_instruction[6:0] == 7'h0f), takeInterrupt_layerCapture, irq_memory_owned, _mulDiv_output_valid, owned};\nendmodule", 1)
                 (work / filename).write_text(text)
             if unit == 'MulDiv' and 'latency' in mode:
-                source, paired = muldiv_latency((work / (module + '.sv')).read_text().replace(body, ''), mode)
+                source, paired = muldiv_latency((work / (module + '.sv')).read_text().replace(body, ''), mode, all(manifest['parameters'].get(key) for key in ('enableC', 'enableZcb', 'enableM')))
                 (work / (module + '.sv')).write_text(source)
                 files['pair.sv'] = license + paired
                 (work / 'pair.sv').write_text(files['pair.sv'])
@@ -7488,6 +7756,8 @@ endmodule''', 1)
                 engine = 'smtbmc --syn --unroll z3'
             if name in ('WideFetch', 'WfiFrontend', 'Gpr', 'PipelineBackend'):
                 engine = 'smtbmc z3' if name == 'WideFetch' else 'smtbmc --unroll z3'
+            if name == 'RvfiExecute' and proving:
+                engine = 'abc pdr'
             if name in ('Gpr', 'PipelineBackend'):
                 engine = 'smtbmc --syn --unroll z3'
             if unit == 'Backend' and task != 'prove':
@@ -7564,6 +7834,7 @@ endmodule''', 1)
             if name in ('FloatingBackend', 'WfiBackend', 'InterruptBackend') and mutating:
                 depth = 32 if name == 'WfiBackend' else 40
             multiclock = 'multiclock on\n' if name == 'DmiBridge' else ''
+            model_defines = '-D RISCV_FORMAL_XLEN=64 -D RISCV_FORMAL_ILEN=32 ' if name == 'RvfiExecute' else ''
             config = f'''[options]
 mode {task}
 depth {depth}
@@ -7571,7 +7842,7 @@ timeout {timeout}
 {multiclock}{witness_option}[engines]
 {engine}
 [script]
-read -formal -sv {'-noautowire ' if name in ('DebugModule', 'DmiBridge', 'MulDiv', 'FloatingFpu', 'FloatingBackend', 'PipelineBackend', 'DataCacheAssociativity') else ''}{' '.join(files)}
+read -formal -sv {model_defines}{'-noautowire ' if name in ('DebugModule', 'DmiBridge', 'MulDiv', 'RvfiExecute', 'ZktControl', 'FloatingFpu', 'FloatingBackend', 'PipelineBackend', 'DataCacheAssociativity') else ''}{' '.join(files)}
 {preparation}
 [files]
 ''' + '\n'.join(files) + '\n'
@@ -7594,11 +7865,19 @@ read -formal -sv {'-noautowire ' if name in ('DebugModule', 'DmiBridge', 'MulDiv
     assert helper_hash == hashlib.sha256(Path(binding_helper_file).read_bytes()).hexdigest(), 'Binding helper changed during proofs'
     assert model_hash is None or model_hash == hashlib.sha256(Path(model_file).read_bytes()).hexdigest(), 'Instruction model changed during proofs'
     assert all(hashlib.sha256(Path(p).read_bytes()).hexdigest() == h for p, h in manifest['sourceHashes'].items())
+    assert all((Path(rvfi_dir) / 'insns' / filename.removeprefix('rvfi_').replace('.sv', '.v')).read_text()==text for filename,text in rvfi_sources.items()), 'Instruction models changed during proofs'
     proved = {report['propertyGroup'] for report in reports if report['mode'].startswith('prove') and report['status'] == 'PASS'}
     if mutations is not None:
         assert set(mutations) == {report['mode'] for report in reports}, 'Incomplete negative-control selection'
+    if 'RvfiExecute' in proved and mutations is None:
+        assert {mode+'-'+insn for insn in rvfi_models for mode in ('prove','cover','mutation-value','mutation-decode')} <= {r['mode'] for r in reports if r['propertyGroup']=='RvfiExecute'}, 'Incomplete execution model checks'
     if 'MulDiv' in proved and mutations is None:
         assert {'prove-latency', 'cover-latency', 'mutation-latency', 'mutation-latency-word'} <= {r['mode'] for r in reports if r['propertyGroup'] == 'MulDiv'}, 'Incomplete multiplication latency checks'
+        if all(manifest['parameters'].get(key) for key in ('enableC', 'enableZcb', 'enableM')):
+            assert any(r['mode']=='mutation-latency-compressed' for r in reports if r['propertyGroup']=='MulDiv'), 'Missing compressed multiplication negative control'
+    if 'LsuReads' in proved and mutations is None and manifest['parameters'].get('floatingPointBits') and manifest['parameters'].get('enableZfhmin'):
+        assert {'prove', 'cover', 'mutation', 'mutation-value', 'mutation-cancel', 'mutation-boxing'} <= {r['mode'] for r in reports if r['propertyGroup'] == 'LsuReads'}, 'Incomplete floating read checks'
+        assert next(r['covers'] for r in reports if r['propertyGroup'] == 'LsuReads' and r['mode'] == 'cover') == 7
     if 'DataCacheWriteback' in proved:
         covers = {f'cover-{i}' for i in range(4)} if manifest['parameters'].get('dCacheRefillBytes') == 64 else {'cover'}
         assert {'prove', *covers, 'mutation', 'mutation-store-missing', 'prove-storage-shape', 'prove-storage-bytes', 'prove-storage', 'cover-storage', 'mutation-storage-mask', 'mutation-storage-word'} <= {r['mode'] for r in reports if r['propertyGroup'] == 'DataCacheWriteback'}, 'Incomplete writeback authorization proof'
@@ -7608,6 +7887,8 @@ read -formal -sv {'-noautowire ' if name in ('DebugModule', 'DmiBridge', 'MulDiv
         expected = {'prove', *covers, 'mutation', 'mutation-way-tag', 'mutation-way-duplicate'} | ({'mutation-way-victim'} if manifest['parameters'].get('dCacheWriteback') else set())
         assert expected <= {r['mode'] for r in reports if r['propertyGroup'] == 'DataCacheAssociativity'}, 'Incomplete associativity proof'
         assert sum(r['covers'] for r in reports if r['propertyGroup'] == 'DataCacheAssociativity' and r['mode'] in covers) == 3 + int(manifest['parameters'].get('dCacheWriteback', False)), 'Incomplete associativity covers'
+    if 'ZktControl' in proved:
+        assert {r['mode'] for r in reports if r['propertyGroup']=='ZktControl'} >= {'prove', 'cover', 'mutation'}
     if 'PipelineBackend' in proved:
         covers = {'cover', 'cover-memory', 'cover-recovery'} | ({'cover-dependency'} if manifest['parameters']['issueWidth'] > 1 else set())
         if manifest['parameters'].get('enableBranchPrediction'):
@@ -7711,9 +7992,10 @@ read -formal -sv {'-noautowire ' if name in ('DebugModule', 'DmiBridge', 'MulDiv
         axiComposition='control, retained values and stable operands proved first; arithmetic/output consumes those facts; all original assertions retained without new environmental constraints' if 'Axi' in proved else None,
         axiMutationGuidance='mutations only: aligned W/D AMO/LR/SC at address8, operand1, values7 then11 after retry, immediate service, per-fault codes, SC eligibility and valid hart1 with changing live sideband for retained-ID check; prove and cover unrestricted' if 'Axi' in proved else None,
         wordMemory='independent decode and execution metadata, accepted LSU ownership, size/mask, alignment, authorization, narrow extension and response fault attribution; metadata inputs unrestricted, functional completion checked for byte/halfword/word/doubleword sizes' if 'Lsu' in proved else None,
-        dualReadOwnership='Bare aligned ordinary doubleword reads without PMP; independent two-context acceptance and completion ledger, arbitrary stalls/data/errors/tags/cancellation, all payload bits, in-order completion and held-request retention; no device, translation or progress claim' if 'LsuReads' in proved else None,
+        dualReadOwnership=('Bare naturally aligned integer and floating reads at configured FLEN; independent two-context size/sign/data-bit/boxing and destination-metadata ledger; arbitrary stalls/data/errors/tags/cancellation, in-order completion and held-request retention; no device, translation, retirement or progress claim' if manifest['parameters'].get('floatingPointBits') and manifest['parameters'].get('enableZfhmin') else 'Bare aligned ordinary doubleword reads without PMP; independent two-context acceptance and completion ledger, arbitrary stalls/data/errors/tags/cancellation, all payload bits, in-order completion and held-request retention; no device, translation or progress claim') if 'LsuReads' in proved else None,
         reservation='independent last-LR physical word and validity, successful matching LR completion only, any atomic acceptance consumes old pair, full-EA SC qualification captured before protection and stable through backpressure; endpoint exclusivity is separate' if 'Lsu' in proved else None,
         physicalMemory='independent configured region/permission/shape model; D-only atomic directions/opcodes, malformed and denied SC isolation regardless of eligibility, retained local-fault response and complete request payload forwarding' if 'Memory' in proved else None,
+        dataIndependentControl=dict(instructions=[e[0] for e in zkt_inventory(manifest['parameters'])], hintFormsRequired=False, scope='actual stateless Decode/Issue/Execute pair, arbitrary distinct consistent GPR data, shared public instruction/control, no whole-Core or RVFI claim') if 'ZktControl' in proved else None,
         integerExecution='independent raw encoding validity and dependency decode, D-only atomic encodings/LR rs2 and direction metadata, integer ALU and 5/6-bit shifts, word truncation/sign extension, branches, narrow metadata and CSR semantics; combinational safety with unrestricted inputs' if 'IntegerExecute' in proved else None,
         userMode='M/U trap stack, fixed UXL64, MPP WARL, MPRV effective data access and lower-return clearing, TW legality, CSR minimum privilege and U ECALL/MRET/WFI exceptions; CSR write/mret inputs are legal retired effects' if 'UserCsr' in proved else None,
         supervisorMode='M/S/U trap target and bank isolation, shared CSR aliases, interrupt target priority, effective data mode and legal return effects; legal retired CSR/return inputs, unrestricted pending levels and trap causes' if 'SupervisorCsr' in proved else None,
@@ -7727,6 +8009,7 @@ read -formal -sv {'-noautowire ' if name in ('DebugModule', 'DmiBridge', 'MulDiv
         localInterrupts='independent request-driven MSIP, MTIME and MTIMECMP model; exact register widths, WARL bit, invalid-access isolation, read snapshots, write-once side effects, tag ownership and timer comparison; timeTick unrestricted' if 'LocalInterrupts' in proved else None,
         configurations=manifest['parameters'], sourceHashes=manifest['sourceHashes'],
         rtlHashes={p: hashlib.sha256(text.encode()).hexdigest() for p, text in (sources | observation_sources).items()},
+        executionModels=dict(scope='actual Decode/Issue/Execute with symbolic consistent GPR reads; nonzero rd value, next PC and effects; no retirement, memory, CSR or mode proof; alternate arithmetic and MISA branch disabled', files={name: hashlib.sha256(text.encode()).hexdigest() for name,text in rvfi_sources.items()}) if rvfi_sources else None,
         checkerHash=checker_hash, bindingHelperHash=helper_hash, instructionModelHash=model_hash, tools=tools, reports=reports), indent=2) + '\n')
 
 
@@ -7736,6 +8019,7 @@ if __name__ == '__main__':
     parser.add_argument('--output', type=Path, default=Path('result/formal'))
     parser.add_argument('--mutations', nargs='+')
     parser.add_argument('--jobs', type=int, default=1)
-    parser.add_argument('--modules', nargs='+', choices=('PlatformMemory', 'DebugModule', 'DmiBridge', 'DebugCsr', 'FloatingBackend', 'FloatingFpu', 'Fetch', 'CompressedFetch', 'WideFetch', 'Gpr', 'MulDiv', 'Backend', 'PipelineBackend', 'Pmp', 'PmpDecode', 'PmpInterval', 'PmpSubset', 'Csr', 'FloatingCsr', 'UserCsr', 'UserExecute', 'SupervisorCsr', 'SupervisorExecute', 'SupervisorFetch', 'Lsu', 'LsuReads', 'InterruptCsr', 'InterruptBackend', 'SynchronizationBackend', 'SharedCache', 'InstructionCache', 'DataCache', 'DataCacheWriteback', 'DataCacheAssociativity', 'Coherence', 'MemoryArbiter', 'ReadQueue', 'MemoryFabric', 'Memory', 'Axi', 'WordDecode', 'WordExecute', 'BitManipDecode', 'BitManipExecute', 'IntegerDecode', 'IntegerExecute', 'WfiBackend', 'WfiFrontend', 'LocalInterrupts', 'Translation'))
+    parser.add_argument('--modules', nargs='+', choices=('ZktControl', 'RvfiExecute', 'PlatformMemory', 'DebugModule', 'DmiBridge', 'DebugCsr', 'FloatingBackend', 'FloatingFpu', 'Fetch', 'CompressedFetch', 'WideFetch', 'Gpr', 'MulDiv', 'Backend', 'PipelineBackend', 'Pmp', 'PmpDecode', 'PmpInterval', 'PmpSubset', 'Csr', 'FloatingCsr', 'UserCsr', 'UserExecute', 'SupervisorCsr', 'SupervisorExecute', 'SupervisorFetch', 'Lsu', 'LsuReads', 'InterruptCsr', 'InterruptBackend', 'SynchronizationBackend', 'SharedCache', 'InstructionCache', 'DataCache', 'DataCacheWriteback', 'DataCacheAssociativity', 'Coherence', 'MemoryArbiter', 'ReadQueue', 'MemoryFabric', 'Memory', 'Axi', 'WordDecode', 'WordExecute', 'BitManipDecode', 'BitManipExecute', 'IntegerDecode', 'IntegerExecute', 'WfiBackend', 'WfiFrontend', 'LocalInterrupts', 'Translation'))
+    parser.add_argument('--instruction-model-dir', type=Path)
     args = parser.parse_args()
-    verify(args.rtl, args.output, args.modules, args.mutations, args.jobs)
+    verify(args.rtl, args.output, args.modules, args.mutations, args.jobs, args.instruction_model_dir)

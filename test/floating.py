@@ -40,14 +40,33 @@ def instruction_encodings():
             put(f'fcvt.{integer}.{suffix}', 24, source=kind, fp_write=False)
             put(f'fcvt.{suffix}.{integer}', 26, source=kind, integer_source=True)
         put('fcvt.' + suffix + ('.s' if fmt else '.d'), 8, source=1-fmt, required=64)
+        put('fli.' + suffix, 30, 0, 1)
+        for selector, name in ((2, 'fminm'), (3, 'fmaxm'), (4, 'fleq'), (5, 'fltq')):
+            put(name + '.' + suffix, 20 if selector > 3 else 5, selector, fp_write=selector < 4)
+        for source, name in ((4, 'fround'), (5, 'froundnx')):
+            put(name + '.' + suffix, 8, source=source)
+        put('fcvt.' + suffix + '.h', 8, source=2)
+    entries['fcvtmod.w.d'] = 0xc2801053, 0xfff0707f, False, False, False, 64
+    for name, encoding, mask, rounding, fp_write, integer_source, minimum in (
+        ('flh', 0x1007, 0x707f, False, True, True, 32),
+        ('fsh', 0x1027, 0x707f, False, False, True, 32),
+        ('fmv.x.h', 0xe4000053, 0xfff0707f, False, False, False, 32),
+        ('fmv.h.x', 0xf4000053, 0xfff0707f, False, True, True, 32),
+        ('fcvt.h.s', 0x44000053, 0xfff0007f, True, True, False, 32),
+        ('fcvt.h.d', 0x44100053, 0xfff0007f, True, True, False, 64)):
+        entries[name] = encoding, mask, rounding, fp_write, integer_source, minimum
     return entries
 
 
 FLOATING_ENCODINGS = instruction_encodings()
+FLOATING_FEATURES = {name: 'Zfa' for name in FLOATING_ENCODINGS if name.startswith(('fli.', 'fminm.', 'fmaxm.', 'fround.', 'froundnx.', 'fleq.', 'fltq.', 'fcvtmod.'))}
+FLOATING_FEATURES.update({name: 'Zfhmin' for name in FLOATING_ENCODINGS if name in ('flh', 'fsh', 'fmv.x.h', 'fmv.h.x') or name.startswith('fcvt.') and (name.endswith('.h') or name.startswith('fcvt.h.'))})
 
 
-def floating_decode(instruction, flen):
-    for entry in FLOATING_ENCODINGS.values():
+def floating_decode(instruction, flen, config=None):
+    for name, entry in FLOATING_ENCODINGS.items():
+        if name in FLOATING_FEATURES and not (config or {}).get('enable' + FLOATING_FEATURES[name]):
+            continue
         encoding, mask, rounding, _, _, minimum = entry
         if flen >= minimum and instruction & mask == encoding and (not rounding or (instruction >> 12) & 7 in (0, 1, 2, 3, 4, 7)):
             return entry
@@ -55,10 +74,10 @@ def floating_decode(instruction, flen):
 
 
 def parts(raw, width, flen):
-    fraction = 23 if width == 32 else 52
+    fraction = {16: 10, 32: 23, 64: 52}[width]
     exponent = width - fraction - 1
     canonical = (((1 << exponent) - 1) << fraction) | (1 << (fraction - 1))
-    raw = canonical if width == 32 and flen == 64 and raw >> 32 != 0xffffffff else raw & ((1 << width) - 1)
+    raw = canonical if width < flen and raw >> width != (1 << (flen - width)) - 1 else raw & ((1 << width) - 1)
     sign, field, tail = raw >> (width - 1), (raw >> fraction) & ((1 << exponent) - 1), raw & ((1 << fraction) - 1)
     kind = 'nan' if tail else 'inf' if field == (1 << exponent) - 1 else 'finite'
     if field != (1 << exponent) - 1:
@@ -76,7 +95,7 @@ def rounded(q, remainder, divisor, mode, sign):
 
 
 def round_float(value, width, mode, zero_sign=0, root=False):
-    fraction = 23 if width == 32 else 52
+    fraction = {16: 10, 32: 23, 64: 52}[width]
     exponent_bits = width - fraction - 1
     bias = (1 << (exponent_bits - 1)) - 1
     sign = int(value < 0) if value else zero_sign
@@ -116,18 +135,27 @@ def round_float(value, width, mode, zero_sign=0, root=False):
 
 def floating_value(instruction, a, b, c, mode, flen):
     opcode, function, fmt, kind = instruction & 127, instruction >> 27, (instruction >> 25) & 3, (instruction >> 20) & 31
-    width = 64 if fmt == 1 else 32
-    if fmt > 1 or width > flen:
+    width = {0: 32, 1: 64, 2: 16}.get(fmt, 128)
+    if fmt > 2 or width > flen:
         raise ValueError('Unsupported floating-point format')
-    fraction = 23 if width == 32 else 52
+    fraction = {16: 10, 32: 23, 64: 52}[width]
     exponent_bits = width - fraction - 1
     nan = (((1 << exponent_bits) - 1) << fraction) | (1 << (fraction - 1))
     infinity = ((1 << exponent_bits) - 1) << fraction
     sign_bit = 1 << (width - 1)
-    box = lambda x: (x | 0xffffffff00000000) if width == 32 and flen == 64 else x
+    box = lambda x: x | (((1 << flen) - (1 << width)) if width < flen else 0)
     if opcode != 0x53 or function in (0, 1, 2, 3, 8, 11, 24, 26):
         if mode not in range(5):
             raise ValueError('Reserved rounding mode')
+    if opcode == 0x53 and function == 30 and kind == 1:
+        index = (instruction >> 15) & 31
+        if index >= 30:
+            return box(infinity if index == 30 else nan), 0
+        constants = (Fraction(-1), Fraction(2) ** (-(1 << (exponent_bits - 1)) + 2),
+            *[Fraction(2) ** n for n in (-16, -15, -8, -7, -4, -3, -2)],
+            Fraction(5, 16), Fraction(3, 8), Fraction(7, 16), Fraction(1, 2), Fraction(5, 8), Fraction(3, 4), Fraction(7, 8),
+            1, Fraction(5, 4), Fraction(3, 2), Fraction(7, 4), 2, Fraction(5, 2), 3, 4, 8, 16, 128, 256, 32768, 65536)
+        return box(round_float(Fraction(constants[index]), width, 0)[0]), 0
     if opcode == 0x53 and function in (26, 30):
         if function == 30:
             return box(a & (sign_bit * 2 - 1)), 0
@@ -138,9 +166,18 @@ def floating_value(instruction, a, b, c, mode, flen):
         value, flags = round_float(Fraction(integer), width, mode)
         return box(value), flags
     if opcode == 0x53 and function == 28 and not instruction & 0x1000:
-        return ((a & 0x7fffffff) - (a & 0x80000000)) & MASK if width == 32 else a, 0
+        return ((a & (sign_bit - 1)) - (a & sign_bit)) & MASK, 0
+    if opcode == 0x53 and function == 8 and kind in (4, 5):
+        source = parts(a, width, flen)
+        if source[2] == 'nan':
+            return box(nan), 16 if source[4] else 0
+        if source[2] == 'inf':
+            return box(source[0]), 0
+        q, remainder = divmod(abs(source[3].numerator), source[3].denominator)
+        integer = rounded(q, remainder, source[3].denominator, mode, source[1]) * (-1 if source[1] else 1)
+        return box(round_float(Fraction(integer), width, 0, source[1])[0]), int(kind == 5 and bool(remainder))
     if opcode == 0x53 and function == 8:
-        source = parts(a, 32 if width == 64 else 64, flen)
+        source = parts(a, {0: 32, 1: 64, 2: 16}[kind], flen)
         value, flags = (nan, 16 if source[4] else 0) if source[2] == 'nan' else ((infinity | source[1] * sign_bit, 0) if source[2] == 'inf' else round_float(source[3], width, mode, source[1]))
         return box(value), flags
     pa, pb, pc = (parts(x, width, flen) for x in (a, b, c))
@@ -161,10 +198,22 @@ def floating_value(instruction, a, b, c, mode, flen):
         equal = not unordered and (va == vb if kind_a == kind_b == 'finite' else kind_a == kind_b == 'inf' and sign_a == sign_b)
         selector = (instruction >> 12) & 7
         if function == 20:
-            return int(not unordered and (equal if selector == 2 else less if selector == 1 else less or equal)), 16 if signaling_a or signaling_b or unordered and selector != 2 else 0
+            return int(not unordered and (equal if selector == 2 else less if selector in (1, 5) else less or equal)), 16 if signaling_a or signaling_b or unordered and selector not in (2, 4, 5) else 0
+        if selector >= 2 and unordered:
+            return box(nan), 16 if signaling_a or signaling_b else 0
+        selector &= 1
         value = nan if kind_a == kind_b == 'nan' else raw_b if kind_a == 'nan' else raw_a if kind_b == 'nan' else (
             ((sign_a & sign_b) if selector else (sign_a | sign_b)) * sign_bit if not va and not vb and kind_a == kind_b == 'finite' else raw_a if less != bool(selector) else raw_b)
         return box(value), 16 if signaling_a or signaling_b else 0
+    if opcode == 0x53 and function == 24 and kind == 8:
+        if fmt != 1 or (instruction >> 12) & 7 != 1:
+            raise ValueError('Reserved modular conversion encoding')
+        if kind_a != 'finite':
+            return 0, 16
+        q, remainder = divmod(abs(va.numerator), va.denominator)
+        integer = -q if sign_a else q
+        flags = 16 if not -(1 << 31) <= integer < 1 << 31 else int(bool(remainder))
+        return ((integer & 0x7fffffff) - (integer & 0x80000000)) & MASK, flags
     if opcode == 0x53 and function == 24:
         integer_width, unsigned = (64 if kind & 2 else 32), bool(kind & 1)
         minimum, maximum = (0, (1 << integer_width) - 1) if unsigned else (-(1 << (integer_width - 1)), (1 << (integer_width - 1)) - 1)

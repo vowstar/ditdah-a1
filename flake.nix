@@ -129,6 +129,7 @@
             (pkgs.python313.withPackages (ps: [ ps.pytest ps.click ps.pyelftools ps.cocotb ]))
           ];
           env = {
+            RISCV_FORMAL_DIR = self.inputs.riscv-formal.outPath;
             ZAOZI_JAR = jar;
             CIRCT_INSTALL_PATH = pkgs.circt-install;
             MLIR_INSTALL_PATH = pkgs.mlir-install;
