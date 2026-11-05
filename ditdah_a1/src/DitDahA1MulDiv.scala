@@ -24,6 +24,7 @@ object DitDahA1MulDiv extends Generator[DitDahA1Parameter, DitDahA1UnitLayers, D
     val valid = RegInit(false.B)
     val factor = Reg(UInt(128))
     val remaining = Reg(UInt(64))
+    val iteration = Reg(UInt(6))
     val work = Reg(UInt(128))
     val functionCode = Reg(UInt(3))
     val wordOperation = Reg(Bool())
@@ -47,9 +48,11 @@ object DitDahA1MulDiv extends Generator[DitDahA1Parameter, DitDahA1UnitLayers, D
       }.otherwise {
         work := (work + remaining.asBits.bit(0).?(factor, 0.U(128))).asBits.bits(127, 0).asUInt
         factor := (factor << 1).asBits.bits(127, 0).asUInt
+        iteration := (iteration + 1.U(6)).asBits.bits(5, 0).asUInt
       }
       remaining := remaining >> 1
-      when(remaining <= 1.U(64)) { busy := false.B; valid := true.B }
+      val finished = functionCode.asBits.bit(2).?(remaining <= 1.U(64), iteration === wordOperation.?(31.U(6), 63.U(6)))
+      when(finished) { busy := false.B; valid := true.B }
     }
     when(io.input.valid & io.input.ready) {
       val encoding = io.input.bits.decoded.instruction.instruction.asBits
@@ -75,6 +78,7 @@ object DitDahA1MulDiv extends Generator[DitDahA1Parameter, DitDahA1UnitLayers, D
       work := division.?((0.B(64) ## word.?((absoluteA.asBits.bits(31, 0) ## 0.B(32)).asUInt, absoluteA).asBits).asUInt,
         (high ## 0.B(64)).asUInt)
       functionCode := function
+      iteration := 0.U(6)
       wordOperation := word
       negateResult := function.asBits.bit(1).?(negativeA, (negativeA ^ negativeB) & (b =/= 0.U(64)))
       busy := true.B

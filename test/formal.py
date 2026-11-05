@@ -362,14 +362,18 @@ MULDIV = r'''
         assert(age <= (operation[3] ? 32 : 64));
         assert(functionCode == operation[2:0] && wordOperation == operation[3]);
         assert(remaining == ((operation[2] ? division_mask : normalized_second) >> age));
-        if (busy && age != 0) assert(remaining != 0);
+        if (operation[2] && busy && age != 0) assert(remaining != 0);
+        if (!operation[2]) begin
+          assert(valid == (age == (operation[3] ? 32 : 64)));
+          if (busy) assert(iteration == age[5:0]);
+        end
       end
       if (pending && operation == 0) begin
         if (first == 0) assert(factor == 0 && work == 0);
         if (second == 0) assert(remaining == 0 && work == 0);
         if (second == 1) assert(
-          (busy && remaining == 1 && work == 0 && factor == {64'd0, first}) ||
-          (valid && work == {64'd0, first}));
+          (age == 0 && busy && remaining == 1 && work == 0 && factor == {64'd0, first}) ||
+          (age != 0 && remaining == 0 && work == {64'd0, first}));
       end
       if (output_valid) begin
         assert(pending);
@@ -394,6 +398,50 @@ MULDIV = r'''
     end
   end
 '''
+
+
+def muldiv_latency(source, mode):
+    source = source.replace(');', ', output formal_busy, output [9:0] formal_control);', 1).replace(
+        'endmodule', 'assign formal_busy=busy;\nassign formal_control={iteration,wordOperation,functionCode};\nendmodule', 1)
+    text, connections = 'module formal_muldiv_pair(input clock, reset);\n', [[], []]
+    for direction, width, name in module_ports(source):
+        if name not in ('clock', 'reset'):
+            text += f'  {"(* anyseq *) reg" if direction == "input" else "wire"} {width} {name};\n'
+        separate = direction == 'output' or name in ('input_bits_operand1', 'input_bits_operand2')
+        if separate:
+            text += f'  {"(* anyseq *) reg" if direction == "input" else "wire"} {width} paired_{name};\n'
+        for index in range(2):
+            connections[index].append(f'.{name}({"paired_" if index and separate else ""}{name})')
+    text += '\n'.join(f'  DitDahA1MulDiv dut{index}({", ".join(pins)});' for index, pins in enumerate(connections))
+    text += r'''
+  reg past_valid=0, distinct_pair, word_pair;
+  wire word_operation=input_bits_decoded_instruction_instruction[6:0]==7'h3b;
+  always @(posedge clock) begin
+    past_valid<=1;
+    if(!past_valid) assume(reset); else assume(!reset);
+    if(reset) begin distinct_pair<=0;word_pair<=0;end
+    else begin
+      assume(input_bits_decoded_instruction_instruction[31:25]==1);
+      assume((!word_operation && input_bits_decoded_instruction_instruction[6:0]==7'h33 &&
+        input_bits_decoded_instruction_instruction[14:12]<4) ||
+        (word_operation && input_bits_decoded_instruction_instruction[14:12]==0));
+      assert(input_ready==paired_input_ready && output_valid==paired_output_valid && formal_busy==paired_formal_busy);
+      if(!input_ready) assert(formal_control==paired_formal_control && !formal_control[2]);
+      if(input_valid && input_ready) begin
+        word_pair<=word_operation;
+        distinct_pair<=input_bits_operand2==1 && paired_input_bits_operand2==
+          (word_operation ? 64'h80000000 : 64'h8000000000000000);
+      end
+      cover(output_valid && distinct_pair && !word_pair);
+      cover(output_valid && distinct_pair && word_pair);
+    end
+  end
+'''
+    if mode.startswith('mutation'):
+        word = mode.endswith('-word')
+        text += f"  always @* assume(input_valid && input_bits_decoded_instruction_instruction==32'h{0x0220833b if word else 0x02208333:x} && input_bits_operand2==1 && paired_input_bits_operand2==64'h{1 << (31 if word else 63):x});\n"
+    return source, text + 'endmodule\n'
+
 
 def backend_names(text, source):
     late, early = backend_control_signals(source)
@@ -6291,6 +6339,9 @@ endmodule''', 1)
             checks[1:2] = [('cover-short', before, after), ('cover-long', before, after)]
             checks += [('mutation-mode', 'functionCode <= input_bits_decoded_instruction_instruction[14:12];', "functionCode <= 3'h0;"),
                        ('mutation-word', '{{32{value[31]}}, value[31:0]}', "{32'h0, value[31:0]}")]
+            completion, = re.findall(r"\biteration == \{~wordOperation,\s*5'h1[fF]\}", sources[module + '.sv'])
+            checks += [(mode, completion, "remaining <= 64'h1") for mode in
+                       ('prove-latency', 'cover-latency', 'mutation-latency', 'mutation-latency-word')]
         if name == 'UserExecute':
             checks += [('mutation-return', 'assign output_bits_instruction_fault =', 'assign output_bits_instruction_fault = 0 &')]
         if name in ('UserExecute', 'SupervisorExecute'):
@@ -6566,6 +6617,7 @@ endmodule''', 1)
         for check in checks:
             top = proof_top
             files.pop('witness.sv', None)
+            files.pop('pair.sv', None)
             mode, before, after, *target = check
             if mutations is not None and mode not in mutations:
                 continue
@@ -7111,7 +7163,7 @@ endmodule''', 1)
   end
 '''
                     text = text.replace('endmodule', guidance + '\nendmodule', 1)
-                if unit == 'MulDiv' and mode.startswith('cover-') and filename == module + '.sv':
+                if unit == 'MulDiv' and mode in ('cover-short', 'cover-long') and filename == module + '.sv':
                     text = partition_covers(text, (2, 5) if mode == 'cover-long' else (0, 1, 3, 4, 6, 7), 8)
                 if unit == 'MulDiv' and mode == 'cover-long' and filename == module + '.sv':
                     text = text.replace('endmodule', "  always @* assume(input_valid && output_ready && input_bits_decoded_instruction_instruction == 32'h0220d333 && input_bits_operand1 == 0 && input_bits_operand2 == 0);\nendmodule", 1)
@@ -7412,6 +7464,12 @@ endmodule''', 1)
                         text = text.replace(');', ', output [4:0] formal_events);', 1)
                         text = text.replace('endmodule', "  assign formal_events = {(issuedCount != 0 && issuedPackets_0_decoded_instruction_instruction[6:0] == 7'h0f), takeInterrupt_layerCapture, irq_memory_owned, _mulDiv_output_valid, owned};\nendmodule", 1)
                 (work / filename).write_text(text)
+            if unit == 'MulDiv' and 'latency' in mode:
+                source, paired = muldiv_latency((work / (module + '.sv')).read_text().replace(body, ''), mode)
+                (work / (module + '.sv')).write_text(source)
+                files['pair.sv'] = license + paired
+                (work / 'pair.sv').write_text(files['pair.sv'])
+                top = 'formal_muldiv_pair'
             if witness:
                 files['witness.sv'] = license + witness_wrapper((work / (module + '.sv')).read_text(), *witness(manifest['parameters'], mode))
                 (work / 'witness.sv').write_text(files['witness.sv'])
@@ -7489,6 +7547,8 @@ endmodule''', 1)
             depth = 2 if unit == 'Axi' and mode.startswith('prove-payload-output-') else 6 * manifest['parameters']['hartCount'] + 8 if unit == 'MemoryArbiter' else 72 if task == 'cover' or (unit == 'InstructionCache' and mode in ('mutation', 'mutation-invalidate', 'mutation-count')) else 1 if name.startswith('Pmp') or unit in ('Decode', 'Execute') else (3 if task == 'prove' else 8) if unit == 'Csr' else 6 if unit in ('DataCache', 'Coherence', 'SharedCache') and task == 'prove' else 4 if name in ('Gpr', 'MulDiv', 'Memory', 'Axi', 'SynchronizationBackend', 'WfiBackend', 'InstructionCache', 'LocalInterrupts') and task == 'prove' else 24
             if mode == 'mutation-buffer-stage' and manifest['parameters'].get('enableBurstRefill'):
                 depth = 40
+            if name == 'MulDiv' and mode == 'mutation-word':
+                depth = 40
             if unit == 'PlatformMemory' and task == 'prove':
                 depth = 4
             if unit == 'ReadQueue' and task == 'prove':
@@ -7511,12 +7571,14 @@ timeout {timeout}
 {multiclock}{witness_option}[engines]
 {engine}
 [script]
-read -formal -sv {'-noautowire ' if name in ('DebugModule', 'DmiBridge', 'FloatingFpu', 'FloatingBackend', 'PipelineBackend', 'DataCacheAssociativity') else ''}{' '.join(files)}
+read -formal -sv {'-noautowire ' if name in ('DebugModule', 'DmiBridge', 'MulDiv', 'FloatingFpu', 'FloatingBackend', 'PipelineBackend', 'DataCacheAssociativity') else ''}{' '.join(files)}
 {preparation}
 [files]
 ''' + '\n'.join(files) + '\n'
             (work / 'check.sby').write_text(config)
             counted = (work / (module + '.sv')).read_text() if unit in ('ReadQueue', 'Axi', 'DataCache', 'MemoryFabric') or name in ('FloatingBackend', 'PipelineBackend', 'WfiFrontend') else body
+            if unit == 'MulDiv' and 'latency' in mode:
+                counted = paired
             arguments = (work, timeout, name, mode, module, engine, counted)
             if jobs > 1 and mode.startswith('prove-bits-'):
                 proof_futures.append(executor.submit(run_check, *arguments))
@@ -7535,6 +7597,8 @@ read -formal -sv {'-noautowire ' if name in ('DebugModule', 'DmiBridge', 'Floati
     proved = {report['propertyGroup'] for report in reports if report['mode'].startswith('prove') and report['status'] == 'PASS'}
     if mutations is not None:
         assert set(mutations) == {report['mode'] for report in reports}, 'Incomplete negative-control selection'
+    if 'MulDiv' in proved and mutations is None:
+        assert {'prove-latency', 'cover-latency', 'mutation-latency', 'mutation-latency-word'} <= {r['mode'] for r in reports if r['propertyGroup'] == 'MulDiv'}, 'Incomplete multiplication latency checks'
     if 'DataCacheWriteback' in proved:
         covers = {f'cover-{i}' for i in range(4)} if manifest['parameters'].get('dCacheRefillBytes') == 64 else {'cover'}
         assert {'prove', *covers, 'mutation', 'mutation-store-missing', 'prove-storage-shape', 'prove-storage-bytes', 'prove-storage', 'cover-storage', 'mutation-storage-mask', 'mutation-storage-word'} <= {r['mode'] for r in reports if r['propertyGroup'] == 'DataCacheWriteback'}, 'Incomplete writeback authorization proof'

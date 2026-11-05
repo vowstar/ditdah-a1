@@ -3122,8 +3122,13 @@ def muldiv_contract():
     check(input_ready && !output_valid, "MulDiv resource reuse"); tick();
     input_bits_operand1 = ~input_bits_operand1; input_bits_operand2 = ~input_bits_operand2;
     input_bits_decoded_instruction_instruction = '1;
-    for (integer cycles = 0; !output_valid; cycles++) begin
-      check(!input_ready && cycles < {32 if instruction & 127 == 0x3b else 64}, "MulDiv acceptance or completion bound"); tick();
+    begin
+    integer cycles;
+    cycles=0;
+    while (!output_valid) begin
+      check(!input_ready && cycles < {32 if instruction & 127 == 0x3b else 64}, "MulDiv acceptance or completion bound"); tick(); cycles++;
+    end
+    check(cycles == {32 if instruction & 127 == 0x3b else 64}, "MulDiv exact completion");
     end
     input_valid = 0;
     repeat (3) begin
@@ -3171,7 +3176,7 @@ def backend_muldiv_contract():
         body += send(words, 0x180, 10)
         if held:
             body += '''
-    while (!data_request_valid || dut.mulDiv.remaining != 7) tick();
+    while (!data_request_valid || dut.mulDiv.iteration != 61) tick();
     check(dut.executePending && !dut.mulDiv.output_valid, "Fault response did not precede mulDiv completion");
     data_request_ready = 1; tick(); data_request_ready = 0;
     data_response_bits_tag = 10; data_response_bits_fault = 1; data_response_valid = 1;
@@ -3452,7 +3457,14 @@ def backend_group_contract(parameters):
     instruction_valid = 1; while (!instruction_ready) tick(); tick(); instruction_valid = 0;
     while (dut.commitCount == 0 || !dut.commitPackets_0_wfi) tick();
     tick(); check(status_sleep && {"dut.executePending && " if parameters.get("enableM", True) else ""}dut.resumePc == 'h204, "WFI cancels younger mulDiv and retains resume PC");
-    repeat (8) begin check(status_sleep && !instruction_ready && !data_request_valid, "Sleep drains owned execution"); tick(); end
+    begin
+      integer drain_cycles;
+      drain_cycles=0;
+      while (drain_cycles<8 || ({"dut.executePending" if parameters.get("enableM", True) else "1'b0"} && drain_cycles<68)) begin
+        check(status_sleep && !instruction_ready && dut.issuedCount==0 && !data_request_valid, "Sleep drains owned execution");
+        tick(); drain_cycles++;
+      end
+    end
     check({"!dut.executePending" if parameters.get("enableM", True) else "!data_request_valid"}, "Cancelled execution drained");
     interrupts_software = 1; tick();
     check(!status_sleep && instruction_ready && !status_trap, "Locally enabled wake without global trap");
@@ -4941,6 +4953,19 @@ def verify(rtl, directory, modules=None):
                               r'(dut.\1Count != 0)', body)
                 body += backend_group_contract(parameters) + (backend_branch_contract() if parameters.get('loadQueueEntries', 1) == 1 else '') + backend_memory_group_contract(parameters)
         source = bench(module, body, 4 + 69 * body.count('MulDiv resource reuse')) if name == 'DitDahA1MulDiv' else bench(module, body)
+        if name == 'DitDahA1MulDiv':
+            declarations, connections = [], []
+            for direction, width, pin in module_ports(module):
+                if direction == 'output':
+                    declarations.append(f'  wire {width} paired_{pin};')
+                value = 'paired_' + pin if direction == 'output' else '~' + pin if pin in ('input_bits_operand1', 'input_bits_operand2') else pin
+                connections.append(f'.{pin}({value})')
+            paired = '\n'.join(declarations) + '\n  DitDahA1MulDiv peer(' + ', '.join(connections) + ''');
+  always @(posedge clock) if (!reset)
+    if ({input_ready, output_valid, dut.busy} !== {paired_input_ready, paired_output_valid, peer.busy})
+      $fatal(1,"Multiplication and division paired control");
+'''
+            source = source.replace('  initial begin', paired + '\n  initial begin', 1)
         if name == 'DitDahA1Fpu':
             source = bench(module, body, 150 * (directory / 'floating.hex').read_text().count('\n')).replace('DitDahA1Fpu dut(', f"DitDahA1Fpu #(.FLEN({parameters['floatingPointBits']})) dut(")
 
