@@ -54,6 +54,7 @@ object DitDahA1Module extends Generator[DitDahA1Parameter, DitDahA1Layers, DitDa
       core.io.clock := io.clock
       core.io.reset := processorReset
       core.io.hartId := hart.U(4)
+      core.io.timeValue.foreach(_ := (if parameter.localInterruptBase.nonEmpty then fabric.io.timeValue.get else io.timeValue.get))
       if parameter.enableInterrupts then
         core.io.interrupts.get :<= io.interrupts.get(hart)
         if parameter.localInterruptBase.nonEmpty then
@@ -198,6 +199,7 @@ object DitDahA1MemoryFabric extends Generator[DitDahA1Parameter, DitDahA1UnitLay
       localInterrupts.io.clock := io.clock
       localInterrupts.io.reset := io.reset
       localInterrupts.io.timeTick := io.timeTick.get
+      io.timeValue.foreach(_ := localInterrupts.io.timeValue.get)
       io.localInterrupts.get :<= localInterrupts.io.interrupts
       axi.io.memory.request.bits :<= port.request.bits
       localInterrupts.io.memory.request.bits :<= port.request.bits

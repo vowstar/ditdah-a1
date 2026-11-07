@@ -17,6 +17,8 @@ class DebugCsrPort extends Bundle:
   val ebreak = Aligned(Bool())
 
 class DitDahA1CsrIO(parameter: DitDahA1Parameter) extends HWBundle(parameter):
+  val timeValue = Option.when(parameter.enableCounters)(Flipped(UInt(64)))
+  val retiredCount = Option.when(parameter.enableCounters)(Flipped(UInt(parameter.issueCountBits)))
   val debug = Option.when(parameter.enableJtag)(Aligned(new DebugCsrPort))
   val fpEnabled = Option.when(parameter.floatingPointBits != 0)(Aligned(Bool()))
   val roundingMode = Option.when(parameter.floatingPointBits != 0)(Aligned(UInt(3)))
@@ -56,6 +58,7 @@ object DitDahA1Csr extends Generator[DitDahA1Parameter, DitDahA1UnitLayers, DitD
   override def moduleName(parameter: DitDahA1Parameter): String = "DitDahA1Csr"
   def architecture(parameter: DitDahA1Parameter) =
     parameter.validateProtection()
+    parameter.validateCounters()
     val io = summon[Interface[DitDahA1CsrIO]]
     given ClockScope = ClockScope.posedge(io.clock)
     given ResetScope = ResetScope.syncActiveHigh(io.reset)
@@ -103,6 +106,77 @@ object DitDahA1Csr extends Generator[DitDahA1Parameter, DitDahA1UnitLayers, DitD
       (privilege === 3.U(2)) | ((privilege === 1.U(2)) & !status.asBits.bit(22)) else false.B)
     io.sfenceLegal := (if parameter.enableTranslation then
       (privilege === 3.U(2)) | ((privilege === 1.U(2)) & !status.asBits.bit(20)) else false.B)
+    val overflowRequest = Option.when(parameter.hpmCounters > 0)(RegInit(false.B))
+    val overflowPending = Option.when(parameter.hpmCounters > 0)(RegInit(false.B))
+    val stimecmp = Option.when(parameter.enableSstc)(RegInit(((BigInt(1) << 64) - 1).U(64)))
+    val stce = Option.when(parameter.enableSstc)(RegInit(false.B))
+    if parameter.enableCounters then
+      val countMask = ((BigInt(1) << (parameter.hpmCounters + 3)) - 1)
+      val inhibitMask = countMask & ~BigInt(2)
+      val mcounteren = Option.when(parameter.enableUserMode)(RegInit(0.U(32)))
+      val scounteren = Option.when(parameter.enableSupervisorMode)(RegInit(0.U(32)))
+      val inhibit = RegInit(0.U(32))
+      val cycle = RegInit(0.U(64))
+      val instret = RegInit(0.U(64))
+      val hpm = Seq.fill(parameter.hpmCounters)(RegInit(0.U(64)))
+      val selectors = Seq.fill(parameter.hpmCounters)(RegInit(0.U(2)))
+      val filters = Seq.fill(parameter.hpmCounters)(RegInit(0.U(3)))
+      val flags = Seq.fill(parameter.hpmCounters)(RegInit(false.B))
+      for (address, register, mask) <- Seq((0x320, inhibit, inhibitMask)) ++
+          mcounteren.map((0x306, _, countMask)) ++ scounteren.map((0x106, _, countMask)) do
+        when(io.readAddress === address.U(12)) { io.readData := register; io.legal := true.B }
+        when(io.write & (io.writeAddress === address.U(12))) { register := (io.writeData.asBits.bits(31, 0) & mask.B(32)).asUInt }
+      for (index, register, delta) <- Seq((0, cycle, 1.U(parameter.issueCountBits)), (2, instret, io.retiredCount.get)) do
+        when(!inhibit.asBits.bit(index)) { register := (register + delta).asBits.bits(63, 0).asUInt }
+        when(io.write & (io.writeAddress === (0xb00 + index).U(12))) { register := io.writeData }
+      val requests = (0 until parameter.hpmCounters).map { index =>
+        val blocked = (privilege === 3.U(2)).?(filters(index).asBits.bit(2),
+          (privilege === 1.U(2)).?(filters(index).asBits.bit(1), filters(index).asBits.bit(0)))
+        val delta = (selectors(index) === 1.U(2)).?(1.U(parameter.issueCountBits),
+          (selectors(index) === 2.U(2)).?(io.retiredCount.get, 0.U(parameter.issueCountBits)))
+        val total = (0.U(65) + hpm(index) + delta).asBits
+        val writing = io.write & (io.writeAddress === (0xb03 + index).U(12))
+        val request = Wire(Bool())
+        request := false.B
+        when(!inhibit.asBits.bit(index + 3) & !blocked & !writing) {
+          hpm(index) := total.bits(63, 0).asUInt
+          when(total.bit(64)) { flags(index) := true.B; request := !flags(index) }
+        }
+        when(writing) { hpm(index) := io.writeData }
+        when(io.write & (io.writeAddress === (0x323 + index).U(12))) {
+          val selection = io.writeData.asBits.bits(1, 0).asUInt
+          selectors(index) := (selection === 3.U(2)).?(0.U(2), selection)
+          val mask = 4 | (if parameter.enableSupervisorMode then 2 else 0) | (if parameter.enableUserMode then 1 else 0)
+          filters(index) := (io.writeData.asBits.bits(62, 60) & mask.B(3)).asUInt
+          flags(index) := io.writeData.asBits.bit(63)
+        }
+        request
+      }
+      overflowRequest.foreach(_ := requests.foldLeft[Referable[Bool]](false.B)(_ | _))
+      val values: Seq[Referable[UInt]] = Seq(cycle, io.timeValue.get, instret) ++ hpm ++ Seq.fill(29 - parameter.hpmCounters)(0.U(64))
+      for index <- 0 until 32 do
+        val lower = mcounteren.map(_.asBits.bit(index)).getOrElse(false.B) &
+          (if parameter.enableSupervisorMode then (privilege =/= 0.U(2)) | scounteren.get.asBits.bit(index) else true.B)
+        when(io.readAddress === (0xc00 + index).U(12)) { io.readData := values(index); io.legal := (privilege === 3.U(2)) | lower }
+        if index != 1 then
+          when(io.readAddress === (0xb00 + index).U(12)) { io.readData := values(index); io.legal := true.B }
+        if index >= 3 then
+          val event = if index < parameter.hpmCounters + 3 then
+            flags(index - 3).asBits ## filters(index - 3).asBits ## 0.B(58) ## selectors(index - 3).asBits else 0.B(64)
+          when(io.readAddress === (0x320 + index).U(12)) { io.readData := event.asUInt; io.legal := true.B }
+      if parameter.enableSupervisorMode && parameter.hpmCounters > 0 then
+        val bits = flags.zipWithIndex.foldLeft[Referable[Bits]](0.B(32)) { case (value, (flag, index)) =>
+          value | flag.?((BigInt(1) << (index + 3)).B(32), 0.B(32)) }
+        when(io.readAddress === 0xda0.U(12)) {
+          io.readData := (bits & (privilege === 3.U(2)).?(countMask.B(32), mcounteren.get.asBits)).asUInt
+          io.legal := true.B
+        }
+      if parameter.enableSstc then
+        val allowed = (privilege === 3.U(2)) | ((privilege === 1.U(2)) & stce.get & mcounteren.get.asBits.bit(1))
+        when(io.readAddress === 0x14d.U(12)) { io.readData := stimecmp.get; io.legal := allowed }
+        when(io.readAddress === 0x30a.U(12)) { io.readData := (stce.get.asBits ## 0.B(63)).asUInt; io.legal := true.B }
+        when(io.write & (io.writeAddress === 0x14d.U(12)) & allowed) { stimecmp.get := io.writeData }
+        when(io.write & (io.writeAddress === 0x30a.U(12))) { stce.get := io.writeData.asBits.bit(63) }
     val mtvec = RegInit(0.U(64))
     val mscratch = RegInit(0.U(64))
     val alignment = if parameter.enableC then 1 else 2
@@ -206,7 +280,7 @@ object DitDahA1Csr extends Generator[DitDahA1Parameter, DitDahA1UnitLayers, DitD
       when(io.write & (io.writeAddress === 0x100.U(12))) {
         status := ((status.asBits & (BigInt("ffffffffffffffff", 16) ^ supervisorMask).B(64)) | (io.writeData.asBits & supervisorMask.B(64))).asUInt
       }
-      Seq((0x302, medeleg.get, if parameter.enableTranslation then 0xb3ff else 0x3ff), (0x303, mideleg.get, 0x222)).foreach { case (address, register, mask) =>
+      Seq((0x302, medeleg.get, if parameter.enableTranslation then 0xb3ff else 0x3ff), (0x303, mideleg.get, 0x222 | (if parameter.hpmCounters > 0 then 0x2000 else 0))).foreach { case (address, register, mask) =>
         when(io.readAddress === address.U(12)) { io.readData := register; io.legal := true.B }
         when(io.write & (io.writeAddress === address.U(12))) { register := (io.writeData.asBits & mask.B(64)).asUInt }
       }
@@ -259,60 +333,54 @@ object DitDahA1Csr extends Generator[DitDahA1Parameter, DitDahA1UnitLayers, DitD
           status.asBits.bit(3).?(0x80.B(64), 0.B(64))).asUInt
       }
     }
-    if parameter.enableSupervisorMode then
-      val enables = RegInit(0.U(12))
-      val softwarePending = RegInit(0.U(3))
+    if parameter.enableInterrupts then
+      val supported = 0x888 | (if parameter.enableSupervisorMode then 0x222 else 0) | (if parameter.hpmCounters > 0 then 0x2000 else 0)
+      val enables = RegInit(0.U(14))
+      val softwarePending = Option.when(parameter.enableSupervisorMode)(RegInit(0.U(3)))
       val inputs = io.interrupts.get
-      val levels = (0.B(52) ## inputs.external.asBits ## 0.B(3) ## inputs.timer.asBits ## 0.B(3) ## inputs.software.asBits ## 0.B(3)).asUInt
-      val supervisorLevels = (0.B(54) ## softwarePending.asBits.bits(2, 2) ## 0.B(3) ## softwarePending.asBits.bits(1, 1) ##
-        0.B(3) ## softwarePending.asBits.bits(0, 0) ## 0.B(1)).asUInt
-      val pending = (levels.asBits | supervisorLevels.asBits).asUInt
-      val mask = mideleg.get.asBits.bits(11, 0)
-      val active = enables.asBits & pending.asBits.bits(11, 0)
-      val machinePending = active & (mask ^ 0xfff.B(12))
+      val machineLevels = 0.B(2) ## inputs.external.asBits ## 0.B(3) ## inputs.timer.asBits ## 0.B(3) ## inputs.software.asBits ## 0.B(3)
+      val supervisorLevels = if parameter.enableSupervisorMode then
+        val software = softwarePending.get.asBits
+        val timer = if parameter.enableSstc then stce.get.?((io.timeValue.get >= stimecmp.get), software.bit(1)) else software.bit(1)
+        0.B(4) ## software.bits(2, 2) ## 0.B(3) ## timer.asBits ## 0.B(3) ## software.bits(0, 0) ## 0.B(1)
+      else 0.B(14)
+      val pending = machineLevels | supervisorLevels | (overflowPending.getOrElse(false.B).asBits ## 0.B(13))
+      val mask = if parameter.enableSupervisorMode then mideleg.get.asBits.bits(13, 0) else 0.B(14)
+      val active = enables.asBits & pending
+      val machinePending = active & (mask ^ 0x3fff.B(14))
       val supervisorPending = active & mask
-      val machineEnabled = ((privilege =/= 3.U(2)) | status.asBits.bit(3)) & (machinePending =/= 0.B(12))
-      val supervisorEnabled = ((privilege === 0.U(2)) | ((privilege === 1.U(2)) & status.asBits.bit(1))) & (supervisorPending =/= 0.B(12))
+      val machineEnabled = ((privilege =/= 3.U(2)) | status.asBits.bit(3)) & (machinePending =/= 0.B(14))
+      val supervisorEnabled = parameter.enableSupervisorMode.B &
+        ((privilege === 0.U(2)) | ((privilege === 1.U(2)) & status.asBits.bit(1))) & (supervisorPending =/= 0.B(14))
       def interruptCause(bits: Referable[Bits]): Referable[UInt] =
-        Seq(5, 1, 9, 7, 3, 11).foldLeft[Referable[UInt]](BigInt("8000000000000007", 16).U(64)) { (cause, bit) =>
+        Seq(13, 5, 1, 9, 7, 3, 11).foldLeft[Referable[UInt]](BigInt("8000000000000007", 16).U(64)) { (cause, bit) =>
           bits.bit(bit).?((BigInt("8000000000000000", 16) | bit).U(64), cause)
         }
-      io.wakeup.get := active =/= 0.B(12)
+      io.wakeup.get := active =/= 0.B(14)
       io.interruptPending.get := machineEnabled | supervisorEnabled
       io.interruptCause.get := machineEnabled.?(interruptCause(machinePending), interruptCause(supervisorPending))
-      Seq((0x304, enables.asBits), (0x344, pending.asBits), (0x104, enables.asBits & mask),
-        (0x144, pending.asBits.bits(11, 0) & mask)).foreach { case (address, bits) =>
+      for (address, bits) <- Seq((0x304, enables.asBits), (0x344, pending)) ++
+          (if parameter.enableSupervisorMode then Seq((0x104, enables.asBits & mask), (0x144, pending & mask)) else Seq.empty) do
         when(io.readAddress === address.U(12)) { io.readData := bits.asUInt; io.legal := true.B }
-      }
-      when(io.write & (io.writeAddress === 0x304.U(12))) { enables := (io.writeData.asBits.bits(11, 0) & 0xaaa.B(12)).asUInt }
-      when(io.write & (io.writeAddress === 0x104.U(12))) {
-        enables := ((enables.asBits & (mask ^ 0xfff.B(12))) | (io.writeData.asBits.bits(11, 0) & mask)).asUInt
-      }
-      when(io.write & (io.writeAddress === 0x344.U(12))) {
-        val bits = io.writeData.asBits
-        softwarePending := (bits.bits(9, 9) ## bits.bits(5, 5) ## bits.bits(1, 1)).asUInt
-      }
-      when(io.write & (io.writeAddress === 0x144.U(12)) & mask.bit(1)) {
-        softwarePending := (softwarePending.asBits.bits(2, 1) ## io.writeData.asBits.bits(1, 1)).asUInt
-      }
-    else if parameter.enableInterrupts then
-      val enables = RegInit(0.U(3))
-      val inputs = io.interrupts.get
-      val levels = inputs.external.asBits ## inputs.timer.asBits ## inputs.software.asBits
-      val pending = enables.asBits & levels
-      io.wakeup.get := pending =/= 0.B(3)
-      io.interruptPending.get := (status.asBits.bit(3) | (privilege =/= 3.U(2))) & (pending =/= 0.B(3))
-      io.interruptCause.get := pending.bit(2).?(BigInt("800000000000000b", 16).U(64),
-        pending.bit(0).?(BigInt("8000000000000003", 16).U(64), BigInt("8000000000000007", 16).U(64)))
-      Seq((0x304, enables.asBits), (0x344, levels)).foreach { case (address, bits) =>
-        when(io.readAddress === address.U(12)) {
-          io.readData := (0.B(52) ## bits.bits(2, 2) ## 0.B(3) ## bits.bits(1, 1) ##
-            0.B(3) ## bits.bits(0, 0) ## 0.B(3)).asUInt
+      when(io.write & (io.writeAddress === 0x304.U(12))) { enables := (io.writeData.asBits.bits(13, 0) & supported.B(14)).asUInt }
+      if parameter.enableSupervisorMode then
+        when(io.write & (io.writeAddress === 0x104.U(12))) {
+          enables := ((enables.asBits & (mask ^ 0x3fff.B(14))) | (io.writeData.asBits.bits(13, 0) & mask & supported.B(14))).asUInt
         }
-      }
-      when(io.write & (io.writeAddress === 0x304.U(12))) {
-        val bits = io.writeData.asBits
-        enables := (bits.bits(11, 11) ## bits.bits(7, 7) ## bits.bits(3, 3)).asUInt
+        when(io.write & (io.writeAddress === 0x344.U(12))) {
+          val timer = stce.getOrElse(false.B).?(softwarePending.get.asBits.bits(1, 1), io.writeData.asBits.bits(5, 5))
+          softwarePending.get := (io.writeData.asBits.bits(9, 9) ## timer ## io.writeData.asBits.bits(1, 1)).asUInt
+        }
+        when(io.write & (io.writeAddress === 0x144.U(12)) & mask.bit(1)) {
+          softwarePending.get := (softwarePending.get.asBits.bits(2, 1) ## io.writeData.asBits.bits(1, 1)).asUInt
+        }
+      overflowPending.foreach { register =>
+        val written = Wire(Bool())
+        written := register
+        when(io.write & ((io.writeAddress === 0x344.U(12)) | ((io.writeAddress === 0x144.U(12)) & mask.bit(13)))) {
+          written := io.writeData.asBits.bit(13)
+        }
+        register := written | overflowRequest.get
       }
     if parameter.pmpEntries != 0 then
       val width = parameter.physicalAddressBits - 2

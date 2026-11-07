@@ -917,6 +917,8 @@ def execute_contract(parameters):
         model = Model(config, {i: (word >> (8 * i)) & 255 for i in range(4)}, {})
         model.registers[1], model.registers[2], model.csrs[0x340] = a & MASK, b & MASK, 0x55aa5555aa55aa55
         address = word >> 20
+        if word & 127 == 0x73 and (word >> 12) & 7 in (1, 2, 3) and (word >> 15) & 31:
+            model.registers[(word >> 15) & 31] = a & MASK
         csr_value, legal = model.csrs.get(address, 0), address in model.csrs
         record = model.step()
         opcode, function = word & 127, (word >> 12) & 7
@@ -930,7 +932,8 @@ def execute_contract(parameters):
             if opcode not in (3, 0x23):
                 checks += [f'output_bits_value == 64\'h{record[6]:x}']
             if opcode == 0x73 and not is_mop(word):
-                checks += [f'output_bits_csrData == 64\'h{model.csrs[address]:x}']
+                source = (word >> 15) & 31 if function & 4 else a & MASK
+                checks += [f'output_bits_csrData == 64\'h{source:x}']
             if opcode in (3, 0x23):
                 checks += [f'output_bits_memorySize == {function & 3}', f'output_bits_unsignedLoad == {int(opcode == 3 and function >= 4)}',
                            f'output_bits_address == 64\'h{a + (signed(word >> 20, 12) if opcode == 3 else immediate):x}']
@@ -978,10 +981,11 @@ def execute_contract(parameters):
         for a, b in pairs:
             for offset in (2, 8):
                 check_instruction(beq(1, 2, offset) | (function << 12), 25, a, b, offset)
-    for function in (3, 5, 6, 7):
+    for function in (1, 2, 3, 5, 6, 7):
         for source in (0, 1, 31):
             for address in (0x340, 0xf14, 0x777):
-                check_instruction(csr(6, address, source, function=function), 28, 0)
+                for value in (0, 0x35) if source and function < 4 else (0,):
+                    check_instruction(csr(6, address, source, function=function), 28 if function >= 3 else 9 + function, value)
     for size in (0, 1):
         for unsigned in (False, True):
             check_instruction(load(6, 1, 4, size, unsigned), 26, 0x1000)
@@ -3411,6 +3415,86 @@ def backend_contract(parameters):
 ''' + (backend_muldiv_contract() if parameters.get('enableM', True) else '')
 
 
+def backend_csr_contract(parameters):
+    def send(word, pc, drain=False):
+        return f'''    @(negedge clock); instruction_bits_pc = 'h{pc:x}; instruction_bits_instruction = 32'h{word:x};
+    instruction_bits_tag = 19; instruction_bits_length = 4; instruction_valid = 1;
+    #1; while (!instruction_ready) tick(); tick(); instruction_valid = 0;
+''' + ('    repeat (8) tick();\n' if drain else '')
+
+    def wait_commit(pc):
+        return f'''    for (integer waited = 0; !(dut.commitCount != 0 && dut.commitPackets_0_instruction_pc == 'h{pc:x}); waited++) begin
+      check(waited < 24 && !redirect && !data_request_valid, "CSR reaches retirement once"); tick();
+    end
+'''
+
+    reset = '''    instruction_valid = 0; instruction_bits_fault = 0; instruction_bits_count = 1;
+    data_request_ready = 0; data_response_valid = 0; data_response_bits_fault = 0;
+    reset = 1; tick(); reset = 0; tick();
+'''
+    if parameters['enableInterrupts']:
+        reset = '    interrupts_software = 0; interrupts_timer = 0; interrupts_external = 0;\n' + reset
+    body = ''
+    for function in (1, 2, 3, 5, 6, 7):
+        for source, value in ((0, 0), (1, 0), (1, 0x35)):
+            operand = source if function & 4 else value
+            write = function & 3 == 1 or source != 0
+            result = operand if function & 3 == 1 else 0x55a | operand if function & 3 == 2 else 0x55a & ~operand
+            for rd in (0, 6):
+                body += reset + send(addi(2, 0, 0x55a), 0x100, True)
+                body += send(csr(0, 0x340, 2), 0x104, True) + send(addi(1, 0, value), 0x108, True)
+                body += send(csr(rd, 0x340, source, function=function), 0x200)
+                body += send(addi(7, rd, 1), 0x204) + wait_commit(0x200)
+                body += f'''    check(dut.commit.output_bits_value == 'h55a && dut.commit.output_bits_csrData == 'h{result:x} &&
+      dut.csr.write == {int(write)} && dut.gpr.we_0 == {int(rd != 0)}, "CSR retirement read, RMW and encoded write semantics");
+'''
+                if rd:
+                    body += '    check(dut.gpr.waddr_0 == 6 && dut.gpr.wdata_0 == \'h55a, "CSR architectural destination");\n'
+                body += '    tick();\n' + wait_commit(0x204)
+                body += f'''    check(dut.gpr.we_0 && dut.gpr.waddr_0 == 7 && dut.gpr.wdata_0 == {0x55b if rd else 1} &&
+      dut.csr.mscratch == 'h{result if write else 0x55a:x}, "CSR dependent value and stored state"); tick();
+    repeat (3) begin check(!dut.gpr.we_0 && !dut.csr.write, "CSR retires exactly once"); tick(); end
+'''
+    if parameters['enableInterrupts']:
+        for function in (1, 2, 3, 5, 6, 7):
+            body += reset + send(addi(1, 0, 1), 0x100, True)
+            body += send(csr(6, 0x344, 1, function=function), 0x200) + send(addi(7, 6, 1), 0x204)
+            body += '''    while (!(dut.resultCount != 0 && dut.resultPackets_0_instruction_pc == 'h200)) tick();
+    interrupts_external = 1;
+''' + wait_commit(0x200)
+            result = 1 if function & 3 == 1 else 0x801 if function & 3 == 2 else 0x800
+            body += f'''    check(dut.commit.output_bits_value == 'h800 && dut.commit.output_bits_csrData == 'h{result:x} &&
+      dut.gpr.we_0 && dut.gpr.wdata_0 == 'h800, "CSR samples hardware pending at retirement"); tick();
+''' + wait_commit(0x204) + '''    check(dut.gpr.we_0 && dut.gpr.wdata_0 == 'h801, "Dependent instruction uses retirement sample");
+    tick(); interrupts_external = 0; repeat (3) tick();
+'''
+    for mode in ('illegal', 'readonly', 'reset', *(('interrupt',) if parameters['enableInterrupts'] else ())):
+        body += reset
+        for index, word in enumerate((addi(1, 0, 0x35), addi(6, 0, 7))):
+            body += send(word, 0x100 + 4 * index, True)
+        if mode == 'interrupt':
+            for index, word in enumerate((addi(2, 0, -1), csr(0, 0x304, 2), addi(2, 0, 8), csr(0, 0x300, 2))):
+                body += send(word, 0x120 + 4 * index, True)
+        address = 0x777 if mode == 'illegal' else 0xf14 if mode == 'readonly' else 0x340
+        body += send(csr(6, address, 1, function=2), 0x200) + send(addi(7, 6, 1), 0x204)
+        if mode in ('reset', 'interrupt'):
+            body += "    while (!(dut.resultCount != 0 && dut.resultPackets_0_instruction_pc == 'h200)) tick();\n"
+        if mode == 'reset':
+            body += '    reset = 1; tick(); reset = 0; tick();\n'
+        else:
+            if mode == 'interrupt':
+                body += '    interrupts_external = 1; #1;\n'
+            body += '''    while (!redirect) begin check(!dut.csr.write && !dut.gpr.we_0, "Rejected CSR has no architectural effect"); tick(); end
+    check(!dut.csr.write && !dut.gpr.we_0 && dut.csr.mscratch == 0, "CSR cancellation preserves state"); tick();
+'''
+            if mode == 'interrupt':
+                body += '    interrupts_external = 0;\n'
+        body += send(csr(8, 0x340, 0, function=2), 0x300) + send(addi(9, 8, 1), 0x304)
+        body += wait_commit(0x300) + '    check(dut.gpr.we_0 && dut.gpr.wdata_0 == 0, "Cancelled CSR releases its owner"); tick();\n'
+        body += wait_commit(0x304) + '    check(dut.gpr.we_0 && dut.gpr.wdata_0 == 1, "CSR cancellation releases dependencies"); tick(); repeat (3) tick();\n'
+    return body
+
+
 def backend_group_contract(parameters):
     if parameters['issueWidth'] == 1:
         return ''
@@ -4016,7 +4100,8 @@ def interrupt_csr_contract(parameters):
     model = Model(parameters, {}, {})
     for enabled in range(8):
         mask = sum(((enabled >> i) & 1) << bit for i, bit in enumerate((3, 7, 11)))
-        body += f"    write = 1; writeAddress = 'h304; writeData = 64'h{mask | 0xfffffffffffff777:x}; tick(); write = 0; readAddress = 'h304;\n    check(readData == 'h{mask:x}, \"Interrupt enable WARL\");\n"
+        actual = mask | (0x2000 if parameters.get('hpmCounters', 0) else 0)
+        body += f"    write = 1; writeAddress = 'h304; writeData = 64'h{mask | 0xfffffffffffff777:x}; tick(); write = 0; readAddress = 'h304;\n    check(readData == 'h{actual:x}, \"Interrupt enable WARL\");\n"
         model.write_csr(0x304, mask)
         for global_enable in (0, 8):
             model.write_csr(0x300, global_enable)
@@ -4060,7 +4145,8 @@ def user_csr_contract(parameters):
 
     state()
     for address in (0x306, 0x30a):
-        body += f"    @(negedge clock); readAddress = 'h{address:x}; writeAddress = 'h{address:x}; writeData = '1; write = 1; tick(); write = 0; check(legal && readData == 0, \"Environment CSR WARL zero\");\n"
+        value = (1 << (parameters.get('hpmCounters', 0) + 3)) - 1 if address == 0x306 and parameters.get('enableCounters') else 1 << 63 if address == 0x30a and parameters.get('enableSstc') else 0
+        body += f"    @(negedge clock); readAddress = 'h{address:x}; writeAddress = 'h{address:x}; writeData = '1; write = 1; tick(); write = 0; check(legal && readData == 64'h{value:x}, \"Environment CSR WARL fields\");\n"
     for previous in range(4):
         value = (previous << 11) | (1 << 17) | (1 << 21) | 0x88
         model.write_csr(0x300, value)
@@ -4183,6 +4269,177 @@ def supervisor_csr_contract(parameters):
         state()
         write(0x100, 0)
         state()
+    return body
+
+
+def counter_csr_contract(parameters):
+    if not parameters.get('enableCounters'):
+        return ''
+    count, width = parameters['hpmCounters'], parameters['issueWidth']
+    implemented = (1 << (count + 3)) - 1
+    frozen = implemented & ~2
+    body = "    @(negedge clock); write=0; trap=0; mret=0; sret=0; retiredCount=0; timeValue=0;\n"
+    if parameters.get('enableInterrupts'):
+        body += '    interrupts_software=0; interrupts_timer=0; interrupts_external=0;\n'
+    if parameters.get('enableJtag'):
+        body += '    debug_enter=0; debug_dret=0;\n'
+    body += '    reset=1; tick(); reset=0; tick();\n'
+
+    def write(address, value, retired=0):
+        nonlocal body
+        body += f"    @(negedge clock); writeAddress='h{address:x}; writeData=64'h{value & MASK:x}; retiredCount={retired}; write=1; tick(); write=0; retiredCount=0;\n"
+
+    def read(address, value=None, legal=True, mask=MASK):
+        nonlocal body
+        comparison = '' if value is None else f" && (readData & 64'h{mask:x}) == 64'h{value & mask:x}"
+        body += f"    readAddress='h{address:x}; check(legal=={int(legal)}{comparison}, \"Counter CSR value and permission\");\n"
+
+    def pulse(value):
+        nonlocal body
+        body += f'    @(negedge clock); retiredCount={value}; tick(); retiredCount=0;\n'
+
+    def mode(value):
+        nonlocal body
+        write(0x300, value << 11)
+        body += '    @(negedge clock); mret=1; tick(); mret=0;\n'
+
+    def machine():
+        nonlocal body
+        body += "    @(negedge clock); trap=1; trapPc='h100; trapCause=8; trapValue=0; tick(); trap=0;\n"
+
+    write(0x320, MASK)
+    read(0x320, frozen)
+    write(0xb00, 100); write(0xb02, 200)
+    read(0xc00, 100); read(0xc02, 200)
+    for address in (*range(0xb80, 0xba0), *range(0xc80, 0xca0), *range(0x723, 0x740), 0xb01):
+        read(address, legal=False)
+    for index in range(3, 32):
+        write(0xb00 + index, index)
+        read(0xb00 + index, index if index < count + 3 else 0)
+        read(0xc00 + index, index if index < count + 3 else 0)
+        if index >= count + 3:
+            write(0x320 + index, MASK); read(0x320 + index, 0)
+    write(0x320, frozen & ~1)
+    body += '    repeat(3) tick();\n'
+    write(0x320, frozen)
+    read(0xb00, 104)
+    write(0x320, frozen & ~4)
+    for amount in range(width + 1):
+        pulse(amount)
+    read(0xb02, 200 + width * (width + 1) // 2)
+    write(0xb02, 17, width); read(0xc02, 17)
+    write(0x320, frozen, width); read(0xb02, 17 + width)
+    pulse(width); read(0xc02, 17 + width)
+    body += "    timeValue=64'h8000000000000001;\n"
+    read(0xc01, (1 << 63) + 1)
+    if count:
+        write(0x323, 1); write(0xb03, MASK)
+        write(0x320, frozen & ~8); write(0xb03, 7)
+        read(0x323, 0, mask=1 << 63)
+        write(0x320, frozen); write(0x344, 0)
+        write(0x323, MASK)
+        filters = 4 | (2 if parameters.get('enableSupervisorMode') else 0) | int(parameters.get('enableUserMode', False))
+        read(0x323, (1 << 63) | (filters << 60))
+        body += '    repeat(2) tick();\n'
+        read(0x344, 0, mask=1 << 13)
+        write(0x323, 0); write(0xb03, 0); write(0x320, frozen & ~8)
+        pulse(width); read(0xb03, 0)
+        write(0x323, 2); write(0xb03, MASK)
+        pulse(1)
+        read(0xb03, 0); read(0x323, 1 << 63, mask=1 << 63)
+        read(0x344, 0, mask=1 << 13)
+        write(0x344, 0); read(0x344, 1 << 13, mask=1 << 13)
+        write(0x344, 0); read(0x344, 0, mask=1 << 13)
+        write(0xb03, MASK); pulse(1)
+        body += '    tick();\n'
+        read(0x344, 0, mask=1 << 13)
+        if parameters.get('enableSupervisorMode'):
+            read(0xda0, 8, mask=implemented)
+        write(0x323, 2); write(0xb03, MASK); pulse(1)
+        body += '    tick();\n'
+        read(0x344, 1 << 13, mask=1 << 13)
+        write(0x344, 0)
+        for privilege in (3, *((1,) if parameters.get('enableSupervisorMode') else ()), *((0,) if parameters.get('enableUserMode') else ())):
+            for blocked in (False, True):
+                write(0x320, frozen); write(0x323, 2 | (int(blocked) << {3: 62, 1: 61, 0: 60}[privilege]))
+                write(0xb03, 0); write(0x320, frozen & ~8)
+                mode(privilege); pulse(width); machine(); read(0xb03, 0 if blocked else width)
+        if count > 1:
+            write(0x320, frozen); write(0x323, 2); write(0x324, 2)
+            write(0xb03, MASK); write(0xb04, MASK - 1); write(0x344, 0)
+            write(0x320, frozen & ~24)
+            body += '    @(negedge clock); retiredCount=1; tick(); tick(); retiredCount=0;\n'
+            write(0x344, 0); read(0x344, 1 << 13, mask=1 << 13)
+            write(0x344, 0); read(0x344, 0, mask=1 << 13)
+            if parameters.get('enableSupervisorMode'):
+                read(0xda0, 24, mask=implemented)
+    write(0x320, frozen)
+    for index in range(min(count, 2)):
+        write(0x323 + index, (1 << 63) | 2)
+    if count:
+        write(0x304, 1 << 13); write(0x344, 1 << 13); write(0x300, 8)
+        body += "    check(wakeup && interruptPending && interruptCause==64'h800000000000000d, \"Counter overflow interrupt route\");\n"
+        for port, cause in (('external', 11), ('software', 3), ('timer', 7)):
+            write(0x304, (1 << 13) | (1 << cause))
+            body += f"    interrupts_{port}=1; check(interruptCause==64'h{(1 << 63) | cause:x}, \"Interrupt priority above counter overflow\"); interrupts_{port}=0;\n"
+        write(0x304, 0); write(0x344, 0)
+        if parameters.get('enableSupervisorMode'):
+            if parameters.get('enableSstc'):
+                write(0x30a, 0)
+            write(0x303, (1 << 13) | 32); write(0x304, (1 << 13) | 32); write(0x344, (1 << 13) | 32)
+            mode(1); write(0x100, 2)
+            body += "    check(interruptCause==64'h8000000000000005, \"Supervisor interrupt priority\");\n"
+            machine(); write(0x344, 1 << 13); mode(1); write(0x100, 2)
+            body += "    check(interruptPending && interruptCause==64'h800000000000000d, \"Delegated counter overflow interrupt\");\n"
+            write(0x144, 0)
+            body += '    check(!interruptPending && !wakeup,"Delegated pending clear");\n'
+            machine(); write(0x303, 0); write(0x304, 0)
+    if parameters.get('enableUserMode'):
+        for privilege in (*((1,) if parameters.get('enableSupervisorMode') else ()), 0):
+            for upper in (0, implemented):
+                for lower in ((0, implemented) if parameters.get('enableSupervisorMode') else (implemented,)):
+                    write(0x306, upper)
+                    if parameters.get('enableSupervisorMode'):
+                        write(0x106, lower)
+                    mode(privilege)
+                    for index in (0, 1, 2, 3, 31):
+                        read(0xc00 + index, legal=bool(upper & (1 << index) and (privilege != 0 or lower & (1 << index))))
+                    if count and parameters.get('enableSupervisorMode') and privilege == 1:
+                        read(0xda0, (24 if count > 1 else 8) & upper, mask=implemented)
+                    machine()
+    if parameters.get('enableSstc'):
+        write(0x30a, 0); write(0x306, 0); write(0x14d, MASK); read(0x14d, MASK)
+        write(0x344, 32); read(0x344, 32, mask=32)
+        write(0x30a, 1 << 63); read(0x344, 0, mask=32)
+        write(0x344, 32); read(0x344, 0, mask=32)
+        write(0x14d, 1 << 63); read(0x344, 32, mask=32)
+        write(0x14d, MASK); read(0x344, 0, mask=32)
+        write(0x30a, 0); read(0x344, 32, mask=32)
+        write(0x344, 0)
+        for stce in (0, 1):
+            for tm in (0, 1):
+                write(0x30a, stce << 63); write(0x306, tm << 1); write(0x106, 0)
+                mode(1); read(0x14d, legal=bool(stce and tm)); machine()
+        write(0x30a, 1 << 63); write(0x306, 2); write(0x106, 2)
+        mode(0); read(0x14d, legal=False); machine()
+        body += '    timeValue=1;\n'
+        write(0x14d, (1 << 63) + 1); read(0x344, 0, mask=32)
+        write(0x14d, 1); read(0x344, 32, mask=32)
+        write(0x303, 32); write(0x304, 32); mode(1)
+        body += '    check(wakeup && !interruptPending, "Local wakeup does not require global enable");\n'
+        write(0x100, 2)
+        body += "    check(interruptPending && interruptCause==64'h8000000000000005, \"Supervisor timer interrupt route\");\n"
+        machine(); write(0x304, 0); write(0x14d, MASK)
+    if parameters.get('enableJtag'):
+        body += "    debug_enter=1;debug_pc='h100;debug_cause=3;tick();debug_enter=0;\n"
+        write(0x7b0, (3 << 9) | 3); read(0x7b0, 0, mask=3 << 9)
+        write(0x320, frozen & ~1); write(0xb00, 100)
+        body += '    repeat(3) tick();\n'
+        write(0x320, frozen); read(0xb00, 104)
+        body += "    timeValue=64'h8000000000000002;\n"
+        read(0xc01, (1 << 63) + 2)
+        write(0x320, frozen & ~4); write(0xb02, 100); pulse(width); read(0xb02, 100 + width)
+        body += '    debug_dret=1;tick();debug_dret=0;\n'
     return body
 
 
@@ -4936,7 +5193,7 @@ def verify(rtl, directory, modules=None):
     suites += (('DitDahA1Csr', identity + (csr_contract(parameters) if enabled else '') +
                 (supervisor_csr_contract(parameters) if parameters.get('enableSupervisorMode') else
                  (interrupt_csr_contract(parameters) if parameters['enableInterrupts'] else '') +
-                 (user_csr_contract(parameters) if parameters.get('enableUserMode') else ''))),)
+                 (user_csr_contract(parameters) if parameters.get('enableUserMode') else '')) + counter_csr_contract(parameters)),)
     if parameters.get('floatingPointBits'):
         suites = tuple((name, body + (floating_csr_contract(parameters) if name == 'DitDahA1Csr' else
                        backend_floating_contract(parameters) if name == 'DitDahA1Backend' else
@@ -4971,6 +5228,8 @@ def verify(rtl, directory, modules=None):
         module = rtl / (name + '.sv')
         test = directory / (name + '_tb.sv')
         if name in ('DitDahA1Frontend', 'DitDahA1Backend'):
+            if name == 'DitDahA1Backend':
+                body += backend_csr_contract(parameters)
             port = 'output' if name == 'DitDahA1Frontend' else 'instruction'
             body = re.sub(rf'\b{port}_bits_(pc|tag|instruction|length|fault|cause|tval)\b', rf'{port}_bits_packets_0_\1', body)
             if name == 'DitDahA1Backend':
@@ -4979,6 +5238,19 @@ def verify(rtl, directory, modules=None):
                               r'(dut.\1Count != 0)', body)
                 body += backend_group_contract(parameters) + (backend_branch_contract() if parameters.get('loadQueueEntries', 1) == 1 else '') + backend_memory_group_contract(parameters)
         source = bench(module, body, 4 + 69 * body.count('MulDiv resource reuse')) if name == 'DitDahA1MulDiv' else bench(module, body)
+        if name == 'DitDahA1Backend' and parameters.get('enableCounters'):
+            slots = '+'.join(f"integer'(dut.commitCount>{lane} && !dut.commitPackets_{lane}_instruction_fault)" for lane in range(parameters['issueWidth']))
+            source = source.replace('  initial begin', f'''  reg [{parameters['issueWidth']}:0] count_seen=0;
+  reg count_fault_seen=0;
+  integer count_expected;
+  always @(posedge clock) if(!reset) begin
+    count_expected=dut.commit.output_valid && dut.commit.output_ready && !dut.commit.output_bits_instruction_fault ? {slots} : 0;
+    if(dut.csr.retiredCount!==count_expected) $fatal(1,"Successful retirement count");
+    count_seen[count_expected]<=1;
+    if(dut.commit.output_valid && dut.commit.output_bits_instruction_fault) count_fault_seen<=1;
+  end
+  initial begin''', 1)
+            source = source.replace('    $display("PASS"); $finish;', '    `CHECK(&count_seen && count_fault_seen,"Successful retirement count coverage");\n    $display("PASS"); $finish;')
         if name == 'DitDahA1MulDiv':
             declarations, connections = [], []
             for direction, width, pin in module_ports(module):

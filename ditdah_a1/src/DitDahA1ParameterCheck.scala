@@ -96,6 +96,25 @@ object DitDahA1ParameterCheck:
     rejects { baseline.copy(pmpEntries = 65); () }
     rejects { DitDahA1Config.parameter(ujson.Obj("unused" -> 1)); () }
     val rtl = DitDahA1Parameter.uncached
+    for enabled <- Seq(false, true); count <- Seq(0, 1, 2, 29); supervisor <- Seq(false, true); timer <- Seq(false, true) if !timer || (enabled && supervisor) do
+      val selected = rtl.copy(enableCounters = enabled, hpmCounters = count, enableInterrupts = true,
+        enableUserMode = supervisor, enableSupervisorMode = supervisor, enableSstc = timer)
+      if !enabled && count != 0 then rejects { selected.validateBackend() }
+      else
+        selected.validateBackend()
+        assert(DitDahA1Config.parameter(upickle.default.writeJs(selected)) == selected)
+        assert(DitDahA1Config.parameter(DitDahA1Config.document(selected)) == selected)
+        val extensions = DitDahA1Config.document(selected)("implementation")("extensions").arr.map(_.str).toSet
+        for (name, present) <- Seq("Zicntr" -> enabled, "Zihpm" -> enabled, "Sscounterenw" -> (enabled && supervisor),
+          "Sscofpmf" -> (enabled && count > 0), "Sstc" -> selected.enableSstc) do assert(extensions.contains(name) == present)
+    for selected <- Seq(rtl.copy(hpmCounters = 1), rtl.copy(enableSstc = true)) do
+      selected.validateFrontend(); selected.validateFabric()
+      rejects { selected.validateBackend() }
+    rejects { rtl.copy(enableCounters = true, hpmCounters = 1).validateCounters() }
+    rejects { rtl.copy(enableSstc = true, enableSupervisorMode = true, enableInterrupts = true).validateCounters() }
+    rejects { rtl.copy(enableCounters = true, enableSstc = true, enableInterrupts = true).validateCounters() }
+    rejects { rtl.copy(enableCounters = true, enableSstc = true, enableSupervisorMode = true).validateCounters() }
+    for count <- Seq(-1, 30) do rejects { rtl.copy(hpmCounters = count); () }
     for count <- Seq(1, 2, 3, 4, 16); slots <- 1 to 4 do
       val selected = rtl.copy(hartCount = count, fabricReadSlots = Some(slots))
       assert(DitDahA1Config.parameter(DitDahA1Config.document(selected)) == selected)

@@ -21,6 +21,7 @@ object DitDahA1Core extends Generator[DitDahA1Parameter, DitDahA1Layers, DitDahA
     backend.io.clock := io.clock
     backend.io.reset := io.reset
     backend.io.hartId := io.hartId
+    backend.io.timeValue.foreach(_ := io.timeValue.get)
     backend.io.debug.foreach { debug =>
       debug.haltReq := io.debug.get.haltReq
       debug.entryPc := io.debug.get.entryPc
@@ -109,6 +110,13 @@ object DitDahA1Backend extends Generator[DitDahA1Parameter, DitDahA1Layers, DitD
     val commitValid = commitCount =/= 0.U
     val commitPackets = Reg(Vec(width, new ResultPacket(parameter)))
     val commitPacket = commitPackets(0)
+    def csrInstruction(instruction: Referable[UInt]): Referable[Bool] =
+      val encoding = instruction.asBits
+      (encoding.bits(6, 0) === 0x73.B(7)) & (encoding.bits(13, 12) =/= 0.B(2))
+    val commitCsr = commitValid & csrInstruction(commitPacket.instruction.instruction)
+    val csrInFlight = (issuedValid & csrInstruction(issuedPacket.decoded.instruction.instruction)) |
+      (resultValid & csrInstruction(resultPacket.instruction.instruction)) |
+      (memoryValid & csrInstruction(memoryPacket.instruction.instruction)) | commitCsr
     val commitResolved = RegInit(false.B)
     val memoryPending = RegInit(false.B)
     val concurrent = parameter.loadQueueEntries == 2
@@ -150,6 +158,7 @@ object DitDahA1Backend extends Generator[DitDahA1Parameter, DitDahA1Layers, DitD
     csr.io.clock := io.clock
     csr.io.reset := io.reset
     csr.io.hartId := io.hartId
+    csr.io.timeValue.foreach(_ := io.timeValue.get)
     if parameter.enableInterrupts then csr.io.interrupts.get :<= io.interrupts.get
     lsu.io.clock := io.clock
     lsu.io.reset := io.reset
@@ -169,7 +178,7 @@ object DitDahA1Backend extends Generator[DitDahA1Parameter, DitDahA1Layers, DitD
       io.translation.get :<>= lsu.io.translation.get
     io.privilege := csr.io.privilege
     lsu.io.privilege := csr.io.dataPrivilege
-    csr.io.readAddress := execute.io.csrAddress
+    csr.io.readAddress := commitCsr.?(commitPacket.csrAddress, execute.io.csrAddress)
     // Completed data operations keep ownership until their architectural event.
     val takeInterrupt = if parameter.enableInterrupts then
       csr.io.interruptPending.get & !debugging & !stepping & !stopDispatch & !memoryPending &
@@ -179,12 +188,19 @@ object DitDahA1Backend extends Generator[DitDahA1Parameter, DitDahA1Layers, DitD
     val interruptCause = if parameter.enableInterrupts then csr.io.interruptCause.get else 0.U(64)
     commit.io.input.valid := (if parameter.enableInterrupts then commitValid & !takeInterrupt else commitValid)
     commit.io.input.bits :<= commitPacket
+    when(commitCsr & !commitPacket.instruction.fault) {
+      commit.io.input.bits.value := csr.io.readData
+      val action = commitPacket.instruction.instruction.asBits.bits(13, 12)
+      when(action === 2.B(2)) { commit.io.input.bits.csrData := (csr.io.readData.asBits | commitPacket.csrData.asBits).asUInt }
+      when(action === 3.B(2)) { commit.io.input.bits.csrData := (csr.io.readData.asBits & (commitPacket.csrData.asBits ^ BigInt("ffffffffffffffff", 16).B(64))).asUInt }
+    }
     commit.io.output.ready := true.B
     commit.io.trapVector := csr.io.trapVector
     commit.io.returnPc := csr.io.returnPc
     val retire = commit.io.output
     val retired = retire.valid & retire.ready
     val retireCount = retired.?(retire.bits.instruction.fault.?(1.U(countBits), commitCount), 0.U(countBits))
+    csr.io.retiredCount.foreach(_ := (retired & !retire.bits.instruction.fault).?(commitCount, 0.U(countBits)))
     val retirement = Wire(Vec(width, new ResultPacket(parameter)))
     retirement(0) :<= retire.bits
     for lane <- 1 until width do
@@ -333,7 +349,7 @@ object DitDahA1Backend extends Generator[DitDahA1Parameter, DitDahA1Layers, DitD
         when(valid & (rd =/= 0.U(5)) & (address === rd)) { value := data; blocked := !ready }
       (value, blocked)
     val older = issuedValid | resultValid | memoryValid | commitValid
-    val available = (!issuedValid | executed) & !executePending.getOrElse(false.B) & !flushYounger & !sleeping & !stopDispatch &
+    val available = (!issuedValid | executed) & !csrInFlight & !executePending.getOrElse(false.B) & !flushYounger & !sleeping & !stopDispatch &
       (if parameter.enableJtag then !debugging | !older else true.B)
     val prefix = Wire(Vec(width, Bool()))
     val simple = (0 until width).map { lane =>

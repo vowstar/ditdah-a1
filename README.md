@@ -19,7 +19,7 @@ PMP is configurable to zero or sixteen entries per hart; the default uncached co
 Optional M uses shared iterative multiplication and division with retained instruction ownership through completion or cancellation draining. Multiplication takes 64 iterations, or 32 for MULW.
 Branches recover in EX while retaining older work; `enableBranchPrediction` enables static backward-branch and direct-jump prediction.
 `branchPredictorEntries` selects 0/8/16 direct-mapped entries with two-bit direction counters and last indirect targets; nonzero requires prediction enabled. This does not implement a return stack.
-The manifest lists I/Zicsr/Zifencei, Zihintpause/Zihintntl/Zkt and optional M/A/C, F/D, Zba/Zbb/Zbs, Zicond/Zimop/Zcb/Zcmop and Zfa/Zfhmin. `floatingPointBits` selects 0/32/64. FPRs and FCSR/FS update at retirement. Sv48 remains a target.
+The manifest lists I/Zicsr/Zifencei, Zihintpause/Zihintntl/Zkt and optional M/A/C, F/D, Zba/Zbb/Zbs, Zicond/Zimop/Zcb/Zcmop, Zfa/Zfhmin and counter/timer extensions. `floatingPointBits` selects 0/32/64. FPRs and FCSR/FS update at retirement. Sv48 remains a target.
 Core composes Frontend and Backend; Frontend owns PC sequencing and Backend owns execution and retirement. `enableC` adds serial halfword fetch and two/four-byte packets with halfword-aligned PCs; raw encodings survive retirement and each parcel receives its own translation and permission check.
 Core exposes separate instruction/data memory ports; the physical fabric owns shared arbitration and AXI.
 Instruction permissions apply before cache lookup and to the complete refill request; region checks also protect external accesses.
@@ -66,15 +66,15 @@ Set `enableUserMode` for Bare M/U execution and effective data privilege via MPR
 Set `enableSupervisorMode` with user mode and interrupts for M/S/U, standard trap delegation and SRET.
 Set `virtualAddressBits` to 39 for Sv39/Svade with 4 KiB/2 MiB/1 GiB pages; zero selects Bare. `asidBits` selects zero or four implemented ASID bits. PTE reads share the data path under S-mode PMP/PMA.
 `iTlbEntries`, `dTlbEntries` and shared `tlbEntries` independently select 0/2/4 entries per hart with one walker. Local entries clear on satp writes; ASID-tagged shared entries survive context changes. With local banks or ASIDs, SFENCE.VMA selects VA/ASID ranges and handles global mappings; PMP maintenance clears all layers, and maintenance excludes stale refills while accepted reads drain.
-`enableInterrupts` enables per-hart software/timer/external interrupt levels; each hart retains independent CSR and PMP state.
-An optional `localInterruptBase` maps protected software-interrupt and 64-bit timer registers; `timeTick` supplies the synchronous timebase.
+`enableCounters` adds 64-bit cycle/time/instret, counter access/inhibit controls and Zicntr/Zihpm; supervisor mode also adds Sscounterenw. `hpmCounters` selects 0–29 actual HPM counters; nonzero enables Sscofpmf, privilege filters and IRQ13. Events 0/1/2 select none/cycles/successful retirements. `enableSstc` adds stimecmp and STCE.
+`enableInterrupts` enables per-hart interrupt levels. An optional `localInterruptBase` maps protected software-interrupt and 64-bit timer registers; `timeTick` supplies the synchronous timebase. Enabled counters share that time or a coherent external `timeValue`; enabled standalone Core/Backend counters require `timeValue`.
 `enableJtag` adds precise per-hart external debugging; system builds require `jtagIdcode` and a dedicated `debugBase`.
 All harts share the reset vector and read their index from `mhartid`; standalone Core and Backend integrations must hold `hartId` constant.
 
 `make verify-signoff` checks standalone Core and AXI integration against the same instruction model, tests interface and component-configuration contracts, lints the five production tops, and proves execution/transaction safety.
 Formal checks cover Fetch cancellation, arithmetic ownership and Backend ownership with an abstract resource. Paired execution-control proofs and selected RVFI instruction models supplement numeric simulation.
 Enabled configurations additionally check PMP decisions, CSR locks, and cancellation/ownership with abstract authorization.
-Interrupt checks cover CSR eligibility, saved PC, transaction ownership, and independently modeled architectural events.
+Interrupt checks cover eligibility, saved PC and ownership; counter checks cover retirement-time CSR updates, 64-bit counting, access, overflow and S timers with 1/2/16-hart console software.
 Multicore checks use per-hart instruction models and shared memory ordered by bus service; arbiter proofs check ownership and bounded overtaking.
 Atomic checks include independent interference, failed-write suppression, returned old values, publication ordering, and AXI retry/error safety.
 Instruction-cache control proofs abstract memory read values; array geometry, storage behavior and instruction publication are checked separately.

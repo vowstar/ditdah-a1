@@ -162,6 +162,8 @@ def memory_group_cases(base, protection, interrupts, sv39):
             p.emit(ld(2, 11), csr(0, 0x180, 2), ld(10, 11, 16), ld(2, 11, 8), csr(0, 0x300, 2))
         if fault.startswith('bus_'):
             p.faults[fault[4:]] = base + 0x1000
+        while (base + p.offset) // 4 % 4:
+            p.emit(addi(0, 0, 0))
         p.pipeline_groups = {base + p.offset: 3}
         p.emit(sd(6, 10) if fault == 'bus_write' else ld(2, 10), addi(6, 0, 99), addi(7, 0, 101))
         resume = p.offset
@@ -174,6 +176,8 @@ def memory_group_cases(base, protection, interrupts, sv39):
         p.address(10, 0x1000)
         p.address(11, 0x5008)
         p.emit(addi(2, 0, 8), csr(0, 0x304, 2), csr(0, 0x300, 2))
+        while (base + p.offset) // 4 % 4:
+            p.emit(addi(0, 0, 0))
         target = base + p.offset
         p.emit(ld(2, 10), addi(6, 6, 1), addi(7, 7, 1), sd(6, 10, 8), sd(7, 10, 16))
         p.finish()

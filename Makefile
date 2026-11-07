@@ -28,6 +28,7 @@ SOFTWARE_HARTS ?= 2
 SOFTWARE_CONFIG ?= software/platform.json
 SOFTWARE_OUTPUT ?= result/software
 SOFTWARE_JOBS ?= 1
+COUNTER_OUTPUT ?= result/counters
 SOFTWARE_ICACHE_BYTES ?= $(if $(filter 16,$(SOFTWARE_HARTS)),8192,0)
 SOFTWARE_DCACHE_BYTES ?= 0
 SOFTWARE_PROFILE = --config $(SOFTWARE_CONFIG) --harts $(SOFTWARE_HARTS) --icache-bytes $(SOFTWARE_ICACHE_BYTES) --dcache-bytes $(SOFTWARE_DCACHE_BYTES) --console-base 0x10000000
@@ -69,6 +70,19 @@ verify-supervisor-software:
 		python3 test/verify.py --elf $$image/software.elf --config $$image/input.json --output $$image/verification --jobs $(SOFTWARE_JOBS) || exit $$?; \
 	done; done
 
+.PHONY: verify-counters verify-counter-software
+verify-counters:
+	python3 test/verify.py --width 64 --issue-width 3 --supervisor-mode --counters --hpm-counters 2 --sstc --case pipeline_integer_stream --output $(COUNTER_OUTPUT)/native
+	python3 test/formal.py --rtl $(COUNTER_OUTPUT)/native/irq-pmp16-axi64/rtl --output $(COUNTER_OUTPUT)/formal --modules CounterCsr CounterBackend --jobs $(FORMAL_JOBS)
+	$(MAKE) verify-counter-software
+
+verify-counter-software:
+	for pair in 1:1 2:2 16:3; do \
+		count=$${pair%:*}; width=$${pair#*:}; cache=$$((count == 1 ? 0 : 8192)); image=$(COUNTER_OUTPUT)/software/h$$count-w$$width; \
+		python3 scripts/build_software.py --config $(SOFTWARE_CONFIG) --counters --hpm-counters 1 --sstc --supervisor-mode --harts $$count --issue-width $$width --icache-bytes $$cache --stack-bytes 512 --console-base 0x10000000 --program software/tests/counters.S --expected-interrupt 5 --expected-interrupt 5 --expected-interrupt 13 --expected-interrupt 13 --output $$image && \
+		python3 test/verify.py --elf $$image/software.elf --config $$image/input.json --output $$image/verification --jobs $(SOFTWARE_JOBS) || exit $$?; \
+	done
+
 zephyr:
 	@test -n "$(ZEPHYR_TRANSACTIONS_$(SOFTWARE_HARTS))" || { echo 'Select SOFTWARE_HARTS=1, 2 or 16'; exit 1; }
 	python3 scripts/build_zephyr.py $(SOFTWARE_PROFILE) --timebase-hz 10000000 --output $(SOFTWARE_OUTPUT)/zephyr-harts$(SOFTWARE_HARTS)
@@ -84,6 +98,7 @@ verify-signoff: verify-debug-core verify-jtag verify-debug-module verify-debug-s
 	$(MAKE) verify-compressed-isa
 	$(MAKE) verify-bitmanip-isa
 	$(MAKE) verify-floating-isa
+	$(MAKE) verify-counters
 	$(MAKE) verify-widths
 	$(MAKE) verify-data-line
 	$(MAKE) verify-read-capacity

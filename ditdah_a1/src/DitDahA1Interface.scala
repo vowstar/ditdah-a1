@@ -196,6 +196,7 @@ class DebugHartPort extends Bundle:
   val exceptionPc = Flipped(UInt(64))
   val mode = Aligned(Bool())
 class DitDahA1IO(parameter: DitDahA1Parameter) extends HWBundle(parameter):
+  val timeValue = Option.when(parameter.enableCounters && parameter.localInterruptBase.isEmpty)(Flipped(UInt(64)))
   val jtag = Option.when(parameter.enableJtag)(Aligned(new JtagPort))
   val systemReset = Option.when(parameter.enableJtag)(Flipped(Bool()))
   // Reset attached AXI peers with the same non-debug reset domain.
@@ -227,6 +228,7 @@ class DitDahA1Probe(parameter: DitDahA1Parameter) extends DVBundle[DitDahA1Param
   val pipelineStall = ProbeRead(Bool(), dv)
 
 class DitDahA1CoreIO(parameter: DitDahA1Parameter) extends HWBundle(parameter):
+  val timeValue = Option.when(parameter.enableCounters)(Flipped(UInt(64)))
   val debug = Option.when(parameter.enableJtag)(Aligned(new DebugHartPort))
   val hartId = Flipped(UInt(4))
   val interrupts = Option.when(parameter.enableInterrupts)(Flipped(new InterruptBundle))
@@ -252,6 +254,7 @@ class DitDahA1FrontendIO(parameter: DitDahA1Parameter) extends HWBundle(paramete
   val memory = Aligned(new MemoryPort(parameter))
 
 class DitDahA1MemoryFabricIO(parameter: DitDahA1Parameter) extends HWBundle(parameter):
+  val timeValue = Option.when(parameter.enableCounters && parameter.localInterruptBase.nonEmpty)(Aligned(UInt(64)))
   val debugMemory = Option.when(parameter.enableDebugMemory)(Aligned(new MemoryPort(parameter)))
   val debugHart = Option.when(parameter.enableDebugMemory)(Aligned(UInt(4)))
   val probe = Option.when(parameter.dCacheBytes != 0)(Aligned(Vec(parameter.hartCount, new CacheProbePort)))
@@ -264,6 +267,7 @@ class DitDahA1MemoryFabricIO(parameter: DitDahA1Parameter) extends HWBundle(para
   val axi = Aligned(new AxiBundle(parameter))
 
 class DitDahA1BackendIO(parameter: DitDahA1Parameter) extends HWBundle(parameter):
+  val timeValue = Option.when(parameter.enableCounters)(Flipped(UInt(64)))
   val debug = Option.when(parameter.enableJtag)(Aligned(new DebugHartPort))
   val prediction = Option.when(parameter.branchPredictorEntries != 0)(Aligned(new BranchUpdate))
   val translation = Option.when(parameter.enableTranslation)(Aligned(new TranslationPort))

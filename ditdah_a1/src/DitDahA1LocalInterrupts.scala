@@ -8,6 +8,7 @@ import me.jiuyang.zaozi.reftpe.*
 import me.jiuyang.zaozi.valuetpe.*
 
 class DitDahA1LocalInterruptsIO(parameter: DitDahA1Parameter) extends HWBundle(parameter):
+  val timeValue = Option.when(parameter.enableCounters)(Aligned(UInt(64)))
   val clock = Flipped(Clock())
   val reset = Flipped(Reset())
   val timeTick = Flipped(Bool())
@@ -27,6 +28,7 @@ object DitDahA1LocalInterrupts extends Generator[DitDahA1Parameter, DitDahA1Unit
     val pending = RegInit(false.B)
     val response = Reg(new MemoryResponse)
     val time = RegInit(0.U(64))
+    io.timeValue.foreach(_ := time)
     val software = Seq.fill(parameter.hartCount)(RegInit(false.B))
     val compare = Seq.fill(parameter.hartCount)(RegInit(((BigInt(1) << 64) - 1).U(64)))
     val memory = io.memory

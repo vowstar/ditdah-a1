@@ -38,6 +38,9 @@ case class DitDahA1Parameter(
   enableZcmop: Boolean = false,
   enableZfa: Boolean = false,
   enableZfhmin: Boolean = false,
+  enableCounters: Boolean = false,
+  hpmCounters: Int = 0,
+  enableSstc: Boolean = false,
   enableInterrupts: Boolean = false,
   enableUserMode: Boolean = false,
   enableSupervisorMode: Boolean = false,
@@ -77,6 +80,7 @@ case class DitDahA1Parameter(
   require(Set(0, 16, 64).contains(pmpEntries), "pmpEntries must be 0, 16 or 64")
 
   require(Set(1, 2).contains(loadQueueEntries), "loadQueueEntries must be one or two")
+  require(hpmCounters >= 0 && hpmCounters <= 29, "hpmCounters must be between zero and 29")
   require(Set(0, 32, 64).contains(floatingPointBits), "floatingPointBits must be zero, 32 or 64")
   require(!(enableZcb || enableZcmop) || enableC, "Compressed extensions require C")
   require(!(enableZfa || enableZfhmin) || floatingPointBits != 0, "Floating extensions require F")
@@ -97,6 +101,11 @@ case class DitDahA1Parameter(
     require(asidBits == 0 || enableTranslation, "ASID requires Sv39")
     validateProtection()
     validatePrediction()
+    validateCounters()
+
+  def validateCounters(): Unit =
+    require(hpmCounters == 0 || (enableCounters && enableInterrupts), "HPM counters require counters and interrupts")
+    require(!enableSstc || (enableCounters && enableSupervisorMode && enableInterrupts), "Sstc requires counters, supervisor mode and interrupts")
 
   def validatePrediction(): Unit =
     require(branchPredictorEntries == 0 || enableBranchPrediction, "Dynamic prediction requires branch prediction")

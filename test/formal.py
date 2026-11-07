@@ -556,7 +556,7 @@ def pipeline_case(source, parameters):
       cover(commitResolved && retireCount != 0 && !redirect_0);
       if (memoryPending) assert(memoryCount >= 1{"" if dual else ' && !commitValid'});
       if (lsu_input_valid) assert(resultCount >= 1);
-      if (mulDiv_input_valid) assert(issuedCount == 1);
+      {'if (mulDiv_input_valid) assert(issuedCount == 1);' if parameters.get('enableM', True) else ''}
       cover(pipeline_owned == {6 * width} && received && retireCount == {width});
       cover(memoryPending && decodedValid && !issued);
       cover(issueCount == {width} && retireCount == {width});
@@ -623,11 +623,13 @@ def pipeline_case(source, parameters):
 '''
 
     gpr = instance_ports(source, 'DitDahA1Gpr')[0][1]
+    commit = instance_ports(source, 'DitDahA1Commit')[0][1]
     for lane in range(width):
         p = f'commitPackets_{lane}'
+        value = commit['output_bits_value'] if lane == 0 else p + '_value'
         body += f'''  always @(posedge clock) if (!reset) begin
     assert(({gpr[f'we_{lane}']}) == (retireCount > {lane} && {p}_rdWrite && {p}_rd != 0 && !{p}_instruction_fault));
-    if ({gpr[f'we_{lane}']}) assert(({gpr[f'waddr_{lane}']}) == {p}_rd && ({gpr[f'wdata_{lane}']}) == {p}_value);
+    if ({gpr[f'we_{lane}']}) assert(({gpr[f'waddr_{lane}']}) == {p}_rd && ({gpr[f'wdata_{lane}']}) == ({value}));
   end
 '''
     issues = [pins for _, pins in instance_ports(source, 'DitDahA1Issue')]
@@ -659,7 +661,7 @@ def pipeline_case(source, parameters):
                     if stage == 'issued':
                         p += '_decoded'
                         ready = '_execute_output_valid && !_execute_output_bits_instruction_fault && !_execute_output_bits_load && !_execute_output_bits_store' if previous == 0 else '_execute_output_valid && !' + p + '_instruction_fault'
-                        value = 'isMulDiv ? _mulDiv_output_bits : _execute_output_bits_value' if previous == 0 else f'pipeline_execution_{previous}'
+                        value = ('isMulDiv ? _mulDiv_output_bits : _execute_output_bits_value' if parameters.get('enableM', True) else '_execute_output_bits_value') if previous == 0 else f'pipeline_execution_{previous}'
                         if previous == 0 and parameters.get('floatingPointBits'):
                             value = f"isFloating ? ({instance_ports(source, 'DitDahA1Fpu')[0][1]['output_bits_value']}) : ({value})"
                     else:
@@ -699,8 +701,13 @@ def pipeline_case(source, parameters):
         body += f'  wire [63:0] pipeline_execution_{lane} = {match[1]};\n'
     expected = ' + '.join(f"{{{width.bit_length()-1}'b0, pipeline_prefix_{lane}}}" if width > 1 else f'pipeline_prefix_{lane}' for lane in range(width))
     sleeping = 'sleep' if parameters.get('enableInterrupts') else "1'b0"
-    body += f'''  always @(posedge clock) if (!reset) begin
-    assert(issueCount == ((!issuedValid || executed) && !executePending && !redirect_0 && !earlyRedirect && !{sleeping} ? ({expected}) : 0));
+    pending = 'executePending' if parameters.get('enableM', True) else "1'b0"
+    csr_live = ' || '.join(f"({stage}Count != 0 && {packet}[6:0]==7'h73 && {packet}[13:12]!=0)"
+        for stage, packet in ((stage, f'{stage}Packets_0_' + ('decoded_' if stage == 'issued' else '') + 'instruction_instruction')
+                              for stage in ('issued', 'result', 'memory', 'commit')))
+    body += f'''  wire pipeline_csr_live={csr_live};
+  always @(posedge clock) if (!reset) begin
+    assert(issueCount == ((!issuedValid || executed) && !{pending} && !pipeline_csr_live && !redirect_0 && !earlyRedirect && !{sleeping} ? ({expected}) : 0));
   end
 '''
     offset = 'issuedPackets_0_decoded_instruction_length'
@@ -1198,10 +1205,10 @@ def protection_cases(parameters):
     ((_commit_output_bits_csrAddress >= 12'h3a0 && _commit_output_bits_csrAddress <= 12'h3ae) ||
      (_commit_output_bits_csrAddress >= 12'h3b0 && _commit_output_bits_csrAddress <= 12'h3ef));
   always @(posedge clock) if (!reset) begin
-    if (permission_update) assert(redirect_0 && !executed && !data_request_valid);
+    if (permission_update) assert(redirect_0 && !issuedValid && !executed && !data_request_valid);
     if (past_valid && $past(!reset && permission_update))
       assert(!instructionValid && !decodedValid && !issuedValid && !resultValid && !memoryValid && !commitValid);
-    cover(permission_update && issuedValid);
+    cover(permission_update && instructionValid);
     cover(permission_update && decodedValid);
   end
 '''
@@ -1218,8 +1225,8 @@ def protection_cases(parameters):
 def interrupt_cases(parameters):
     csr = r'''
   reg irq_past = 0;
-  wire [2:0] irq_levels = {interrupts_external, interrupts_timer, interrupts_software};
-  wire [2:0] irq_enabled = enables & irq_levels;
+  wire [13:0] irq_levels = {IRQ_OVERFLOW, 1'b0, interrupts_external, 3'd0, interrupts_timer, 3'd0, interrupts_software, 3'd0};
+  wire [13:0] irq_enabled = enables & irq_levels;
   always @(posedge clock) begin
     irq_past <= 1;
     if (!irq_past) assume(reset);
@@ -1227,7 +1234,7 @@ def interrupt_cases(parameters):
       if ($past(reset)) assert(enables == 0 && status == 0);
       else begin
         assert(enables == ($past(write && writeAddress == 12'h304) ?
-          {$past(writeData[11]), $past(writeData[7]), $past(writeData[3])} : $past(enables)));
+          ($past(writeData[13:0]) & IRQ_MASK) : $past(enables)));
         if ($past(trap)) begin
           assert(mepc == ($past(trapPc) & ~64'd3));
           assert(mcause == $past(trapCause) && mtval == $past(trapValue));
@@ -1238,12 +1245,10 @@ def interrupt_cases(parameters):
       assert(interruptPending == (status[3] && irq_enabled != 0));
       assert(wakeup == (irq_enabled != 0));
       if (interruptPending) assert(interruptCause == (64'h8000000000000000 |
-        (irq_enabled[2] ? 64'd11 : irq_enabled[0] ? 64'd3 : 64'd7)));
-      if (readAddress == 12'h304) assert(legal && readData ==
-        (({61'd0, enables} & 1) << 3 | ({61'd0, enables} & 2) << 6 | ({61'd0, enables} & 4) << 9));
-      if (readAddress == 12'h344) assert(legal && readData ==
-        (({61'd0, irq_levels} & 1) << 3 | ({61'd0, irq_levels} & 2) << 6 | ({61'd0, irq_levels} & 4) << 9));
-      cover(interruptPending && interruptCause[3:0] == 11 && irq_levels == 7);
+        (irq_enabled[11] ? 64'd11 : irq_enabled[3] ? 64'd3 : irq_enabled[7] ? 64'd7 : 64'd13)));
+      if (readAddress == 12'h304) assert(legal && readData == {50'd0, enables});
+      if (readAddress == 12'h344) assert(legal && readData == {50'd0, irq_levels});
+      cover(interruptPending && interruptCause[3:0] == 11 && (irq_levels & 14'h888) == 14'h888);
       cover(interruptPending && interruptCause[3:0] == 3);
       cover(interruptPending && interruptCause[3:0] == 7);
       cover(irq_levels != 0 && !status[3] && readAddress == 12'h344);
@@ -1253,6 +1258,10 @@ def interrupt_cases(parameters):
     end
   end
 '''
+    csr = csr.replace('IRQ_OVERFLOW', 'overflowPending' if parameters.get('hpmCounters') else "1'b0")
+    csr = csr.replace('IRQ_MASK', f"14'h{0x888 | (0x2000 if parameters.get('hpmCounters') else 0):x}")
+    if parameters.get('hpmCounters'):
+        csr += "  always @(posedge clock) if (irq_past && !reset) cover(interruptPending && interruptCause == 64'h800000000000000d);\n"
     if parameters.get('enableUserMode'):
         csr = csr.replace("status == ($past(writeData) & 64'h88)",
                           "status == (($past(writeData) & 64'h220088) | ($past(writeData[12:11]) == 3 ? 64'h1800 : 0))")
@@ -2995,7 +3004,7 @@ def integer_cases(parameters):
   wire [5:0] i_shift = i_small ? {1'b0, i_rhs[4:0]} : i_rhs[5:0];
   wire signed [63:0] i_signed_a = i_small ? {{32{i_a[31]}}, i_a[31:0]} : i_a;
   wire [63:0] i_arithmetic_shift = i_signed_a >>> i_shift;
-  reg [63:0] i_result, i_expected, i_csr_value;
+  reg [63:0] i_result, i_expected;
   reg i_taken, i_write;
   wire [63:0] i_target = input_bits_decoded_instruction_pc + i_imm;
   wire [63:0] i_sequential = input_bits_decoded_instruction_pc + input_bits_decoded_instruction_length;
@@ -3036,11 +3045,6 @@ def integer_cases(parameters):
       default: i_taken = 0;
     endcase
     i_write = i_function[1:0] == 1 || input_bits_decoded_rs1 != 0;
-    case (i_function[1:0])
-      1: i_csr_value = i_csr_source;
-      2: i_csr_value = csrValue | i_csr_source;
-      default: i_csr_value = csrValue & ~i_csr_source;
-    endcase
     if (i_op >= 21 && i_op <= 24 && (!i_small || i_function == 0 || i_function == 1 || i_function == 5)) begin
       assert(output_bits_value == i_expected && output_bits_nextPc == i_sequential);
       assert(output_bits_instruction_fault == input_bits_decoded_instruction_fault);
@@ -3062,7 +3066,7 @@ def integer_cases(parameters):
     if ((i_op == 28 || i_op == 10 || i_op == 11) && i_function != 0 && i_function != 4 &&
         input_bits_decoded_rs1 == i_word[19:15] &&
         (i_op == 28 ? (i_function == 3 || i_function >= 5) : i_function == (i_op == 10 ? 1 : 2))) begin
-      assert(output_bits_value == csrValue && output_bits_csrData == i_csr_value && output_bits_csrWrite == i_write);
+      assert(output_bits_value == csrValue && output_bits_csrData == i_csr_source && output_bits_csrWrite == i_write);
       assert(csrAddress == i_word[31:20] && output_bits_csrAddress == i_word[31:20]);
       assert(output_bits_instruction_fault == (input_bits_decoded_instruction_fault || !csrLegal || (i_write && i_word[31:30] == 3)));
       if (!input_bits_decoded_instruction_fault && (!csrLegal || (i_write && i_word[31:30] == 3)))
@@ -3385,6 +3389,208 @@ def floating_fpu_case(parameters):
   end
 '''
     return ('FloatingFpu', body, 'assign output_valid=valid;', 'assign output_valid=valid||busy;')
+
+
+def csr_backend_case(parameters, source, trace=None):
+    ports = {name: instance_ports(source, 'DitDahA1' + name)[0][1] for name in ('Commit', 'Csr', 'Execute', 'Gpr')}
+    cp, cs, ex, gp = (ports[name] for name in ('Commit', 'Csr', 'Execute', 'Gpr'))
+    body = f'''
+  function csr_encoding(input [31:0] word);
+    csr_encoding=word[6:0]==7'h73 && word[13:12]!=0;
+  endfunction
+  wire [31:0] csr_word=commitPacket_instruction_instruction;
+  wire csr_commit=commitValid && csr_encoding(csr_word);
+  wire csr_retired=({cp['output_valid']}) && ({cp['output_ready']});
+  wire csr_fault=({cp['output_bits_instruction_fault']});
+  wire csr_live=(issuedValid && csr_encoding(issuedPacket_decoded_instruction_instruction)) ||
+    (resultValid && csr_encoding(resultPacket_instruction_instruction)) ||
+    (memoryValid && csr_encoding(memoryPacket_instruction_instruction)) || csr_commit;
+  wire [63:0] csr_current=({cs['readData']}), csr_written=({cs['writeData']});
+  wire [63:0] csr_returned=({cp['output_bits_value']}), csr_prepared=commitPacket_csrData;
+  wire [63:0] csr_canonical=({cp['output_bits_csrData']});
+  wire [63:0] csr_ex_source=issuedPacket_decoded_instruction_instruction[14] ?
+    {{59'd0,issuedPacket_decoded_instruction_instruction[19:15]}} : issuedPacket_operand1;
+  wire csr_write=csr_word[13:12]==1 || csr_word[19:15]!=0;
+  (* anyconst *) reg [5:0] csr_bit;
+  reg csr_past=0, csr_owned=0, csr_source, csr_old;
+  reg [31:0] csr_instruction;
+  wire csr_expected=csr_word[13:12]==1 ? csr_source :
+    csr_word[13:12]==2 ? csr_current[csr_bit] | csr_source : csr_current[csr_bit] & ~csr_source;
+  always @(posedge clock) begin
+    csr_past<=1;
+    if(!csr_past) assume(reset); else assume(!reset);
+    if(reset || redirect_0) csr_owned<=0;
+    else begin
+      if(executed && csr_encoding(issuedPacket_decoded_instruction_instruction)) begin
+        assert(!csr_owned);
+        csr_owned<=1; csr_source<=csr_ex_source[csr_bit];
+        csr_old<=csr_current[csr_bit]; csr_instruction<=issuedPacket_decoded_instruction_instruction;
+      end
+      if(csr_retired && csr_commit) csr_owned<=0;
+    end
+    if(!reset) begin
+      if(csr_past && $past(reset || redirect_0)) assert(!csr_live);
+      if(csr_live) assert(issueCount==0);
+      if(csr_commit) begin
+        assert(csr_owned && csr_instruction==csr_word);
+        if(!csr_fault) assert(csr_prepared[csr_bit]==csr_source);
+        assert(({cs['readAddress']})==csr_word[31:20]);
+      end
+      assert(({cs['write']})==(csr_retired && csr_commit && !csr_fault && csr_write));
+      if(csr_retired && csr_commit && !csr_fault) begin
+        assert(csr_returned[csr_bit]==csr_current[csr_bit] && csr_canonical[csr_bit]==csr_expected);
+        assert(({cp['output_bits_csrWrite']})==csr_write);
+        if(csr_write) assert(csr_written[csr_bit]==csr_expected && ({cs['writeAddress']})==csr_word[31:20]);
+        assert(({gp['we_0']})==(csr_word[11:7]!=0));
+        if(csr_word[11:7]!=0) begin
+          assert(({gp['waddr_0']})==csr_word[11:7] && ({gp['wdata_0']})==csr_returned);
+        end
+        cover(csr_write && !csr_word[14]);
+        cover(!csr_write && csr_word[14]);
+        cover(csr_current[csr_bit]!=csr_old);
+      end
+      if(csr_retired && csr_commit && csr_fault) assert(!({gp['we_0']}) && !({cs['write']}));
+      cover(csr_owned && redirect_0);
+    end
+  end
+'''
+    if not parameters.get('enableInterrupts') and not parameters.get('enableCounters'):
+        body = body.replace('        cover(csr_current[csr_bit]!=csr_old);\n', '')
+    if trace:
+        debug = cs.get('debug_mode', "1'b0")
+        for field, bits in dict(pc=64, instruction=32, rdWrite=1, rd=5, value=64, trap=1).items():
+            signal = trace[field].removeprefix('dV.')
+            select = f'[{bits-1}:0]' if parameters['issueWidth'] > 1 else ''
+            body += f'  wire [{bits-1}:0] csr_trace_{field}={signal}{select};\n'
+        body += f'''  always @(posedge clock) if(!reset && csr_retired && csr_commit && !({debug})) begin
+    assert(traceCount==1 && csr_trace_instruction==csr_word && csr_trace_rdWrite==({gp['we_0']}));
+    assert(csr_trace_rd==csr_word[11:7] && csr_trace_pc==({cp['output_bits_instruction_pc']}) && csr_trace_trap==csr_fault);
+    assert(csr_trace_value==(({gp['we_0']}) ? csr_returned : 64'd0));
+  end
+'''
+    return ('CsrBackend', body, 'assign output_bits_csrData =', "assign output_bits_csrData = 64'h1 ^")
+
+
+def csr_witness(parameters, mode):
+    dynamic = parameters.get('enableInterrupts') or parameters.get('enableCounters')
+    selected = int(mode.rsplit('-', 1)[-1]) if mode.startswith('cover-') else -1
+    changing, fault = dynamic and selected == 2, selected == (3 if dynamic else 2)
+    address = 0x777 if fault else (0x344 if parameters.get('enableInterrupts') else 0xb00) if changing else 0x340
+    function = 6 if selected == 1 else 2 if changing or mode == 'mutation-hold' else 1
+    instruction = (address << 20) | (function << 12) | (6 << 7) | 0x73
+    body = '''  reg [1:0] csr_sequence=0;
+  reg [3:0] csr_age=0;
+  always @(posedge clock) if(reset) begin csr_sequence<=0;csr_age<=0;end
+  else begin
+    if(instruction_valid && instruction_ready) csr_sequence<=csr_sequence+1;
+    if(csr_age!=15) csr_age<=csr_age+1;
+  end
+'''
+    return body, dict(instruction_valid=f'csr_sequence<{2 if mode == "mutation-hold" else 1}', instruction_bits_count=1,
+        instruction_bits_packets_0_pc="64'h100+{62'd0,csr_sequence}*4", instruction_bits_packets_0_length=4,
+        instruction_bits_packets_0_instruction=f"csr_sequence==0 ? 32'h{instruction:x} : 32'h00100393",
+        interrupts_external='csr_age>=5' if changing and parameters.get('enableInterrupts') else 0,
+        data_response_bits_last=1)
+
+
+def counter_csr_case(parameters, source):
+    count = parameters['hpmCounters']
+    mask = (1 << (count + 3)) - 1
+    def registers(prefix):
+        result = re.findall(r'\breg\s+(?:\[\d+:0\]\s+)?(' + prefix + r'(?:_\d+)?)\s*;', source)
+        assert len(result) == count, (prefix, result)
+        return result
+    hpm, selectors, filters, flags = (registers(prefix) for prefix in ('hpm', 'selectors', 'filters', 'flags'))
+    body = '''  reg cc_past=0;
+  always @(posedge clock) begin
+    cc_past<=1;
+    if(!cc_past) assume(reset);
+    if(cc_past && !$past(reset)) begin
+      assert(cycle==($past(write && writeAddress==12'hb00) ? $past(writeData) :
+        $past(cycle)+($past(inhibit[0]) ? 64'd0 : 64'd1)));
+      assert(instret==($past(write && writeAddress==12'hb02) ? $past(writeData) :
+        $past(instret)+($past(inhibit[2]) ? 64'd0 : $past(retiredCount))));
+    end
+  end
+'''
+    for address, register, allowed in [(0x320, 'inhibit', mask & ~2), *([(0x306, 'mcounteren', mask)] if parameters.get('enableUserMode') else []), *([(0x106, 'scounteren', mask)] if parameters.get('enableSupervisorMode') else [])]:
+        body += f"  always @(posedge clock) if(cc_past) assert({register}==($past(reset) ? 32'd0 : $past(write && writeAddress==12'h{address:x}) ? $past(writeData[31:0]) & 32'h{allowed:x} : $past({register})));\n"
+    requests = []
+    for index, (counter, selector, filtering, flag) in enumerate(zip(hpm, selectors, filters, flags)):
+        number = index + 3
+        body += f'''  wire [64:0] cc_sum_{index}={{1'b0,{counter}}}+({selector}==1 ? 65'd1 : {selector}==2 ? retiredCount : 65'd0);
+  wire cc_filter_{index}=privilege==3 ? {filtering}[2] : privilege==1 ? {filtering}[1] : {filtering}[0];
+  wire cc_write_{index}=write && writeAddress==12'h{0xb00+number:x};
+  wire cc_event_{index}=write && writeAddress==12'h{0x320+number:x};
+  wire cc_run_{index}=!inhibit[{number}] && !cc_filter_{index} && !cc_write_{index};
+  wire cc_wrap_{index}=cc_run_{index} && cc_sum_{index}[64];
+  always @(posedge clock) if(cc_past) begin
+    assert({counter}==($past(reset) ? 64'd0 : $past(cc_write_{index}) ? $past(writeData) : $past(cc_run_{index}) ? $past(cc_sum_{index}[63:0]) : $past({counter})));
+    assert({flag}==(!$past(reset) && ($past(cc_event_{index}) ? $past(writeData[63]) : $past({flag}) || $past(cc_wrap_{index}))));
+    if(!$past(reset)) begin
+      assert({selector}==($past(cc_event_{index}) ? ($past(writeData[1:0])==3 ? 2'd0 : $past(writeData[1:0])) : $past({selector})));
+      assert({filtering}==($past(cc_event_{index}) ? $past(writeData[62:60]) & 3'd{4 | (2 if parameters.get('enableSupervisorMode') else 0) | int(parameters.get('enableUserMode', False))} : $past({filtering})));
+    end
+    cover(!reset && cc_wrap_{index} && !{flag});
+    cover(!reset && cc_write_{index} && !inhibit[{number}] && !cc_filter_{index} && cc_sum_{index}[64] && !{flag});
+  end
+'''
+        requests.append(f'(cc_wrap_{index} && !{flag})')
+    if count:
+        delegated_write = " || (writeAddress==12'h144 && mideleg[13])" if parameters.get('enableSupervisorMode') else ''
+        body += f'''  wire cc_software_pending=write && (writeAddress==12'h344{delegated_write}) ? writeData[13] : overflowPending;
+  always @(posedge clock) if(cc_past) begin
+    assert(overflowRequest==(!$past(reset) && $past({' || '.join(requests)})));
+    assert(overflowPending==(!$past(reset) && ($past(cc_software_pending) || $past(overflowRequest))));
+    cover(!reset && overflowRequest && write && writeAddress==12'h344 && !writeData[13]);
+  end
+'''
+    access = '(privilege==3)' if not parameters.get('enableUserMode') else '(privilege==3 || (mcounteren[readAddress[4:0]]' + (' && (privilege!=0 || scounteren[readAddress[4:0]])' if parameters.get('enableSupervisorMode') else '') + '))'
+    body += f"  always @* if(!reset && readAddress>=12'hc00 && readAddress<=12'hc1f) assert(legal=={access});\n"
+    values = ['cycle', 'timeValue', 'instret', *hpm, *['0']*(29-count)]
+    for number, value in enumerate(values):
+        body += f"  always @* if(!reset && legal && readAddress==12'h{0xc00+number:x}) assert(readData=={value});\n"
+    if parameters.get('enableSstc'):
+        body += '''  wire cc_timer_allowed=privilege==3 || (privilege==1 && stce && mcounteren[1]);
+  always @(posedge clock) if(cc_past) begin
+    assert(stce==(!$past(reset) && ($past(write && writeAddress==12'h30a) ? $past(writeData[63]) : $past(stce))));
+    assert(stimecmp==($past(reset) ? 64'hffffffffffffffff : $past(write && writeAddress==12'h14d && cc_timer_allowed) ? $past(writeData) : $past(stimecmp)));
+    cover(!reset && stce && timeValue==stimecmp);
+  end
+  always @* if(!reset) begin
+    if(readAddress==12'h14d) assert(legal==cc_timer_allowed);
+    if(readAddress==12'h344) assert(readData[5]==(stce ? timeValue>=stimecmp : softwarePending[1]));
+  end
+'''
+    before = re.search(r'instret <= instret \+[^;]+;', source).group()
+    return ('CounterCsr', body, before, "instret <= instret + 64'd1;")
+
+
+def counter_backend_case(parameters, source):
+    cp = instance_ports(source, 'DitDahA1Commit')[0][1]
+    csr = instance_ports(source, 'DitDahA1Csr')[0][1]
+    slots = '+'.join(f"{{1'b0,(commitCount>{lane} && !commitPackets_{lane}_instruction_fault)}}" for lane in range(parameters['issueWidth']))
+    body = f'''  reg counted_past=0;
+  always @(posedge clock) begin counted_past<=1; if(!counted_past) assume(reset); end
+  wire [1:0] counted_retired=({cp['output_valid']}) && ({cp['output_ready']}) && !({cp['output_bits_instruction_fault']}) ? {slots} : 2'd0;
+  wire [1:0] counted_input={csr['retiredCount']};
+  always @* if(!reset) assert(counted_input==counted_retired);
+  always @(posedge clock) if(!reset) cover(({cp['output_valid']}) && ({cp['output_bits_instruction_fault']}));
+'''
+    for amount in range(parameters['issueWidth'] + 1):
+        body += f"  always @(posedge clock) if(!reset) cover(counted_retired==2'd{amount});\n"
+    before = f"wire [1:0] counted_input={csr['retiredCount']};"
+    retire = re.search(r'wire\s+(?:\[[^]]+\]\s+)?(retireCount\w*)\s*=', source).group(1)
+    return ('CounterBackend', body, before, f'wire [1:0] counted_input={retire};')
+
+
+def counter_witness(parameters, mode):
+    selected = int(mode.rsplit('-',1)[-1]) if mode.startswith('cover-') else 0
+    values = dict(instruction_valid=1, instruction_bits_count=max(1,selected-1), data_response_bits_last=1)
+    for lane in range(parameters['issueWidth']):
+        for field, value in dict(instruction="32'h13", length=4, pc=0x100+4*lane, fault=int(selected==0)).items():
+            values[f'instruction_bits_packets_{lane}_{field}']=value
+    return '', values
 
 
 def floating_backend_case(parameters, source):
@@ -5740,6 +5946,13 @@ def verify(rtl, directory, modules=None, mutations=None, jobs=1, rvfi_dir=None):
             cases.append(floating_backend_case(manifest['parameters'], sources['DitDahA1Backend.sv']))
     if manifest['parameters'].get('enableJtag'):
         cases.append(debug_csr_case(manifest['parameters']))
+    if manifest['parameters'].get('enableCounters'):
+        cases.append(counter_csr_case(manifest['parameters'], sources['DitDahA1Csr.sv']))
+        if 'DitDahA1Backend.sv' in sources:
+            cases.append(counter_backend_case(manifest['parameters'], sources['DitDahA1Backend.sv']))
+    if 'DitDahA1Backend.sv' in sources and (not modules or 'CsrBackend' in modules):
+        trace = dict(re.findall(r'`define ref_DitDahA1Backend_(\w+) (\S+)', (rtl / 'ref_DitDahA1Backend.sv').read_text())) if observation_sources else None
+        cases.append(csr_backend_case(manifest['parameters'], sources['DitDahA1Backend.sv'], trace))
     if 'DitDahA1DebugModule.sv' in sources:
         cases.append(debug_module_case(manifest['parameters']))
     if 'DitDahA1DmiBridge.sv' in sources:
@@ -5793,6 +6006,10 @@ def verify(rtl, directory, modules=None, mutations=None, jobs=1, rvfi_dir=None):
             unit = 'DebugModule'
         if name == 'LsuReads':
             unit = 'Lsu'
+        if name in ('CsrBackend', 'CounterBackend'):
+            unit = 'Backend'
+        if name == 'CounterCsr':
+            unit = 'Csr'
         origin_contract = manifest['parameters'].get('enableJtag') and manifest['parameters'].get('debugBase') is not None and unit in ('Fetch', 'Lsu', 'MemoryArbiter')
         if origin_contract:
             output = 'downstream_request' if unit == 'MemoryArbiter' else 'memory_request'
@@ -5998,7 +6215,8 @@ def verify(rtl, directory, modules=None, mutations=None, jobs=1, rvfi_dir=None):
             body += f"\n  always @* if ({machine}readAddress == 12'hf14) assert(legal && readData == {{60'd0, hartId}});\n"
             for address in (0x306, 0x30a, 0xf15):
                 legal = 'privilege == 3' if manifest['parameters'].get('enableUserMode') else str(int(address == 0xf15))
-                body += f"  always @* if (!reset && readAddress == 12'h{address:x}) assert(legal == ({legal}) && readData == 0);\n"
+                zero = not (address == 0x306 and manifest['parameters'].get('enableCounters') or address == 0x30a and manifest['parameters'].get('enableSstc'))
+                body += f"  always @* if (!reset && readAddress == 12'h{address:x}) assert(legal == ({legal}){' && readData == 0' if zero else ''});\n"
             if manifest['parameters'].get('enableUserMode') and not manifest['parameters'].get('enableSupervisorMode'):
                 body += '\n  always @* begin assume(!mret || privilege == 3); assume(!write || privilege == 3); end\n'
             if not manifest['parameters'].get('enableSupervisorMode'):
@@ -6020,6 +6238,10 @@ def verify(rtl, directory, modules=None, mutations=None, jobs=1, rvfi_dir=None):
             files = {module + '.sv': license + 'module formal_subset(input [64:0] low, high, input [7:0] config, input [63:0] address, input [1:0] privilege, input prior_whole, prior_subset);\nendmodule\n'}
         else:
             files = dict(sources) if unit in ('Backend', 'Frontend', 'InstructionCache', 'DataCache', 'SharedCache', 'MemoryFabric') or unit == 'Fetch' and manifest['parameters'].get('iCacheBytes') else {module + '.sv': sources[module + '.sv']}
+        if name == 'CounterBackend':
+            connection = '.retiredCount\n      ('+instance_ports(sources[module+'.sv'], 'DitDahA1Csr')[0][1]['retiredCount']+')'
+            assert files[module+'.sv'].count(connection)==1, 'Unknown successful retirement connection'
+            files[module+'.sv'] = files[module+'.sv'].replace(connection,'.retiredCount(counted_input)')
         if unit == 'PlatformMemory':
             source = files[module + '.sv']
             expression = 'axi_r_bits_data <= ram[(read_address-RAM_BASE)>>3];'
@@ -6153,7 +6375,7 @@ endmodule
                 for lane in range(1, manifest['parameters']['issueWidth']):
                     next_pc = f"(!({retirement['output_bits_instruction_fault']}) && commitCount == {lane+1} ? commitPackets_{lane}_nextPc : {next_pc})"
                 body = body.replace('$past(commit_output_bits_nextPc_layerCapture)', '$past(' + next_pc + ')')
-            if name == 'PipelineBackend' and observation_sources:
+            if name in ('PipelineBackend', 'CsrBackend') and observation_sources:
                 observation = observation_sources[backend_dv.name].split('();', 1)[1].rsplit('endmodule', 1)[0]
                 observation = observation.replace('DitDahA1Backend.', '')
                 files[module + '.sv'] = files[module + '.sv'].replace('endmodule', observation + '\nendmodule', 1)
@@ -6304,7 +6526,8 @@ endmodule''', 1)
     end
   end
 ''')
-                files['DitDahA1MulDiv.sv'] = license + header(sources['DitDahA1MulDiv.sv']) + RESOURCE + 'endmodule\n'
+                if manifest['parameters'].get('enableM', True):
+                    files['DitDahA1MulDiv.sv'] = license + header(sources['DitDahA1MulDiv.sv']) + RESOURCE + 'endmodule\n'
                 if manifest['parameters'].get('floatingPointBits'):
                     resource = RESOURCE.replace('[63:0]', '[68:0]').replace('assign output_bits = data;', 'assign output_bits_value=data[63:0]; assign output_bits_flags=data[68:64];')
                     resource = resource.replace('if (input_valid && input_ready) pending <= 1;', 'if(input_valid && input_ready)begin pending<=1;if(finish)begin valid<=1;data<=result;end end')
@@ -6364,6 +6587,25 @@ endmodule''', 1)
             checks = [(mode + '-' + insn, before, after) if mode != 'mutation-decode' else
                       (mode + '-' + insn, 'assign output_bits_operation =', "assign output_bits_operation = 5'h0 &", 'DitDahA1Decode.sv')
                       for insn in rvfi_models for mode in ('prove', 'cover', 'mutation-value', 'mutation-decode')]
+        if name == 'CsrBackend':
+            available = re.search(r'wire\s+available\s*=[^;]+;', sources[module + '.sv']).group()
+            released, count = re.subn(r'&\s*~\(issued(?:Valid|Count)[^;]*\|\s*commitCsr\)', '', available)
+            assert count == 1, 'Missing CSR issue exclusion driver'
+            prepared = re.search(r'assign output_bits_csrData\s*=[^;]+;', sources['DitDahA1Execute.sv']).group()
+            returned = re.search(r'assign output_bits_value\s*=[^;]+;', sources['DitDahA1Commit.sv']).group()
+            flipped = lambda driver: driver.replace('=', "= 64'h1 ^ (", 1)[:-1] + ');'
+            checks = [(mode, prepared, flipped(prepared), 'DitDahA1Execute.sv') for mode in ('prove', *(f'cover-{n}' for n in range(body.count('cover('))), 'mutation')]
+            checks += [('mutation-value', returned, flipped(returned), 'DitDahA1Commit.sv'),
+                       ('mutation-hold', available, released)]
+        if name == 'CounterCsr':
+            checks = [('prove', before, after), *((f'cover-{n}', before, after) for n in range(body.count('cover('))), ('mutation', before, after)]
+            if manifest['parameters']['hpmCounters']:
+                pending = re.search(r'overflowPending <=\s*\([^;]+;', sources[module+'.sv']).group()
+                checks.append(('mutation-pending', pending, pending.replace('| overflowRequest', "| 1'h0")))
+            if manifest['parameters'].get('enableSstc'):
+                checks.append(('mutation-timer', 'timeValue >= stimecmp', '$signed(timeValue) >= $signed(stimecmp)'))
+        if name == 'CounterBackend':
+            checks = [('prove', before, after), *((f'cover-{n}', before, after) for n in range(body.count('cover('))), ('mutation', before, after)]
 
         if origin_contract:
             output = 'downstream_request' if unit == 'MemoryArbiter' else 'memory_request'
@@ -6885,16 +7127,24 @@ endmodule''', 1)
             mutating = mode.startswith('mutation')
             proving = mode.startswith('prove')
             witness = ({'WfiBackend': wfi_witness, 'SynchronizationBackend': synchronization_witness,
-                        'InterruptBackend': interrupt_witness}.get(name) or
+                        'InterruptBackend': interrupt_witness, 'CsrBackend': csr_witness, 'CounterBackend': counter_witness}.get(name) or
                        (pipeline_witness if name == 'PipelineBackend' and (mode.startswith('cover') or mutating) else None) or
                        (resource_witness if name == 'Backend' else None)) if not proving else None
             work = directory / f'{name.lower()}-{mode}'
             work.mkdir(exist_ok=True)
             for filename, text in files.items():
+                if name == 'CsrBackend' and filename == module + '.sv' and not proving:
+                    changing = mode == 'cover-2' and (manifest['parameters'].get('enableInterrupts') or manifest['parameters'].get('enableCounters'))
+                    if not changing or manifest['parameters'].get('enableInterrupts'):
+                        text = text.replace('endmodule', f'  always @* assume(csr_bit=={11 if changing else 0});\nendmodule', 1)
+                    if mode.startswith('cover-'):
+                        text = partition_covers(text, int(mode.rsplit('-', 1)[-1]), body.count('cover('))
                 if name == 'RvfiExecute' and filename == 'wrapper.sv':
                     insn = mode.rsplit('-', 1)[-1]
                     text = text.replace('RVFI_MODEL', insn).replace('RVFI_ENCODING', {'add':'00000033','sub':'40000033','andn':'40007033'}[insn])
                 if name == 'WfiFrontend' and mode.startswith('cover-') and filename == module + '.sv':
+                    text = partition_covers(text, int(mode.rsplit('-', 1)[1]), body.count('cover('))
+                if name in ('CounterCsr', 'CounterBackend') and mode.startswith('cover-') and filename == module + '.sv':
                     text = partition_covers(text, int(mode.rsplit('-', 1)[1]), body.count('cover('))
                 if name == 'WfiFrontend' and filename == module + '.sv' and manifest['parameters'].get('branchPredictorEntries'):
                     if mode == 'prove-predictor':
@@ -7765,7 +8015,7 @@ endmodule''', 1)
             if name == 'FloatingBackend' and task != 'prove':
                 engine = 'smtbmc --nopresat --unroll z3' if mutating else 'smtbmc --unroll z3'
             if witness:
-                engine = 'smtbmc --unroll z3'
+                engine = 'smtbmc --nopresat --unroll z3' if name == 'CounterBackend' and mutating else 'smtbmc --unroll z3'
             if name in ('WfiBackend', 'SynchronizationBackend') and task == 'prove':
                 engine = 'smtbmc --syn --unroll z3'
             timeout = 90 if name == 'FloatingBackend' and task != 'prove' else 180 if name in ('SharedCache', 'InterruptBackend', 'SynchronizationBackend') and task == 'cover' else 60
@@ -7842,12 +8092,12 @@ timeout {timeout}
 {multiclock}{witness_option}[engines]
 {engine}
 [script]
-read -formal -sv {model_defines}{'-noautowire ' if name in ('DebugModule', 'DmiBridge', 'MulDiv', 'RvfiExecute', 'ZktControl', 'FloatingFpu', 'FloatingBackend', 'PipelineBackend', 'DataCacheAssociativity') else ''}{' '.join(files)}
+read -formal -sv {model_defines}{'-noautowire ' if name in ('DebugModule', 'DmiBridge', 'MulDiv', 'RvfiExecute', 'ZktControl', 'FloatingFpu', 'FloatingBackend', 'CounterCsr', 'CounterBackend', 'CsrBackend', 'PipelineBackend', 'DataCacheAssociativity') else ''}{' '.join(files)}
 {preparation}
 [files]
 ''' + '\n'.join(files) + '\n'
             (work / 'check.sby').write_text(config)
-            counted = (work / (module + '.sv')).read_text() if unit in ('ReadQueue', 'Axi', 'DataCache', 'MemoryFabric') or name in ('FloatingBackend', 'PipelineBackend', 'WfiFrontend') else body
+            counted = (work / (module + '.sv')).read_text() if unit in ('ReadQueue', 'Axi', 'DataCache', 'MemoryFabric') or name in ('FloatingBackend', 'CounterCsr', 'CounterBackend', 'CsrBackend', 'PipelineBackend', 'WfiFrontend') else body
             if unit == 'MulDiv' and 'latency' in mode:
                 counted = paired
             arguments = (work, timeout, name, mode, module, engine, counted)
@@ -7889,6 +8139,20 @@ read -formal -sv {model_defines}{'-noautowire ' if name in ('DebugModule', 'DmiB
         assert sum(r['covers'] for r in reports if r['propertyGroup'] == 'DataCacheAssociativity' and r['mode'] in covers) == 3 + int(manifest['parameters'].get('dCacheWriteback', False)), 'Incomplete associativity covers'
     if 'ZktControl' in proved:
         assert {r['mode'] for r in reports if r['propertyGroup']=='ZktControl'} >= {'prove', 'cover', 'mutation'}
+    if 'CsrBackend' in proved:
+        covers = 4 if manifest['parameters'].get('enableInterrupts') or manifest['parameters'].get('enableCounters') else 3
+        assert {'prove', *(f'cover-{n}' for n in range(covers)), 'mutation', 'mutation-value', 'mutation-hold'} <= {r['mode'] for r in reports if r['propertyGroup']=='CsrBackend'}, 'Incomplete CSR retirement checks'
+        assert sum(r['covers'] for r in reports if r['propertyGroup']=='CsrBackend' and r['mode'].startswith('cover-')) == covers
+    if 'CounterCsr' in proved and mutations is None:
+        covers = 2*manifest['parameters']['hpmCounters'] + int(bool(manifest['parameters']['hpmCounters'])) + int(manifest['parameters'].get('enableSstc', False))
+        expected = {'prove', 'mutation', *(f'cover-{n}' for n in range(covers))}
+        expected |= {'mutation-pending'} if manifest['parameters']['hpmCounters'] else set()
+        expected |= {'mutation-timer'} if manifest['parameters'].get('enableSstc') else set()
+        assert expected == {r['mode'] for r in reports if r['propertyGroup']=='CounterCsr'}, 'Incomplete counter CSR checks'
+        assert sum(r['covers'] for r in reports if r['propertyGroup']=='CounterCsr' and r['mode'].startswith('cover-')) == covers
+    if 'CounterBackend' in proved and mutations is None:
+        covers = manifest['parameters']['issueWidth'] + 2
+        assert {'prove','mutation',*(f'cover-{n}' for n in range(covers))} == {r['mode'] for r in reports if r['propertyGroup']=='CounterBackend'}, 'Incomplete successful retirement checks'
     if 'PipelineBackend' in proved:
         covers = {'cover', 'cover-memory', 'cover-recovery'} | ({'cover-dependency'} if manifest['parameters']['issueWidth'] > 1 else set())
         if manifest['parameters'].get('enableBranchPrediction'):
@@ -8010,6 +8274,10 @@ read -formal -sv {model_defines}{'-noautowire ' if name in ('DebugModule', 'DmiB
         configurations=manifest['parameters'], sourceHashes=manifest['sourceHashes'],
         rtlHashes={p: hashlib.sha256(text.encode()).hexdigest() for p, text in (sources | observation_sources).items()},
         executionModels=dict(scope='actual Decode/Issue/Execute with symbolic consistent GPR reads; nonzero rd value, next PC and effects; no retirement, memory, CSR or mode proof; alternate arithmetic and MISA branch disabled', files={name: hashlib.sha256(text.encode()).hexdigest() for name,text in rvfi_sources.items()}) if rvfi_sources else None,
+        csrRetirement='all six standard CSR encodings; accepted EX source watched over every bit, unique read-port ownership, current-state RMW, canonical Commit/GPR values, younger-issue exclusion and cancellation; matching DV trace when present; GPR read data abstracted in safety proofs' if 'CsrBackend' in proved else None,
+        counterState='actual 64-bit base/HPM state, old-control inhibition and mode filtering, write priority, sticky overflow and delayed request publication, permissions and unsigned supervisor time comparison; arbitrary inputs after initial reset, no Core retirement or shared-time wiring claim' if 'CounterCsr' in proved else None,
+        counterRetirement='actual Csr retiredCount connection equals the sum of valid nonfault Commit slots; all retirement counts and a fault are reachable; no hidden trace or fault-consuming retirement count used' if 'CounterBackend' in proved else None,
+        csrWitnessGuidance='cover and mutations only: one real CSR or a pure CSR read followed by an independent ADDI; pending changes through an external input after EX; unrestricted safety proof' if any(r['propertyGroup']=='CsrBackend' for r in reports) else None,
         checkerHash=checker_hash, bindingHelperHash=helper_hash, instructionModelHash=model_hash, tools=tools, reports=reports), indent=2) + '\n')
 
 
@@ -8019,7 +8287,7 @@ if __name__ == '__main__':
     parser.add_argument('--output', type=Path, default=Path('result/formal'))
     parser.add_argument('--mutations', nargs='+')
     parser.add_argument('--jobs', type=int, default=1)
-    parser.add_argument('--modules', nargs='+', choices=('ZktControl', 'RvfiExecute', 'PlatformMemory', 'DebugModule', 'DmiBridge', 'DebugCsr', 'FloatingBackend', 'FloatingFpu', 'Fetch', 'CompressedFetch', 'WideFetch', 'Gpr', 'MulDiv', 'Backend', 'PipelineBackend', 'Pmp', 'PmpDecode', 'PmpInterval', 'PmpSubset', 'Csr', 'FloatingCsr', 'UserCsr', 'UserExecute', 'SupervisorCsr', 'SupervisorExecute', 'SupervisorFetch', 'Lsu', 'LsuReads', 'InterruptCsr', 'InterruptBackend', 'SynchronizationBackend', 'SharedCache', 'InstructionCache', 'DataCache', 'DataCacheWriteback', 'DataCacheAssociativity', 'Coherence', 'MemoryArbiter', 'ReadQueue', 'MemoryFabric', 'Memory', 'Axi', 'WordDecode', 'WordExecute', 'BitManipDecode', 'BitManipExecute', 'IntegerDecode', 'IntegerExecute', 'WfiBackend', 'WfiFrontend', 'LocalInterrupts', 'Translation'))
+    parser.add_argument('--modules', nargs='+', choices=('ZktControl', 'RvfiExecute', 'PlatformMemory', 'DebugModule', 'DmiBridge', 'DebugCsr', 'CounterCsr', 'CounterBackend', 'CsrBackend', 'FloatingBackend', 'FloatingFpu', 'Fetch', 'CompressedFetch', 'WideFetch', 'Gpr', 'MulDiv', 'Backend', 'PipelineBackend', 'Pmp', 'PmpDecode', 'PmpInterval', 'PmpSubset', 'Csr', 'FloatingCsr', 'UserCsr', 'UserExecute', 'SupervisorCsr', 'SupervisorExecute', 'SupervisorFetch', 'Lsu', 'LsuReads', 'InterruptCsr', 'InterruptBackend', 'SynchronizationBackend', 'SharedCache', 'InstructionCache', 'DataCache', 'DataCacheWriteback', 'DataCacheAssociativity', 'Coherence', 'MemoryArbiter', 'ReadQueue', 'MemoryFabric', 'Memory', 'Axi', 'WordDecode', 'WordExecute', 'BitManipDecode', 'BitManipExecute', 'IntegerDecode', 'IntegerExecute', 'WfiBackend', 'WfiFrontend', 'LocalInterrupts', 'Translation'))
     parser.add_argument('--instruction-model-dir', type=Path)
     args = parser.parse_args()
     verify(args.rtl, args.output, args.modules, args.mutations, args.jobs, args.instruction_model_dir)

@@ -404,6 +404,47 @@ class Model:
         self.requests = []
         self.request_privileges = []
         self.order = 0
+        self.counter_cycle, self.counter_retired, self.counter_request, self.counter_mode = -1, 0, 0, 3
+        self.counter_written, self.counter_control, self.time_value = set(), None, 0
+        if config.get('enableCounters'):
+            self.csrs.update({address: 0 for address in (0xb00, 0xb02, 0x320, *range(0xb03, 0xb20),
+                                                       *range(0x323, 0x340), *range(0xc00, 0xc20))})
+        if config.get('hpmCounters') and config.get('enableSupervisorMode'):
+            self.csrs[0xda0] = 0
+        if config.get('enableSstc'):
+            self.csrs[0x14d] = MASK
+
+    def begin_cycle(self, cycle, time_value):
+        if not self.config.get('enableCounters'):
+            return
+        assert cycle == self.counter_cycle + 1, 'Missing or repeated counter cycle'
+        count = self.config.get('hpmCounters', 0)
+        if self.counter_control is not None:
+            inhibit, events, mode = self.counter_control
+            request = False
+            for index, event in ((0, 1), (2, 2), *((n + 3, e) for n, e in enumerate(events))):
+                delta = 1 if event & 3 == 1 else self.counter_retired if event & 3 == 2 else 0
+                if inhibit >> index & 1 or index >= 3 and event >> {3: 62, 1: 61, 0: 60}[mode] & 1:
+                    delta = 0
+                address = 0xb00 + index
+                if address not in self.counter_written:
+                    total = self.csrs[address] + delta
+                    self.csrs[address] = total & MASK
+                    if index >= 3 and total > MASK:
+                        request |= not bool(event >> 63)
+                        if 0x320 + index not in self.counter_written:
+                            self.csrs[0x320 + index] |= 1 << 63
+            self.csrs[0x344] |= self.counter_request << 13
+            self.counter_request = int(request)
+        self.counter_cycle, self.counter_retired, self.time_value = cycle, 0, time_value & MASK
+        self.counter_written.clear()
+        self.counter_control = self.csrs[0x320], [self.csrs[0x323 + n] for n in range(count)], self.counter_mode
+
+    def observe_retirement(self, record):
+        if self.config.get('enableCounters'):
+            self.counter_retired += int(not record[7])
+            assert self.counter_retired <= self.config['issueWidth'], 'Too many successful retirements in one cycle'
+            self.counter_mode = self.privilege
 
     def translate(self, address, kind, privilege=None):
         if self.config.get('virtualAddressBits') != 39:
@@ -484,16 +525,16 @@ class Model:
         return old
 
     def set_interrupts(self, levels):
-        self.csrs[0x344] = (self.csrs[0x344] & 0x222) | sum(
+        self.csrs[0x344] = (self.csrs[0x344] & (0x222 | (0x2000 if self.config.get('hpmCounters') else 0))) | sum(
             ((levels >> index) & 1) << bit for index, bit in enumerate((3, 7, 11)))
 
     def interrupt_cause(self):
-        pending = self.csrs[0x304] & self.csrs[0x344]
+        pending = self.csrs[0x304] & self.read_csr(0x344)
         delegated = self.csrs.get(0x303, 0)
         machine = pending & ~delegated if self.privilege < 3 or self.csrs[0x300] & 8 else 0
         supervisor = pending & delegated if self.privilege == 0 or self.privilege == 1 and self.csrs[0x300] & 2 else 0
         return next(((1 << 63) | bit for mask in (machine, supervisor)
-                     for bit in (11, 3, 7, 9, 1, 5) if mask & (1 << bit)), 0)
+                     for bit in (11, 3, 7, 9, 1, 5, 13) if mask & (1 << bit)), 0)
 
     def data_privilege(self):
         return (self.csrs[0x300] >> 11) & 3 if self.privilege == 3 and self.csrs[0x300] & (1 << 17) else self.privilege
@@ -524,10 +565,19 @@ class Model:
         return (self.csrs[0x3a0 + (index // 8) * 2] >> ((index % 8) * 8)) & 255
 
     def csr_legal(self, address):
+        enabled = self.csrs.get(0x306, 0) & (self.csrs.get(0x106, 0) if self.privilege == 0 and self.config.get('enableSupervisorMode') else MASK)
         return address in self.csrs and (address not in (1, 2, 3) or self.fp_state != 0) and (address >> 8) & 3 <= self.privilege and not (
-            address == 0x180 and self.privilege == 1 and self.csrs[0x300] & (1 << 20))
+            address == 0x180 and self.privilege == 1 and self.csrs[0x300] & (1 << 20)) and not (
+            0xc00 <= address < 0xc20 and self.privilege < 3 and not enabled >> (address - 0xc00) & 1) and not (
+            address == 0x14d and self.privilege < 3 and not (self.csrs.get(0x30a, 0) >> 63 and self.csrs.get(0x306, 0) & 2))
 
     def read_csr(self, address):
+        if 0xc00 <= address < 0xc20:
+            return self.time_value if address == 0xc01 else self.csrs[0xb00 + address - 0xc00]
+        if address == 0xda0:
+            return sum((self.csrs[0x320 + n] >> 63) << n for n in range(3, 32)) & (MASK if self.privilege == 3 else self.csrs[0x306])
+        if address == 0x344 and self.config.get('enableSstc') and self.csrs[0x30a] >> 63:
+            return (self.csrs[address] & ~32) | (int(self.time_value >= self.csrs[0x14d]) << 5)
         if address in (1, 2, 3):
             return self.csrs[3] & 31 if address == 1 else self.csrs[3] >> 5 if address == 2 else self.csrs[3]
         fp_status = (self.fp_state << 13) | ((1 << 63) if self.fp_state == 3 else 0)
@@ -536,7 +586,7 @@ class Model:
         if address == 0x100:
             return (self.csrs[0x300] & ((3 << 32) | 0x122 | (0xc0000 if self.config.get('virtualAddressBits') == 39 else 0))) | fp_status
         if address in (0x104, 0x144):
-            return self.csrs[address + 0x200] & self.csrs[0x303]
+            return self.read_csr(address + 0x200) & self.csrs[0x303]
         return self.csrs[address]
 
     def return_from_trap(self, supervisor=False):
@@ -555,6 +605,27 @@ class Model:
         return self.csrs[0x141 if supervisor else 0x341]
 
     def write_csr(self, address, value):
+        if self.config.get('enableCounters'):
+            self.counter_written.add(address)
+            hpm = ((1 << self.config.get('hpmCounters', 0)) - 1) << 3
+            if address in (0x106, 0x306, 0x320):
+                self.csrs[address] = value & (hpm | (5 if address == 0x320 else 7))
+                return
+            if address in (0xb00, 0xb02) or 0xb03 <= address < 0xb20:
+                if address in (0xb00, 0xb02) or hpm >> (address - 0xb00) & 1:
+                    self.csrs[address] = value & MASK
+                return
+            if 0x323 <= address < 0x340:
+                if hpm >> (address - 0x320) & 1:
+                    modes = (1 << 62) | (int(self.config.get('enableSupervisorMode', False)) << 61) | (int(self.config.get('enableUserMode', False)) << 60)
+                    self.csrs[address] = (value & ((1 << 63) | modes)) | (value & 3 if value & 3 != 3 else 0)
+                return
+        if address == 0x14d:
+            self.csrs[address] = value & MASK
+            return
+        if address == 0x30a and self.config.get('enableSstc'):
+            self.csrs[address] = value & (1 << 63)
+            return
         if address in (1, 2, 3):
             self.csrs[3] = ((self.csrs[3] & 0xe0) | (value & 31)) if address == 1 else ((self.csrs[3] & 31) | ((value & 7) << 5)) if address == 2 else value & 255
             self.fp_state = 3
@@ -572,21 +643,24 @@ class Model:
             mask = 0xc0122 if self.config.get('virtualAddressBits') == 39 else 0x122
             self.csrs[0x300] = (self.csrs[0x300] & ~mask) | (value & mask)
         elif address in (0x302, 0x303):
-            self.csrs[address] = value & ((0xb3ff if self.config.get('virtualAddressBits') == 39 else 0x3ff) if address == 0x302 else 0x222)
+            self.csrs[address] = value & ((0xb3ff if self.config.get('virtualAddressBits') == 39 else 0x3ff) if address == 0x302 else 0x222 | (0x2000 if self.config.get('hpmCounters') else 0))
         elif address == 0x180 and self.config.get('virtualAddressBits') == 39:
             if value >> 60 == 0:
                 self.csrs[address] = 0
             elif value >> 60 == 8 and value & ((1 << 44) - 1) < 1 << (self.config['physicalAddressBits'] - 12):
                 self.csrs[address] = (8 << 60) | (value & ((1 << (44 + self.config.get('asidBits', 0))) - 1))
         elif address == 0x304 and self.config.get('enableInterrupts', False):
-            self.csrs[address] = value & (0xaaa if self.config.get('enableSupervisorMode') else 0x888)
+            self.csrs[address] = value & ((0xaaa if self.config.get('enableSupervisorMode') else 0x888) | (0x2000 if self.config.get('hpmCounters') else 0))
         elif address == 0x104:
             mask = self.csrs[0x303]
             self.csrs[0x304] = (self.csrs[0x304] & ~mask) | (value & mask)
-        elif address == 0x344 and self.config.get('enableSupervisorMode'):
-            self.csrs[address] = (self.csrs[address] & ~0x222) | (value & 0x222)
+        elif address == 0x344:
+            mask = (0x222 if self.config.get('enableSupervisorMode') else 0) | (0x2000 if self.config.get('hpmCounters') else 0)
+            if self.config.get('enableSstc') and self.csrs[0x30a] >> 63:
+                mask &= ~32
+            self.csrs[address] = (self.csrs[address] & ~mask) | (value & mask)
         elif address == 0x144:
-            mask = self.csrs[0x303] & 2
+            mask = self.csrs[0x303] & (2 | (0x2000 if self.config.get('hpmCounters') else 0))
             self.csrs[0x344] = (self.csrs[0x344] & ~mask) | (value & mask)
         elif address in (0x105, 0x141, 0x305, 0x341):
             self.csrs[address] = value & ~(1 if address in (0x141, 0x341) and self.config.get('enableC') else 3)

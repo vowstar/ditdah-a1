@@ -128,8 +128,6 @@ object DitDahA1Execute extends Generator[DitDahA1Parameter, DitDahA1UnitLayers, 
     val csrSource = ((op === Csr.U(operationBits)) & funct3.bit(2)).?(d.rs1, a)
     out.csrWrite := csr & ((csrAction === 1.B(2)) | (d.rs1 =/= 0.U(5)))
     out.csrData := csrSource
-    when(csrAction === 2.B(2)) { out.csrData := (io.csrValue.asBits | csrSource.asBits).asUInt }
-    when(csrAction === 3.B(2)) { out.csrData := (io.csrValue.asBits & (csrSource.asBits ^ BigInt("ffffffffffffffff", 16).B(64))).asUInt }
     out.mret := op === Mret.U(operationBits)
     out.sret := op === Sret.U(operationBits)
     out.fenceI := op === FenceI.U(operationBits)
