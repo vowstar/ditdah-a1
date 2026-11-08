@@ -27,6 +27,7 @@ case class DitDahA1Parameter(
   loadQueueEntries: Int = 1,
   enableM: Boolean = true,
   enableA: Boolean = true,
+  enableMisaligned: Boolean = false,
   enableC: Boolean = false,
   floatingPointBits: Int = 0,
   enableZba: Boolean = false,

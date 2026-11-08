@@ -20,13 +20,13 @@ def load_configuration(args):
     translation = {key: value for key, value in translation.items() if value is not None}
     burst_refill = getattr(args, 'burst_refill', None)
     data_refill = getattr(args, 'dcache_refill_bytes', None)
-    counters = {key: value for key, value in ((key, getattr(args, option, None)) for key, option in
-                (('enableCounters', 'counters'), ('hpmCounters', 'hpm_counters'), ('enableSstc', 'sstc'))) if value is not None}
+    features = {key: value for key, value in ((key, getattr(args, option, None)) for key, option in
+                (('enableCounters', 'counters'), ('hpmCounters', 'hpm_counters'), ('enableSstc', 'sstc'), ('enableMisaligned', 'misaligned'))) if value is not None}
     original = args.config
     content = original.read_bytes()
     document = json.loads(content)
     config = document.get('parameters', document)
-    if args.harts is None and args.icache_bytes is None and args.dcache_bytes is None and not supervisor_mode and tlb_entries is None and burst_refill is None and data_refill is None and not translation and issue_width is None and not counters:
+    if args.harts is None and args.icache_bytes is None and args.dcache_bytes is None and not supervisor_mode and tlb_entries is None and burst_refill is None and data_refill is None and not translation and issue_width is None and not features:
         return config, {}
     if issue_width is not None:
         config['issueWidth'] = issue_width
@@ -43,7 +43,7 @@ def load_configuration(args):
     if sv39:
         config['virtualAddressBits'] = 39
     config.update(translation)
-    config.update(counters)
+    config.update(features)
     if tlb_entries is not None:
         config['tlbEntries'] = tlb_entries
     if burst_refill is not None:
@@ -74,6 +74,7 @@ def main():
     parser.add_argument('--dcache-bytes', type=int, choices=(0, 8192, 16384, 32768, 65536))
     parser.add_argument('--dcache-refill-bytes', type=int, choices=(8, 64))
     parser.add_argument('--supervisor-mode', action='store_true')
+    parser.add_argument('--misaligned', action=argparse.BooleanOptionalAction, default=None)
     parser.add_argument('--counters', action=argparse.BooleanOptionalAction, default=None)
     parser.add_argument('--hpm-counters', type=int, choices=range(30))
     parser.add_argument('--sstc', action=argparse.BooleanOptionalAction, default=None)

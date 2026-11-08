@@ -14,6 +14,7 @@ import subprocess
 import click
 from contracts import backend_control_signals, __file__ as binding_helper_file
 from model import BITMANIP_ENCODINGS, SCALAR_ENCODINGS, Model, __file__ as model_file
+from programs import sd
 
 
 DMI_BRIDGE = r'''
@@ -761,6 +762,14 @@ def pipeline_case(source, parameters):
         if dual:
             expected = f'(memoryPending ? {expected} : extraPackets_0_{field})'
         body += f'  always @(posedge clock) if (!reset && {"backend_memory_owned != 0" if dual else "memoryPending"}) assert({expected} == _lsu_output_bits_{field});\n'
+    if parameters.get('enableMisaligned') and not dual:
+        body += '''  reg [2:0] pipeline_fragments;
+  always @(posedge clock) begin
+    if (reset || !memoryPending) pipeline_fragments <= 0;
+    else if (data_request_valid && data_request_ready && data_request_bits_write) pipeline_fragments <= pipeline_fragments + 1;
+    cover(memoryPending && !reset && _lsu_output_valid && _lsu_output_bits_store && !_lsu_output_bits_instruction_fault && pipeline_fragments == 4);
+  end
+'''
     return ('PipelineBackend', backend_names(body, source), before, "commitPackets_0_instruction_pc <= 64'h0;")
 
 
@@ -966,7 +975,7 @@ def pipeline_witness(parameters, mode):
     if (data_response_valid && data_response_ready) pending <= 0;
   end
 '''
-    scenario = 3 if mode.startswith('mutation-recovery') or mode == 'cover-recovery' else 4 if mode.startswith('mutation-memory') else {'cover-memory': 1, 'cover-dependency': 2, 'cover-dual': 5, 'cover-drain': 6, 'mutation-dual-owner': 5, 'mutation-dual-drain': 6}.get(mode, 0)
+    scenario = 3 if mode.startswith('mutation-recovery') or mode in ('cover-recovery', 'mutation-store-cancel') else 4 if mode.startswith('mutation-memory') else {'cover-memory': 1, 'cover-dependency': 2, 'cover-dual': 5, 'cover-drain': 6, 'mutation-dual-owner': 5, 'mutation-dual-drain': 6}.get(mode, 0)
     body = body.replace('(* anyconst *) reg [2:0] scenario;', f"wire [2:0] scenario = {scenario};")
     values = dict(instruction_valid=1, instruction_bits_count=f'scenario == 3 || (scenario == 1 && !started) ? 1 : {width}',
                   data_request_ready=1, data_response_valid='pending && (scenario == 3 || respond)', data_response_bits_last=1, data_response_bits_fault='scenario == 4')
@@ -976,6 +985,11 @@ def pipeline_witness(parameters, mode):
         values[packet + 'instruction'] = (f"scenario == 4 && !started ? 32'h00803083 : scenario == 3 ? (!started ? 32'h00003023 : pc == 64'h108 ? 32'h0080006f : 32'h{word:x}) : scenario == 1 && !started ? 32'h00003023 : 32'h{word:x}" if lane == 0 else
                                          f"scenario == 2 ? 32'h{word | (1 << 15):x} : 32'h{word:x}" if lane == 1 else f"32'h{word:x}")
         values[packet + 'pc'], values[packet + 'length'] = f'pc + {4 * lane}', 4
+        if parameters.get('enableMisaligned') and (mode.startswith('cover') or mode == 'mutation-store-cancel'):
+            values[packet + 'instruction'] = values[packet + 'instruction'].replace("32'h00003023", f"32'h{sd(0, 0, 1):08x}")
+    if mode == 'mutation-store-cancel':
+        values['data_response_valid'] = 'pending && respond'
+        values['instruction_bits_packets_0_instruction'] = values['instruction_bits_packets_0_instruction'].replace("pc == 64'h108", "pc == 64'h104")
     if mode in ('mutation', 'mutation-forward', 'mutation-dependency'):
         for lane in range(width):
             rd = lane + 1
@@ -1267,6 +1281,11 @@ def interrupt_cases(parameters):
                           "status == (($past(writeData) & 64'h220088) | ($past(writeData[12:11]) == 3 ? 64'h1800 : 0))")
         csr = csr.replace('status[3] && irq_enabled != 0', '(privilege < 3 || status[3]) && irq_enabled != 0')
         csr = csr.replace("if (readAddress ==", "if (privilege == 3 && readAddress ==")
+    dual = parameters.get('loadQueueEntries', 1) == 2
+    completion = ('backend_memory_owned == 1 && _lsu_output_valid && lsu_output_ready && !_lsu_output_bits_instruction_fault' if dual else
+                  'irq_memory_owned && _lsu_output_valid && lsu_output_ready && !_lsu_output_bits_instruction_fault && _lsu_output_bits_instruction_tag == irq_memory_tag'
+                  if parameters.get('enableMisaligned') else 'data_response_valid && data_response_ready && !data_response_bits_fault && data_response_bits_tag == irq_memory_tag')
+    deadline = 2 if dual or parameters.get('enableMisaligned') else 3
     backend = BACKEND + f'''
   reg irq_memory_owned = 0;
   reg [1:0] irq_service_age = 0;
@@ -1276,11 +1295,10 @@ def interrupt_cases(parameters):
   always @(posedge clock) begin
     if (reset) begin irq_memory_owned <= 0; irq_service_age <= 0; end
     else begin
-      if (data_response_valid && data_response_ready && !data_response_bits_fault &&
-          data_response_bits_tag == irq_memory_tag && _csr_interruptPending) irq_service_age <= 1;
+      if ({completion} && _csr_interruptPending) irq_service_age <= 1;
       else if (irq_service_age != 0) irq_service_age <= irq_service_age + 1;
       if (!_csr_interruptPending || takeInterrupt_layerCapture) irq_service_age <= 0;
-      if (irq_service_age == 3 && _csr_interruptPending)
+      if (irq_service_age == {deadline} && _csr_interruptPending)
         assert(takeInterrupt_layerCapture || (commit_output_valid_layerCapture && commitPacket_instruction_fault));
       if (lsu_input_valid && _lsu_input_ready) begin
         assert(!irq_memory_owned);
@@ -1322,10 +1340,45 @@ def interrupt_cases(parameters):
       cover(takeInterrupt_layerCapture && !instructionValid && !decodedValid && !issuedValid && !resultValid && !memoryValid && !commitValid);
       cover(takeInterrupt_layerCapture && executePending);
       cover(takeInterrupt_layerCapture && $past(commit_output_valid_layerCapture && irq_memory_commit));
-      cover(irq_service_age == 3 && takeInterrupt_layerCapture);
+      cover(irq_service_age == {deadline} && takeInterrupt_layerCapture);
       cover(takeInterrupt_layerCapture && issuedValid && issuedPacket_decoded_instruction_instruction[6:0] == 7'h0f);
       cover(_csr_interruptPending && memoryPending && decodedValid && decodedPacket_instruction_instruction[6:0] == 7'h0f);
     end
+  end
+'''
+    if dual:
+        start = backend.index('      if (lsu_input_valid && _lsu_input_ready) begin')
+        end = backend.index('      if (takeInterrupt_layerCapture) begin', start)
+        backend = backend[:start] + backend[end:]
+        backend = backend.replace('reg irq_memory_owned = 0;', 'wire irq_memory_owned = backend_memory_owned != 0 || irq_memory_commit || extraCount != 0 || (memoryValid && (memoryPacket_load || memoryPacket_store));')
+        backend = backend.replace('  reg [63:0] irq_memory_pc;\n  reg [7:0] irq_memory_tag;\n', '').replace('irq_memory_owned <= 0; ', '')
+        backend = backend.replace('if (_csr_interruptPending && !memoryPending && !irq_memory_commit', 'if (_csr_interruptPending && !irq_memory_owned && !memoryPending && !irq_memory_commit')
+        backend += '''  reg irq_dual_seen = 0;
+  always @(posedge clock) if (reset || !_csr_interruptPending || takeInterrupt_layerCapture) irq_dual_seen <= 0;
+    else if (_csr_interruptPending && backend_memory_owned == 2) irq_dual_seen <= 1;
+  always @(posedge clock) if (!reset) begin
+    if (memoryPending) assert(memoryCount >= 1 && (memoryPackets_0_load || memoryPackets_0_store) && !memoryPackets_0_instruction_fault && (extraCount == 0 || extraPending));
+    if (extraPending) assert(extraCount != 0 && !extraPackets_0_instruction_fault);
+    if (extraCount != 0) begin
+      assert(memoryCount != 0 && memoryPackets_0_load && !memoryPackets_0_store && !memoryPackets_0_atomic);
+      assert(extraPackets_0_load && !extraPackets_0_store && !extraPackets_0_atomic);
+    end
+    if (commitCount != 0 && (memoryPending || extraPending))
+      assert(commitPackets_0_load && !commitPackets_0_store && !commitPackets_0_atomic && !commitPackets_0_instruction_fault);
+    assert(owned == !_mulDiv_input_ready && (!_mulDiv_output_valid || owned));
+    if (owned) assert(cancelled ? resultCount == 0 && memoryCount == 0 && extraCount == 0 : issuedCount == 1 && isMulDiv);
+    if (_csr_interruptPending) assert(!lsu_input_valid);
+    if (irq_service_age != 0) assert(backend_memory_owned == 0);
+    cover(_csr_interruptPending && backend_memory_owned == 2);
+    cover(irq_dual_seen && irq_service_age == 2 && takeInterrupt_layerCapture);
+  end
+'''
+    if parameters.get('enableMisaligned'):
+        backend += '''  reg [2:0] irq_fragments;
+  always @(posedge clock) begin
+    if (reset || !irq_memory_owned) irq_fragments <= 0;
+    else if (data_request_valid && data_request_ready && data_request_bits_write && !data_request_bits_atomic) irq_fragments <= irq_fragments + 1;
+    if (!reset) cover(irq_fragments == 4 && irq_service_age == 2 && takeInterrupt_layerCapture);
   end
 '''
     return [('InterruptCsr', csr, 'status[3]\n    &', "1'h1\n    &"),
@@ -2780,9 +2833,233 @@ def word_cases(parameters):
         lsu = lsu.replace('      if (input_valid && input_ready) begin', events + '      if (input_valid && input_ready) begin', 1)
     if data_line:
         lsu = line_lsu_contract(lsu, parameters)
+    if parameters.get('enableMisaligned'):
+        lsu += '  always @* assume(input_bits_atomic || word_aligned);\n'
+        if not parameters.get('enableUserMode'): lsu += '  always @* assume(privilege == 3);\n'
     return [('WordDecode', decode, 'assign output_bits_usesRs2 =', "assign output_bits_usesRs2 = 1'h0 &"),
             ('WordExecute', execute, 'assign output_bits_unsignedLoad =', "assign output_bits_unsignedLoad = 1'h0 &"),
             ('Lsu', lsu, 'assign memory_request_bits_size =', "assign memory_request_bits_size = 3'h3 |")]
+
+
+def lsu_fragments_case(parameters):
+    dual = parameters.get('loadQueueEntries', 1) == 2
+    ranges = ' || '.join(f"(f_address + f_offset >= 64'd{int(r['base'])} && f_address + f_offset < 64'd{int(r['base']) + int(r['size'])})"
+                        for r in parameters['memoryRegions'] if not r['device'] and int(r['size']) >= 8) or "1'b0"
+    fields = dict(instruction_pc=64, instruction_instruction=32, instruction_tag=8, instruction_length=3,
+                  nextPc=64, rd=5, rdWrite=1, address=64, storeData=64, memorySize=3, unsignedLoad=1, load=1, store=1,
+                  atomic=1, instruction_predictedTaken=1, csrWrite=1, csrAddress=12, csrData=64, mret=1, sret=1, fenceI=1, sfenceVma=1, wfi=1)
+    floating = parameters.get('floatingPointBits', 0)
+    if floating: fields.update(fpWrite=1, fpFlags=5)
+    bits = sum(fields.values())
+    body = f'''  wire [{bits-1}:0] f_input_meta = {{{', '.join('input_bits_' + n for n in fields)}}};
+  wire [{bits-1}:0] f_output_meta = {{{', '.join('output_bits_' + n for n in fields)}}};
+  (* anyconst *) reg [{(bits-1).bit_length()-1}:0] f_meta_bit;
+  wire f_fp_input = {"input_bits_fpWrite" if floating else "1'b0"};
+  wire f_box = f_fp && f_size < {3 if floating == 64 else 2 if floating else 0};
+  wire f_allowed = !f_split || ({ranges});
+  wire f_dual = 1'b{int(dual)};
+  wire f_cancel = {"cancel" if dual else "1'b0"};
+  wire [7:0] f_transport_tag = {"{7'd0, f_slot}" if dual else "f_tag"};
+  always @* assume(f_meta_bit < {bits});
+'''
+    if not parameters.get('enableUserMode'): body += '  always @* assume(privilege == 3);\n'
+    body += r'''
+  reg f_past = 0, f_owned = 0, f_pending = 0, f_done = 0, f_fault = 0, f_completed = 0;
+  reg f_load, f_store, f_unsigned, f_split, f_fp, f_meta, f_value;
+  reg f_slot = 0, f_offered = 0, f_killed = 0, f_poison = 0, f_prepared = 0, f_local = 0, f_cancel_pending = 0, f_cancel_unsent = 0;
+  reg [63:0] f_address, f_data, f_cause, f_tval;
+  reg [7:0] f_tag;
+  reg [2:0] f_size, f_count;
+  reg [3:0] f_offset;
+  (* anyconst *) reg [5:0] f_bit;
+  wire [3:0] f_width = 4'd1 << f_size;
+  wire [63:0] f_current = f_address + f_offset;
+  wire [3:0] f_remaining = f_width - f_offset;
+  wire [2:0] f_child = !f_split ? f_size :
+    f_remaining >= 4 && !f_current[1:0] ? 2 : f_remaining >= 2 && !f_current[0] ? 1 : 0;
+  wire [3:0] f_next = f_offset + (4'd1 << f_child);
+  wire f_accept = input_valid && input_ready;
+  wire f_send = memory_request_valid && memory_request_ready;
+  wire f_reply = memory_response_valid && memory_response_ready;
+  wire f_match = memory_response_bits_tag == f_transport_tag;
+  wire f_stop = f_dual && (f_cancel || f_killed || f_poison);
+  wire f_input_split = (input_bits_address & ((64'd1 << input_bits_memorySize) - 1)) != 0;
+  always @* begin
+    assume(input_bits_memorySize <= 3 && !input_bits_atomic && (input_bits_load != input_bits_store));
+    if (f_dual) assume(f_input_split);
+    assume(!memory_response_valid || ((f_pending || f_send) && memory_response_bits_last));
+  end
+  always @(posedge clock) begin
+    f_past <= 1;
+    if (!f_past) assume(reset); else assume(!reset);
+    if (reset) begin
+      f_owned <= 0; f_pending <= 0; f_done <= 0; f_completed <= 0;
+      f_slot <= 0; f_offered <= 0; f_killed <= 0; f_poison <= 0; f_prepared <= 0; f_local <= 0;
+      f_cancel_pending <= 0; f_cancel_unsent <= 0;
+    end
+    else begin
+      if (f_dual && f_local) begin f_local <= 0; f_done <= 1; end
+      if (f_dual && f_owned && f_cancel) f_killed <= 1;
+      if (f_cancel && f_owned && !f_done && f_pending) f_cancel_pending <= 1;
+      if (f_cancel && f_owned && !f_done && !f_local && !f_pending && !f_offered && f_allowed && !f_fault) f_cancel_unsent <= 1;
+      if (f_dual && f_reply && !f_match) f_poison <= 1;
+      if (f_dual && (f_poison || f_cancel)) assert(!f_accept);
+      if (f_accept) begin
+        assert(!f_owned && (input_bits_instruction_fault || !input_bits_store || storeAllowed));
+        f_owned <= 1; f_pending <= 0; f_offset <= 0; f_count <= 0;
+        f_prepared <= 0; f_local <= f_dual && input_bits_instruction_fault; f_killed <= 0; f_offered <= 0;
+        f_cancel_pending <= 0; f_cancel_unsent <= 0;
+        f_address <= input_bits_address; f_data <= input_bits_storeData; f_size <= input_bits_memorySize;
+        f_load <= input_bits_load; f_store <= input_bits_store; f_unsigned <= input_bits_unsignedLoad;
+        f_split <= f_input_split; f_fp <= f_fp_input; f_tag <= input_bits_instruction_tag;
+        f_meta <= f_input_meta[f_meta_bit]; f_value <= f_input_split ? 0 : input_bits_value[f_bit];
+        f_done <= input_bits_instruction_fault && !f_dual; f_fault <= input_bits_instruction_fault;
+        f_cause <= input_bits_instruction_cause; f_tval <= input_bits_instruction_tval;
+      end
+      assert(memory_response_ready == f_pending);
+      if (f_owned) begin
+        assert(f_output_meta[f_meta_bit] == f_meta);
+        assert(output_valid == f_done && f_offset < f_width && f_count <= 4);
+        if (!f_killed) assert(output_bits_instruction_fault == f_fault);
+        if (f_fault && !f_killed) assert(output_bits_instruction_cause == f_cause && output_bits_instruction_tval == f_tval);
+        if (f_load && !f_fault && !f_killed) assert(output_bits_value[f_bit] == f_value);
+      end
+      if (f_owned && !f_done && !f_pending && !f_local) begin
+        f_prepared <= 1;
+        if (!f_allowed && (!f_dual || !f_prepared)) begin
+          f_done <= !f_dual; f_local <= f_dual; f_fault <= 1; f_cause <= f_store ? 7 : 5; f_tval <= f_current;
+        end else if (f_dual && f_prepared && f_stop && !f_offered) f_local <= 1;
+      end
+      if (memory_request_valid) begin
+        assert(f_owned && !f_done && !f_pending && f_allowed);
+        assert(memory_request_bits_address == f_current && memory_request_bits_size == f_child);
+        assert(memory_request_bits_data == (f_data >> (8 * f_offset)));
+        assert(memory_request_bits_mask == (f_store ? (9'd1 << (1 << f_child)) - 1 : 0));
+        assert(memory_request_bits_tag == f_transport_tag && memory_request_bits_write == f_store);
+        if (f_stop) assert(f_offered);
+        assert(!memory_request_bits_atomic && !memory_request_bits_fetch && !memory_request_bits_refillSize);
+        assert(!memory_request_bits_cacheOperation && !memory_request_bits_atomicOperation && !memory_request_bits_scEligible);
+        assert(f_next <= f_width && (f_current & ((64'd1 << f_child) - 1)) == 0);
+      end
+      if (memory_request_valid && !memory_request_ready) f_offered <= 1;
+      if (f_send) begin f_pending <= 1; f_count <= f_count + 1; f_offered <= 0; end
+      if (f_reply && (!f_dual || f_match)) begin
+        assert(f_owned && f_pending && !f_done);
+        f_pending <= 0;
+        if (f_load) begin
+          if (!f_split || (f_bit >= {f_offset, 3'b0} && {1'b0, f_bit} < {f_next, 3'b0}))
+            f_value <= memory_response_bits_data[f_split ? f_bit - 8 * f_offset : f_bit];
+          if (f_next == f_width && {1'b0, f_bit} >= {f_width, 3'b0})
+            f_value <= f_box || (!f_unsigned && memory_response_bits_data[(8 << f_child) - 1]);
+        end
+        if (memory_response_bits_fault || !f_match || f_poison) begin
+          f_done <= 1; f_fault <= 1; f_cause <= f_store ? 7 : 5; f_tval <= f_current;
+        end else if (f_next == f_width || f_stop) f_done <= 1;
+        else begin f_offset <= f_next; f_prepared <= 0; end
+      end
+      if (output_valid) begin
+        assert(f_owned && f_done && !f_pending);
+        if (output_ready) begin f_owned <= 0; f_done <= 0; f_completed <= 1; f_slot <= !f_slot; end
+      end
+      if (f_past && $past(!reset && memory_request_valid && !memory_request_ready)) begin
+        assert(memory_request_valid);
+        assert($stable({memory_request_bits_address, memory_request_bits_data, memory_request_bits_size,
+          memory_request_bits_mask, memory_request_bits_tag, memory_request_bits_write, memory_request_bits_privileged,
+          memory_request_bits_cacheOperation, memory_request_bits_atomicOperation, memory_request_bits_scEligible}));
+      end
+      if (f_past && $past(!reset && output_valid && !output_ready)) begin
+        assert(output_valid && $stable({f_output_meta, output_bits_value, output_bits_instruction_fault,
+          output_bits_instruction_cause, output_bits_instruction_tval}));
+      end
+      if (f_past && $past(!reset && memory_response_valid && !memory_response_ready)) begin
+        assume(memory_response_valid && $stable({memory_response_bits_data, memory_response_bits_fault,
+          memory_response_bits_tag, memory_response_bits_last}));
+      end
+      cover(output_valid && f_split && f_load && !f_fault && !f_stop && f_count == 4);
+      cover(output_valid && f_split && f_store && !f_fault && !f_stop && f_count == 4);
+      cover(output_valid && f_split && f_fault && f_offset != 0 && f_count == 2);
+      cover(memory_request_valid && f_split && f_offset != 0 && !memory_request_ready);
+      cover(output_valid && f_split && !output_ready);
+      cover(output_valid && f_split && f_fault && f_count == 0);
+      cover(output_valid && f_fault && !f_split && f_count == 0);
+      cover(output_valid && f_split && f_fault && f_count != 0 && !f_allowed);
+      cover(output_valid && !f_fault && !f_stop && f_load && f_size < 3 && !f_unsigned && f_bit == 63 && f_value);
+      cover(output_valid && !f_fault && !f_stop && f_load && f_size < 3 && f_unsigned && f_bit == 63 && !f_value);
+      cover(f_reply && f_split && memory_response_bits_tag != f_tag);
+      cover(f_accept && f_input_split && f_completed);
+    end
+  end
+'''
+    if dual:
+        body = body.replace('      cover(output_valid && f_fault && !f_split && f_count == 0);\n', '')
+        body += '''  wire [2:0] f_prefix_count = {2'b0, f_offset[0]} + {2'b0, f_offset[1]} + {2'b0, f_offset[2]};
+  always @(posedge clock) if (!reset) begin
+    assert(head == f_slot && tail == (f_slot ^ f_owned) && splitting == f_owned);
+    if (!f_owned) assert(state == 0 && !offered);
+    assert({contexts_0 != 0, contexts != 0} == (f_owned ? (2'b1 << f_slot) : 0));
+    if (f_owned) assert(owner == f_slot && ((f_slot ? contexts_0 : contexts) == 2) == f_pending);
+    assert(poisoned == f_poison);
+    if (f_owned) begin
+      assert(!(f_pending && (f_done || f_local)) && !(f_done && f_local));
+      if (f_poison && !f_pending) assert(f_fault);
+      assert(memory_request_bits_privileged == access_privileged);
+      assert((f_slot ? killed_0 : killed) == f_killed && f_split && (f_load != f_store) && !output_bits_atomic && !scEligible);
+      assert(f_size != 0 && f_size <= 3 && (f_address & (f_width - 4'd1)) != 0);
+      if (f_load && !f_fault && !f_killed && !f_done && !f_local) begin
+        assert((output_bits_value >> {f_offset, 3'b0}) == 0);
+        if (f_bit >= {f_offset, 3'b0}) assert(!f_value);
+      end
+      if (f_offset != 0) assert((f_current & (f_offset ^ (f_offset - 4'd1))) == 0);
+      if (f_next < f_width) assert((f_offset & (4'd1 << f_child)) == 0);
+      assert(f_count <= f_prefix_count + 1);
+      if (!f_done && !f_local) assert(f_count == f_prefix_count + f_pending);
+      assert(output_bits_address == f_address && output_bits_memorySize == f_size && output_bits_storeData == f_data);
+      assert({output_bits_load, output_bits_store, output_bits_unsignedLoad} == {f_load, f_store, f_unsigned});
+      assert(offset == f_offset[2:0] && offered == f_offered);
+      if (f_offered) assert(!f_done && !f_local && !f_pending && state == 1);
+      if (f_fault) assert(f_done || f_local);
+      if (!f_done && !f_local && (f_pending || f_prepared)) assert(f_allowed);
+      assert(f_pending ? state == 2 : f_local ? state == 3 : f_done ? (state == 0 || state == 3) : state == (f_prepared ? 1 : 4));
+    end
+  end
+'''.replace('access_privileged', 'access_privileged' if parameters.get('enableUserMode') else "1'b1")
+        body += ''.join(f'''  always @(posedge clock) if (!reset) begin
+    cover(output_valid && f_slot == {slot} && !f_fault && !f_stop && f_count == 4);
+    cover(output_valid && f_slot == {slot} && f_killed && f_cancel_pending);
+    cover(memory_request_valid && !memory_request_ready && f_cancel && f_offered && f_slot == {slot});
+  end
+''' for slot in range(2))
+        body += '  always @(posedge clock) if (!reset) begin cover(output_valid && f_killed && f_cancel_unsent && f_count == 0); cover(f_poison && !f_pending && !f_owned); end\n'
+    body = body.replace('cover(f_reply && f_split && memory_response_bits_tag != f_tag);', 'cover(f_reply && f_split && !f_match);')
+    body += ''.join(f'  always @(posedge clock) if (!reset) cover(output_valid && !f_fault && !f_stop && f_size == {size});\n' for size in range(1 if dual else 0, 4))
+    body += ''.join(f'  always @(posedge clock) if (!reset) cover(output_valid && f_split && f_fault && f_count == {count});\n' for count in (1, 2, 4))
+    if floating:
+        sizes = 'input_bits_memorySize == 2' + (' || input_bits_memorySize == 3' if floating == 64 else '') + (' || input_bits_memorySize == 1' if parameters.get('enableZfhmin') else '')
+        body += f"  always @* if (input_bits_fpWrite) assume(input_bits_load && !input_bits_rdWrite && !input_bits_unsignedLoad && input_bits_fpFlags == 0 && ({sizes}));\n"
+        body += f'  always @(posedge clock) if (!reset) cover(output_valid && f_fp && f_size == {1 if parameters.get("enableZfhmin") else 2} && f_bit == {16 if parameters.get("enableZfhmin") else 32} && !f_fault && !f_stop && f_value);\n'
+    if parameters.get('pmpEntries'):
+        body = body.replace('if (!f_allowed &&', 'if ((!f_allowed || !_pmp_allowed) &&')
+        body = body.replace('assert(f_owned && !f_done && !f_pending && f_allowed);', 'assert(f_owned && !f_done && !f_pending && f_allowed && f_grant);')
+        body += '''  reg [1:0] f_mode;
+  reg f_grant;
+  wire f_check = f_owned && !f_done && !f_local && !f_pending && !f_prepared;
+  always @(posedge clock) if (!reset) begin
+    if (f_accept) f_mode <= privilege;
+    if (f_check) f_grant <= _pmp_allowed;
+    if (f_owned) begin
+      assert(privilege_0 == f_mode);
+      if (!f_done && !f_local && (f_prepared || f_pending)) assert(f_grant);
+    end
+    cover(output_valid && f_fault && !f_killed && f_prepared && f_allowed && !f_grant && f_count == 0);
+    cover(output_valid && f_fault && !f_killed && f_prepared && f_allowed && !f_grant && f_count != 0);
+    cover(memory_request_valid && !memory_request_ready && f_grant && !_pmp_allowed && $changed(pmp_config));
+  end
+'''
+    if not parameters.get('enableA', True):
+        body = body.replace('!scEligible', '!memory_request_bits_scEligible')
+    if dual and floating == 64 and parameters.get('enableZfhmin'):
+        body += '  always @(posedge clock) if (!reset && f_owned) assert(output_bits_fpWrite == f_fp);\n'
+    return 'LsuFragments', body, 'assign memory_request_bits_size =', "assign memory_request_bits_size = 3'h3 |"
 
 
 def lsu_reads_case(parameters):
@@ -5032,6 +5309,22 @@ def interrupt_witness(parameters, mode):
                   interrupts_software='formal_events[2] || irq_latched || (formal_events[0] && (!irq_delay || formal_events[1])) || (irq_scenario == 5 && formal_events[4])')
     if mode.startswith('mutation'):
         body += f"  always @* assume(irq_scenario == {0 if mode == 'mutation' else 2});\n"
+    if mode == 'cover-fragments': body += '  always @* assume(irq_scenario == 0);\n'
+    if parameters.get('enableMisaligned'):
+        values['instruction_bits_packets_0_instruction'] = values['instruction_bits_packets_0_instruction'].replace("32'h00103023", f"32'h{sd(1, 0, 1):08x}")
+    if parameters.get('loadQueueEntries', 1) == 2:
+        body = body.replace('irq_scenario <= 5', 'irq_scenario <= 6').replace('irq_scenario == 3 || irq_scenario == 4 ? 2 : 1', 'irq_scenario == 6 ? 3 : irq_scenario == 3 || irq_scenario == 4 ? 2 : 1')
+        if mode == 'mutation-admission': body = body.replace('irq_scenario == 2', 'irq_scenario == 6')
+        body += '''  reg [2:0] irq_reply_phase = 0;
+  always @(posedge clock) if (reset) irq_reply_phase <= 0;
+    else if (irq_reply_phase == 0 && formal_events[5]) irq_reply_phase <= 1;
+    else if (irq_reply_phase > 0 && irq_reply_phase < 7 && ((irq_reply_phase != 1 && irq_reply_phase != 6) || (data_response_valid && data_response_ready))) irq_reply_phase <= irq_reply_phase + 1;
+'''
+        values['instruction_bits_packets_0_instruction'] = '(!irq_initializing && !irq_redirected && irq_scenario == 6) ? (irq_packet == 0 ? 32\'h00003103 : irq_packet == 1 ? 32\'h00803183 : 32\'h01003203) : (' + values['instruction_bits_packets_0_instruction'] + ')'
+        values['data_request_ready'] = 'irq_scenario == 6 || (' + values['data_request_ready'] + ')'
+        values['data_response_valid'] = 'irq_scenario == 6 ? (data_response_ready && (irq_reply_phase == 1 || irq_reply_phase == 6)) : (' + values['data_response_valid'] + ')'
+        values['data_response_bits_tag'] = 'irq_scenario == 6 && irq_reply_phase == 6 ? 1 : 0'
+        values['interrupts_software'] = 'irq_scenario == 6 ? irq_reply_phase != 0 : (' + values['interrupts_software'] + ')'
     return body, values
 
 
@@ -5961,6 +6254,8 @@ def verify(rtl, directory, modules=None, mutations=None, jobs=1, rvfi_dir=None):
         cases.append(platform_memory_case())
     if manifest['parameters'].get('loadQueueEntries', 1) == 2 and not enabled and manifest['parameters'].get('virtualAddressBits') == 0:
         cases.append(lsu_reads_case(manifest['parameters']))
+    if manifest['parameters'].get('enableMisaligned') and manifest['parameters'].get('virtualAddressBits') == 0 and not manifest['parameters'].get('dCacheBytes') and (not enabled or manifest['parameters']['pmpEntries'] == 16 and manifest['parameters'].get('loadQueueEntries') == 2 and manifest['parameters'].get('enableUserMode') and manifest['parameters'].get('enableA', True) and not manifest['parameters'].get('floatingPointBits') and not manifest['parameters'].get('enableJtag')):
+        cases.append(lsu_fragments_case(manifest['parameters']))
     if 'DitDahA1ReadQueue.sv' in sources:
         cases.append(read_queue_case(manifest['parameters']))
     if 'DitDahA1Backend.sv' in sources and not manifest['parameters'].get('floatingPointBits') and (
@@ -6004,7 +6299,7 @@ def verify(rtl, directory, modules=None, mutations=None, jobs=1, rvfi_dir=None):
             unit = 'DataCache'
         if name == 'DebugModule':
             unit = 'DebugModule'
-        if name == 'LsuReads':
+        if name in ('LsuReads', 'LsuFragments'):
             unit = 'Lsu'
         if name in ('CsrBackend', 'CounterBackend'):
             unit = 'Backend'
@@ -6433,11 +6728,13 @@ endmodule
             if unit == 'Lsu':
                 for port, width, expected in (('address', 64, 'input_bits_address'), ('size', 3, 'input_bits_memorySize'),
                                               ('write', 1, 'input_bits_store'), ('fetch', 1, "1'b0"),
-                                              ('atomic', 1, 'input_bits_load && input_bits_store'), ('privilege', 2, 'privilege')):
-                    pattern = rf'\.{port}\s*\(([^()]*)\)'
+                                              ('atomic', 1, 'input_bits_load && input_bits_store'), ('privilege', 2, 'privilege'),
+                                              *((('state_config', 8 * manifest['parameters']['pmpEntries'], 'pmp_config'), ('state_address', (manifest['parameters']['physicalAddressBits'] - 2) * manifest['parameters']['pmpEntries'], 'pmp_address')) if name == 'LsuFragments' else ())):
                     observed = files[module + '.sv']
-                    connections = re.findall(pattern, observed)
-                    assert len(connections) == 1, (port, connections)
+                    instances = instance_ports(observed, 'DitDahA1Pmp')
+                    assert len(instances) == 1, (port, instances)
+                    connection = instances[0][1][port]
+                    pattern = rf'\.{port}\s*\(' + re.escape(connection) + r'\)'
                     files[module + '.sv'] = re.sub(pattern, f'.{port}(formal_pmp_{port})', observed)
                     checking = 'input_valid && input_ready'
                     if manifest['parameters'].get('virtualAddressBits') == 39:
@@ -6445,7 +6742,10 @@ endmodule
                         expected = {'address': 'translation_response_bits_address', 'size': 'word_size', 'write': 'word_store', 'fetch': "1'b0", 'atomic': 'word_load && word_store', 'privilege': 'word_privilege'}[port]
                     if manifest['parameters'].get('dCacheBytes') and manifest['parameters'].get('dCacheRefillBytes', 8) == 64:
                         expected = {'address': 'word_probe_address', 'size': 'word_probe_size'}.get(port, expected)
-                    body += f'\n  wire [{width-1}:0] formal_pmp_{port} = {connections[0]};\n  always @* if (!reset && {checking}) assert(formal_pmp_{port} == ({expected}));\n'
+                    if name == 'LsuFragments':
+                        checking = 'f_check'
+                        expected = {'address': 'f_current', 'size': 'f_child', 'write': 'f_store', 'fetch': "1'b0", 'atomic': "1'b0", 'privilege': 'f_mode', 'state_config': 'pmp_config', 'state_address': 'pmp_address'}[port]
+                    body += f'\n  wire [{width-1}:0] formal_pmp_{port} = {connection};\n  always @* if (!reset && {checking}) assert(formal_pmp_{port} == ({expected}));\n'
         if enabled and unit == 'Translation':
             files['DitDahA1Pmp.sv'] = license + header(sources['DitDahA1Pmp.sv']) + '\n(* anyseq *) reg permit;\nassign allowed = permit;\nendmodule\n'
             for port, width, expected in (('address', 64, 'walk_address'), ('size', 3, "3'd3"), ('write', 1, "1'b0"),
@@ -6469,6 +6769,10 @@ endmodule
         if unit in ('PlatformMemory', 'DebugModule', 'Backend', 'Frontend', 'Gpr', 'MulDiv', 'Fpu', 'Csr', 'MemoryArbiter', 'ReadQueue', 'MemoryFabric', 'Memory', 'Axi', 'InstructionCache', 'DataCache', 'Coherence', 'SharedCache', 'Lsu', 'LocalInterrupts', 'Translation') or (enabled and unit not in ('Decode', 'Execute')) or unit == 'Fetch' and manifest['parameters'].get('iCacheBytes'):
             if unit == 'Backend':
                 dual = manifest['parameters'].get('loadQueueEntries', 1) == 2
+                if name == 'InterruptBackend' and dual:
+                    ownership = pipeline_case(sources[module + '.sv'], manifest['parameters'])[1]
+                    body += '\n'.join(line for line in ownership.splitlines() if line.startswith('  always @(posedge clock) if (!reset && backend_memory_owned != 0) assert(')) + '\n'
+                    body += ''.join(re.findall(r'  always @\(posedge clock\) if \(!reset && (?:backend_memory_owned != 0|(?:result|memory|extra|commit)Count != 0 && \([^\n]+_store\))\) begin\n.*?\n  end\n', ownership, re.S))
                 owned = '{1\'b0, contexts != 0} + {1\'b0, contexts_0 != 0}' if dual else 'state != 0'
                 files['DitDahA1Lsu.sv'] = files['DitDahA1Lsu.sv'].replace(');', ', output [1:0] formal_owned);' if dual else ', output formal_owned);', 1).replace('endmodule', f'assign formal_owned = {owned};\nendmodule', 1)
                 if dual:
@@ -6496,6 +6800,32 @@ endmodule
     if (contexts != 0 || contexts_0 != 0) assert(head ? contexts_0 != 0 : contexts != 0);
   end
 endmodule''', 1)
+                    if manifest['parameters'].get('enableMisaligned'):
+                        files['DitDahA1Lsu.sv'] = files['DitDahA1Lsu.sv'].replace('if (state != 0) assert(owner ? contexts_0 == 1 : contexts == 1);', '''if (state != 0) begin
+      if (splitting && state == 2) assert((owner ? contexts_0 : contexts) == 2);
+      else if (splitting && state == 3) assert((owner ? contexts_0 : contexts) == 1 || (owner ? contexts_0 : contexts) == 3);
+      else assert((owner ? contexts_0 : contexts) == 1);
+    end
+    if (!splitting) assert(offset == 0);
+    if (splitting) assert(owner == head && ((owner ? contexts : contexts_0) == 0));
+    if (splitting) assert(((owner ? contexts_0 : contexts) == 2) == (state == 2));''')
+                        files['DitDahA1Lsu.sv'] = files['DitDahA1Lsu.sv'].replace(');', ', output formal_cancel_seen, formal_store);', 1).replace('endmodule', 'assign formal_cancel_seen = cancel;\nassign formal_store = input_bits_store && !input_bits_instruction_fault;\nendmodule', 1)
+                        files[module + '.sv'] = re.sub(r'(DitDahA1Lsu\s+\w+\s*\()', r'\1\n.formal_cancel_seen(backend_cancel_seen), .formal_store(backend_store_input),', files[module + '.sv'])
+                        body += '''  wire backend_cancel_seen, backend_store_input;
+  reg backend_store_owned = 0;
+  always @(posedge clock) if (reset) backend_store_owned <= 0; else begin
+    if (backend_store_owned) assert(memoryPending && memoryPackets_0_store && !memoryPackets_0_instruction_fault);
+    if (backend_store_owned) begin
+      assert(backend_memory_owned == 1 && !(lsu_input_valid && _lsu_input_ready));
+      if (!_lsu_output_valid) assert(!backend_cancel_seen);
+    end
+    if (_lsu_output_valid && lsu_output_ready) backend_store_owned <= 0;
+    if (lsu_input_valid && _lsu_input_ready) begin
+      if (backend_store_input) assert(backend_memory_owned == 0);
+      backend_store_owned <= backend_store_input;
+    end
+  end
+'''
                 files[module + '.sv'], connected = re.subn(r'(DitDahA1Lsu\s+\w+\s*\()', r'\1\n.formal_owned(backend_lsu_owned),', files[module + '.sv'])
                 assert connected == 1
                 body += ('''
@@ -6583,6 +6913,30 @@ endmodule''', 1)
             before = re.search(r': ~\w+ \| abort \| responseFault \| bypass \| ~complete', sources[module + '.sv']).group()
             after = before.replace(' | abort', '')
         checks = [('prove', before, after), ('cover', before, after), ('mutation', before, after)]
+        if name == 'LsuFragments':
+            original = sources[module + '.sv']
+            tval = re.search(r'packet_instruction_tval <= splitting \?[^;]+;', original).group()
+            data = re.search(r'assign memory_request_bits_data\s*=[^;]+;', original).group()
+            mask = re.search(r'assign memory_request_bits_mask\s*=[^;]+;', original).group()
+            checks += [('mutation-offset', 'offset <= nextOffset[2:0];', 'offset <= offset;'),
+                       ('mutation-mask', mask, "assign memory_request_bits_mask = 8'hff;"),
+                       ('mutation-shift', data, 'assign memory_request_bits_data = packet_storeData;'),
+                       ('mutation-assembly', 'packet_value | value[63:0]', 'value[63:0]'),
+                       ('mutation-tval', tval, 'packet_instruction_tval <= packet_address;'),
+                       ('mutation-parent', 'assign output_valid = output_valid_0;', 'assign output_valid = output_valid_0 | (splitting && state == 2);')]
+            if not manifest['parameters'].get('enableA', True):
+                checks.append(('mutation-sc-disabled', "assign memory_request_bits_scEligible = 1'h0;", "assign memory_request_bits_scEligible = 1'h1;"))
+            if manifest['parameters'].get('loadQueueEntries', 1) == 2:
+                cancellation = re.search(r'wire\s+cancelled\s*=[^;]+;', original).group()
+                checks.append(('mutation-cancel', cancellation, cancellation.replace('=', "= 1'h0 &", 1)))
+                killed = re.search(r'killed <=[^;]+cancel[^;]+;', original).group()
+                checks.append(('mutation-killed', killed, "killed <= 1'h0;"))
+            if enabled:
+                denial = next(d for d in re.findall(r'wire\s+\w+\s*=[^;]+;', original) if '~_pmp_allowed' in d)
+                checks.append(('mutation-permission', denial, denial.replace('~_pmp_allowed', "1'h0")))
+                for port, wrong in (('address', 'output_bits_address'), ('size', 'output_bits_memorySize'), ('privilege', 'privilege'), ('write', "1'b0"), ('state_config', '0'), ('state_address', '0')):
+                    assignment = re.search(r'wire\s+\[[^]]+\]\s+formal_pmp_' + port + r'\s*=[^;]+;', files[module + '.sv']).group()
+                    checks.append(('mutation-pmp-' + port, assignment, assignment.split('=')[0] + '= ' + wrong + ';'))
         if name == 'RvfiExecute':
             checks = [(mode + '-' + insn, before, after) if mode != 'mutation-decode' else
                       (mode + '-' + insn, 'assign output_bits_operation =', "assign output_bits_operation = 5'h0 &", 'DitDahA1Decode.sv')
@@ -6704,6 +7058,9 @@ endmodule''', 1)
                           (('cover-dependency',) if manifest['parameters']['issueWidth'] > 1 else ())]
             original = sources[module + '.sv']
             early = re.search(r'wire\s+earlyRedirect\s*=[^;]+;', original).group()
+            if manifest['parameters'].get('enableMisaligned') and manifest['parameters'].get('loadQueueEntries', 1) == 2:
+                cancellation = re.search(r'\.cancel\s*\([^()]+\)', original).group()
+                checks.append(('mutation-store-cancel', cancellation, cancellation[:-1] + ' | backend_bad_cancel)'))
             younger = re.search(r'resultCount <=\s*~redirect_0[^;]+;' if manifest['parameters']['issueWidth'] == 1
                                 else r'if \(redirect_0\) begin\s+issuedCount', original).group()
             checks += [('mutation-recovery-missing', early, early.split('=')[0] + '= 0;'),
@@ -6855,6 +7212,12 @@ endmodule''', 1)
         if name == 'InterruptBackend':
             checks += [('mutation-pc', '? resumePc', "? 64'h0"),
                        ('mutation-write', 'formal_write =', 'formal_write = takeInterrupt_layerCapture |')]
+            if manifest['parameters'].get('loadQueueEntries', 1) == 2:
+                barrier = re.search(r'wire\s+takeInterrupt_layerCapture\s*=[^;]+;', sources[module + '.sv']).group()
+                checks[2] = ('mutation', barrier, barrier.split('=', 1)[0] + '= _csr_interruptPending;')
+                if manifest['parameters'].get('enableMisaligned'): checks.insert(2, ('cover-fragments', before, after))
+                admission = re.search(r'(?:wire|assign)\s+lsu_input_valid\s*=[^;]+;', sources[module + '.sv']).group()
+                checks.append(('mutation-admission', admission, admission.replace(' & ~_csr_interruptPending', '')))
         if name == 'InterruptCsr':
             pending = re.search(r'assign interruptPending\s*=\s*[^;]+;', sources[module + '.sv']).group()
             checks[2] = ('mutation', pending, 'assign interruptPending = wakeup;')
@@ -6928,7 +7291,7 @@ endmodule''', 1)
         if name == 'Pmp':
             checks += [('mutation-atomic-read', 'state_config[0] & state_config[1]', 'state_config[1]'),
                        ('mutation-atomic-write', 'state_config[0] & state_config[1]', 'state_config[0]')]
-        if unit == 'Lsu' and name != 'LsuReads':
+        if name == 'Lsu':
             mask_assignment = re.search(r'assign memory_request_bits_mask\s*=\s*[^;]+;', sources[module + '.sv']).group(0)
             checks += [('mutation-mask', mask_assignment,
                         "assign memory_request_bits_mask = 8'hff;"),
@@ -7467,6 +7830,7 @@ endmodule''', 1)
                     guidance += f"    assume(prediction_valid == (predictor_cycle == 0) && prediction_clear == ({('predictor_cycle == 1' if mode == 'mutation-predictor-clear' else '0')})); end\n"
                     text = text.replace('endmodule', guidance + 'endmodule', 1)
                 if name == 'PipelineBackend' and mutating and filename == module + '.sv':
+                    if mode == 'mutation-store-cancel': text = text.replace('endmodule', '  reg backend_bad_cancel = 0;\n  always @(posedge clock) backend_bad_cancel <= !reset && earlyRedirect;\nendmodule', 1)
                     bit = 40 if mode in ('mutation', 'mutation-dual-owner') else 96 if mode == 'mutation-recovery-metadata' else 0
                     size = (pipeline_identity_bits(manifest['parameters'])-1).bit_length()
                     text = text.replace(f'(* anyconst *) reg [{size-1}:0] pipeline_bit;', f"wire [{size-1}:0] pipeline_bit = {size}'d{bit};")
@@ -7629,7 +7993,7 @@ endmodule''', 1)
                                         ' && input_bits_instruction_length == 4 && input_bits_rd == 1 && !input_bits_rdWrite && input_bits_fpFlags == 0);\nendmodule', 1)
                     if mode == 'mutation-boxing':
                         text = text.replace('endmodule', '  always @* assume(q_bit == 16 && !memory_response_bits_data[15]);\nendmodule', 1)
-                if unit == 'Lsu' and name != 'LsuReads' and mutating and filename == module + '.sv':
+                if name == 'Lsu' and mutating and filename == module + '.sv':
                     load = mode == 'mutation-extension'
                     atomic = mode in ('mutation-consume', 'mutation-pair', 'mutation-alias', 'mutation-lr-fault', 'mutation-pmp-direction')
                     guidance = f'''
@@ -7662,6 +8026,24 @@ endmodule''', 1)
                     if enabled:
                         guidance += f"  always @* assume(_pmp_allowed == {int(mode != 'mutation-permission')});\n"
                     text = text.replace('endmodule', guidance + '\nendmodule', 1)
+                if name == 'LsuFragments' and mutating and filename == module + '.sv':
+                    store = mode in ('mutation-mask', 'mutation-shift', 'mutation-pmp-write')
+                    permission_guidance = ''
+                    if enabled:
+                        permission_guidance = f"    assume(_pmp_allowed == {'(f_offset == 0)' if mode == 'mutation-permission' else '1'});\n"
+                        if mode == 'mutation-pmp-privilege': permission_guidance += '    assume(privilege == (f_owned ? 0 : 3));\n'
+                    text = text.replace('endmodule', f'''
+  always @* begin
+    assume(input_valid && !input_bits_instruction_fault && input_bits_memorySize == 3 && !f_fp_input);
+    assume(input_bits_address == 1 && input_bits_instruction_tag == 37 && f_bit == 0);
+    assume(input_bits_load == {int(not store)} && input_bits_store == {int(store)});
+    assume(storeAllowed && output_ready && memory_request_ready);
+    assume(input_bits_storeData == 64'h123456789abcdef && memory_response_bits_data == 64'h123456789abcdef);
+    assume(memory_response_valid == (f_pending {"&& f_cancel_pending" if mode == 'mutation-killed' else ""}) && memory_response_bits_tag == f_transport_tag);
+    assume(memory_response_bits_fault == {"(f_offset != 0)" if mode == 'mutation-tval' else "0"});
+    {"assume(cancel == " + ("(f_owned && f_prepared && !f_pending && f_offset != 0)" if mode == 'mutation-cancel' else "(f_pending && !f_cancel_pending)" if mode == 'mutation-killed' else "0") + ");" if manifest['parameters'].get('loadQueueEntries', 1) == 2 else ""}
+{permission_guidance}  end
+endmodule''', 1)
                 if name == 'IntegerExecute' and mutating and filename == module + '.sv':
                     op, instruction, immediate, first = {
                         'mutation': (28, 0x3401f2f3, 0, 0),
@@ -7938,8 +8320,9 @@ endmodule''', 1)
                     if manifest['parameters']['enableInterrupts']:
                         text = text.replace('(* anyseq *) reg finish;', "wire finish=1;")
                 if mutating and filename == mutated_file:
-                    assert text.count(before) == (2 if name == 'Csr' else 1), (name, before)
-                    text = text.replace(before, after, 1)
+                    mutation_sites = manifest['parameters'].get('loadQueueEntries', 1) if name == 'LsuFragments' and mode == 'mutation-offset' else 2 if name == 'Csr' else 1
+                    assert text.count(before) == mutation_sites, (name, before)
+                    text = text.replace(before, after, mutation_sites if name == 'LsuFragments' else 1)
                 if name == 'WideFetch' and filename == module + '.sv':
                     for instance, prefix in (('DitDahA1InstructionCache', 'CACHE'), ('DitDahA1Pmp', 'PMP')):
                         connected = instance_ports(text, instance)
@@ -7979,8 +8362,10 @@ endmodule''', 1)
                     if mode != 'prove' and name in ('Backend', 'InterruptBackend', 'SynchronizationBackend', 'WfiBackend'):
                         text = text.replace('endmodule', '  always @* assume(instruction_bits_count == 1);\nendmodule', 1)
                     if name == 'InterruptBackend' and mode != 'prove':
-                        text = text.replace(');', ', output [4:0] formal_events);', 1)
-                        text = text.replace('endmodule', "  assign formal_events = {(issuedCount != 0 && issuedPackets_0_decoded_instruction_instruction[6:0] == 7'h0f), takeInterrupt_layerCapture, irq_memory_owned, _mulDiv_output_valid, owned};\nendmodule", 1)
+                        dual_irq = manifest['parameters'].get('loadQueueEntries', 1) == 2
+                        if dual_irq and manifest['parameters'].get('enableMisaligned') and mode.startswith('cover'): text = partition_covers(text, 16 if mode == 'cover-fragments' else set(range(16)), 17)
+                        text = text.replace(');', f', output [{5 if dual_irq else 4}:0] formal_events);', 1)
+                        text = text.replace('endmodule', '  assign formal_events = {' + ('backend_memory_owned == 2, ' if dual_irq else '') + "(issuedCount != 0 && issuedPackets_0_decoded_instruction_instruction[6:0] == 7'h0f), takeInterrupt_layerCapture, irq_memory_owned, _mulDiv_output_valid, owned};\nendmodule", 1)
                 (work / filename).write_text(text)
             if unit == 'MulDiv' and 'latency' in mode:
                 source, paired = muldiv_latency((work / (module + '.sv')).read_text().replace(body, ''), mode, all(manifest['parameters'].get(key) for key in ('enableC', 'enableZcb', 'enableM')))
@@ -8012,6 +8397,8 @@ endmodule''', 1)
                 engine = 'smtbmc --syn --unroll z3'
             if unit == 'Backend' and task != 'prove':
                 engine = 'smtbmc --syn --unroll z3'
+            if name == 'LsuFragments' and manifest['parameters'].get('loadQueueEntries', 1) == 2 and proving: engine = 'smtbmc --syn --unroll z3'
+            if name == 'InterruptBackend' and manifest['parameters'].get('loadQueueEntries', 1) == 2 and proving: engine = 'smtbmc --syn --unroll z3'
             if name == 'FloatingBackend' and task != 'prove':
                 engine = 'smtbmc --nopresat --unroll z3' if mutating else 'smtbmc --unroll z3'
             if witness:
@@ -8081,6 +8468,8 @@ endmodule''', 1)
                     timeout = 180
             if name in ('WideFetch', 'WfiFrontend', 'PipelineBackend') and task == 'prove':
                 depth = 6 if name == 'WideFetch' else 4
+            if name == 'LsuFragments' and manifest['parameters'].get('loadQueueEntries', 1) == 2 and proving: depth = 2
+            if name == 'InterruptBackend' and manifest['parameters'].get('loadQueueEntries', 1) == 2 and proving: depth = 4
             if name in ('FloatingBackend', 'WfiBackend', 'InterruptBackend') and mutating:
                 depth = 32 if name == 'WfiBackend' else 40
             multiclock = 'multiclock on\n' if name == 'DmiBridge' else ''
@@ -8092,12 +8481,12 @@ timeout {timeout}
 {multiclock}{witness_option}[engines]
 {engine}
 [script]
-read -formal -sv {model_defines}{'-noautowire ' if name in ('DebugModule', 'DmiBridge', 'MulDiv', 'RvfiExecute', 'ZktControl', 'FloatingFpu', 'FloatingBackend', 'CounterCsr', 'CounterBackend', 'CsrBackend', 'PipelineBackend', 'DataCacheAssociativity') else ''}{' '.join(files)}
+read -formal -sv {model_defines}{'-noautowire ' if name in ('DebugModule', 'DmiBridge', 'MulDiv', 'RvfiExecute', 'ZktControl', 'FloatingFpu', 'FloatingBackend', 'CounterCsr', 'CounterBackend', 'CsrBackend', 'PipelineBackend', 'LsuFragments', 'DataCacheAssociativity') else ''}{' '.join(files)}
 {preparation}
 [files]
 ''' + '\n'.join(files) + '\n'
             (work / 'check.sby').write_text(config)
-            counted = (work / (module + '.sv')).read_text() if unit in ('ReadQueue', 'Axi', 'DataCache', 'MemoryFabric') or name in ('FloatingBackend', 'CounterCsr', 'CounterBackend', 'CsrBackend', 'PipelineBackend', 'WfiFrontend') else body
+            counted = (work / (module + '.sv')).read_text() if unit in ('ReadQueue', 'Axi', 'DataCache', 'MemoryFabric') or name in ('FloatingBackend', 'CounterCsr', 'CounterBackend', 'CsrBackend', 'PipelineBackend', 'WfiFrontend', 'InterruptBackend') else body
             if unit == 'MulDiv' and 'latency' in mode:
                 counted = paired
             arguments = (work, timeout, name, mode, module, engine, counted)
@@ -8128,6 +8517,15 @@ read -formal -sv {model_defines}{'-noautowire ' if name in ('DebugModule', 'DmiB
     if 'LsuReads' in proved and mutations is None and manifest['parameters'].get('floatingPointBits') and manifest['parameters'].get('enableZfhmin'):
         assert {'prove', 'cover', 'mutation', 'mutation-value', 'mutation-cancel', 'mutation-boxing'} <= {r['mode'] for r in reports if r['propertyGroup'] == 'LsuReads'}, 'Incomplete floating read checks'
         assert next(r['covers'] for r in reports if r['propertyGroup'] == 'LsuReads' and r['mode'] == 'cover') == 7
+    if 'LsuFragments' in proved and mutations is None:
+        assert {'prove', 'cover', 'mutation', 'mutation-offset', 'mutation-mask', 'mutation-shift', 'mutation-assembly', 'mutation-tval', 'mutation-parent'} <= {r['mode'] for r in reports if r['propertyGroup'] == 'LsuFragments'}, 'Incomplete fragment safety checks'
+        if manifest['parameters'].get('loadQueueEntries', 1) == 2: assert {'mutation-cancel', 'mutation-killed'} <= {r['mode'] for r in reports if r['propertyGroup'] == 'LsuFragments'}, 'Incomplete fragment cancellation checks'
+        if not manifest['parameters'].get('enableA', True): assert 'mutation-sc-disabled' in {r['mode'] for r in reports if r['propertyGroup'] == 'LsuFragments'}, 'Incomplete disabled atomic check'
+        if enabled: assert {'mutation-permission', *('mutation-pmp-' + port for port in ('address', 'size', 'privilege', 'write', 'state_config', 'state_address'))} <= {r['mode'] for r in reports if r['propertyGroup'] == 'LsuFragments'}, 'Incomplete fragment authorization checks'
+    if 'InterruptBackend' in proved and mutations is None and manifest['parameters'].get('loadQueueEntries', 1) == 2:
+        assert {'prove', 'cover', 'mutation', 'mutation-pc', 'mutation-write', 'mutation-admission'} <= {r['mode'] for r in reports if r['propertyGroup'] == 'InterruptBackend'}, 'Incomplete dual interrupt checks'
+        if manifest['parameters'].get('enableMisaligned'):
+            assert {r['mode']: r['covers'] for r in reports if r['propertyGroup'] == 'InterruptBackend' and r['mode'].startswith('cover')} == {'cover': 16, 'cover-fragments': 1}, 'Incomplete interrupt fragment covers'
     if 'DataCacheWriteback' in proved:
         covers = {f'cover-{i}' for i in range(4)} if manifest['parameters'].get('dCacheRefillBytes') == 64 else {'cover'}
         assert {'prove', *covers, 'mutation', 'mutation-store-missing', 'prove-storage-shape', 'prove-storage-bytes', 'prove-storage', 'cover-storage', 'mutation-storage-mask', 'mutation-storage-word'} <= {r['mode'] for r in reports if r['propertyGroup'] == 'DataCacheWriteback'}, 'Incomplete writeback authorization proof'
@@ -8159,6 +8557,7 @@ read -formal -sv {model_defines}{'-noautowire ' if name in ('DebugModule', 'DmiB
             covers.add('prove-control')
         if manifest['parameters'].get('loadQueueEntries', 1) == 2:
             covers |= {'prove-control', 'cover-dual', 'cover-drain', 'mutation-dual-owner', 'mutation-dual-drain'}
+            if manifest['parameters'].get('enableMisaligned'): covers.add('mutation-store-cancel')
             if manifest['parameters']['issueWidth'] == 1:
                 covers |= {'prove-identity'}
         assert covers <= {report['mode'] for report in reports if report['propertyGroup'] == 'PipelineBackend'}, 'Incomplete pipeline covers'
@@ -8243,8 +8642,8 @@ read -formal -sv {model_defines}{'-noautowire ' if name in ('DebugModule', 'DmiB
         coherenceWitnessGuidance='acknowledgement mutation only fixes a nonzero dirty mask on probe port zero; unrestricted safety and cover retain arbitrary masks' if 'Coherence' in proved else None,
         cacheWitnessGuidance='cover/mutations only: zero-address demand, successful service, canceled stalls, last-beat/post-fill invalidation, permission denial and demand/speculative fault scenarios; unrestricted safety proof' if 'InstructionCache' in proved else None,
         arbitration='one retained request and owner, hart identity from independent accepted requester/2 through response; at most 2N-1 other completions while continuously requesting; no bound on external service delay' if 'MemoryArbiter' in proved else None,
-        interruptProgress='with eligibility held, successful matching data response reaches interrupt entry or priority synchronous trap within three cycles; memory service itself is external' if any(r['propertyGroup'] == 'InterruptBackend' for r in reports) else None,
-        witnessGuidance='InterruptBackend cover/mutations drive ADDI and mie/mstatus at clocks 0/8/16, then SD, AMOADD.D, MUL, SD-to-MUL, SD-to-FENCE.I or FENCE.I; fixed PC/tag, successful data service, request stall and read-only ownership events select interrupt timing; unrestricted safety proof' if 'InterruptBackend' in proved else None,
+        interruptProgress=('with eligibility held and new parent admission stopped, the last outstanding successful parent output reaches interrupt entry or priority synchronous trap within two cycles' if manifest['parameters'].get('loadQueueEntries', 1) == 2 else 'with eligibility held, successful matching parent output reaches interrupt entry or priority synchronous trap within two cycles' if manifest['parameters'].get('enableMisaligned') else 'with eligibility held, successful matching data response reaches interrupt entry or priority synchronous trap within three cycles') + '; memory service itself is external' if any(r['propertyGroup'] == 'InterruptBackend' for r in reports) else None,
+        witnessGuidance=('InterruptBackend cover/mutations drive ADDI and mie/mstatus at clocks 0/8/16, then SD, AMOADD.D, MUL, SD-to-MUL, SD-to-FENCE.I or FENCE.I; fixed PC/tag, successful data service, request stall and read-only ownership events select interrupt timing; unrestricted safety proof' + ('; dual context also drives two aligned reads and a third queued read, with ordered finite replies and a held eligible interrupt' if manifest['parameters'].get('loadQueueEntries', 1) == 2 else '')) if 'InterruptBackend' in proved else None,
         arbiterWitnessGuidance='cover/mutations hold all requesters valid with zero payloads, one request stall and one response stall then immediate service; unrestricted proof' if 'MemoryArbiter' in proved else None,
         readStreaming='one accepted line and external AR; independent beat/chunk counters, buffered data ordering, response-last ownership, stalled payloads and malformed-last drain; endpoint R data, ID, status, last and delays unrestricted' if 'Axi' in proved and (manifest['parameters'].get('enableBurstRefill') or manifest['parameters'].get('dCacheRefillBytes', 8) == 64) else None,
         cachedFetch='actual cache upstream scalar connections retain request/response ownership; external scalar responses terminate, line responses may fault or end early/late; cancel and invalidate are independent' if 'Fetch' in proved and manifest['parameters'].get('iCacheBytes') else None,
@@ -8255,8 +8654,9 @@ read -formal -sv {model_defines}{'-noautowire ' if name in ('DebugModule', 'DmiB
         axiAssumptions='initial reset only; R requires accepted AR, B requires accepted AW and W; blocked response payloads persist; all request metadata, hart/response IDs, data, responses, last and delays unrestricted' if 'Axi' in proved else None,
         axiComposition='control, retained values and stable operands proved first; arithmetic/output consumes those facts; all original assertions retained without new environmental constraints' if 'Axi' in proved else None,
         axiMutationGuidance='mutations only: aligned W/D AMO/LR/SC at address8, operand1, values7 then11 after retry, immediate service, per-fault codes, SC eligibility and valid hart1 with changing live sideband for retained-ID check; prove and cover unrestricted' if 'Axi' in proved else None,
-        wordMemory='independent decode and execution metadata, accepted LSU ownership, size/mask, alignment, authorization, narrow extension and response fault attribution; metadata inputs unrestricted, functional completion checked for byte/halfword/word/doubleword sizes' if 'Lsu' in proved else None,
+        wordMemory='independent decode and execution metadata, accepted LSU ownership, size/mask, alignment, authorization, narrow extension and response fault attribution; metadata inputs unrestricted, functional completion checked for byte/halfword/word/doubleword sizes' + ('; enabled ordinary inputs are naturally aligned; original atomic domain retained' if manifest['parameters'].get('enableMisaligned') else '') if 'Lsu' in proved else None,
         dualReadOwnership=('Bare naturally aligned integer and floating reads at configured FLEN; independent two-context size/sign/data-bit/boxing and destination-metadata ledger; arbitrary stalls/data/errors/tags/cancellation, in-order completion and held-request retention; no device, translation, retirement or progress claim' if manifest['parameters'].get('floatingPointBits') and manifest['parameters'].get('enableZfhmin') else 'Bare aligned ordinary doubleword reads without PMP; independent two-context acceptance and completion ledger, arbitrary stalls/data/errors/tags/cancellation, all payload bits, in-order completion and held-request retention; no device, translation or progress claim') if 'LsuReads' in proved else None,
+        fragmentMemory=('Bare LQ2 serial split parents of 2/4/8 bytes, physical slot ownership, held offers, cancellation and poisoned reply drain' if manifest['parameters'].get('loadQueueEntries', 1) == 2 else 'Bare LQ1 ordinary parents of 1/2/4/8 bytes') + ('; per-child PMP ports and sampled grant, arbitrary changing PMP bank and permit; PMP semantics proved separately' if enabled else '; no PMP') + '; no data cache; independent parent/child ledger and result bits; single last=1 child reply, arbitrary data/errors/tags/delays; no translation, complete PMA, architectural retirement or progress claim' if 'LsuFragments' in proved else None,
         reservation='independent last-LR physical word and validity, successful matching LR completion only, any atomic acceptance consumes old pair, full-EA SC qualification captured before protection and stable through backpressure; endpoint exclusivity is separate' if 'Lsu' in proved else None,
         physicalMemory='independent configured region/permission/shape model; D-only atomic directions/opcodes, malformed and denied SC isolation regardless of eligibility, retained local-fault response and complete request payload forwarding' if 'Memory' in proved else None,
         dataIndependentControl=dict(instructions=[e[0] for e in zkt_inventory(manifest['parameters'])], hintFormsRequired=False, scope='actual stateless Decode/Issue/Execute pair, arbitrary distinct consistent GPR data, shared public instruction/control, no whole-Core or RVFI claim') if 'ZktControl' in proved else None,
@@ -8287,7 +8687,7 @@ if __name__ == '__main__':
     parser.add_argument('--output', type=Path, default=Path('result/formal'))
     parser.add_argument('--mutations', nargs='+')
     parser.add_argument('--jobs', type=int, default=1)
-    parser.add_argument('--modules', nargs='+', choices=('ZktControl', 'RvfiExecute', 'PlatformMemory', 'DebugModule', 'DmiBridge', 'DebugCsr', 'CounterCsr', 'CounterBackend', 'CsrBackend', 'FloatingBackend', 'FloatingFpu', 'Fetch', 'CompressedFetch', 'WideFetch', 'Gpr', 'MulDiv', 'Backend', 'PipelineBackend', 'Pmp', 'PmpDecode', 'PmpInterval', 'PmpSubset', 'Csr', 'FloatingCsr', 'UserCsr', 'UserExecute', 'SupervisorCsr', 'SupervisorExecute', 'SupervisorFetch', 'Lsu', 'LsuReads', 'InterruptCsr', 'InterruptBackend', 'SynchronizationBackend', 'SharedCache', 'InstructionCache', 'DataCache', 'DataCacheWriteback', 'DataCacheAssociativity', 'Coherence', 'MemoryArbiter', 'ReadQueue', 'MemoryFabric', 'Memory', 'Axi', 'WordDecode', 'WordExecute', 'BitManipDecode', 'BitManipExecute', 'IntegerDecode', 'IntegerExecute', 'WfiBackend', 'WfiFrontend', 'LocalInterrupts', 'Translation'))
+    parser.add_argument('--modules', nargs='+', choices=('ZktControl', 'RvfiExecute', 'PlatformMemory', 'DebugModule', 'DmiBridge', 'DebugCsr', 'CounterCsr', 'CounterBackend', 'CsrBackend', 'FloatingBackend', 'FloatingFpu', 'Fetch', 'CompressedFetch', 'WideFetch', 'Gpr', 'MulDiv', 'Backend', 'PipelineBackend', 'Pmp', 'PmpDecode', 'PmpInterval', 'PmpSubset', 'Csr', 'FloatingCsr', 'UserCsr', 'UserExecute', 'SupervisorCsr', 'SupervisorExecute', 'SupervisorFetch', 'Lsu', 'LsuReads', 'LsuFragments', 'InterruptCsr', 'InterruptBackend', 'SynchronizationBackend', 'SharedCache', 'InstructionCache', 'DataCache', 'DataCacheWriteback', 'DataCacheAssociativity', 'Coherence', 'MemoryArbiter', 'ReadQueue', 'MemoryFabric', 'Memory', 'Axi', 'WordDecode', 'WordExecute', 'BitManipDecode', 'BitManipExecute', 'IntegerDecode', 'IntegerExecute', 'WfiBackend', 'WfiFrontend', 'LocalInterrupts', 'Translation'))
     parser.add_argument('--instruction-model-dir', type=Path)
     args = parser.parse_args()
     verify(args.rtl, args.output, args.modules, args.mutations, args.jobs, args.instruction_model_dir)

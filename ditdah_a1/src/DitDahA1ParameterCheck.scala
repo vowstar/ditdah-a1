@@ -129,6 +129,11 @@ object DitDahA1ParameterCheck:
     rtl.copy(fabricReadSlots = Some(1)).validateFabric()
     rtl.copy(fabricReadSlots = Some(2)).validateFabric()
     rejects { rtl.copy(fabricReadSlots = Some(3)).validateFabric() }
+    for enabled <- Seq(false, true) do
+      val selected = rtl.copy(enableMisaligned = enabled)
+      selected.validateRtl()
+      assert(DitDahA1Config.parameter(DitDahA1Config.document(selected)) == selected)
+      assert(DitDahA1Config.document(selected)("implementation")("enableMisaligned").bool == enabled)
     for entries <- Seq(1, 2) do
       val selected = rtl.copy(loadQueueEntries = entries, fabricReadSlots = Some(entries + 1))
       selected.validateRtl()

@@ -195,10 +195,10 @@ LSU = r'''
     output_ready = 1; tick(); output_ready = 0;
 
     input_bits_store = 0; input_bits_load = 1;
-    input_bits_address = 64'h1002;
+    input_bits_address = 64'h1002; input_bits_atomic = SPLIT_ENABLED;
     input_valid = 1; tick(); input_valid = 0;
     check(output_valid && output_bits_instruction_fault && output_bits_instruction_cause == 4 && !memory_request_valid, "Misaligned load escaped");
-    output_ready = 1; tick(); output_ready = 0;
+    output_ready = 1; tick(); output_ready = 0; input_bits_atomic = 0;
 
     input_bits_address = 64'h1008;
     input_bits_rd = 7; input_bits_rdWrite = 1;
@@ -284,13 +284,99 @@ for size in range(3):
     output_ready = 1; tick(); output_ready = 0;
 '''
 LSU += '''
-    input_bits_address = 'h1002; input_bits_load = 1; input_bits_store = 0;
+    input_bits_address = 'h1002; input_bits_load = 1; input_bits_store = 0; input_bits_atomic = SPLIT_ENABLED;
     input_valid = 1; tick(); input_valid = 0;
     check(output_valid && output_bits_instruction_fault && output_bits_instruction_cause == 4 && !memory_request_valid, "Word alignment fault");
-    output_ready = 1; tick(); output_ready = 0;
+    output_ready = 1; tick(); output_ready = 0; input_bits_atomic = 0;
     input_bits_memorySize = 3; input_bits_unsignedLoad = 0;
     input_bits_load = 0; input_bits_store = 0;
 '''
+
+
+def misaligned_lsu_contract(parameters):
+    translated = parameters.get('virtualAddressBits') == 39
+    body = r"""    reset = 1; tick(); reset = 0; tick();
+    begin
+      integer width, displacement, writing, extension, progress, bytes, fragments, tag, failure, failed, boundary, fault_cause;
+      reg [63:0] address, physical, expected, returned, source, expected_data;
+      storeAllowed = 1; input_bits_instruction_fault = 0; input_bits_atomic = 0;
+      input_bits_instruction_pc = 'h120; input_bits_instruction_tag = 81;
+      input_bits_rd = 9; input_bits_instruction_instruction = 'h0000b483;
+      for (failure=-1; failure<FAILURES; failure=failure+1)
+      for (boundary=0; boundary<2; boundary=boundary+1)
+      for (width=0; width<4; width=width+1)
+        for (displacement=0; displacement<8; displacement=displacement+1)
+          for (writing=0; writing<2; writing=writing+1)
+            for (extension=0; extension<EXTENSIONS; extension=extension+1) begin
+              address=RAM_BASE+(boundary ? 'hff8 : 'h1038)+displacement; source=64'h91f3b5792d4e8ac6;
+              input_bits_address=address; input_bits_memorySize=width;
+              input_bits_store=writing; input_bits_load=!writing; input_bits_rdWrite=!writing;
+              input_bits_unsignedLoad=extension!=0; input_bits_storeData=source;
+FP_INPUT
+              input_valid=1; #1; while (!input_ready) tick(); tick(); input_valid=0;
+              progress=0; fragments=0; expected=0; failed=0; fault_cause=writing ? 7 : 5;
+              while (progress<(1<<width) && !failed) begin
+TRANSLATE
+                if (!failed) begin
+                while (!memory_request_valid) begin check(!output_valid,"No early fragment completion"); tick(); end
+                bytes=1<<memory_request_bits_size; tag=memory_request_bits_tag;
+                physical=address+progress+PA_OFFSET;
+                check(bytes<=8 && bytes<=((1<<width)-progress) && !(physical&(bytes-1)),"Exact aligned fragment range");
+                returned=0;
+                for (integer b=0; b<bytes; b=b+1) returned[b*8+:8]=(address+progress+b)*43+'h95;
+                expected=expected | (returned<<(progress*8));
+                expected_data=source>>(progress*8);
+                repeat (3) begin
+                  check(memory_request_valid && memory_request_bits_address==physical && memory_request_bits_tag==tag &&
+                    (1<<memory_request_bits_size)==bytes && memory_request_bits_write==writing && !memory_request_bits_atomic &&
+                    !memory_request_bits_fetch && (!(address&((1<<width)-1)) || memory_request_bits_refillSize==0) &&
+                    memory_request_bits_mask==(writing ? ((1<<bytes)-1) : 0) &&
+                    (!writing || memory_request_bits_data==expected_data),"Fragment fields stay stable"); tick();
+                end
+                memory_request_ready=1; tick(); memory_request_ready=0;
+                repeat (2) begin check(!output_valid,"Parent waits for child response"); tick(); end
+                memory_response_bits_tag=tag; memory_response_bits_data=returned;
+                memory_response_bits_fault=fragments==failure; memory_response_bits_last=1; memory_response_valid=1;
+                while (!memory_response_ready) tick(); tick(); memory_response_valid=0;
+                failed=fragments==failure;
+                if (!failed) progress=progress+bytes;
+                fragments=fragments+1;
+                end
+              end
+              check(fragments<=4,"Bounded exact decomposition");
+              if (width<3 && ((!extension && expected[(8<<width)-1]) || FP_BOX)) expected=expected | ('1<<(8<<width));
+              while (!output_valid) tick();
+              repeat (3) begin
+                check(output_valid && output_bits_instruction_fault==failed &&
+                  (!failed || (output_bits_instruction_cause==fault_cause && output_bits_instruction_tval==address+progress)) &&
+                  output_bits_instruction_pc=='h120 &&
+                  output_bits_instruction_tag==81 && output_bits_address==address && output_bits_memorySize==width &&
+                  output_bits_rd==9 && output_bits_rdWrite==(!writing && !FP_WRITE) &&
+                  (failed || writing || output_bits_value==expected),"Single parent result and extension"); tick();
+              end
+              output_ready=1; tick(); output_ready=0; tick();
+              check(!output_valid && !memory_request_valid,"Parent completes once");
+            end
+    end
+"""
+    if parameters.get('floatingPointBits'):
+        floating = f"(extension==2 && width>={1 if parameters.get('enableZfhmin') else 2} && width<={3 if parameters['floatingPointBits']==64 else 2})"
+        body = body.replace('FP_INPUT', f'              input_bits_fpWrite={floating} && !writing; input_bits_rdWrite=!writing && !{floating};')
+        body = body.replace('FP_BOX', f"{floating} && (8<<width)<{parameters['floatingPointBits']}").replace('FP_WRITE', floating)
+    else:
+        body = body.replace('FP_INPUT', '').replace('FP_BOX', '0').replace('FP_WRITE', '0')
+    body = body.replace('EXTENSIONS', '3' if parameters.get('floatingPointBits') else '2').replace('FAILURES', '5' if translated else '4')
+    if parameters['pmpEntries']:
+        body = body.replace('      storeAllowed = 1;', f"      pmp_config='h1f; pmp_address='h{(1 << (parameters['physicalAddressBits']-2))-1:x};\n      storeAllowed = 1;")
+    translation = r"""                translation_response_bits_fault=failure==4 && fragments==1; translation_response_bits_cause=writing ? 15 : 13;
+                while (!translation_request_valid) begin check(!memory_request_valid && !output_valid,"Child translation precedes demand"); tick(); end
+                check(translation_request_bits_address==address+progress && translation_request_bits_write==writing,"Each child uses its own virtual address");
+                translation_request_ready=1; tick(); translation_request_ready=0;
+                translation_response_bits_address=address+progress+PA_OFFSET;
+                translation_response_valid=1; while (!translation_response_ready) tick(); tick(); translation_response_valid=0;
+                if (translation_response_bits_fault) begin failed=1; fault_cause=writing ? 15 : 13; end"""
+    ram = next(r for r in parameters['memoryRegions'] if r['readable'] and r['writable'] and not r['device'])
+    return body.replace('TRANSLATE', translation if translated else '').replace('PA_OFFSET', "((address+progress<RAM_BASE+'h1000) ? 'h1000 : 'h2000)" if translated else '0').replace('RAM_BASE', f"64'h{int(ram['base']):x}")
 
 
 def lsu_queue_contract(parameters):
@@ -412,18 +498,19 @@ def lsu_queue_contract(parameters):
     output_ready = 1; tick(); output_ready = 0; reset = 1; tick();
 '''
         body += f"    pmp_config = 'h1f; pmp_address = 'h{pmp_address:x}; reset = 0; tick();\n"
-    body += submit(0x1000, 0x100, 5, 2) + issue(0, 0x1000)
-    body += '''    input_bits_atomic = 0; input_bits_store = 0; input_bits_load = 1; input_valid = 1;
+    if parameters.get('enableA', True):
+        body += submit(0x1000, 0x100, 5, 2) + issue(0, 0x1000)
+        body += '''    input_bits_atomic = 0; input_bits_store = 0; input_bits_load = 1; input_valid = 1;
     repeat (3) begin check(!input_ready, "Pending atomic excludes younger data requests"); tick(); end
     input_valid = 0;
 '''
-    body += respond(0, 101) + complete(0x100, 5, 101)
-    body += submit(0x1000, 0x104, 6, 3)
-    body += '    while (!memory_request_valid) tick(); check(memory_request_bits_scEligible, "Shared reservation survives its completed LR");\n'
-    body += issue(1, 0x1000, True) + respond(1, 0) + complete(0x104, 6, 0)
-    body += submit(0x1000, 0x100, 5, 3)
-    body += '    while (!memory_request_valid) tick(); check(!memory_request_bits_scEligible, "SC consumes the shared reservation");\n'
-    body += issue(0, 0x1000, True) + respond(0, 1) + complete(0x100, 5, 1)
+        body += respond(0, 101) + complete(0x100, 5, 101)
+        body += submit(0x1000, 0x104, 6, 3)
+        body += '    while (!memory_request_valid) tick(); check(memory_request_bits_scEligible, "Shared reservation survives its completed LR");\n'
+        body += issue(1, 0x1000, True) + respond(1, 0) + complete(0x104, 6, 0)
+        body += submit(0x1000, 0x100, 5, 3)
+        body += '    while (!memory_request_valid) tick(); check(!memory_request_bits_scEligible, "SC consumes the shared reservation");\n'
+        body += issue(0, 0x1000, True) + respond(0, 1) + complete(0x100, 5, 1)
     body += submit(0x1000, 0x100, 5) + issue(0, 0x1000) + submit(0x1040, 0x104, 6) + issue(1, 0x1040)
     body += respond(0, 101, last=False) + respond(1, 202)
     body += '    repeat (3) begin check(!output_valid, "Nonterminal response retains its owner"); tick(); end\n'
@@ -1896,9 +1983,9 @@ def lsu_refill_contract(parameters):
     if line:
         body += f'''    reset = 1; tick(); reset = 0; tick(); privilege = 3;
     input_bits_memorySize = 1; input_bits_address = 64'h{base + 1:x};
-    input_bits_instruction_fault = 0; input_valid = 1; tick(); input_valid = 0;
+    input_bits_instruction_fault = 0; input_bits_atomic = {int(parameters.get('enableMisaligned', False))}; input_valid = 1; tick(); input_valid = 0;
     check(output_valid && output_bits_instruction_fault && output_bits_instruction_cause == 4 && !memory_request_valid, "Wide permission cannot hide demand misalignment");
-    output_ready = 1; tick(); output_ready = 0;
+    output_ready = 1; tick(); output_ready = 0; input_bits_atomic = 0;
 '''
     return body
 
@@ -3240,29 +3327,37 @@ def backend_queue_contract(parameters):
 '''
 
     body = ''
-    for mode in ('reverse', 'waw', 'old_fault', 'young_fault', *(('interrupt',) if parameters['enableInterrupts'] else ())):
+    for mode in ('reverse', 'waw', 'old_fault', 'young_fault', *(('interrupt', 'interrupt_refill', 'interrupt_prefault') if parameters['enableInterrupts'] else ())):
         second = 3 if mode == 'waw' else 4
         result = 23 if mode == 'waw' else 33
         words = (ld(3, 0, 0x200), ld(second, 0, 0x240),
                  addi(5, 3, 1) if mode == 'waw' else alu(5, 3, 4, 0), sd(5, 0, 0x280))
-        if mode == 'interrupt':
+        if mode.startswith('interrupt'):
             words = (*words[:2], mul(5, 1, 1), addi(6, 0, 7), sd(6, 0, 0x280))
+            if mode == 'interrupt_refill': words = (*words[:2], ld(6, 0, 0x280), mul(5, 1, 1))
+            if mode == 'interrupt_prefault': words = words[:2]
         body += '''    begin
-    integer writes;
+    integer writes, service_age;
     logic [7:0] saved_tag;
-    writes = 0; instruction_valid = 0; instruction_bits_fault = 0;
+    writes = 0; service_age = 0; instruction_valid = 0; instruction_bits_fault = 0;
     data_request_ready = 0; data_response_valid = 0; data_response_bits_fault = 0;
     reset = 1; tick(); reset = 0; tick();
 '''
-        if mode == 'interrupt':
+        if mode.startswith('interrupt'):
             body += '    interrupts_external = 0;\n' + send((addi(1, 0, 0x400), csr(0, 0x305, 1), addi(2, 0, -1),
                 csr(0, 0x304, 2), addi(3, 0, 8), csr(0, 0x300, 3)), 0xe8) + '    while (!dut.csr.status[3]) tick();\n'
-        body += '''    fork
+        observe_parent = 'if (interrupts_external && dut.lsu_input_valid && dut._lsu_input_ready) $fatal(1, "Pending interrupt admitted a younger memory parent pc=%h", dut.resultPackets_0_instruction_pc);' if mode == 'interrupt_refill' else ''
+        if mode == 'interrupt_prefault':
+            observe_parent = '''if (service_age == 2 && dut._csr_interruptPending && !dut.takeInterrupt_layerCapture && !(dut._commit_output_valid && dut.commitPackets_0_instruction_fault)) $fatal(1, "Interrupt parent deadline");
+        if (service_age != 0) service_age++;
+        if (dut._lsu_output_valid && dut.lsu_output_ready && dut.memoryPackets_0_instruction_pc == 'h104) service_age = 1;'''
+        body += f'''    fork
       forever begin
         @(posedge clock);
+        {observe_parent}
         if (dut.gpr.we_0) begin
 '''
-        expected = ((3, 11),) if mode == 'young_fault' else () if mode == 'old_fault' else ((3, 11), (4, 22)) if mode == 'interrupt' else ((3, 11), (second, 22), (5, result))
+        expected = ((3, 11),) if mode == 'young_fault' else () if mode == 'old_fault' else ((3, 11), (4, 22)) if mode.startswith('interrupt') else ((3, 11), (second, 22), (5, result))
         checks = ' || '.join(f'(writes == {index} && dut.gpr.waddr_0 == {rd} && dut.gpr.wdata_0 == {value})'
                             for index, (rd, value) in enumerate(expected)) or "1'b0"
         body += f'''          if (!({checks})) $fatal(1, "Dual-load retirement order and dependencies: write=%0d rd=%0d value=%h pc=%h", writes, dut.gpr.waddr_0, dut.gpr.wdata_0, dut.commitPackets_0_instruction_pc);
@@ -3279,24 +3374,30 @@ def backend_queue_contract(parameters):
     data_request_ready = 1; tick(); data_request_ready = 0;
 '''
         body += '    repeat (4) begin check(!redirect && writes == 0 && !data_request_valid, "Pending reads retain architectural ownership"); tick(); end\n'
-        if mode == 'interrupt':
+        if mode.startswith('interrupt'):
             body += '    interrupts_external = 1;\n'
         if mode == 'old_fault':
             body += response(0, 11, True)
             body += '    repeat (5) begin check(!redirect && writes == 0 && !data_request_valid, "Old fault waits for younger accepted read to drain"); tick(); end\n'
             body += response(1, 22)
+        elif mode in ('interrupt_refill', 'interrupt_prefault'):
+            body += response(0, 11)
+            body += '    repeat (4) begin check(!data_request_valid && !redirect, "Pending interrupt published younger data"); tick(); end\n'
+            if mode == 'interrupt_prefault':
+                body += "    instruction_bits_fault = 1; instruction_bits_cause = 1; instruction_bits_tval = 'h108;\n" + send((ld(6, 0, 0x280),), 0x108) + '    instruction_bits_fault = 0; instruction_bits_cause = 0; instruction_bits_tval = 0; tick();\n'
+            body += response(1, 22)
         else:
             body += response(1, 22, mode == 'young_fault')
             body += '    repeat (4) begin check(!redirect && writes == 0 && !data_request_valid, "Younger completion cannot retire before older load"); tick(); end\n'
             body += response(0, 11)
-        if 'fault' in mode:
+        if mode in ('old_fault', 'young_fault'):
             body += f'''    while (!redirect) begin check(!data_request_valid, "Younger store escaped a load fault"); tick(); end
     check(status_trap && dut.commitPackets_0_instruction_pc == 'h{0x100 if mode == 'old_fault' else 0x104:x} &&
           dut.commitPackets_0_instruction_tval == 'h{0x200 if mode == 'old_fault' else 0x240:x} && writes == {len(expected)},
           "Precise oldest fault context"); tick();
     repeat (8) begin check(!data_request_valid && !dut.gpr.we_0 && !redirect, "Cancelled dual-load effects do not escape"); tick(); end
 '''
-        elif mode == 'interrupt':
+        elif mode.startswith('interrupt'):
             body += '''    for (integer waited = 0; !redirect; waited++) begin
       check(waited < 8 && !data_request_valid, "Interrupt waits only for accepted loads"); tick(); end
     check(status_trap && writes == 2, "Both accepted loads retire before interrupt"); tick();
@@ -3349,7 +3450,7 @@ def backend_floating_contract(parameters):
       "Cancelled floating operation changed context");
 '''
         body += send((0xe00002d3, sd(5, 0))) + stored(0x3f800000)
-        body += send((addi(2, 0, 21), addi(3, 0, 3), muldiv(5, 2, 3, 4), sd(5, 0))) + stored(7)
+        if parameters.get('enableM', True): body += send((addi(2, 0, 21), addi(3, 0, 3), muldiv(5, 2, 3, 4), sd(5, 0))) + stored(7)
         body += send((0x00000053, 0xe00002d3, sd(5, 0))) + stored(0x40000000)
         body += '    check(dut.csr.fcsr==0 && dut.csr.fs==3, "Retired floating operation updates context");\n'
     return body
@@ -5144,6 +5245,8 @@ def verify(rtl, directory, modules=None):
     manifest = json.loads((rtl / 'ditdah_a1_config.json').read_text())
     parameters = manifest['parameters']
     def emitted_source(name): return (rtl / (name + '.sv')).read_text() if (rtl / (name + '.sv')).is_file() else ''
+    if not parameters.get('enableMisaligned'):
+        assert not re.search(r'\breg\s+(?:\[[^]]+\]\s+)?(?:splitting|offset)(?:_\d+)?\s*[;,=]', emitted_source('DitDahA1Lsu')), 'Disabled fragment state was emitted'
     verified = []
     enabled = parameters['pmpEntries'] != 0
     cached = bool(parameters['iCacheBytes'])
@@ -5155,7 +5258,7 @@ def verify(rtl, directory, modules=None):
         assert 'fpWrite' not in emitted_source('DitDahA1Backend') and 'fcsr' not in emitted_source('DitDahA1Csr'), 'Disabled floating state was emitted'
     suites = (('DitDahA1Fetch', (burst_fetch_contract(parameters) if parameters.get('enableBurstRefill') else cached_fetch_contract(parameters)) if cached else FETCH + (protection_contract(True) if enabled else '')),
                        ('DitDahA1Lsu', lsu_queue_contract(parameters) if parameters.get('loadQueueEntries', 1) == 2 else
-                        LSU + (lsu_reservation_contract(parameters) if parameters.get('enableA', True) else '') + (protection_contract(False) if enabled else '') + lsu_refill_contract(parameters)),
+                        LSU.replace('SPLIT_ENABLED', str(int(parameters.get('enableMisaligned', False)))) + (lsu_reservation_contract(parameters) if parameters.get('enableA', True) else '') + (protection_contract(False) if enabled else '') + lsu_refill_contract(parameters)),
                        ('DitDahA1MulDiv', muldiv_contract(parameters)),
                        ('DitDahA1Frontend', (burst_fetch_contract(parameters, True) if parameters.get('enableBurstRefill') else cached_fetch_contract(parameters, True)) if cached else frontend_contract(parameters)),
                        ('DitDahA1Decode', decode_contract(parameters, directory)),
@@ -5217,6 +5320,8 @@ def verify(rtl, directory, modules=None):
     if parameters.get('enableC'):
         suites = tuple((name, compressed_fetch_contract(parameters, name == 'DitDahA1Frontend')
                         if name in ('DitDahA1Fetch', 'DitDahA1Frontend') else body) for name, body in suites)
+    if parameters.get('enableMisaligned'):
+        suites = tuple((name, body + (misaligned_lsu_contract(parameters) if name == 'DitDahA1Lsu' else '')) for name, body in suites)
     assert not modules or set(modules) <= {name for name, _ in suites}, 'Unsupported contract selection'
     for name, body in suites:
         if name == 'DitDahA1MulDiv' and not parameters.get('enableM', True):
@@ -5237,7 +5342,7 @@ def verify(rtl, directory, modules=None):
                 body = re.sub(r'\bdut\.(instruction|decoded|issued|result|memory|commit)Valid\b',
                               r'(dut.\1Count != 0)', body)
                 body += backend_group_contract(parameters) + (backend_branch_contract() if parameters.get('loadQueueEntries', 1) == 1 else '') + backend_memory_group_contract(parameters)
-        source = bench(module, body, 4 + 69 * body.count('MulDiv resource reuse')) if name == 'DitDahA1MulDiv' else bench(module, body)
+        source = bench(module, body, 4 + 69 * body.count('MulDiv resource reuse')) if name == 'DitDahA1MulDiv' else bench(module, body, 60000 if name == 'DitDahA1Lsu' and parameters.get('enableMisaligned') else 10000)
         if name == 'DitDahA1Backend' and parameters.get('enableCounters'):
             slots = '+'.join(f"integer'(dut.commitCount>{lane} && !dut.commitPackets_{lane}_instruction_fault)" for lane in range(parameters['issueWidth']))
             source = source.replace('  initial begin', f'''  reg [{parameters['issueWidth']}:0] count_seen=0;

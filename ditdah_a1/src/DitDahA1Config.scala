@@ -43,6 +43,7 @@ object DitDahA1Config:
         "dTlbEntries" -> (if parameter.enableTranslation then parameter.dTlbEntries else 0),
         "fabricReadSlots" -> parameter.resolvedFabricReadSlots,
         "loadQueueEntries" -> parameter.loadQueueEntries,
+        "enableMisaligned" -> parameter.enableMisaligned,
         "enableBranchPrediction" -> parameter.enableBranchPrediction,
         "branchPredictorEntries" -> parameter.branchPredictorEntries,
         "dCacheRefillBytes" -> (if parameter.dCacheBytes != 0 then parameter.dCacheRefillBytes else 0),

@@ -131,7 +131,7 @@ def integer_stream(p, name='integer_stream'):
     p.emit(jal(0, loop - p.offset))
 
 
-def memory_group_cases(base, protection, interrupts, sv39):
+def memory_group_cases(base, protection, interrupts, sv39, misaligned=False):
     p = Program(base)
     p.address(10, 0x1000)
     p.emit(addi(30, 0, 4))
@@ -169,6 +169,8 @@ def memory_group_cases(base, protection, interrupts, sv39):
         resume = p.offset
         p.emit(addi(8, 6, 0), addi(9, 7, 0))
         p.expected_registers = {6: 11, 7: 13, 8: 11, 9: 13, 23: 1}
+        if fault == 'alignment' and misaligned:
+            p.expected_registers = {6: 99, 7: 101, 8: 99, 9: 101, 23: 0}
         yield 'memory_group_' + fault, p.finish(resume_offset=resume)
 
     if interrupts:
@@ -210,6 +212,21 @@ def load_window_program(base, harts=1, cancel=False):
     return p.finish()
 
 
+def load_fault_program(base):
+    p = Program(base)
+    p.address(10, 0x1800)
+    p.emit(addi(6, 0, 17), addi(7, 0, 35))
+    older = base + p.offset
+    p.emit(ld(6, 10), ld(7, 10, 64))
+    resume = p.offset
+    p.emit(add(8, 6, 0), add(9, 7, 0))
+    p.faults['read'] = base + 0x1800
+    p.load_fault = older, older + 4, base + 0x1800
+    p.expected_registers = {6: 17, 7: 35, 8: 17, 9: 35, 20: 5, 21: base + 0x1800, 22: base + resume, 23: 1}
+    p.memory[base + 0x1800], p.memory[base + 0x1840] = 81, 122
+    return p.finish(resume_offset=resume)
+
+
 def cases(base, protection=False, interrupts=False, user=False, local_interrupt_base=None, supervisor=False, sv39=False, writeback=False, compressed=False, floating_point_bits=None, scalar=None):
     if not sv39:
         yield 'load_window', load_window_program(base)
@@ -245,7 +262,7 @@ def cases(base, protection=False, interrupts=False, user=False, local_interrupt_
                 p.emit(addi(5, 5, 1), jalr(0, 1))
                 p.offset = end
             yield name, p.finish()
-    yield from memory_group_cases(base, protection, interrupts, sv39)
+    yield from memory_group_cases(base, protection, interrupts, sv39, (scalar or {}).get('enableMisaligned', False))
     for fault in (False, True):
         p = Program(base)
         p.address(10, 0x1000)
@@ -411,7 +428,7 @@ def cases(base, protection=False, interrupts=False, user=False, local_interrupt_
            sd(4, 11), mul(6, 0, 4), sd(6, 11, 8),
            mul(7, 2, 3) | (1 << 12), mul(7, 2, 3) | (4 << 12), mul(7, 2, 3) | 8)
     yield 'multiply', p.finish()
-    yield from integer_cases(base)
+    yield from integer_cases(base, (scalar or {}).get('enableMisaligned', False))
     yield from bitmanip_cases(base)
     if floating_point_bits is not None:
         yield from floating_cases(base, floating_point_bits)
@@ -439,6 +456,9 @@ def cases(base, protection=False, interrupts=False, user=False, local_interrupt_
                         p.stop += 4
                         p.expected_registers = {7: 0x5678}
                     yield ('floating_half_' if width == 16 else 'floating_') + name, p
+            if (scalar or {}).get('enableMisaligned'):
+                for size in ([1] if (scalar or {}).get('enableZfhmin') else []) + [2] + ([3] if floating_point_bits == 64 else []):
+                    yield from sv39_cases(base, protection, writeback, True, (size, floating_point_bits))
     if compressed:
         yield from compressed_cases(base, protection, sv39, scalar or {})
 
@@ -457,10 +477,10 @@ def cases(base, protection=False, interrupts=False, user=False, local_interrupt_
     if supervisor:
         yield from supervisor_cases(base, protection)
     if sv39:
-        yield from sv39_cases(base, protection, writeback)
+        yield from sv39_cases(base, protection, writeback, bool(scalar and scalar.get('enableMisaligned')))
 
 
-def sv39_cases(base, protection, writeback=False):
+def sv39_cases(base, protection, writeback=False, misaligned=False, floating=None):
     p = Program(base)
     root, middle, leaf, virtual = base + 0x1000, base + 0x2000, base + 0x3000, 0x40000000
     values = [(root + 8, ((middle >> 12) << 10) | 1), (middle, ((leaf >> 12) << 10) | 1),
@@ -477,8 +497,8 @@ def sv39_cases(base, protection, writeback=False):
         p.memory.update((address + byte, (value >> (8 * byte)) & 255) for byte in range(8))
     p.finish()
     p.stop = stop
-    yield 'sv39_integer_stream', p
-    for name, flags, status, address, levels in (
+    if not floating: yield 'sv39_integer_stream', p
+    variants = (
             ('data', 0xcf, 0x20800, 0x40000100, 0),
             ('atomic', 0xcf, 0x20800, 0x40000104, 0),
             ('reuse', 0xcf, 0x20800, 0x40000100, 0),
@@ -490,8 +510,14 @@ def sv39_cases(base, protection, writeback=False):
             ('user_denied', 0xdf, 0x20800, 0x40000100, 0),
             ('sum', 0xdf, 0x60800, 0x40000100, 0),
             ('mxr', 0xc9, 0xa0800, 0x40000100, 0),
-            ('canonical', 0xcf, 0x20800, 1 << 39, 0)):
-        if name == 'protection' and not protection:
+            ('canonical', 0xcf, 0x20800, 1 << 39, 0))
+    if misaligned:
+        variants += tuple(('misaligned_' + kind, 0xcf, 0x20800, 0x40000ffd, 0)
+                          for kind in ('success', 'missing', 'accessed', 'dirty', 'readonly', 'pmp'))
+    size, flen = floating or (3, 64)
+    if floating: variants = tuple(v for v in variants if v[0] in ('misaligned_success', 'misaligned_missing', 'misaligned_pmp'))
+    for name, flags, status, address, levels in variants:
+        if name in ('protection', 'misaligned_pmp') and not protection:
             continue
         p = Program(base)
         def word(physical, value):
@@ -504,6 +530,23 @@ def sv39_cases(base, protection, writeback=False):
         word(base + 0x100, 0x12345678)
         if protection:
             p.emit(addi(2, 0, -1), csr(0, 0x3b0, 2), addi(2, 0, 0x1f), csr(0, 0x3a0, 2))
+        split = name.startswith('misaligned_')
+        read_fault = name in ('misaligned_missing', 'misaligned_accessed', 'misaligned_pmp')
+        if floating: address, status = 0x40000fff, status | 0x4000
+        if split:
+            word(leaf + 8, ((base + 0x7000) >> 2) | {'misaligned_missing': 0, 'misaligned_accessed': 0x8f,
+                 'misaligned_dirty': 0x4f, 'misaligned_readonly': 0xcb}.get(name, 0xcf))
+            word(base + 0xff8, 0x80f7e6d5c4b3a291)
+            word(base + 0x7000, 0x8877665544332211)
+            if name == 'misaligned_pmp':
+                p.address(12, 0x7000)
+                p.emit(alu(12, 12, 2, 5, immediate=True), csr(0, 0x3b0, 12), addi(12, 0, -1), csr(0, 0x3b1, 12),
+                       addi(12, 0, 0x1f), alu(12, 12, 8, 1, immediate=True), addi(12, 12, 0x18), csr(0, 0x3a0, 12))
+        if floating:
+            word(base + 0x680, (1 << flen) - 147); word(base + 0x688, 0x0123456789abcdef)
+            p.emit(0x000020b7, csr(0, 0x300, 1)); p.address(12, 0x680)
+            p.emit(load(0, 12, 0, 2 if flen == 32 else 3) | 4, load(3, 12, 8, 2 if flen == 32 else 3) | 4,
+                   csr(0, 1, 21, function=5))
         p.address(10, 0x600)
         word(base + 0x600, (8 << 60) | (root >> 12))
         word(base + 0x608, address)
@@ -512,7 +555,12 @@ def sv39_cases(base, protection, writeback=False):
         if name == 'reuse':
             p.emit(addi(4, 0, 32), ld(3, 11), addi(4, 4, -1), beq(4, 0, -8) ^ (1 << 12))
         else:
-            p.emit(load(3, 11, size=2) if name == 'atomic' else ld(3, 11))
+            read = (load(3, 11, size=size) | 4) if floating else ld(3, 11)
+            if split:
+                if not floating: p.emit(addi(3, 0, 93))
+                if floating: p.emit(ld(13, 11, -7))
+                p.required_memory = [(base + p.offset, read, read_fault)]
+            p.emit(load(3, 11, size=2) if name == 'atomic' else read)
         if name == 'atomic':
             p.emit(addi(4, 0, -1))
             for operation in (0, 1, 4, 8, 12, 16, 20, 24, 28):
@@ -522,9 +570,37 @@ def sv39_cases(base, protection, writeback=False):
             p.address(12, 0x1000)
             p.emit(csr(0, 0x300, 0), alu(12, 12, 2, 5, immediate=True), csr(0, 0x3b0, 12),
                    addi(12, 0, 0xf), csr(0, 0x3a0, 12), csr(0, 0x300, 2), ld(4, 11))
-        p.emit(store(3, 11, size=2) if name == 'atomic' else sd(3, 11), csr(0, 0x300, 0))
+        if split:
+            if floating:
+                p.emit(csr(14, 0x300, 0, True), alu(14, 14, 13, 5, immediate=True), alu(14, 14, 3, 7, immediate=True), csr(15, 1, 0, True))
+            else: p.emit(addi(6, 3, 0), addi(3, 0, -147))
+            p.emit(csr(0, 0x300, 2))
+            write = (store(0, 11, size=size) | 4) if floating else sd(3, 11)
+            p.required_memory.append((base + p.offset, write, name != 'misaligned_success'))
+        p.emit(store(3, 11, size=2) if name == 'atomic' else write if split else sd(3, 11))
+        if floating:
+            p.emit(csr(8, 0x300, 0, True), alu(8, 8, 13, 5, immediate=True), alu(8, 8, 3, 7, immediate=True),
+                   csr(9, 1, 0, True), 0x000040b7, csr(0, 0x300, 1))
+            p.address(12, 0x680)
+            p.emit(store(3, 12, 16, 2 if flen == 32 else 3) | 4, load(7, 12, 16, 2 if flen == 32 else 3, flen == 32))
+        else: p.emit(csr(0, 0x300, 0))
+        if split:
+            p.address(12, 0xfff if floating else 0xffd)
+            p.emit(load(6 if floating else 7, 12, size=0, unsigned=True))
+            p.address(12, 0x7000)
+            if name == 'misaligned_pmp': p.emit(csr(0, 0x3a0, 0))
+            p.emit(load(5 if floating else 8, 12, size=0, unsigned=True))
+            p.expected_registers = {6: 93 if read_fault else 0x554433221180f7e6, 7: 0x6d,
+                                    8: 0xff if name == 'misaligned_success' else 0x11, 23: 0 if name == 'misaligned_success' else 1 + read_fault}
+            if name != 'misaligned_success': p.expected_registers.update({20: 7 if name == 'misaligned_pmp' else 15, 21: 0x40001000, 22: p.required_memory[-1][0] + 4})
+            if floating:
+                value = 0x0123456789abcdef & ((1 << flen) - 1) if read_fault else (0x7766554433221180 & ((1 << (8 << size)) - 1)) | ((1 << flen) - (1 << (8 << size)))
+                p.expected_registers = {7: value, 8: 2, 9: 21, 14: 2 if read_fault else 3, 15: 21, 6: 0x6d, 5: 0x11 if read_fault else 0xff, **{k: v for k, v in p.expected_registers.items() if k >= 20}}
+                p.fragmented_floating, p.floating_memory = True, (3, 2) if read_fault else (5, 0)
+                p.data_cache = dict(minHits=1, addresses=(base + 0xfff,), minSplitHits=1, minSplitPhysicalReads=int(not read_fault), minSplitStores=1)
         if name == 'atomic': p.required_atomics = 11
-        yield 'sv39_' + name, p.finish()
+        yield (f'floating_sv39_{8 << size}_' + name if floating else 'sv39_' + name), p.finish()
+    if floating: return
     p = Program(base)
     root, middle, leaf, virtual = base + 0x1000, base + 0x2000, base + 0x3000, 0x40000000
     def word(physical, value):
@@ -981,6 +1057,42 @@ def floating_extension_cases(base, flen, config):
         p.emit(jal(0, 8), wrong, 0xe40083d3, csr(8, 3, 0, True))
         p.expected_registers = {7: 0x3c00, 8: 0, 23: 0}
         yield 'floating_half_cancel', p.finish()
+    if flen and config.get('enableMisaligned'):
+        for size in ([1] if config.get('enableZfhmin') else []) + [2] + ([3] if flen == 64 else []):
+            value = {1: 0x7c01, 2: 0x7f800001, 3: 0x7ff0000000000001}[size]
+            dump_size = 2 if flen == 32 else 3
+            for fault in (None, 'read', 'write'):
+                p = Program(base)
+                p.emit(0x000020b7, csr(0, 0x300, 1, True))
+                p.address(10, 0x3000); p.address(12, 0x2800)
+                p.memory.update((base + 0x3000 + byte, value >> (8 * byte) & 255) for byte in range(1 << size))
+                p.emit(load(0, 10, 0, size) | 4, csr(0, 1, 21, function=5))
+                p.required_memory, p.fragmented_floating = [], True
+                for address in ((0x30ff,) if fault else (0x103f, 0x1fff)):
+                    p.address(11, address)
+                    payload = value ^ (16 if address == 0x1fff else 0)
+                    p.memory.update((base + address + byte, 0x5a if fault else payload >> (8 * byte) & 255) for byte in range(1 << size))
+                    if fault: p.faults[fault] = base + 0x3100
+                    for warm in range(1 if fault else 2):
+                        if warm:
+                            p.address(13, address & ~7)
+                            p.emit(ld(5, 13), ld(5, 13, 8))
+                            instruction = store(0, 11, 0, size) | 4
+                            p.required_memory.append((base + p.offset, instruction, False)); p.emit(instruction)
+                        p.emit(0x00004fb7, csr(0, 0x300, 31))
+                        instruction = (store(0, 11, 0, size) if fault == 'write' else load(0, 11, 0, size)) | 4
+                        p.required_memory.append((base + p.offset, instruction, bool(fault))); p.emit(instruction)
+                        p.emit(csr(8, 0x300, 0, True), alu(8, 8, 13, 5, immediate=True), alu(8, 8, 3, 7, immediate=True),
+                               csr(9, 1, 0, True), store(0, 12, 0, dump_size) | 4, load(7, 12, 0, dump_size, flen == 32))
+                p.expected_registers = {7: (value if fault else payload) | ((1 << flen) - (1 << (8 << size))), 8: 2 if fault else 3, 9: 21, 23: int(bool(fault))}
+                if fault:
+                    p.expected_registers.update({20: 5 if fault == 'read' else 7, 21: base + 0x3100, 22: p.required_memory[-1][0] + 4})
+                    if fault == 'write':
+                        p.emit(load(6, 11, size=0, unsigned=True), load(5, 11, 1, 0, True))
+                        p.expected_registers.update({6: value & 255, 5: 0x5a})
+                else:
+                    p.data_cache = dict(minHits=2, addresses=(base + 0x103f, base + 0x1fff), minSplitHits=2, minSplitPhysicalReads=2, minSplitStores=2)
+                yield f'floating_misaligned_{8 << size}_{fault or "memory"}', p.finish()
 
 
 def scalar_cases(base, config):
@@ -1057,7 +1169,7 @@ def bitmanip_cases(base):
         yield 'bitmanip_' + extension.lower(), p.finish()
 
 
-def integer_cases(base):
+def integer_cases(base, misaligned=False):
     values = (0, 1, -1, 1 << 63, (1 << 63) - 1, 0x80000000, 0xffffffff, 0x80000001)
     for name in ('register', 'immediate', 'word', 'branch'):
         p = Program(base)
@@ -1147,6 +1259,37 @@ def integer_cases(base):
         p.address(10, offset)
         p.emit(load(3, 10, 1, 0), store(2, 10, 1, 0), load(4, 10, 0, 1), store(2, 10, 0, 1))
     yield 'narrow_memory', p.finish()
+    if misaligned:
+        for kind in ('memory', 'read', 'write'):
+            p = Program(base)
+            p.address(10, 0x1038)
+            p.emit(addi(2, 0, -147))
+            p.required_memory = []
+            for boundary in (0x1038, 0x1ff8):
+                p.address(10, boundary)
+                for size in (1, 2, 3):
+                    for offset in range(1, 8):
+                        for instruction in (store(2, 10, offset, size), load(3, 10, offset, size),
+                                            load(4, 10, offset, size, size < 3)):
+                            p.required_memory.append((base + p.offset, instruction, False))
+                            p.emit(instruction)
+            for address in (0x3fff, 0x4fff, 0x5001):
+                p.address(10, address)
+                p.emit(store(2, 10), ld(5, 10))
+            if kind != 'memory':
+                p.address(10, 0x203d)
+                p.faults[kind] = base + 0x2040
+                instruction = ld(5, 10) if kind == 'read' else sd(2, 10)
+                p.required_memory.append((base + p.offset, instruction, True))
+                p.emit(instruction, load(6, 10, size=0, unsigned=True))
+            yield 'misaligned_' + kind, p.finish()
+        p = Program(base)
+        p.emit(addi(2, 0, -1))
+        p.address(10, p.offset + 9)
+        instruction = store(2, 10, size=1)
+        p.required_memory = [(base + p.offset, instruction, False)]
+        p.emit(instruction)
+        yield 'misaligned_instruction', p.finish()
     for kind in ('read', 'write'):
         p = Program(base)
         p.address(10, 0x1002)

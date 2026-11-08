@@ -265,6 +265,16 @@ def integer_value(insn, a, b, config=None):
     return signed(value, 32) if word else value & MASK
 
 
+def fragment_ranges(address, size):
+    offset = 0
+    while offset < size:
+        length = 1
+        while 2 * length <= size - offset and (address + offset) % (2 * length) == 0:
+            length *= 2
+        yield offset, length
+        offset += length
+
+
 def pmp_allowed(configs, addresses, address, size, kind, pa, privilege=3):
     permission = {'fetch': 4, 'read': 1, 'write': 2, 'atomic': 3}[kind]
     if address < 0 or address + size > 1 << pa:
@@ -369,6 +379,7 @@ class Model:
         self.memory = dict(memory)
         self.faults = faults
         self.external_access = access
+        self.external_translation = None
         self.monitor = ExclusiveMonitor()
         self.local_reservation = None
         self.atomic_operation, self.sc_eligible = 0, False
@@ -450,6 +461,8 @@ class Model:
         if self.config.get('virtualAddressBits') != 39:
             return address
         privilege = (self.privilege if kind == 'fetch' else self.data_privilege()) if privilege is None else privilege
+        if kind != 'fetch' and self.external_translation is not None:
+            return self.external_translation(address, kind, privilege)
         def read_pte(physical):
             if not pmp_allowed([self.pmp_config(i) for i in range(self.config['pmpEntries'])],
                     [self.csrs[0x3b0 + i] for i in range(self.config['pmpEntries'])],
@@ -462,12 +475,18 @@ class Model:
             return sum(self.memory.get(physical + i, 0) << (8 * i) for i in range(8))
         return sv39_walk(address, kind, privilege, self.csrs[0x180], self.csrs[0x300], read_pte)
 
-    def access(self, address, size, kind, data=0):
+    def access(self, address, size, kind, data=0, fragment=False):
         virtual = address
         permission_kind = {2: 'read', 3: 'write'}.get(self.atomic_operation, 'atomic') if kind == 'atomic' else kind
         cause = {'fetch': 1, 'read': 5, 'write': 7, 'atomic': 7}[permission_kind]
         data &= (1 << (8 * size)) - 1
         if address % size:
+            if self.config.get('enableMisaligned') and kind in ('read', 'write'):
+                result = 0
+                for offset, length in fragment_ranges(address, size):
+                    result |= self.access((address + offset) & MASK, length, kind,
+                                          data >> (8 * offset), fragment=True) << (8 * offset)
+                return result
             raise Fault({'fetch': 0, 'read': 4, 'write': 6, 'atomic': 6}[permission_kind], address)
         try:
             address = self.translate(address, permission_kind)
@@ -475,6 +494,9 @@ class Model:
             if kind == 'fetch':
                 self.local_fetch_faults.add(self.order)
             raise
+        if fragment and not any(not r['device'] and int(r['base']) <= address and
+                                address + size <= int(r['base']) + int(r['size']) for r in self.config['memoryRegions']):
+            raise Fault(cause, virtual)
         self.last_physical_address = address
         if kind == 'atomic' and self.atomic_operation == 3:
             self.sc_eligible = self.reservation_candidate == (address, size)
@@ -683,14 +705,18 @@ class Model:
                 if not locked:
                     self.csrs[address] = value & ((1 << (self.config['physicalAddressBits'] - 2)) - 1)
 
-    def step(self):
+    def step(self, instruction=None):
         pc, insn, raw = self.pc, 0, 0
         length = 4
         fp_write, fp_value, fp_flags = False, 0, 0
         next_pc = (pc + length) & MASK
         rd, write, value, trap, cause, tval = 0, False, 0, False, 0, 0
         try:
-            if self.config.get('enableC'):
+            if instruction is not None:
+                raw = instruction
+                length = 2 if self.config.get('enableC') and raw & 3 != 3 else 4
+                insn = compressed_instruction(raw, self.config.get('floatingPointBits') == 64, self.config) if length == 2 else raw
+            elif self.config.get('enableC'):
                 first = self.access(pc, 2, 'fetch')
                 length = 4 if first & 3 == 3 else 2
                 raw = first | (self.access((pc + 2) & MASK, 2, 'fetch') << 16) if length == 4 else first

@@ -180,11 +180,12 @@ object DitDahA1Backend extends Generator[DitDahA1Parameter, DitDahA1Layers, DitD
     lsu.io.privilege := csr.io.dataPrivilege
     csr.io.readAddress := commitCsr.?(commitPacket.csrAddress, execute.io.csrAddress)
     // Completed data operations keep ownership until their architectural event.
-    val takeInterrupt = if parameter.enableInterrupts then
-      csr.io.interruptPending.get & !debugging & !stepping & !stopDispatch & !memoryPending &
-        (if concurrent then !extraValid & !(memoryValid & (memoryPacket.load | memoryPacket.store)) else true.B) &
-        !(commitValid & (commitPacket.load | commitPacket.store | commitPacket.instruction.fault))
+    val interruptEligible = if parameter.enableInterrupts then
+      csr.io.interruptPending.get & !debugging & !stepping & !stopDispatch
     else false.B
+    val takeInterrupt = interruptEligible & !memoryPending &
+      (if concurrent then !extraValid & !(memoryValid & (memoryPacket.load | memoryPacket.store)) else true.B) &
+      !(commitValid & (commitPacket.load | commitPacket.store | commitPacket.instruction.fault))
     val interruptCause = if parameter.enableInterrupts then csr.io.interruptCause.get else 0.U(64)
     commit.io.input.valid := (if parameter.enableInterrupts then commitValid & !takeInterrupt else commitValid)
     commit.io.input.bits :<= commitPacket
@@ -264,7 +265,8 @@ object DitDahA1Backend extends Generator[DitDahA1Parameter, DitDahA1Layers, DitD
       memoryPacket.load & !memoryPacket.store & !memoryPacket.atomic &
       resultPacket.load & !resultPacket.store & !resultPacket.atomic & !resultPacket.instruction.fault
     val resultAdvance = resultValid & ((!memoryValid | (memoryAdvance & !extraValid)) | append) &
-      (!memoryOperation | (lsu.io.input.valid & lsu.io.input.ready)) & !redirect
+      (!memoryOperation | (lsu.io.input.valid & lsu.io.input.ready)) & !redirect &
+      (if concurrent then !interruptEligible | !(resultPacket.load | resultPacket.store) else true.B)
     val floating = issuedPacket.decoded.floating.getOrElse(false.B)
     val arithmetic = issuedPacket.decoded.operation === DitDahA1Isa.Arithmetic.U(DitDahA1Isa.operationBits)
     val isMulDiv = parameter.enableM.B & arithmetic & !floating & !issuedPacket.decoded.instruction.fault
@@ -414,6 +416,7 @@ object DitDahA1Backend extends Generator[DitDahA1Parameter, DitDahA1Layers, DitD
       when(enterDebug) { io.redirectPc := debug.entryPc }
     }
     lsu.io.input.valid := resultValid & memoryOperation & !commitValid & !redirect &
+      (if concurrent then !interruptEligible else true.B) &
       (if concurrent then ((!memoryValid & !extraValid) | append) & !memoryFault else !memoryPending & !memoryValid)
     lsu.io.input.bits :<= resultPacket
     lsu.io.storeAllowed := (if concurrent then !memoryValid | memoryPending else !memoryValid) & !commitValid & !redirect & !memoryFault

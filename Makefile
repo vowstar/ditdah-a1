@@ -94,6 +94,7 @@ verify-zephyr-long:
 	for count in 1 2 16; do $(MAKE) verify-zephyr SOFTWARE_HARTS=$$count || exit $$?; done
 
 verify-signoff: verify-debug-core verify-jtag verify-debug-module verify-debug-system verify-platform-system verify-writeback verify-formal
+	$(MAKE) verify-misaligned
 	$(MAKE) verify-scalar-isa
 	$(MAKE) verify-compressed-isa
 	$(MAKE) verify-bitmanip-isa
@@ -107,6 +108,15 @@ verify-signoff: verify-debug-core verify-jtag verify-debug-module verify-debug-s
 	$(MAKE) verify-cache-configuration
 	$(MAKE) verify-shared-cache
 	$(MAKE) verify-translation-context SOFTWARE_CONFIG=$(SHARED_OUTPUT)/software/w3-h16/input.json
+
+.PHONY: verify-misaligned
+verify-misaligned:
+	python3 test/verify.py --no-m --no-a --width 64 --pmp-entries 0 --case narrow_memory --case narrow_bus_read --case narrow_bus_write --output result/misaligned/disabled
+	python3 test/verify.py --misaligned --user-mode --no-m --no-a --floating-point-bits 64 --scalar Zfhmin --width 64 --pmp-entries 0 --case floating_misaligned_16_memory --case floating_misaligned_32_memory --case floating_misaligned_64_memory --case floating_misaligned_16_read --case floating_misaligned_32_write --case floating_misaligned_64_write --output result/misaligned/floating
+	for cache in wt wb; do extra=; test "$$cache" != wb || extra=--dcache-writeback; python3 test/verify.py --misaligned --user-mode --floating-point-bits 64 --scalar Zfhmin --width 64 --pmp-entries 0 --issue-width 2 --load-queue-entries 2 --fabric-read-slots 2 --dcache-bytes 8192 --dcache-refill-bytes 64 $$extra --case floating_misaligned_16_memory --case floating_misaligned_32_memory --case floating_misaligned_64_memory --case floating_misaligned_16_read --case floating_misaligned_32_write --case floating_misaligned_64_write --output result/misaligned/$$cache || exit $$?; done
+	python3 test/verify.py --misaligned --sv39 --floating-point-bits 64 --scalar Zfhmin --width 64 --pmp-entries 16 --issue-width 3 --load-queue-entries 2 --fabric-read-slots 2 --icache-bytes 8192 --dcache-bytes 8192 --dcache-refill-bytes 64 --l2-cache-bytes 131072 --tlb-entries 4 --i-tlb-entries 4 --d-tlb-entries 2 --case sv39_misaligned_success --case sv39_misaligned_missing --case sv39_misaligned_accessed --case sv39_misaligned_dirty --case sv39_misaligned_readonly --case sv39_misaligned_pmp --case sv39_sum --case sv39_mxr --case sv39_context $(foreach width,16 32 64,$(foreach kind,success missing pmp,--case floating_sv39_$(width)_misaligned_$(kind))) --output result/misaligned/translated-floating
+	python3 test/verify.py --misaligned --interrupts --width 64 --pmp-entries 0 --load-queue-entries 2 --fabric-read-slots 2 --case misaligned_memory --case misaligned_read --case misaligned_write --case interrupt_read_pending --case interrupt_multiply --output result/misaligned/interrupt
+	python3 test/formal.py --rtl result/misaligned/interrupt/irq-axi64/rtl --output result/misaligned/formal --modules LsuFragments PipelineBackend InterruptBackend --jobs $(FORMAL_JOBS)
 
 .PHONY: verify-debug-core
 JTAG_OUTPUT ?= result/jtag-signoff
