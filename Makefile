@@ -23,7 +23,7 @@ ICACHE_CASES := pipeline_reuse pipeline_integer_stream pipeline_dependency_strea
 PIPELINE_CASES := memory_groups memory_group_alignment memory_group_bus_read memory_group_bus_write pipeline_recovery pipeline_recovery_fault
 USER_CASES := user_access user_system user_wait user_protection user_fetch user_mprv
 SUPERVISOR_CASES := supervisor_traps supervisor_csr supervisor_mprv
-TRANSLATION_CASES := sv39_data sv39_reuse sv39_protection sv39_large sv39_gigantic sv39_accessed sv39_dirty sv39_user_denied sv39_sum sv39_mxr sv39_canonical sv39_context
+TRANSLATION_CASES := sv39_data sv39_atomic exceptions narrow_memory atomic_denied lrsc_denied sv39_reuse sv39_protection sv39_large sv39_gigantic sv39_accessed sv39_dirty sv39_user_denied sv39_sum sv39_mxr sv39_canonical sv39_context
 SOFTWARE_HARTS ?= 2
 SOFTWARE_CONFIG ?= software/platform.json
 SOFTWARE_OUTPUT ?= result/software
@@ -95,6 +95,7 @@ verify-zephyr-long:
 
 verify-signoff: verify-debug-core verify-jtag verify-debug-module verify-debug-system verify-platform-system verify-writeback verify-formal
 	$(MAKE) verify-misaligned
+	$(MAKE) verify-memory-contracts
 	$(MAKE) verify-scalar-isa
 	$(MAKE) verify-compressed-isa
 	$(MAKE) verify-bitmanip-isa
@@ -109,12 +110,29 @@ verify-signoff: verify-debug-core verify-jtag verify-debug-module verify-debug-s
 	$(MAKE) verify-shared-cache
 	$(MAKE) verify-translation-context SOFTWARE_CONFIG=$(SHARED_OUTPUT)/software/w3-h16/input.json
 
+MEMORY_OUTPUT ?= result/memory-contracts
+CBO_CASES = cbo_clean cbo_inval cbo_flush cbo_clean_readonly cbo_inval_readonly cbo_flush_readonly cbo_clean_device cbo_inval_device cbo_flush_device cbo_clean_denied cbo_inval_denied cbo_flush_denied cbo_zero
+WRS_CASES = wrs_nto_valid wrs_sto_valid wrs_nto_cleared wrs_sto_cleared wrs_nto_u_tw1_valid wrs_nto_s_tw1_valid wrs_nto_mprv wrs_sto_mprv
+.PHONY: verify-memory-contracts
+verify-memory-contracts:
+	python3 test/verify.py --multicore-only --harts 2 --no-m --no-a --width 128 --pmp-entries 0 --issue-width 3 --load-queue-entries 2 --fabric-read-slots 4 --case store_buffering --case store_buffering_fence --output $(MEMORY_OUTPUT)/ordering
+	python3 test/verify.py --multicore-only --harts 2 --no-m --no-a --width 128 --pmp-entries 0 --issue-width 3 --load-queue-entries 2 --fabric-read-slots 4 --icache-bytes 8192 --burst-refill --dcache-bytes 8192 --dcache-ways 2 --dcache-refill-bytes 64 --dcache-writeback --l2-cache-bytes 131072 --case store_buffering --case store_buffering_fence --output $(MEMORY_OUTPUT)/ordering-writeback
+	python3 test/verify.py --no-m --no-a --width 64 --pmp-entries 0 --case cbo_disabled --case wrs_nto_none --case wrs_sto_none --output $(MEMORY_OUTPUT)/disabled
+	python3 test/verify.py --no-m --no-a --scalar Zicboz --width 64 --pmp-entries 0 --case cbo_zero --case cbo_clean --output $(MEMORY_OUTPUT)/zero
+	python3 test/verify.py --no-m --no-a --scalar Zicbom --width 64 --pmp-entries 0 $(foreach name,$(CBO_CASES),--case $(name)) --output $(MEMORY_OUTPUT)/management
+	python3 test/verify.py --no-m --scalar Zawrs --supervisor-mode --width 64 --pmp-entries 0 $(foreach name,$(WRS_CASES),--case $(name)) --output $(MEMORY_OUTPUT)/wait
+	for profile in single supervisor; do python3 test/debug.py --profile $$profile --zawrs --case wrs_nto --case wrs_sto --case step_wrs_nto --case step_wrs_sto --output $(MEMORY_OUTPUT)/debug-$$profile || exit $$?; done
+	python3 test/verify.py --software-memory-matrix --config $(SOFTWARE_CONFIG) --output $(MEMORY_OUTPUT)/software --jobs $(SOFTWARE_JOBS)
+	python3 scripts/build_software.py --config $(MEMORY_OUTPUT)/software/sv39-h2/input.json --isa rv64ia --scalar Zawrs --program software/tests/reservation.S --stack-bytes 512 --console-base 0x10000000 --output $(MEMORY_OUTPUT)/reservation/software
+	python3 test/verify.py --elf $(MEMORY_OUTPUT)/reservation/software/software.elf --config $(MEMORY_OUTPUT)/software/sv39-h2/input.json --software-transactions 8192 --output $(MEMORY_OUTPUT)/reservation/verification --jobs $(SOFTWARE_JOBS)
+
 .PHONY: verify-misaligned
 verify-misaligned:
 	python3 test/verify.py --no-m --no-a --width 64 --pmp-entries 0 --case narrow_memory --case narrow_bus_read --case narrow_bus_write --output result/misaligned/disabled
 	python3 test/verify.py --misaligned --user-mode --no-m --no-a --floating-point-bits 64 --scalar Zfhmin --width 64 --pmp-entries 0 --case floating_misaligned_16_memory --case floating_misaligned_32_memory --case floating_misaligned_64_memory --case floating_misaligned_16_read --case floating_misaligned_32_write --case floating_misaligned_64_write --output result/misaligned/floating
 	for cache in wt wb; do extra=; test "$$cache" != wb || extra=--dcache-writeback; python3 test/verify.py --misaligned --user-mode --floating-point-bits 64 --scalar Zfhmin --width 64 --pmp-entries 0 --issue-width 2 --load-queue-entries 2 --fabric-read-slots 2 --dcache-bytes 8192 --dcache-refill-bytes 64 $$extra --case floating_misaligned_16_memory --case floating_misaligned_32_memory --case floating_misaligned_64_memory --case floating_misaligned_16_read --case floating_misaligned_32_write --case floating_misaligned_64_write --output result/misaligned/$$cache || exit $$?; done
 	python3 test/verify.py --misaligned --sv39 --floating-point-bits 64 --scalar Zfhmin --width 64 --pmp-entries 16 --issue-width 3 --load-queue-entries 2 --fabric-read-slots 2 --icache-bytes 8192 --dcache-bytes 8192 --dcache-refill-bytes 64 --l2-cache-bytes 131072 --tlb-entries 4 --i-tlb-entries 4 --d-tlb-entries 2 --case sv39_misaligned_success --case sv39_misaligned_missing --case sv39_misaligned_accessed --case sv39_misaligned_dirty --case sv39_misaligned_readonly --case sv39_misaligned_pmp --case sv39_sum --case sv39_mxr --case sv39_context $(foreach width,16 32 64,$(foreach kind,success missing pmp,--case floating_sv39_$(width)_misaligned_$(kind))) --output result/misaligned/translated-floating
+	python3 test/formal.py --rtl result/misaligned/translated-floating/irq-pmp16-axi64/rtl --output result/misaligned/translation-formal --modules TranslationCore --jobs $(FORMAL_JOBS)
 	python3 test/verify.py --misaligned --interrupts --width 64 --pmp-entries 0 --load-queue-entries 2 --fabric-read-slots 2 --case misaligned_memory --case misaligned_read --case misaligned_write --case interrupt_read_pending --case interrupt_multiply --output result/misaligned/interrupt
 	python3 test/formal.py --rtl result/misaligned/interrupt/irq-axi64/rtl --output result/misaligned/formal --modules LsuFragments PipelineBackend InterruptBackend --jobs $(FORMAL_JOBS)
 
@@ -140,6 +158,7 @@ verify-platform-system:
 		python3 test/formal.py --rtl $(PLATFORM_OUTPUT)/h$$count/rtl --output $(PLATFORM_OUTPUT)/h$$count/formal --modules PlatformMemory || exit $$?; \
 	done
 	python3 test/platform_system.py --rtl $(PLATFORM_OUTPUT)/h1/rtl --output $(PLATFORM_OUTPUT)/atomic-negative --mutation exclusive-read --openocd $(OPENOCD) --gdb $(RISCV_GDB)
+	python3 test/platform_system.py --virtual-memory --output $(PLATFORM_OUTPUT)/virtual --openocd $(OPENOCD) --gdb $(RISCV_GDB)
 .PHONY: verify-debug-system
 verify-debug-system:
 	for profile in $(DEBUG_SYSTEM_PROFILES); do \
@@ -233,6 +252,8 @@ verify-memory-concurrency:
 		python3 test/verify.py --multicore-only --harts $$count --width 128 --pmp-entries 0 --load-queue-entries 2 --fabric-read-slots $$slots --dcache-bytes 8192 --output result/dual-load --case load_window --case load_cancel || exit $$?; \
 	done
 	python3 test/formal.py --rtl result/dual-load/harts1-axi128/rtl --output result/formal/dual-load --modules LsuReads ReadQueue PipelineBackend
+	python3 test/verify.py --sv39 --width 64 --pmp-entries 0 --load-queue-entries 2 --fabric-read-slots 2 --case sv39_atomic --output result/dual-load-atomic
+	python3 test/formal.py --rtl result/dual-load-atomic/irq-axi64/rtl --output result/formal/dual-load-atomic --modules PipelineBackend --jobs $(FORMAL_JOBS)
 	python3 test/verify.py --multicore-only --harts 1 --width 256 --issue-width 2 --pmp-entries 0 --load-queue-entries 2 --fabric-read-slots 2 --dcache-bytes 8192 --dcache-refill-bytes 64 --output result/dual-load-line --case load_window --case load_cancel
 	python3 test/verify.py --multicore-only --interrupts --harts 2 --width 64 --issue-width 2 --load-queue-entries 2 --pmp-entries 0 --dcache-bytes 8192 --dcache-writeback --output result/dual-load-writeback --case data_coherence --case synchronization --case atomic_interrupt --case cache_reservation --case interrupt
 	python3 test/verify.py --user-mode --interrupts --width 512 --issue-width 3 --load-queue-entries 2 --fabric-read-slots 3 --pmp-entries 16 --icache-bytes 8192 --burst-refill --dcache-bytes 8192 --dcache-refill-bytes 64 --dcache-writeback --output result/dual-load-protection --case user_mprv --case pmp_update --case pmp_permissions --case interrupt_read_pending --case synchronization --case fence_i_prefetch --case fence_ordering
@@ -241,6 +262,7 @@ verify-memory-concurrency:
 	$(MAKE) verify-translation-software SOFTWARE_CONFIG=$(SOFTWARE_OUTPUT)/dual-load/w3-h16/input.json SOFTWARE_TLB_ENTRIES=4 SOFTWARE_CACHE_SIZES=8192 SOFTWARE_BURST_REFILL=--burst-refill TRANSLATION_SOFTWARE_DIR=dual-load-translation
 
 verify-writeback:
+	python3 test/verify.py $(SHARED_ARGS) --multicore-only --harts 2 --width 64 --issue-width 2 --case atomic_lrsc_neighbor --output result/writeback-neighbor
 	for profile in 2:64:1:8 2:128:2:64 16:512:3:64; do \
 		count=$${profile%%:*}; rest=$${profile#*:}; bus=$${rest%%:*}; rest=$${rest#*:}; width=$${rest%%:*}; span=$${rest#*:}; \
 		python3 test/verify.py --multicore-only --harts $$count --width $$bus --issue-width $$width --pmp-entries 16 --icache-bytes 8192 --burst-refill --dcache-bytes 8192 --dcache-refill-bytes $$span --dcache-writeback --output result/writeback-harts$$count-axi$$bus --case data_coherence --case synchronization --case cache_reservation --case atomic_lrsc_shared --case atomic_interrupt || exit $$?; \
@@ -438,7 +460,7 @@ verify-translation-software:
 	for count in 1 2 16; do for cache in $(SOFTWARE_CACHE_SIZES); do \
 		image=$(SOFTWARE_OUTPUT)/$(TRANSLATION_SOFTWARE_DIR)/harts$$count-cache$$cache; \
 		python3 scripts/build_software.py --config $(SOFTWARE_CONFIG) --sv39 --tlb-entries $(SOFTWARE_TLB_ENTRIES) $(SOFTWARE_TRANSLATION_ARGS) $(SOFTWARE_BURST_REFILL) --expected-interrupt 3 --harts $$count --icache-bytes $$cache --dcache-bytes $$cache --console-base 0x10000000 --program software/tests/virtual_memory.S --stack-bytes 512 --output $$image && \
-		python3 test/verify.py --elf $$image/software.elf --config $$image/input.json --output $$image/verification --software-transactions $$((4096 * count)) --jobs $(SOFTWARE_JOBS) || exit $$?; \
+		python3 test/verify.py --elf $$image/software.elf --config $$image/input.json --output $$image/verification --software-transactions $$(((count == 16 ? 8192 : 4096) * count)) --jobs $(SOFTWARE_JOBS) || exit $$?; \
 	done; done
 
 verify-translation: verify-supervisor-formal
@@ -496,6 +518,7 @@ verify-scalar-isa:
 	python3 test/verify.py --no-m --no-a --issue-width 2 --width 64 --pmp-entries 0 $(foreach name,$(SCALAR_CASES) scalar_zicond_disabled scalar_zimop_disabled scalar_zcb_disabled scalar_zcmop_disabled scalar_zihintpause scalar_zihintntl,--case $(name)) --output $(SCALAR_OUTPUT)/disabled
 	python3 test/formal.py --rtl $(SCALAR_OUTPUT)/disabled/axi64/rtl --output $(SCALAR_OUTPUT)/disabled-formal --modules IntegerDecode RvfiExecute Memory --jobs 2
 	python3 test/verify.py $(SCALAR_CACHE) --issue-width 3 --load-queue-entries 2 --fabric-read-slots 4 --multicore-only --harts 2 --width 64 --pmp-entries 0 --case atomic_lrsc_shared_word --case atomic_lrsc_private_word --case atomic_lrsc_shared --case atomic_lrsc_private --case atomic --output $(SCALAR_OUTPUT)/coherent
+	python3 test/verify.py $(SCALAR_CACHE) --issue-width 3 --load-queue-entries 2 --fabric-read-slots 2 --multicore-only --harts 2 --width 64 --pmp-entries 0 --burst-refill --dcache-ways 2 --dcache-refill-bytes 64 --case atomic_lrsc_collision --output $(SCALAR_OUTPUT)/reservation-collision
 	python3 test/verify.py $(SCALAR_CACHE) --sv39 --issue-width 2 --load-queue-entries 2 --width 512 --pmp-entries 16 --tlb-entries 4 --i-tlb-entries 4 --d-tlb-entries 4 --asid-bits 4 --case sv39_atomic --case sv39_protection --output $(SCALAR_OUTPUT)/translated
 	for count in 1 2 16; do \
 		python3 scripts/build_software.py --config $(SOFTWARE_CONFIG) --isa rv64ima --program software/tests/atomic.c --harts $$count --issue-width $$((count < 3 ? count : 3)) --icache-bytes 8192 --dcache-bytes 8192 --stack-bytes 512 --console-base 0x10000000 --output $(SCALAR_OUTPUT)/software/harts$$count || exit $$?; \

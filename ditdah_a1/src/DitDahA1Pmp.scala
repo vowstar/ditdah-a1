@@ -14,8 +14,10 @@ class DitDahA1PmpIO(parameter: DitDahA1Parameter) extends HWBundle(parameter):
   val write = Flipped(Bool())
   val fetch = Flipped(Bool())
   val atomic = Flipped(Bool())
+  val management = Option.when(parameter.enableZicbom)(Flipped(Bool()))
   val privilege = Flipped(UInt(2))
   val allowed = Aligned(Bool())
+  val permissions = Option.when(parameter.enableZicboz || parameter.enableZicbom)(Aligned(UInt(3)))
 
 @generator
 object DitDahA1Pmp extends Generator[DitDahA1Parameter, DitDahA1UnitLayers, DitDahA1PmpIO, DitDahA1UnitProbe]:
@@ -37,6 +39,7 @@ object DitDahA1Pmp extends Generator[DitDahA1Parameter, DitDahA1UnitLayers, DitD
     }
     val points = addresses.map(encoded => (encoded.asBits.bits(61, 0) ## 0.B(2)).asUInt)
     val allowed = Wire(Bool())
+    io.permissions.foreach(_ := 7.U(3))
     val machine = if parameter.enableUserMode then io.privilege === 3.U(2) else true.B
     allowed := machine
     for index <- (0 until parameter.pmpEntries).reverse do
@@ -59,9 +62,11 @@ object DitDahA1Pmp extends Generator[DitDahA1Parameter, DitDahA1UnitLayers, DitD
         base := napotBase
         limit := (napotBase + mask + 1.U(65)).asBits.bits(64, 0).asUInt
       }
-      val permission = io.atomic.?(config.bit(0) & config.bit(1), io.fetch.?(config.bit(2), io.write.?(config.bit(1), config.bit(0))))
+      val permission = io.management.getOrElse(false.B).?(config.bit(0) | config.bit(1),
+        io.atomic.?(config.bit(0) & config.bit(1), io.fetch.?(config.bit(2), io.write.?(config.bit(1), config.bit(0)))))
       when((mode =/= 0.U(2)) & (limit > base) & (start < limit) & (end > base)) {
         allowed := (start >= base) & (end <= limit) & ((machine & !config.bit(7)) | permission)
+        io.permissions.foreach(_ := config.bits(2, 0).asUInt)
       }
     val fetchSize = fetchSizes.map(size => io.size === size.U(3)).reduceOption(_ | _).getOrElse(false.B)
     val dataLine = if parameter.enableDataBurstRefill then !io.fetch & !io.write & !io.atomic & (io.size === 6.U(3)) else false.B

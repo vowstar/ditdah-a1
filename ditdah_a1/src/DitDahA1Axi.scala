@@ -10,6 +10,7 @@ import java.lang.foreign.Arena
 import org.llvm.mlir.scalalib.capi.ir.{Block, Context}
 
 class DitDahA1AxiIO(parameter: DitDahA1Parameter) extends HWBundle(parameter):
+  val writeEvent = Option.when(parameter.enableA)(Aligned(new MemoryWriteEvent))
   val clock = Flipped(Clock())
   val reset = Flipped(Reset())
   val hartId = Flipped(UInt(4))
@@ -144,6 +145,8 @@ object DitDahA1Axi extends Generator[DitDahA1Parameter, DitDahA1UnitLayers, DitD
       beat.foreach(_ := 0.U(3))
       state := 1.U(3)
       when(inputSc & !io.memory.request.bits.scEligible) { data := 1.U(64); state := 4.U(3) }
+      if parameter.enableZicbom then
+        when(io.memory.request.bits.cacheOperation === 3.U(2)) { fault := true.B; state := 4.U(3) }
     }
     when(ar.valid & ar.ready) { state := 2.U(3) }
     when(aw.valid & aw.ready) { awDone := true.B }
@@ -172,6 +175,12 @@ object DitDahA1Axi extends Generator[DitDahA1Parameter, DitDahA1UnitLayers, DitD
           data := 0.U(64)
           when(r.bits.last) { state := 4.U(3) }
         }
+    }
+    io.writeEvent.foreach { event =>
+      event.valid := b.valid & b.ready & request.write & (b.bits.id === hartId) &
+        (b.bits.resp === request.atomic.?(1.U(2), 0.U(2))) & (request.mask =/= 0.U(8))
+      event.address := (request.address.asBits.bits(63, 3) ## 0.B(3)).asUInt
+      event.mask := (request.mask << request.address.asBits.bits(2, 0).asUInt).asBits.bits(7, 0).asUInt
     }
     when(b.valid & b.ready) {
       when(amo & (b.bits.resp === 0.U(2)) & (b.bits.id === hartId)) {

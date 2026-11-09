@@ -13,6 +13,7 @@ import struct
 import subprocess
 
 from formal import instance_ports
+from contracts import verify as verify_contracts
 from programs import Program, addi, alu, amo, beq, csr, ld, muldiv, sd
 from verify import compile_tb, compare, configuration, run
 
@@ -20,6 +21,8 @@ from verify import compile_tb, compare, configuration, run
 def program(name):
     p = Program(0)
     steps, trigger = 0, 0
+    if name in ('step_wrs_nto', 'step_wrs_sto'):
+        steps = 7
     if name in ('step', 'step_compressed', 'step_fault', 'step_wfi', 'step_user', 'step_supervisor', 'step_interrupt'):
         steps = 7 if name == 'step_compressed' else 6 if name == 'step' else 3 if name in ('step_user', 'step_supervisor') else 4
     p.emit(addi(4, 0, 9), addi(5, 0, 3), addi(6, 0, 5))
@@ -35,6 +38,11 @@ def program(name):
     elif name == 'step_wfi':
         p.offset = 12
         p.emit(0x10500073)
+    elif name in ('wrs_nto', 'wrs_sto', 'step_wrs_nto', 'step_wrs_sto'):
+        p.address(10, 0x200)
+        p.emit(amo(2, 7, 10), 0x00d00073 if name.endswith('nto') else 0x01d00073)
+        p.memory[0x200] = 9
+        trigger = 0 if steps else 8
     elif name in ('store', 'atomic', 'load'):
         p.address(10, 0x200)
         p.emit(sd(4, 10))
@@ -152,6 +160,8 @@ def check(name, log, steps, trigger):
         assert values[0x200] == 12 and values[0x228] == 9
     if name == 'load':
         assert values[0x228] == 9
+    if 'wrs_' in name:
+        assert values[0x228] == 9 and sum(record[2] in (0x00d00073, 0x01d00073) for record in traces) == 1
     if name == 'exception':
         assert values[0x3030] == 1
         assert values[0x3130] == values[0x3138] == 0
@@ -209,6 +219,7 @@ def main():
     parser.add_argument('--case', action='append', dest='selected')
     parser.add_argument('--mutations', action='store_true')
     parser.add_argument('--quiet-only', action='store_true')
+    parser.add_argument('--zawrs', action='store_true')
     args = parser.parse_args()
     inputs = [Path(__file__), Path('test/debug_driver.svh'), Path('test/memory_tb.sv'), Path('test/memory_port.svh'), Path('test/verify.py'),
               Path('test/programs.py'), Path('test/formal.py'), Path('test/contracts.py'), Path('test/core_tb.sv'), Path('test/model.py')]
@@ -222,6 +233,8 @@ def main():
                       issueWidth=3 if wide else 1, loadQueueEntries=2 if wide else 1,
                       enableSupervisorMode=args.profile == 'supervisor',
                       floatingPointBits=64 if args.profile == 'floating' else 0)
+        if args.zawrs:
+            config['enableZawrs'] = True
         args.config = output / 'input.json'
         args.config.write_text(json.dumps(config, indent=2) + '\n')
     rtl = output / 'rtl'
@@ -232,6 +245,7 @@ def main():
              '--output', output / 'memory'], output / 'memory-build.log')
     manifest = json.loads((rtl / 'ditdah_a1_config.json').read_text())
     config = manifest['parameters']
+    assert not args.zawrs or config.get('enableZawrs'), 'Reservation waits are disabled in the selected configuration'
     expected = json.loads(args.config.read_text())
     for key, value in expected.items():
         if key == 'memoryRegions':
@@ -241,6 +255,8 @@ def main():
             assert config[key] == value, ('Stale configuration', key)
     assert manifest['top'] == 'DitDahA1Core' and config['enableJtag'] and int(config['resetVector']) == 0
     assert all(hashlib.sha256(Path(p).read_bytes()).hexdigest() == h for p, h in manifest['sourceHashes'].items()), 'Stale RTL'
+    if config.get('enableZawrs'):
+        verify_contracts(rtl, output / 'contracts', ['DitDahA1Backend'])
     binary = compile_tb(rtl, output, config['axiDataBits'], config['physicalAddressBits'], 'memory_tb',
                         Path('test/memory_tb.sv').resolve(), [(output / 'memory/DitDahA1Memory.sv').resolve()])
     names = ['step', 'step_multiply', 'step_fault', 'step_wfi', 'breakpoint', 'priority', 'store', 'atomic', 'load', 'divide', 'exception', 'illegal_dret', 'illegal_dpc']
@@ -254,6 +270,8 @@ def main():
         names.append('step_supervisor')
     if config['floatingPointBits'] == 64:
         names.append('floating')
+    if config.get('enableZawrs'):
+        names.extend(('wrs_nto', 'wrs_sto', 'step_wrs_nto', 'step_wrs_sto'))
     reports = []
     for name in [] if args.quiet_only else args.selected or names:
         p, steps, trigger = program(name)

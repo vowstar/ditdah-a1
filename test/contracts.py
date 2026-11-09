@@ -10,8 +10,20 @@ import random
 import subprocess
 
 from floating import FLOATING_ENCODINGS, FLOATING_FEATURES, floating_decode, floating_value
-from programs import addi, alu, amo, beq, csr, sd, mul, muldiv, ld, lw, sw, load, store, fence
+from programs import addi, alu, amo, beq, jal, csr, sd, mul, muldiv, ld, lw, sw, load, store, fence
 from model import BITMANIP_ENCODINGS, SCALAR_ENCODINGS, ATOMIC_OPERATIONS, Fault, LocalInterrupts, Model, MASK, atomic_value, compressed_instruction, is_mop, muldiv_value, pmp_allowed, signed, sv39_walk
+
+
+def atomic_translation_entries(parameters):
+    return int(parameters.get('enableA', True) and parameters.get('virtualAddressBits') == 39 and not parameters.get('dTlbEntries'))
+
+
+def translation_banks(parameters):
+    banks = [(prefix, valid, position, parameters[key], owner) for prefix, valid, position, key, owner in
+             (('tlb', 'tlbValid', 'replacement', 'tlbEntries', None),
+              ('instructionTlb', 'instructionValid', 'instructionReplacement', 'iTlbEntries', 0),
+              ('dataTlb', 'dataValid', 'dataReplacement', 'dTlbEntries', 1)) if parameters.get(key)]
+    return banks + ([('atomicTlb', 'atomicValid', None, 1, 1)] if atomic_translation_entries(parameters) else [])
 
 
 def backend_control_signals(source):
@@ -69,6 +81,13 @@ def verify_storage(rtl, directory):
             depth = way_size // (64 if name == 'dataTags' else 8)
             assert len(re.findall(rf'^\s*\w+_{depth}x{width}\s+{name}_ext(?:_\d+)?\s*\(', cache, re.M)) == expected_count, 'Physical cache way count'
     modules = {Path(file).stem: (rtl / file).read_text() for file in files if file.endswith('.sv')}
+    translation = modules.get('DitDahA1Translation', '')
+    atomic_entries = atomic_translation_entries(manifest['parameters']) if translation else 0
+    assert manifest['implementation']['atomicTranslationEntries'] == atomic_entries, 'Atomic translation metadata'
+    for name, width in (('atomicValid', 1), ('atomicTlb_0_vpn', 27), ('atomicTlb_0_pte', 64), ('atomicTlb_0_level', 2)):
+        shape = r'\s+' if width == 1 else rf'\s+\[{width-1}:0\]\s+'
+        assert len(re.findall(r'\breg' + shape + name + r'\s*;', translation)) == (atomic_entries if translation else 0), 'Atomic translation state geometry'
+    assert not re.search(r'\batomicReplacement\b', translation), 'Single translation context has no replacement state'
     instances = {}
 
     def visit(name, ancestors=()):
@@ -370,13 +389,108 @@ TRANSLATE
         body = body.replace('      storeAllowed = 1;', f"      pmp_config='h1f; pmp_address='h{(1 << (parameters['physicalAddressBits']-2))-1:x};\n      storeAllowed = 1;")
     translation = r"""                translation_response_bits_fault=failure==4 && fragments==1; translation_response_bits_cause=writing ? 15 : 13;
                 while (!translation_request_valid) begin check(!memory_request_valid && !output_valid,"Child translation precedes demand"); tick(); end
-                check(translation_request_bits_address==address+progress && translation_request_bits_write==writing,"Each child uses its own virtual address");
+                check(translation_request_bits_address==address+progress && translation_request_bits_write==writing && !translation_request_bits_atomic,"Each child uses its own virtual address");
                 translation_request_ready=1; tick(); translation_request_ready=0;
                 translation_response_bits_address=address+progress+PA_OFFSET;
                 translation_response_valid=1; while (!translation_response_ready) tick(); tick(); translation_response_valid=0;
                 if (translation_response_bits_fault) begin failed=1; fault_cause=writing ? 15 : 13; end"""
     ram = next(r for r in parameters['memoryRegions'] if r['readable'] and r['writable'] and not r['device'])
     return body.replace('TRANSLATE', translation if translated else '').replace('PA_OFFSET', "((address+progress<RAM_BASE+'h1000) ? 'h1000 : 'h2000)" if translated else '0').replace('RAM_BASE', f"64'h{int(ram['base']):x}")
+
+
+def cache_zero_lsu_contract(parameters):
+    translated = parameters.get('virtualAddressBits') == 39
+    ram = next(r for r in parameters['memoryRegions'] if r['readable'] and r['writable'] and not r['device'])
+    body = '''    reset = 1; tick(); reset = 0; tick();
+    storeAllowed = 1; input_bits_store = 1; input_bits_load = 0; input_bits_atomic = 0;
+    input_bits_memorySize = 3; input_bits_storeData = 0; input_bits_rdWrite = 0;
+    input_bits_instruction_instruction = 'h0044200f; input_bits_instruction_pc = 'h120;
+    input_bits_instruction_tag = 81; input_bits_instruction_fault = 0;
+'''
+    if parameters['pmpEntries']:
+        physical = int(ram['base']) + 0x1000 + (4096 if translated else 0)
+        width = parameters['physicalAddressBits'] - 2
+        entries = ((physical + 32) >> 2) | ((physical + 64) >> 2) << width
+        body += f"    privilege = 0; pmp_config = 'h0b0b; pmp_address = 'h{entries:x};\n"
+    body += '''    begin
+      reg [63:0] address;
+      integer displacement, failure, word, tag;
+      for (displacement = 0; displacement < 64; displacement++)
+      for (failure = -1; failure < 8; failure++) begin
+        address = RAM_BASE + 'h1000 + displacement;
+        input_bits_address = address; input_valid = 1;
+        #1; while (!input_ready) tick(); tick(); input_valid = 0;
+TRANSLATE
+        for (word = 0; word < (failure < 0 ? 8 : failure + 1); word++) begin
+          while (!memory_request_valid) begin check(!output_valid, "Zero waits for authorization"); tick(); end
+          tag = memory_request_bits_tag;
+          repeat (3) begin
+            check(memory_request_valid && memory_request_bits_address == RAM_BASE + 'h1000 + PA_OFFSET + 8*word &&
+              memory_request_bits_tag == tag && memory_request_bits_size == 3 && memory_request_bits_mask == 255 &&
+              memory_request_bits_write && !memory_request_bits_atomic && !memory_request_bits_fetch &&
+              memory_request_bits_cacheOperation == 0 && memory_request_bits_data == 0,
+              "Zero emits eight stable ordinary stores within its block"); tick();
+          end
+          memory_request_ready = 1; tick(); memory_request_ready = 0;
+          repeat (2) begin check(!output_valid, "Zero retains its parent until completion"); tick(); end
+          memory_response_bits_tag = tag; memory_response_bits_fault = word == failure;
+          memory_response_bits_last = 1; memory_response_valid = 1;
+          while (!memory_response_ready) tick(); tick(); memory_response_valid = 0;
+        end
+        while (!output_valid) tick();
+        repeat (3) begin
+          check(output_valid && output_bits_instruction_fault == (failure >= 0) &&
+            (failure < 0 || (output_bits_instruction_cause == 7 && output_bits_instruction_tval == address)) &&
+            output_bits_address == address && output_bits_instruction_tag == 81 && !output_bits_rdWrite &&
+            !memory_request_valid, "Zero retires once with its original fault address"); tick();
+        end
+        output_ready = 1; tick(); output_ready = 0; memory_response_bits_fault = 0; tick();
+        check(!output_valid && !memory_request_valid, "Zero releases its parent");
+      end
+    end
+'''
+    translation = '''        while (!translation_request_valid) begin check(!memory_request_valid, "Zero translates before writing"); tick(); end
+        check(translation_request_bits_address == address && translation_request_bits_write && !translation_request_bits_atomic,
+          "Zero translates its original effective address");
+        translation_request_ready = 1; tick(); translation_request_ready = 0;
+        translation_response_bits_address = address + PA_OFFSET;
+        translation_response_bits_fault = 0; translation_response_valid = 1;
+        while (!translation_response_ready) tick(); tick(); translation_response_valid = 0;
+'''
+    if translated:
+        body = body.replace('          tag = memory_request_bits_tag;',
+            '          check(!translation_request_valid, "Zero reuses its block translation");\n          tag = memory_request_bits_tag;')
+    def rejected(address, physical, setup):
+        result = f'''    reset = 1; tick(); reset = 0; tick(); {setup}
+    input_bits_address = 64'h{address:x}; input_valid = 1;
+    #1; while (!input_ready) tick(); tick(); input_valid = 0;
+'''
+        if translated:
+            result += f'''    while (!translation_request_valid) begin check(!memory_request_valid, "Rejected zero has no writes"); tick(); end
+    translation_request_ready = 1; tick(); translation_request_ready = 0;
+    translation_response_bits_address = 64'h{physical:x}; translation_response_valid = 1;
+    while (!translation_response_ready) tick(); tick(); translation_response_valid = 0;
+'''
+        return result + f'''    while (!output_valid) begin check(!memory_request_valid, "Entire zero block is checked before writing"); tick(); end
+    check(!memory_request_valid && output_bits_instruction_fault && output_bits_instruction_cause == 7 &&
+      output_bits_instruction_tval == 64'h{address:x}, "Rejected zero preserves its original address without effects");
+    output_ready = 1; tick(); output_ready = 0;
+'''
+    if parameters['pmpEntries'] and parameters.get('enableUserMode'):
+        address = int(ram['base']) + 0x101f
+        physical = (address & -64) + (4096 if translated else 0)
+        width = parameters['physicalAddressBits'] - 2
+        entries = ((physical + 32) >> 2) | ((physical + 64) >> 2) << width
+        for control in (0x0909, 0x090b, 0x0f0b):
+            body += rejected(address, address + (4096 if translated else 0),
+                f"privilege = 0; pmp_config = 'h{control:x}; pmp_address = 'h{entries:x};")
+    device = next((r for r in parameters['memoryRegions'] if r['device'] and int(r['size']) >= 64), None)
+    if device:
+        setup = 'privilege = 3;'
+        if parameters['pmpEntries']:
+            setup += f" pmp_config = 'h1f; pmp_address = 'h{(1 << (parameters['physicalAddressBits'] - 2)) - 1:x};"
+        body += rejected(int(device['base']) + 7, int(device['base']) + 7, setup)
+    return body.replace('TRANSLATE', translation if translated else '').replace('RAM_BASE', str(int(ram['base']))).replace('PA_OFFSET', '4096' if translated else '0')
 
 
 def lsu_queue_contract(parameters):
@@ -397,7 +511,7 @@ def lsu_queue_contract(parameters):
             body += '    memory_response_valid = 0;\n'
         if translated:
             body += f'''    while (!translation_request_valid) tick();
-    check(translation_request_bits_address == 'h{address:x}, "Translation retains its input owner");
+    check(translation_request_bits_address == 'h{address:x} && translation_request_bits_atomic == {int(operation is not None)}, "Translation retains its input owner");
     translation_request_ready = 1; tick(); translation_request_ready = 0;
     translation_response_bits_address = 'h{address if physical is None else physical:x}; translation_response_valid = 1;
     while (!translation_response_ready) tick(); tick(); translation_response_valid = 0;
@@ -405,9 +519,11 @@ def lsu_queue_contract(parameters):
         return body
 
     def issue(index, address, write=False):
+        reservation = (f'    if (memory_request_bits_atomic && memory_request_bits_atomicOperation == 2) begin check(reservation_address == 64\'h{address & ~7:x} && reservation_mask == 8\'hff, "Reservation byte range"); end\n'
+                       if parameters.get('enableA', True) else '')
         return f'''    while (!memory_request_valid) tick();
     bus_id[{index}] = memory_request_bits_tag; privilege = 3;
-    repeat (3) begin
+{reservation}    repeat (3) begin
       check(memory_request_valid && memory_request_bits_address == 'h{address:x} && memory_request_bits_tag == bus_id[{index}] && memory_request_bits_write == {int(write)} && memory_request_bits_privileged == {int(not user)}, "Memory offer retains context and effective privilege"); tick();
     end
     memory_request_ready = 1; tick(); memory_request_ready = 0;
@@ -511,6 +627,19 @@ def lsu_queue_contract(parameters):
         body += submit(0x1000, 0x100, 5, 3)
         body += '    while (!memory_request_valid) tick(); check(!memory_request_bits_scEligible, "SC consumes the shared reservation");\n'
         body += issue(0, 0x1000, True) + respond(0, 1) + complete(0x100, 5, 1)
+        body += '    reservation_auto = 0;\n' + submit(0x1000, 0x100, 5, 2) + issue(0, 0x1000)
+        body += '    reservation_pulse = 1; reservation_invalidate = 1; tick(); reservation_pulse = 0; reservation_invalidate = 0;\n'
+        body += respond(0, 101) + complete(0x100, 5, 101)
+        body += submit(0x1000, 0x104, 6, 3)
+        body += '    while (!memory_request_valid) tick(); check(!memory_request_bits_scEligible, "Endpoint write prevents delayed LR resurrection");\n'
+        body += issue(1, 0x1000, True) + respond(1, 1) + complete(0x104, 6, 1)
+        body += submit(0x1000, 0x100, 5, 2) + issue(0, 0x1000)
+        body += '    cancel = 1; tick(); cancel = 0; reservation_pulse = 1; tick(); reservation_pulse = 0;\n'
+        body += '    check(!dut.reserved, "Cancelled LR rejects its delayed endpoint begin");\n'
+        body += respond(0, 101) + complete(0x100, 5, 101)
+        body += submit(0x1000, 0x104, 6, 3)
+        body += '    while (!memory_request_valid) tick(); check(!memory_request_bits_scEligible, "Cancelled LR ignores its delayed endpoint begin");\n'
+        body += issue(1, 0x1000, True) + respond(1, 1) + complete(0x104, 6, 1) + '    reservation_auto = 1;\n'
     body += submit(0x1000, 0x100, 5) + issue(0, 0x1000) + submit(0x1040, 0x104, 6) + issue(1, 0x1040)
     body += respond(0, 101, last=False) + respond(1, 202)
     body += '    repeat (3) begin check(!output_valid, "Nonterminal response retains its owner"); tick(); end\n'
@@ -529,11 +658,19 @@ def lsu_queue_contract(parameters):
 
 def lsu_reservation_contract(parameters):
     body, serial = '', 0
+    translated = parameters.get('virtualAddressBits') == 39
+    if translated:
+        body = '''    reset = 1; tick(); reset = 0; tick(); privilege = 3;
+    memory_request_ready = 0; memory_response_valid = 0; output_ready = 0; reservation_invalidate = 0; input_bits_unsignedLoad = 0;
+'''
+        if parameters['pmpEntries']:
+            body += '    pmp_config = 0; pmp_address = 0;\n'
 
-    def transfer(operation, address=0x1000, value=0, fault=False, eligible=False, local_fault=0, wrong_tag=False, size=3):
+    def transfer(operation, address=0x1000, value=0, fault=False, eligible=False, local_fault=0, wrong_tag=False, size=3, loss=None):
         nonlocal body, serial
         serial += 1
         tag = 80 + serial
+        loss = {None: 0, 'before_begin': 1, 'at_begin': 2, 'before_reply': 3, 'at_reply': 4, 'after_reply': 5}[loss]
         body += f'''    input_bits_atomic = 1; input_bits_instruction_instruction = 32'h{amo(operation, 7, 1, 0 if operation == 2 else 2, size=size):x};
     input_bits_instruction_fault = 0; input_bits_instruction_tag = {tag}; input_bits_memorySize = {size};
     input_bits_load = {int(operation != 3)}; input_bits_store = {int(operation != 2)};
@@ -541,15 +678,28 @@ def lsu_reservation_contract(parameters):
     input_valid = 1; storeAllowed = 1; tick(); input_valid = 0; storeAllowed = 0;
     input_bits_atomic = 0; input_bits_address = 0;
 '''
+        if translated and local_fault not in (4, 6):
+            body += f'''    while (!translation_request_valid) tick();
+    check(translation_request_bits_address == 64'h{address:x} && translation_request_bits_atomic, "Reservation translation ownership");
+    translation_request_ready = 1; tick(); translation_request_ready = 0;
+    translation_response_bits_address = 64'h{address:x}; translation_response_bits_fault = 0;
+    translation_response_valid = 1; tick(); translation_response_valid = 0;
+'''
         if local_fault:
             body += f'    check(output_valid && output_bits_instruction_fault && output_bits_instruction_cause == {local_fault} && !memory_request_valid, "Reservation local fault");\n'
         else:
             body += f'''    repeat (3) begin
+      check({operation} != 2 || reservation_address == 64'h{address & ~7:x} && reservation_mask == 8'h{(((1 << (1 << size))-1) << (address & 7)) & 255:x}, "Reservation byte range");
       check(memory_request_valid && memory_request_bits_atomic && memory_request_bits_atomicOperation == {operation} && memory_request_bits_scEligible == {int(eligible)} && memory_request_bits_address == 64'h{address:x} && memory_request_bits_mask == {0 if operation == 2 else (1 << (1 << size)) - 1}, "Reservation request capture"); tick();
     end
-    memory_request_ready = 1; tick(); memory_request_ready = 0;
+    if ({loss} == 1) begin reservation_invalidate = 1; tick(); reservation_invalidate = 0; end
+    reservation_invalidate = {int(loss == 2)};
+    memory_request_ready = 1; tick(); memory_request_ready = 0; reservation_invalidate = 0;
+    if ({loss} == 3) begin repeat (3) tick(); reservation_invalidate = 1; tick(); reservation_invalidate = 0; end
+    reservation_invalidate = {int(loss == 4)};
     memory_response_bits_tag = {tag + int(wrong_tag)}; memory_response_bits_fault = {int(fault)};
-    memory_response_bits_data = 64'h{value:x}; memory_response_valid = 1; tick(); memory_response_valid = 0;
+    memory_response_bits_data = 64'h{value:x}; memory_response_valid = 1; tick(); memory_response_valid = 0; reservation_invalidate = 0;
+    if ({loss} == 5) begin reservation_invalidate = 1; tick(); reservation_invalidate = 0; end
     repeat (3) begin
       check(output_valid && output_bits_instruction_fault == {int(fault or wrong_tag)} && output_bits_rd == 7 && output_bits_rdWrite && output_bits_value == 64'h{signed(value, 32) & MASK if size == 2 else value:x}, "Reservation result retention"); tick();
     end
@@ -558,6 +708,10 @@ def lsu_reservation_contract(parameters):
                 body += f'    check(output_bits_instruction_cause == {5 if operation == 2 else 7} && output_bits_instruction_tval == 64\'h{address:x}, "Reservation response fault");\n'
         body += '    output_ready = 1; tick(); output_ready = 0; memory_response_bits_fault = 0;\n'
 
+    for size in (2, 3):
+        for loss in ('before_begin', 'at_begin', 'before_reply', 'at_reply', 'after_reply'):
+            transfer(2, size=size, loss=loss)
+            transfer(3, size=size, eligible=loss == 'before_begin', value=0 if loss == 'before_begin' else 1)
     transfer(3, value=1)
     transfer(2, value=MASK)
     transfer(3, eligible=True)
@@ -654,7 +808,39 @@ def compressed_fetch_contract(parameters, frontend=False):
     base = int(parameters['resetVector'])
     prefix = 'output_bits_packets_0_' if frontend else 'output_bits_'
     translated = parameters.get('virtualAddressBits') == 39
-    body = f'''    begin
+    body = ''
+    if not frontend and not parameters['iCacheBytes'] and not parameters['pmpEntries'] and not translated:
+        snapshot_pc = base & ~3
+        body = f'''    begin
+      reg [31:0] memory_word, sampled;
+      integer size, parts;
+      for (integer scenario=0; scenario<3; scenario=scenario+1) begin
+        memory_request_ready=0; memory_response_valid=0; memory_response_bits_fault=0; output_ready=0;
+        reset=1; tick(); reset=0; tick();
+        memory_word=scenario==1 ? 32'h00200313 : 32'h00100293;
+        request_bits_pc='h{snapshot_pc:x}; request_bits_tag=5+scenario; request_valid=1;
+        while (!request_ready) tick(); tick(); request_valid=0; parts=2;
+        for (integer part=0; part<parts; part=part+1) begin
+          while (!memory_request_valid) tick();
+          size=memory_request_bits_size; sampled=memory_word>>(16*part);
+          check(memory_request_bits_address=='h{snapshot_pc:x}+2*part && (size==1 || part==0 && size==2), "Snapshot child range");
+          if (size==2) parts=1;
+          memory_request_ready=1; tick(); memory_request_ready=0; repeat (2) tick();
+          memory_response_bits_data=size==2 ? sampled : sampled&32'hffff;
+          memory_response_bits_tag=5+scenario; memory_response_valid=1;
+          while (!memory_response_ready) tick(); tick(); memory_response_valid=0;
+          if (scenario==2) memory_word=32'h00200313;
+        end
+        while (!output_valid) tick();
+        check(output_bits_pc=='h{snapshot_pc:x} && output_bits_tag==5+scenario && !output_bits_fault && output_bits_length==4, "Snapshot parent identity");
+        $display("SNAPSHOT_WORD %08x %0d",output_bits_instruction,scenario);
+        check(scenario==2 || output_bits_instruction==(scenario==1 ? 32'h00200313 : 32'h00100293), "Stable snapshot data");
+        check(output_bits_instruction==32'h00100293 || output_bits_instruction==32'h00200313, "Atomic word snapshot");
+        output_ready=1; tick(); output_ready=0;
+      end
+    end
+'''
+    body += f'''    begin
       reg [63:0] expected_pc, address;
       integer size, tag, count;
       expected_pc = 'h{base:x};
@@ -723,6 +909,13 @@ def compressed_fetch_contract(parameters, frontend=False):
       cancel=1; tick(); cancel=0;
       check(!output_valid, "Cancelled compressed fault escaped");
 '''
+    if not frontend and (translated or parameters['pmpEntries']):
+        body += '    disable fork; memory_request_ready=0; memory_response_valid=0;\n'
+        if translated:
+            body += '    translation_request_ready=0; translation_response_valid=0;\n' + translated_consumer_contract(parameters, True)
+        else:
+            body += privilege_memory_contract(parameters, True) if parameters.get('enableUserMode') else ''
+            body += protection_contract(True, int(parameters['resetVector']) & ~3)
     return body + '    end\n'
 
 
@@ -813,7 +1006,7 @@ def decode_contract(parameters, directory):
     cases += tuple((0x0072b32f | (ordering << 25), 1, 1, 1) for ordering in range(4))
     cases += tuple((fence(instruction, reserved), 0, 0, 0) for instruction in (False, True)
                    for reserved in (0, 0x83328880, 0xffff8f80))
-    cases += ((0x200f, 0, 0, 0), (0x700f, 0, 0, 0))
+    cases += ((0x700f, 0, 0, 0),)
     for name, (extension, encoding, mask) in BITMANIP_ENCODINGS.items():
         for amount in ((0, 1, 31, 32, 63) if mask == 0xfc00707f else (0, 1, 31)):
             operand = amount if mask != 0xfff0707f else 0
@@ -849,7 +1042,7 @@ def decode_contract(parameters, directory):
         if word in (0x00000073, 0x00100073):
             body += '    check(output_bits_operation == 12, "Environment exception operation class");\n'
     if parameters.get('virtualAddressBits') == 39:
-        precise = any(parameters.get(key) for key in ('tlbEntries', 'iTlbEntries', 'dTlbEntries')) and any(parameters.get(key) for key in ('asidBits', 'iTlbEntries', 'dTlbEntries'))
+        precise = atomic_translation_entries(parameters) or any(parameters.get(key) for key in ('tlbEntries', 'iTlbEntries', 'dTlbEntries')) and any(parameters.get(key) for key in ('asidBits', 'iTlbEntries', 'dTlbEntries'))
         for rs1, rs2 in ((0, 0), (1, 0), (0, 31), (31, 31)):
             word = 0x12000073 | (rs1 << 15) | (rs2 << 20)
             body += f'''    input_bits_instruction = 32'h{word:x};
@@ -857,6 +1050,22 @@ def decode_contract(parameters, directory):
 '''
         for word in (0x120000f3, 0x12001073, 0x14000073):
             body += f"    input_bits_instruction = 32'h{word:x}; check(output_bits_operation != 16, \"SFENCE requires its complete standard encoding\");\n"
+    for operation in range(4):
+        for rs1 in (0, 8, 31):
+            word = operation << 20 | rs1 << 15 | 0x200f
+            enabled = int(operation < 3 and parameters.get('enableZicbom', False))
+            body += f'''    input_bits_instruction = 'h{word:x};
+    check(output_bits_operation == {16 if enabled else 0} && output_bits_usesRs1 == {enabled} &&
+      !output_bits_usesRs2 && !output_bits_writesRd && output_bits_serializing == {enabled}, "Management encoding and address dependency");
+    input_bits_instruction = 'h{word | 128:x}; check(output_bits_operation == 0, "Management requires rd zero");
+'''
+    for rs1 in (0, 8, 31):
+        word = 0x0040200f | rs1 << 15
+        enabled = int(parameters.get('enableZicboz', False))
+        body += f'''    input_bits_instruction = 'h{word:x};
+    check(output_bits_operation == {16 if enabled else 0} && output_bits_usesRs1 == {enabled} &&
+      !output_bits_usesRs2 && !output_bits_writesRd && output_bits_serializing == {enabled}, "Zero encoding and address dependency");
+'''
     body += floating_decode_contract(parameters)
     return body + (compressed_decode_contract(directory, parameters) if parameters.get('enableC') else "    input_bits_length=2; input_bits_instruction='h4485; check(output_bits_operation==0, \"Disabled compressed encoding\"); input_bits_length=4;\n") + '''    input_bits_instruction = 32'h00728333; input_bits_fault = 1;
     check(!output_bits_usesRs1 && !output_bits_usesRs2 && !output_bits_writesRd, "Faulting instruction dependencies");
@@ -1100,9 +1309,130 @@ def execute_contract(parameters):
     check(output_bits_instruction_cause == 1 && output_bits_instruction_tval == 'habc, "Prior fetch fault precedes breakpoint");
     input_bits_decoded_instruction_fault = 0; privilege = 3;
 '''
+    if parameters.get('enableZicboz'):
+        for address in (0, 0x103f, MASK):
+            for legal in (0, 1):
+                body += f'''    zeroLegal = {legal}; input_valid = 1; output_ready = 1;
+    input_bits_decoded_instruction_instruction = 'h0044200f; input_bits_decoded_instruction_fault = 0;
+    input_bits_decoded_instruction_length = 4; input_bits_decoded_operation = 16;
+    input_bits_decoded_writesRd = 0; input_bits_decoded_immediate = 4; input_bits_operand1 = 64'h{address:x};
+    check(output_valid && output_bits_instruction_fault == {1-legal} && !output_bits_rdWrite &&
+      output_bits_address == 64'h{address:x} && output_bits_memorySize == 3 && output_bits_storeData == 0 &&
+      !output_bits_load && !output_bits_atomic && !output_bits_fenceI && !output_bits_sfenceVma && !output_bits_wfi &&
+      ({legal} ? output_bits_store : output_bits_instruction_cause == 2 && output_bits_instruction_tval == 'h0044200f),
+      "Zero execution preserves its address and checks environment permission");
+'''
+    if parameters.get('enableZicbom'):
+        for operation in range(3):
+            word = operation << 20 | 8 << 15 | 0x200f
+            for controls in range(4):
+                allowed = bool(controls & (1 if operation == 0 else 2))
+                body += f'''    invalidateLegal = {controls & 1}; cleanLegal = {controls >> 1};
+    input_valid = 1; output_ready = 1; input_bits_decoded_operation = 16;
+    input_bits_decoded_instruction_instruction = 'h{word:x}; input_bits_decoded_instruction_fault = 0;
+    input_bits_decoded_instruction_length = 4; input_bits_decoded_writesRd = 0;
+    input_bits_decoded_immediate = {operation}; input_bits_operand1 = 'h103f;
+    check(output_valid && output_bits_instruction_fault == {int(not allowed)} && !output_bits_rdWrite &&
+      output_bits_address == 'h103f && output_bits_memorySize == 3 && !output_bits_load &&
+      !output_bits_fenceI && !output_bits_sfenceVma && !output_bits_wfi && !output_bits_atomic &&
+      ({int(allowed)} ? output_bits_store : output_bits_instruction_cause == 2 && output_bits_instruction_tval == 'h{word:x}),
+      "Management execution checks its own environment control and retains rs1");
+'''
     if parameters.get('enableC'):
         body = re.sub(r"(input_bits_decoded_instruction_instruction = [^;]+;)",
                       r"\1 input_bits_decoded_functionCode = {input_bits_decoded_instruction_instruction[30], input_bits_decoded_instruction_instruction[14:12]};", body)
+    return body
+
+
+def cache_management_lsu_contract(parameters):
+    translated = parameters.get('virtualAddressBits') == 39
+    body = '''    reset = 1; tick(); reset = 0; tick();
+    storeAllowed = 1; input_bits_store = 1; input_bits_load = 0; input_bits_atomic = 0;
+    input_bits_memorySize = 3; input_bits_rdWrite = 0; input_bits_instruction_pc = 'h120;
+    input_bits_instruction_tag = 81; input_bits_instruction_fault = 0;
+'''
+    if parameters['pmpEntries']:
+        body += f"    privilege = 0; pmp_config = 'h19; pmp_address = 'h{(1 << (parameters['physicalAddressBits'] - 2)) - 1:x};\n"
+    for operation in range(3):
+        for physical, allowed in ((0x1000, True), (0x4000, True), (0x5000, True), (0x6000, False), (0x8000, False)):
+            for displacement in (range(64) if physical == 0x1000 else (0, 31, 63)):
+                for failure in ((False, True) if allowed else (False,)):
+                    address = physical + displacement + (0x100000 if translated else 0)
+                    fault = not allowed or failure
+                    body += f'''    input_bits_instruction_instruction = 'h{operation << 20 | 8 << 15 | 0x200f:x};
+    input_bits_address = 'h{address:x}; input_valid = 1;
+    #1; while (!input_ready) tick(); tick(); input_valid = 0;
+'''
+                    if translated:
+                        body += f'''    while (!translation_request_valid) begin check(!memory_request_valid, "Management authorizes before maintenance"); tick(); end
+    check(translation_request_bits_management && translation_request_bits_write && !translation_request_bits_atomic &&
+      translation_request_bits_address == 'h{address:x}, "Management translation retains its access class and original address");
+    translation_request_ready = 1; tick(); translation_request_ready = 0;
+    translation_response_bits_address = 'h{physical + displacement:x}; translation_response_valid = 1;
+    while (!translation_response_ready) tick(); tick(); translation_response_valid = 0;
+'''
+                    body += '    while (!memory_request_valid && !output_valid) tick();\n'
+                    if allowed:
+                        body += f'''    begin
+      integer tag;
+      tag = memory_request_bits_tag;
+      repeat (3) begin
+        check(memory_request_valid && !output_valid && memory_request_bits_address == 'h{physical:x} &&
+          memory_request_bits_tag == tag && memory_request_bits_cacheOperation == 3 && memory_request_bits_size == 3 &&
+          memory_request_bits_mask == 0 && !memory_request_bits_write && !memory_request_bits_fetch && !memory_request_bits_atomic,
+          "Management emits one stable control request without an ordinary read or write"); tick();
+      end
+      memory_request_ready = 1; tick(); memory_request_ready = 0;
+      memory_response_bits_tag = tag; memory_response_bits_fault = {int(failure)}; memory_response_valid = 1;
+      while (!memory_response_ready) tick(); tick(); memory_response_valid = 0; memory_response_bits_fault = 0;
+    end
+'''
+                    body += f'''    while (!output_valid) tick();
+    repeat (3) begin
+      check(output_bits_instruction_fault == {int(fault)} && !output_bits_rdWrite && !memory_request_valid &&
+        output_bits_instruction_tag == 81 && ({int(not fault)} ||
+        (output_bits_instruction_cause == 7 && output_bits_instruction_tval == 'h{address:x})),
+        "Management retains its parent and original store-class fault address"); tick();
+    end
+    output_ready = 1; tick(); output_ready = 0; tick();
+    check(!output_valid && !memory_request_valid, "Management completes only once");
+'''
+    return body
+
+
+def cache_environment_csr_contract(parameters):
+    if not parameters.get('enableUserMode'):
+        return '    check(' + ' && '.join(name for name, enabled in
+            (('zeroLegal', parameters.get('enableZicboz')), ('cleanLegal', parameters.get('enableZicbom')),
+             ('invalidateLegal', parameters.get('enableZicbom'))) if enabled) + ', "Machine mode permits block operations");\n'
+    body = ''
+    mask = (8 if parameters.get('enableZicboz') else 0) | (7 if parameters.get('enableZicbom') else 0)
+    def normalized(value):
+        return (value & ~3 if value & 3 == 2 else value) & mask
+    for mode in ((3, 1, 0) if parameters.get('enableSupervisorMode') else (3, 0)):
+        for machine in (0, 1, 2, 3, 4, 7, 8, 15):
+            for supervisor in ((0, 1, 2, 3, 4, 7, 8, 15) if parameters.get('enableSupervisorMode') else (15,)):
+                for mprv in (0, 1):
+                    stce = int(bool(parameters.get('enableSstc'))) << 63
+                    body += f'''    reset = 1; tick(); reset = 0; tick();
+    writeAddress = 'h30a; writeData = 64'h{stce | machine << 4:x}; write = 1; tick(); write = 0;
+    readAddress = 'h30a; check(legal && readData == 64'h{stce | normalized(machine) << 4:x}, "Machine block controls preserve timer control");
+'''
+                    if parameters.get('enableSupervisorMode'):
+                        body += f'''    writeAddress = 'h10a; writeData = {supervisor << 4}; write = 1; tick(); write = 0;
+    readAddress = 'h10a; check(legal && readData == {normalized(supervisor) << 4}, "Supervisor block control readback");
+'''
+                    body += f'''    writeAddress = 'h300; writeData = {(mode << 11 if mode != 3 else 0) | mprv << 17}; write = 1; tick(); write = 0;
+'''
+                    if mode != 3:
+                        body += '    mret = 1; tick(); mret = 0;\n'
+                    checks = [f'privilege == {mode}']
+                    for name, bits, enabled in (('zeroLegal', 8, parameters.get('enableZicboz')),
+                            ('cleanLegal', 4, parameters.get('enableZicbom')), ('invalidateLegal', 3, parameters.get('enableZicbom'))):
+                        if enabled:
+                            allowed = mode == 3 or bool(normalized(machine) & bits) and (mode == 1 or bool(normalized(supervisor) & bits))
+                            checks.append(f'{name} == {int(allowed)}')
+                    body += '    check(' + ' && '.join(checks) + ', "Block controls use execution privilege independently of MPRV");\n'
     return body
 
 
@@ -1950,7 +2280,7 @@ def lsu_refill_contract(parameters):
                 body += f"    pmp_config = 'h{config:x}; pmp_address = 'h{point:x};\n"
             body += '    tick(); input_valid = 0; privilege = 3; input_bits_address = 0;\n'
             if translated:
-                body += f'''    check(translation_request_valid && translation_request_bits_address == 64'h{virtual:x}, "Refill original virtual address");
+                body += f'''    check(translation_request_valid && translation_request_bits_address == 64'h{virtual:x} && !translation_request_bits_atomic, "Refill original virtual address");
     translation_request_ready = 1; tick(); translation_request_ready = 0;
     translation_response_bits_address = 64'h{address:x}; translation_response_bits_fault = 0;
     translation_response_bits_cause = 0; translation_response_valid = 1;
@@ -2515,12 +2845,19 @@ def coherence_contract(parameters):
     base = int(next(r for r in parameters['memoryRegions'] if r.get('dataCacheable'))['base'])
     writeback = parameters.get('dCacheWriteback', False)
     body = ''
-    cases = ((0, 0, 0, 1), (0, 1, 0, 1), (0, 1, 1, 1)) + (((1, 1, 0, 1), (2, 0, 0, 1), (0, 0, 0, 0)) if writeback else ())
+    cases = ((0, 0, 0, 1), (0, 1, 0, 1)) + (((0, 1, 1, 1),) if parameters.get('enableA', True) else ())
+    cases += (((1, 1, 0, 1), (2, 0, 0, 1), (0, 0, 0, 0)) if writeback else ())
+    if parameters.get('enableZicbom'):
+        cases += ((3, 0, 0, 1),)
     for operation, write, atomic, privileged in cases:
         writer = count - 1
         targets = ([writer] if operation == 2 else [h for h in range(count) if operation != 1 or h != writer]) if writeback else (
             [h for h in range(count) if atomic or h != writer] if write else [])
-        for dirty in (False, True) if targets and writeback else (False,):
+        if operation == 3:
+            targets = list(range(count))
+        owners = (None, *targets) if operation == 3 and writeback else (None, targets[0]) if targets and writeback else (None,)
+        for dirty_owner in owners:
+            dirty = dirty_owner is not None
             body += f'''    @(negedge clock);
     hartId = {writer}; upstream_request_bits_address = 64'h{base & ~63 if operation == 2 else base:x}; upstream_request_bits_tag = 37;
     upstream_request_bits_size = 3; upstream_request_bits_mask = {255 if write else 0};
@@ -2533,7 +2870,7 @@ def coherence_contract(parameters):
                 for peer in range(count):
                     body += f'''    check(probe_{peer}_request_valid == {int(peer in targets and peer >= hart)}, "Exactly the required probes remain offered");
 '''
-                body += f'''    check(probe_{hart}_request_bits_address == 64'h{base & ~63:x} && probe_{hart}_request_bits_invalidate == {int(bool(write or operation == 2 or atomic))}, "Probe address and operation");
+                body += f'''    check(probe_{hart}_request_bits_address == 64'h{base & ~63:x} && probe_{hart}_request_bits_invalidate == {int(bool(write or operation in (2, 3) or atomic))}, "Probe address and operation");
     probe_{hart}_request_ready = 1; tick(); probe_{hart}_request_ready = 0;
 '''
             if targets:
@@ -2542,7 +2879,7 @@ def coherence_contract(parameters):
     end
 '''
             for hart in targets:
-                if dirty and hart == targets[0]:
+                if dirty and hart == dirty_owner:
                     value, mask, word = 0x1122334455667788, 0x55, 3
                     body += f'''    probe_{hart}_response_valid = 1; probe_{hart}_response_bits_mask = {mask};
     probe_{hart}_response_bits_word = {word}; probe_{hart}_response_bits_last = 0;
@@ -2579,7 +2916,7 @@ def coherence_contract(parameters):
 '''
             body += '''    while (!upstream_request_ready && !downstream_request_valid) tick();
 '''
-            if operation:
+            if operation in (1, 2):
                 body += '''    check(upstream_request_ready && !downstream_request_valid && !upstream_response_valid, "Ownership grant needs request acceptance");
     tick(); upstream_request_valid = 0; upstream_request_bits_tag = 99;
     repeat (3) begin
@@ -2588,13 +2925,13 @@ def coherence_contract(parameters):
 '''
             else:
                 body += f'''    repeat (3) begin
-      check(downstream_request_valid && downstream_request_bits_address == 64'h{base:x} && downstream_request_bits_tag == 37 && downstream_request_bits_write == {write} && downstream_request_bits_atomic == {atomic} && downstream_request_bits_privileged == {privileged} && !upstream_request_ready, "Original request follows probe completion"); tick();
+      check(downstream_request_valid && downstream_request_bits_address == 64'h{base:x} && downstream_request_bits_tag == 37 && downstream_request_bits_write == {write} && downstream_request_bits_atomic == {atomic} && downstream_request_bits_privileged == {privileged} && downstream_request_bits_cacheOperation == {operation} && !upstream_request_ready, "Original request follows probe completion"); tick();
     end
     downstream_request_ready = 1; tick(); downstream_request_ready = 0; upstream_request_valid = 0;
-    downstream_response_bits_tag = 37; downstream_response_bits_data = 23; downstream_response_bits_fault = 0;
+    downstream_response_bits_tag = 37; downstream_response_bits_data = {0 if operation == 3 else 23}; downstream_response_bits_fault = 0;
     downstream_response_bits_last = 1; downstream_response_valid = 1;
     repeat (3) begin
-      check(upstream_response_valid && upstream_response_bits_tag == 37 && upstream_response_bits_data == 23 && !downstream_response_ready, "Shared response retention"); tick();
+      check(upstream_response_valid && upstream_response_bits_tag == 37 && upstream_response_bits_data == {0 if operation == 3 else 23} && !downstream_response_ready, "Shared response retention"); tick();
     end
 '''
             body += '    upstream_response_ready = 1; tick(); upstream_response_ready = 0; downstream_response_valid = 0;\n'
@@ -2975,7 +3312,7 @@ def coherent_fabric_contract(parameters):
       reset = 1; tick(); reset = 0; tick();
       data_0_request_bits_cacheOperation = {operation}; data_0_request_bits_address = 64'h{address:x};
       data_0_request_bits_size = 3; data_0_request_bits_write = {write};
-      data_0_request_bits_mask = {255 if write else 0}; data_0_request_bits_tag = 77;
+      data_0_request_bits_mask = {255 if write or operation == 3 else 0}; data_0_request_bits_tag = 77;
       data_0_request_valid = 1;
       #1; while (!data_0_request_ready) tick(); tick(); data_0_request_valid = 0;
 '''
@@ -3015,6 +3352,91 @@ def coherent_fabric_contract(parameters):
       data_0_response_ready = 1; tick(); data_0_response_ready = 0;
 '''
         body += ''.join(f'      probe_{h}_response_valid = 0; probe_{h}_request_ready = 0;\n' for h in range(count))
+        body += '    end\n'
+    return body
+
+
+def cache_management_axi_contract():
+    return '''    reset = 1; tick(); reset = 0; tick();
+    memory_request_bits_cacheOperation = 3; memory_request_bits_size = 3;
+    memory_request_bits_mask = 0; memory_request_bits_atomic = 0;
+    memory_request_bits_fetch = 0; memory_request_bits_write = 0; memory_request_bits_tag = 37;
+    memory_request_valid = 1; tick(); memory_request_valid = 0;
+    while (!memory_response_valid) begin
+      check(!axi_ar_valid && !axi_aw_valid && !axi_w_valid, "Maintenance cannot escape to AXI"); tick();
+    end
+    repeat (3) begin
+      check(memory_response_valid && memory_response_bits_fault && memory_response_bits_tag == 37 &&
+        memory_response_bits_last && !axi_ar_valid && !axi_aw_valid && !axi_w_valid,
+        "Escaped maintenance is rejected without a bus access"); tick();
+    end
+    memory_response_ready = 1; tick(); memory_response_ready = 0; memory_request_bits_cacheOperation = 0;
+'''
+
+
+def cache_management_fabric_contract(parameters):
+    count = parameters['hartCount']
+    cached = bool(parameters.get('dCacheBytes'))
+    shared = bool(parameters.get('enableZicbom') and parameters.get('l2CacheBytes'))
+    body = ''
+    for region in parameters['memoryRegions']:
+        address = (int(region['base']) + 63) & -64
+        if address + 64 > int(region['base']) + int(region['size']):
+            continue
+        allowed = parameters.get('enableZicbom') and (region['readable'] or region['writable']) and (not region['writable'] or region['readable'])
+        targets = (1 << count) - 1 if cached and allowed else 0
+        body += f'''    begin
+      reg [{count-1}:0] seen, pending;
+      integer waits;
+      seen = 0; pending = 0; waits = 0;
+      data_0_request_valid = 0; data_0_response_ready = 0;
+      reset = 1; tick(); reset = 0; tick();
+      data_0_request_bits_address = 64'h{address:x}; data_0_request_bits_size = 3;
+      data_0_request_bits_cacheOperation = 3; data_0_request_bits_write = 0;
+      data_0_request_bits_mask = 0; data_0_request_bits_atomic = 0; data_0_request_bits_fetch = 0;
+      data_0_request_bits_tag = 37; data_0_request_valid = 1;
+'''
+        if shared:
+            body += '      maintenance_ready = 0;\n'
+        body += '''      #1; while (!data_0_request_ready) tick(); tick(); data_0_request_valid = 0;
+      while (!data_0_response_valid) begin
+        check(!axi_ar_valid && !axi_aw_valid && !axi_w_valid, "Cache management has no ordinary external access");
+'''
+        if cached:
+            for hart in range(count):
+                body += f'''        probe_{hart}_request_ready = 1; probe_{hart}_response_valid = pending[{hart}];
+        probe_{hart}_response_bits_mask = 0; probe_{hart}_response_bits_last = 1;
+'''
+            body += '        #1;\n'
+            for hart in range(count):
+                body += f'''        if (probe_{hart}_response_valid && probe_{hart}_response_ready) pending[{hart}] = 0;
+        if (probe_{hart}_request_valid && probe_{hart}_request_ready) begin
+          check(!seen[{hart}] && probe_{hart}_request_bits_address == 64'h{address:x} && probe_{hart}_request_bits_invalidate,
+            "Maintenance includes each private cache once"); seen[{hart}] = 1; pending[{hart}] = 1;
+        end
+'''
+        if shared:
+            body += f'''        if (maintenance_valid) begin
+          check(seen == {count}'h{targets:x} && pending == 0 && maintenance_bits == 64'h{address:x},
+            "Shared maintenance follows all private acknowledgements");
+          waits = waits + 1; maintenance_ready = waits >= 4;
+        end
+'''
+        body += f'''        tick();
+      end
+      check(seen == {count}'h{targets:x} && pending == 0, "Complete cache-management probe set");
+'''
+        if shared and allowed:
+            body += '      check(waits >= 4, "Shared-cache backpressure delays completion");\n'
+        body += f'''      repeat (3) begin
+        check(data_0_response_valid && data_0_response_bits_tag == 37 && data_0_response_bits_last &&
+          data_0_response_bits_fault == {int(not allowed)} && !axi_ar_valid && !axi_aw_valid && !axi_w_valid,
+          "Cache management retains one attributed completion"); tick();
+      end
+      data_0_response_ready = 1; tick(); data_0_response_ready = 0;
+'''
+        if cached:
+            body += ''.join(f'      probe_{hart}_request_ready = 0; probe_{hart}_response_valid = 0;\n' for hart in range(count))
         body += '    end\n'
     return body
 
@@ -3593,6 +4015,154 @@ def backend_csr_contract(parameters):
         body += send(csr(8, 0x340, 0, function=2), 0x300) + send(addi(9, 8, 1), 0x304)
         body += wait_commit(0x300) + '    check(dut.gpr.we_0 && dut.gpr.wdata_0 == 0, "Cancelled CSR releases its owner"); tick();\n'
         body += wait_commit(0x304) + '    check(dut.gpr.we_0 && dut.gpr.wdata_0 == 1, "CSR cancellation releases dependencies"); tick(); repeat (3) tick();\n'
+    if parameters.get('enableZawrs') and not parameters['pmpEntries'] and parameters.get('virtualAddressBits') != 39:
+        cases = [(3, loss) for loss in (None, 0, 31, 63, 'reset', *(('interrupt', 'preempt') if parameters['enableInterrupts'] else ()),
+                  *(('halt', 'step') if parameters.get('enableJtag') else ()))]
+        if parameters.get('enableUserMode'):
+            cases += [(mode, loss) for mode in ((0, 1) if parameters.get('enableSupervisorMode') else (0,))
+                      for loss in (None, 63, *(('halt', 'step') if parameters.get('enableJtag') else ()))]
+        for word in (0x00d00073, 0x01d00073):
+            for mode, loss in cases:
+                body += reset + '    reservation_invalidate = 0;\n'
+                if parameters.get('enableJtag'):
+                    body += "    debug_haltReq = 0; debug_entryPc = 'h500; debug_exceptionPc = 'h600;\n"
+                if mode != 3:
+                    body += send(addi(1, 0, 0x100), 0x60, True) + send(csr(0, 0x341, 1), 0x64, True)
+                    body += send(0x002000b7, 0x68, True) + send(addi(2, 0, mode), 0x6c, True)
+                    body += send(alu(2, 2, 11, 1, immediate=True), 0x70, True) + send(alu(1, 1, 2, 6), 0x74, True)
+                    body += send(csr(0, 0x300, 1), 0x78, True) + send(0x30200073, 0x7c, True)
+                if loss in ('interrupt', 'preempt'):
+                    body += send(addi(1, 0, 8), 0x80, True) + send(csr(0, 0x304, 1), 0x84, True)
+                    if loss == 'preempt':
+                        body += send(csr(0, 0x300, 1), 0x88, True)
+                body += send(addi(8, 0, 0x400), 0x100, True) + send(amo(2, 9, 8), 0x104)
+                body += '''    while (!data_request_valid) tick();
+    check(data_request_bits_atomic && data_request_bits_atomicOperation == 2 && data_request_bits_address == 'h400,
+      "Wait obtains its reservation through an LR request");
+    data_response_bits_tag = data_request_bits_tag; data_request_ready = 1; tick(); data_request_ready = 0;
+    data_response_bits_data = 5; data_response_valid = 1;
+    while (!data_response_ready) tick(); tick(); data_response_valid = 0;
+''' + wait_commit(0x104) + '''    check(dut.commit.output_valid && dut.gpr.we_0 && dut.gpr.wdata_0 == 5,
+      "LR completes before the wait"); tick();
+'''
+                if loss == 'step':
+                    body += '    debug_haltReq = 1; while (!debug_mode) tick(); debug_haltReq = 0;\n'
+                    body += send(addi(1, 0, 4 | mode), 0x500, True) + send(csr(0, 0x7b0, 1), 0x504, True)
+                    body += send(addi(1, 0, 0x108), 0x508, True) + send(csr(0, 0x7b1, 1), 0x50c, True)
+                    body += send(0x7b200073, 0x510, True)
+                    if parameters.get('loadQueueEntries', 1) == 1:
+                        body += '    check(dut.lsu.reservationValid, "Single-step wait retains a real LR reservation");\n'
+                body += send(word, 0x108) + wait_commit(0x108)
+                body += f'''    repeat ({0 if loss == 'step' else 63 if loss is None else loss if isinstance(loss, int) else 31}) begin
+      check(!dut.commit.output_valid && !dut.gpr.we_0 && !dut.csr.trap && !status_sleep && !data_request_valid,
+        "Reservation wait holds retirement without WFI or memory effects"); tick();
+    end
+'''
+                if loss == 'reset':
+                    body += '    reset = 1; tick(); reset = 0; tick();\n'
+                    body += send(word, 0x300) + wait_commit(0x300)
+                    body += '    check(dut.commit.output_valid && !dut.csr.trap, "Reset cancels the wait and its reservation"); tick();\n'
+                    continue
+                if loss == 'preempt':
+                    body += '''    interrupts_software = 1;
+    check(!dut.commit.output_valid && dut.csr.trap && dut.csr.trapPc == 'h108 &&
+      dut.csr.trapCause == 64'h8000000000000003, "Enabled interrupt cancels the wait at its PC");
+    tick(); interrupts_software = 0; repeat (3) tick();
+'''
+                    continue
+                if loss == 'interrupt':
+                    body += '    interrupts_software = 1;\n'
+                elif loss == 'halt':
+                    body += '    debug_haltReq = 1;\n'
+                elif loss is not None and loss != 'step':
+                    body += '    reservation_invalidate = 1;\n'
+                if mode != 3 and loss is None and word == 0x00d00073:
+                    body += '''    check(dut.commit.output_valid && dut.commit.output_bits_instruction_fault &&
+      dut.commit.output_bits_instruction_cause == 2 && dut.commit.output_bits_instruction_tval == 'h00d00073 &&
+      !dut.gpr.we_0 && !status_sleep, "TW faults only while the reservation still holds at the quantum boundary");
+    tick(); repeat (3) tick();
+'''
+                    continue
+                body += '''    check(dut.commit.output_valid && !dut.commit.output_bits_instruction_fault && !dut.gpr.we_0 && !status_sleep,
+      "Reservation loss or the finite quantum completes the wait"); tick(); reservation_invalidate = 0;
+    repeat (3) begin check(!dut.commit.output_valid && !dut.csr.trap, "Wait retires once"); tick(); end
+'''
+                if loss == 'interrupt':
+                    body += '    interrupts_software = 0;\n'
+                if loss in ('halt', 'step'):
+                    body += f'''    while (!debug_mode) tick();
+    check(dut.csr.dpc == 'h10c && dut.csr.dcsr[8:6] == {3 if loss == 'halt' else 4} && dut.csr.dcsr[1:0] == {mode} && !status_sleep,
+      "Debug observes the completed wait and the next instruction PC"); debug_haltReq = 0;
+'''
+    if parameters.get('enableA', True) and not parameters['pmpEntries'] and parameters.get('virtualAddressBits') != 39:
+        for size in (2, 3):
+            for forward in (beq(0, 0, 8), jal(0, 8)):
+                body += reset + send(addi(8, 0, 0x400), 0x100, True) + send(amo(2, 9, 8, size=size), 0x104)
+                body += '''    while (!data_request_valid) tick();
+    check(data_request_bits_atomicOperation == 2, "Forward-control sequence begins with LR");
+    data_response_bits_tag = data_request_bits_tag; data_request_ready = 1; tick(); data_request_ready = 0;
+    data_response_bits_data = 5; data_response_valid = 1;
+    while (!data_response_ready) tick(); tick(); data_response_valid = 0;
+''' + wait_commit(0x104) + '    tick();\n' + send(forward, 0x108, True)
+                body += send(amo(3, 6, 8, 9, size=size), 0x110)
+                body += f'''    while (!data_request_valid) tick();
+    check(data_request_bits_atomic && data_request_bits_atomicOperation == 3 && data_request_bits_scEligible &&
+      data_request_bits_address == 'h400 && data_request_bits_size == {size} && data_request_bits_data == 5,
+      "A retired LR survives forward control recovery before SC");
+    data_response_bits_tag = data_request_bits_tag; data_request_ready = 1; tick(); data_request_ready = 0;
+    data_response_bits_data = 0; data_response_valid = 1;
+    while (!data_response_ready) tick(); tick(); data_response_valid = 0;
+''' + wait_commit(0x110) + '''    check(dut.gpr.we_0 && dut.gpr.waddr_0 == 6 && dut.gpr.wdata_0 == 0,
+      "Forward-control SC completes once"); tick(); repeat (3) tick();
+'''
+    if (parameters.get('enableZicboz') or parameters.get('enableZicbom')) and parameters.get('virtualAddressBits') != 39:
+        from programs import Program
+        base = int(parameters['resetVector'])
+        address = int(next(r for r in parameters['memoryRegions'] if r['readable'] and r['writable'] and not r['device'])['base']) + 0x1000
+        for operation in ((4,) if parameters.get('enableZicboz') else ()) + ((0, 1, 2) if parameters.get('enableZicbom') else ()):
+            zero = operation == 4
+            program = Program(base)
+            program.emit(addi(7, 0, -1))
+            for selector in (0, 1, 3):
+                for offset in (0, -2048, 2016):
+                    program.emit(alu(0, 7, (offset & -32) | selector, 6, immediate=True))
+            program.address(8, address + 31 - base)
+            program.emit(operation << 20 | 8 << 15 | 0x200f)
+            program.finish()
+            body += reset
+            for pc in range(base, program.stop, 4):
+                word = sum(program.memory[pc + byte] << (8 * byte) for byte in range(4))
+                body += send(word, pc)
+                if pc != program.stop - 4:
+                    body += '    repeat (8) begin check(!dut.csr.trap && !data_request_valid, "Address setup and prefetch hints have no memory effects"); tick(); end\n'
+            body += send(ld(9, 8, -23), program.stop)
+            for word in range(8 if zero else 1):
+                body += f'''    while (!data_request_valid) begin check(!dut.csr.trap, "Block instruction reaches its memory service"); tick(); end
+    repeat (3) begin
+      check(data_request_bits_address == 64'h{address+8*word:x} && data_request_bits_write == {int(zero)} &&
+        data_request_bits_size == 3 && data_request_bits_mask == {255 if zero else 0} && data_request_bits_data == 0 &&
+        data_request_bits_cacheOperation == {0 if zero else 3} && !data_request_bits_atomic && !dut.commit.output_valid,
+        "Decoded block instruction retains ownership through its memory service"); tick();
+    end
+    data_response_bits_tag = data_request_bits_tag; data_request_ready = 1; tick(); data_request_ready = 0;
+    data_response_bits_fault = 0; data_response_valid = 1;
+    while (!data_response_ready) tick(); tick(); data_response_valid = 0;
+'''
+            body += wait_commit(program.stop - 4) + f'''    check(dut.commit.output_valid && !dut.commit.output_bits_instruction_fault &&
+      !dut.gpr.we_0 && !status_sleep, "Decoded block instruction retires once after completion"); tick();
+    while (!data_request_valid) tick();
+    repeat (3) begin
+      check(data_request_bits_address == 64'h{address+8:x} && !data_request_bits_write &&
+        data_request_bits_size == 3 && !data_request_bits_cacheOperation && !data_request_bits_atomic,
+        "Younger same-block load follows block completion"); tick();
+    end
+    data_response_bits_tag = data_request_bits_tag; data_request_ready = 1; tick(); data_request_ready = 0;
+    data_response_bits_data = 57; data_response_valid = 1;
+    while (!data_response_ready) tick(); tick(); data_response_valid = 0;
+''' + wait_commit(program.stop) + '''    check(dut.gpr.we_0 && dut.gpr.waddr_0 == 9 && dut.gpr.wdata_0 == 57,
+      "Younger block load retires its response once"); tick();
+    repeat (3) begin check(!dut.commit.output_valid && !data_request_valid, "Block sequence releases ownership"); tick(); end
+'''
     return body
 
 
@@ -3935,11 +4505,11 @@ def verify_cache_coherence(cache_rtl, fabric_rtl, directory, mutations=False):
     oracle = {address + b: value >> (8 * b) & 255 for address, value in initial.items() for b in range(8)}
     body = f'''    begin
       reg [7:0] memory [0:{limit-1}];
-      integer cycles, reads, writes, failures, failure_budget, delay;
+      integer cycles, reads, writes, failures, failure_budget, delay, maintenances;
       reg owned, response_fault;
       reg [7:0] response_tag;
       reg [63:0] response_data;
-      cycles = 0; reads = 0; writes = 0; failures = 0; failure_budget = 2; delay = 0; owned = 0;
+      cycles = 0; reads = 0; writes = 0; failures = 0; failure_budget = 2; delay = 0; owned = 0; maintenances = 0;
       for (integer b = 0; b < {limit}; b++) memory[b] = 0;
 '''
     body += ''.join(f"      memory[{address}] = 8'h{value:x};\n" for address, value in oracle.items())
@@ -3953,10 +4523,15 @@ def verify_cache_coherence(cache_rtl, fabric_rtl, directory, mutations=False):
             physical_response_bits_tag = response_tag; physical_response_bits_last = 1;
             @(posedge clock); cycles = cycles + 1;
             if (physical_request_valid && physical_request_ready) begin
-              if (physical_request_bits_cacheOperation != 0 || physical_request_bits_size > 3 || physical_request_bits_address < {base} ||
+              if ((physical_request_bits_cacheOperation != 0 && (!{int(parameters.get('enableZicbom', False))} || physical_request_bits_cacheOperation != 3)) || physical_request_bits_size > 3 || physical_request_bits_address < {base} ||
                   physical_request_bits_address + (1 << physical_request_bits_size) > {limit}) $fatal(1, "Invalid physical transaction");
               owned = 1; delay = 3; response_data = 0; response_fault = 0; response_tag = physical_request_bits_tag;
-              if (physical_request_bits_write) begin
+              if (physical_request_bits_cacheOperation == 3) begin
+                if (physical_request_bits_write || physical_request_bits_mask || physical_request_bits_atomic ||
+                    physical_request_bits_fetch || physical_request_bits_size != 3 || physical_request_bits_address % 64)
+                  $fatal(1, "Invalid coherent maintenance command");
+                maintenances = maintenances + 1;
+              end else if (physical_request_bits_write) begin
                 writes = writes + 1;
                 if (failure_budget > 0) begin
                   response_fault = failures % 2 == 0; response_tag = physical_request_bits_tag ^ (failures % 2 == 1);
@@ -3977,16 +4552,17 @@ def verify_cache_coherence(cache_rtl, fabric_rtl, directory, mutations=False):
       join_none
 '''
 
-    def transfer(hart, address, value=None, size=3):
+    def transfer(hart, address, value=None, size=3, management=False):
         write = value is not None
         mask = (1 << (1 << size)) - 1 if write else 0
-        expected = 0 if write else sum(oracle.get(address + b, 0) << (8 * b) for b in range(1 << size))
+        expected = 0 if write or management else sum(oracle.get(address + b, 0) << (8 * b) for b in range(1 << size))
         if write:
             oracle.update((address + b, value >> (8 * b) & 255) for b in range(1 << size))
         return f'''      @(negedge clock);
       upstream_{hart}_request_bits_address = 64'h{address:x}; upstream_{hart}_request_bits_size = {size};
       upstream_{hart}_request_bits_write = {int(write)}; upstream_{hart}_request_bits_data = 64'h{(value or 0):x};
       upstream_{hart}_request_bits_mask = {mask}; upstream_{hart}_request_bits_tag = 37;
+      upstream_{hart}_request_bits_cacheOperation = {3 if management else 0};
       upstream_{hart}_request_valid = 1;
       #1; while (!upstream_{hart}_request_ready) tick(); tick(); upstream_{hart}_request_valid = 0;
       while (!upstream_{hart}_response_valid) tick();
@@ -4037,6 +4613,22 @@ def verify_cache_coherence(cache_rtl, fabric_rtl, directory, mutations=False):
         upstream_0_response_ready = 0; upstream_1_response_ready = 0;
       end
       check(failures == 4 && writes == 11, "Concurrent release retains dirty data across injected errors");
+'''
+    if parameters.get('enableZicbom'):
+        for owner in range(2):
+            for issuer in range(2):
+                case = 2 * owner + issuer + 1
+                value = 0x3579bdf02468ace0 + case
+                body += transfer(owner, base) + transfer(owner, base, value)
+                body += '      failure_budget = 2;\n' + transfer(issuer, base, management=True)
+                for byte in range(8):
+                    body += f'      check(memory[{base+byte}] == {value >> (8*byte) & 255}, "Maintenance exposes actual dirty bytes at its lower completion boundary");\n'
+                body += '      begin integer prior_reads; prior_reads = reads;\n'
+                body += transfer(owner, base) + transfer(1-owner, base)
+                body += f'''      check(reads == prior_reads + 2 && maintenances == {case} && failures == {4+2*case} && writes == {11+3*case},
+        "Maintenance invalidates both real cache arrays and retries dirty errors"); end
+'''
+    body += '''
       $display("COHERENCE reads=%0d writes=%0d failures=%0d", reads, writes, failures);
     end
 '''
@@ -4081,13 +4673,21 @@ def bench(module, body, cycle_limit=10000):
     declarations, connections, names = [], [], []
     for direction, width, name in module_ports(module):
         initial = (" = 3" if name == 'privilege' else " = 1" if name == 'wfiLegal' or name.endswith(('_privileged', '_response_bits_last')) else " = '0") if direction == 'input' else ''
+        if name == 'reservation_begin': initial = ''
         declarations.append(f'  logic {width} {name}{initial};')
         connections.append(f'.{name}({name})')
         names.append(name)
+    reservation = ''
+    if 'reservation_begin' in names:
+        port = 'memory' if 'memory_request_valid' in names else 'data'
+        reservation = f'''  logic reservation_auto = 1, reservation_pulse = 0;
+  assign reservation_begin = reservation_auto ? {port}_request_valid && {port}_request_ready &&
+    {port}_request_bits_atomic && {port}_request_bits_atomicOperation == 2 : reservation_pulse;
+'''
     header = '\n'.join(line.replace('#', '//', 1) for line in Path(__file__).read_text().splitlines()[:2])
     return (header + '\n`timescale 1ns/1ps\nmodule contract_tb;\n'
             + '`define CHECK(ok, message) #1; if ((ok) !== 1\'b1) $fatal(1, \"%s\", message)\n'
-            + '\n'.join(declarations) + '\n  ' + module.stem + ' dut(' + ', '.join(connections) + ');\n'
+            + '\n'.join(declarations) + '\n  ' + module.stem + ' dut(' + ', '.join(connections) + ');\n' + reservation
             + ('''  always #5 clock = ~clock;
   task tick;
     @(posedge clock); #1;
@@ -4247,6 +4847,8 @@ def user_csr_contract(parameters):
     state()
     for address in (0x306, 0x30a):
         value = (1 << (parameters.get('hpmCounters', 0) + 3)) - 1 if address == 0x306 and parameters.get('enableCounters') else 1 << 63 if address == 0x30a and parameters.get('enableSstc') else 0
+        if address == 0x30a:
+            value |= (0x80 if parameters.get('enableZicboz') else 0) | (0x70 if parameters.get('enableZicbom') else 0)
         body += f"    @(negedge clock); readAddress = 'h{address:x}; writeAddress = 'h{address:x}; writeData = '1; write = 1; tick(); write = 0; check(legal && readData == 64'h{value:x}, \"Environment CSR WARL fields\");\n"
     for previous in range(4):
         value = (previous << 11) | (1 << 17) | (1 << 21) | 0x88
@@ -4547,17 +5149,22 @@ def counter_csr_contract(parameters):
 def translation_contract(parameters):
     base, pa = int(parameters['resetVector']), parameters['physicalAddressBits']
     root, middle, bottom = base + 0x1000, base + 0x2000, base + 0x3000
-    body = '    reset = 1; tick(); reset = 0; tick();\n'
-    cached = [bool(parameters.get('tlbEntries') or parameters.get(key)) for key in ('iTlbEntries', 'dTlbEntries')]
+    body = '    reset = 1; tick(); reset = 0; tick(); ports_0_request_bits_atomic = 0; ports_1_request_bits_atomic = 0;\n'
+    atomic_entries = atomic_translation_entries(parameters)
+    cached = [bool(parameters.get('tlbEntries') or parameters.get(key) or port == 1 and atomic_entries)
+              for port, key in enumerate(('iTlbEntries', 'dTlbEntries'))]
     flush = '    invalidate = 1; tick(); invalidate = 0; tick();\n' if any(cached) else ''
     if parameters['pmpEntries']:
         body += f"    pmp_config = 'h1f; pmp_address = 'h{(1 << (pa - 2)) - 1:x};\n"
     vectors = []
     for level in (0, 1, 2):
-        for kind in ('fetch', 'read', 'write'):
+        for kind in ('fetch', 'read', 'write') + (('management',) if parameters.get('enableZicbom') else ()):
             for privilege in (0, 1, 3):
                 for flags, status in ((0xcf, 0), (0xdf, 0), (0xdf, 1 << 18), (0xc9, 0), (0xc9, 1 << 19), (0x4f, 0), (0x8f, 0)):
                     vectors.append((level, kind, privilege, flags, status, 0x12345100, None))
+                if kind == 'management':
+                    for flags, status in ((0x43, 0), (0x53, 0), (0x53, 1 << 18), (0x49, 0), (0x49, 1 << 19)):
+                        vectors.append((level, kind, privilege, flags, status, 0x12345100, None))
     for bad in (0, 1, 0xc5, 0xce, (1 << 54) | 0xcf, (1 << 63) | 0xcf, 0x100000000000cf):
         vectors.append((0, 'read', 1, bad, 0, 0x12345100, None))
     for level in (1, 2):
@@ -4585,7 +5192,8 @@ def translation_contract(parameters):
         body += flush
         body += f'''    state_satp = 64'h{(8 << 60) | root >> 12:x}; state_sum = {int(bool(status & (1 << 18)))}; state_mxr = {int(bool(status & (1 << 19)))};
     ports_{port}_request_bits_address = 64'h{address:x}; ports_{port}_request_bits_privilege = {privilege};
-    ports_{port}_request_bits_fetch = {int(kind == 'fetch')}; ports_{port}_request_bits_write = {int(kind == 'write')};
+    ports_{port}_request_bits_fetch = {int(kind == 'fetch')}; ports_{port}_request_bits_write = {int(kind in ('write', 'management'))};
+{f"    ports_{port}_request_bits_management = {int(kind == 'management')};" if parameters.get('enableZicbom') else ''}
     ports_{port}_request_valid = 1; #1; while (!ports_{port}_request_ready) tick(); tick(); ports_{port}_request_valid = 0;
     state_satp = 0; state_sum = !state_sum; state_mxr = !state_mxr; ports_{port}_request_bits_address = '1;
 '''
@@ -4604,7 +5212,7 @@ def translation_contract(parameters):
     end
     ports_{port}_response_ready = 1; tick(); ports_{port}_response_ready = 0;
 '''
-        if cached[port] and reads and not fault:
+        if (parameters.get('tlbEntries') or parameters.get(('iTlbEntries', 'dTlbEntries')[port])) and reads and not fault:
             hit_address = address + (8 if address <= MASK - 15 and address % 4096 < 4088 else 0)
             for hit_kind, hit_privilege, hit_status in ((kind, privilege, status), ('write', privilege, status),
                     ('read', privilege, status ^ (1 << 19)), (kind, 1 - privilege, status ^ (1 << 18))):
@@ -4615,7 +5223,8 @@ def translation_contract(parameters):
                     hit_fault, hit_cause = True, error.cause
                 body += f'''    state_satp = 64'h{(8 << 60) | root >> 12:x}; state_sum = {int(bool(hit_status & (1 << 18)))}; state_mxr = {int(bool(hit_status & (1 << 19)))};
     ports_{port}_request_bits_address = 64'h{hit_address:x}; ports_{port}_request_bits_privilege = {hit_privilege};
-    ports_{port}_request_bits_fetch = {int(hit_kind == 'fetch')}; ports_{port}_request_bits_write = {int(hit_kind == 'write')};
+    ports_{port}_request_bits_fetch = {int(hit_kind == 'fetch')}; ports_{port}_request_bits_write = {int(hit_kind in ('write', 'management'))};
+{f"    ports_{port}_request_bits_management = {int(hit_kind == 'management')};" if parameters.get('enableZicbom') else ''}
     ports_{port}_request_valid = 1; #1; while (!ports_{port}_request_ready) tick(); tick(); ports_{port}_request_valid = 0;
     while (!ports_{port}_response_valid) begin check(!memory_request_valid, "Warm translation repeated page-table service"); tick(); end
     repeat (2) begin
@@ -4623,6 +5232,8 @@ def translation_contract(parameters):
     end
     ports_{port}_response_ready = 1; tick(); ports_{port}_response_ready = 0;
 '''
+    if parameters.get('enableZicbom'):
+        body += '    ports_0_request_bits_management = 0; ports_1_request_bits_management = 0;\n'
     body += f'''    state_satp = 64'h{(8 << 60) | root >> 12:x}; ports_0_request_bits_address = 0; ports_0_request_bits_privilege = 1; ports_0_request_bits_fetch = 1; ports_0_request_valid = 1;
     #1; while (!ports_0_request_ready) tick(); tick(); ports_0_request_valid = 0;
     while (!memory_request_valid) tick(); cancelInstruction = 1; tick(); cancelInstruction = 0;
@@ -4666,14 +5277,14 @@ def translation_contract(parameters):
                 body += f"    pmp_config = 'h1f; pmp_address = 'h{(1 << (pa - 2)) - 1:x};\n"
             body += f'''    state_satp = 64'h{(8 << 60) | root >> 12:x}; state_sum = 0; state_mxr = 0;
     ports_{hit}_request_bits_address = 'h100; ports_{hit}_request_bits_privilege = 1;
-    ports_{hit}_request_bits_fetch = {int(hit == 0)}; ports_{hit}_request_bits_write = 0; ports_{hit}_request_valid = 1;
+    ports_{hit}_request_bits_fetch = {int(hit == 0)}; ports_{hit}_request_bits_write = 0; ports_{hit}_request_bits_atomic = {int(hit == 1 and atomic_entries)}; ports_{hit}_request_valid = 1;
     #1; while (!ports_{hit}_request_ready) tick(); tick(); ports_{hit}_request_valid = 0;
     while (!memory_request_valid) tick(); memory_request_ready = 1; tick(); memory_request_ready = 0;
     memory_response_bits_data = 64'h{((base >> 12) << 10) | 0xcf:x}; memory_response_valid = 1;
     tick(); memory_response_valid = 0; ports_{hit}_response_ready = 1;
     while (!ports_{hit}_response_valid) tick(); tick(); ports_{hit}_response_ready = 0;
     ports_{walking}_request_bits_address = 'h40000100; ports_{walking}_request_bits_privilege = 1;
-    ports_{walking}_request_bits_fetch = {int(walking == 0)}; ports_{walking}_request_bits_write = 0; ports_{walking}_request_valid = 1;
+    ports_{walking}_request_bits_fetch = {int(walking == 0)}; ports_{walking}_request_bits_write = 0; ports_{walking}_request_bits_atomic = 0; ports_{walking}_request_valid = 1;
     #1; while (!ports_{walking}_request_ready) tick(); tick(); ports_{walking}_request_valid = 0;
     while (!memory_request_valid) tick();
     ports_{hit}_request_bits_address = 'h104; ports_{hit}_request_valid = 1; ports_{hit}_response_ready = 1;
@@ -4696,40 +5307,85 @@ def translation_contract(parameters):
     memory_response_valid = 1; tick(); memory_response_valid = 0; ports_{walking}_response_ready = 1;
     while (!ports_{walking}_response_valid) tick(); tick(); ports_{walking}_response_ready = 0;
 '''
+    def demand(port, virtual, miss, concurrent=None, write=False, physical=base, atomic=False, flags=0xcf, cause=0, maintain=False):
+        nonlocal body
+        body += f'''    ports_{port}_request_bits_address = 64'h{virtual:x}; ports_{port}_request_bits_privilege = 1;
+    ports_{port}_request_bits_fetch = {int(port == 0)}; ports_{port}_request_bits_write = {int(write)}; ports_{port}_request_bits_atomic = {int(atomic)}; ports_{port}_request_valid = 1;
+    #1; while (!ports_{port}_request_ready) tick(); tick(); ports_{port}_request_valid = 0;
+'''
+        if miss:
+            body += f'''    while (!memory_request_valid) begin check(!ports_{port}_response_valid, "Cold translation needs its walk"); tick(); end
+    check(memory_request_bits_address == 'h{root + (virtual >> 30) * 8:x}, "Replacement walk uses independent root index");
+    memory_request_ready = 1; tick(); memory_request_ready = 0;
+'''
+            if maintain:
+                body += '    maintenance_valid = 1; maintenance_fence = 1; maintenance_addressValid = 0; maintenance_asidValid = 0; tick(); maintenance_valid = 0;\n'
+            body += f"    memory_response_bits_data = 64'h{((physical >> 12) << 10) | flags:x}; memory_response_valid = 1;\n"
+            if concurrent is not None:
+                body += f'''    ports_{concurrent}_request_bits_address = 'h100; ports_{concurrent}_request_bits_privilege = 1;
+    ports_{concurrent}_request_bits_fetch = {int(concurrent == 0)}; ports_{concurrent}_request_bits_write = 0; ports_{concurrent}_request_bits_atomic = {int(concurrent == 1 and atomic_entries)};
+    ports_{concurrent}_request_valid = 1;
+    #1; check(ports_{concurrent}_request_ready && ports_{concurrent}_response_valid &&
+      !ports_{concurrent}_response_bits_fault && ports_{concurrent}_response_bits_address == 'h{base+0x100:x},
+      "Shared hit promotes during the other client's leaf reply");
+'''
+            body += '    tick(); memory_response_valid = 0;\n'
+            if concurrent is not None:
+                body += f'''    ports_{concurrent}_request_valid = 0; ports_{concurrent}_response_ready = 1;
+'''
+        body += f'''    while (!ports_{port}_response_valid) begin check(!memory_request_valid, "Promoted translation survives shared replacement"); tick(); end
+    check(!memory_request_valid && ports_{port}_response_bits_fault == {int(bool(cause))} && ports_{port}_response_bits_cause == {cause} && ports_{port}_response_bits_address == 'h{virtual if cause else physical + (virtual & ((1 << 30) - 1)):x}, "Local translation retains its leaf bytes");
+    ports_{port}_response_ready = 1; tick(); ports_{port}_response_ready = 0;
+'''
+        if concurrent is not None:
+            body += f'    ports_{concurrent}_response_ready = 0;\n'
     if parameters.get('tlbEntries'):
         for target, key in enumerate(('iTlbEntries', 'dTlbEntries')):
-            if not parameters.get(key):
+            if not parameters.get(key) and not (target == 1 and atomic_entries):
                 continue
+            evictions = max(parameters['tlbEntries'], parameters.get(('dTlbEntries', 'iTlbEntries')[target], 0))
             body += '''    reset = 1; tick(); reset = 0; tick();
     ports_0_request_valid = 0; ports_1_request_valid = 0; cancelInstruction = 0; invalidate = 0;
     ports_0_response_ready = 0; ports_1_response_ready = 0;
     memory_request_ready = 0; memory_response_valid = 0; memory_response_bits_fault = 0; memory_response_bits_tag = 0;
+    memory_response_bits_last = 1;
 '''
             if parameters['pmpEntries']:
                 body += f"    pmp_config = 'h1f; pmp_address = 'h{(1 << (pa - 2)) - 1:x};\n"
             body += f"    state_satp = 64'h{(8 << 60) | root >> 12:x}; state_sum = 0; state_mxr = 0;\n"
-            def demand(port, virtual, miss):
-                nonlocal body
-                body += f'''    ports_{port}_request_bits_address = 64'h{virtual:x}; ports_{port}_request_bits_privilege = 1;
-    ports_{port}_request_bits_fetch = {int(port == 0)}; ports_{port}_request_bits_write = 0; ports_{port}_request_valid = 1;
-    #1; while (!ports_{port}_request_ready) tick(); tick(); ports_{port}_request_valid = 0;
-'''
-                if miss:
-                    body += f'''    while (!memory_request_valid) begin check(!ports_{port}_response_valid, "Cold translation needs its walk"); tick(); end
-    check(memory_request_bits_address == 'h{root + (virtual >> 30) * 8:x}, "Replacement walk uses independent root index");
-    memory_request_ready = 1; tick(); memory_request_ready = 0;
-    memory_response_bits_data = 64'h{((base >> 12) << 10) | 0xcf:x}; memory_response_valid = 1;
-    tick(); memory_response_valid = 0;
-'''
-                body += f'''    while (!ports_{port}_response_valid) begin check(!memory_request_valid, "Promoted translation survives shared replacement"); tick(); end
-    check(!memory_request_valid && !ports_{port}_response_bits_fault && ports_{port}_response_bits_address == 'h{base + (virtual & ((1 << 30) - 1)):x}, "Local translation retains its leaf bytes");
-    ports_{port}_response_ready = 1; tick(); ports_{port}_response_ready = 0;
-'''
             demand(1 - target, 0x100, True)
-            demand(target, 0x100, False)
-            for page in range(1, parameters['tlbEntries'] + 1):
+            demand(1 - target, ((evictions + 1) << 30) | 0x100, True,
+                   concurrent=target, physical=base ^ (1 << 30))
+            for page in range(1, evictions + 1):
                 demand(1 - target, (page << 30) | 0x100, True)
-            demand(target, 0x100, False)
+            demand(1 - target, 0x100, True, physical=base ^ (1 << 30))
+            demand(target, 0x100, False, write=target == 1, atomic=bool(target == 1 and atomic_entries))
+    if atomic_entries:
+        body += "    reset = 1; tick(); reset = 0; tick(); ports_0_request_valid = 0; ports_1_request_valid = 0;\n"
+        body += "    ports_0_response_ready = 0; ports_1_response_ready = 0; memory_request_ready = 0; memory_response_valid = 0;\n"
+        body += "    memory_response_bits_fault = 0; memory_response_bits_tag = 0; memory_response_bits_last = 1; invalidate = 0; cancelInstruction = 0; maintenance_valid = 0;\n"
+        if parameters['pmpEntries']:
+            body += f"    pmp_config = 'h1f; pmp_address = 'h{(1 << (pa - 2)) - 1:x};\n"
+        body += f"    state_satp = 64'h{(8 << 60) | root >> 12:x}; state_sum = 0; state_mxr = 0;\n"
+        demand(1, 0x100, True, atomic=True)
+        for page in range(1, parameters.get('tlbEntries', 0) + 2):
+            demand(1, (page << 30) | 0x100, True, physical=base ^ (1 << 30))
+        if parameters.get('tlbEntries'):
+            demand(1, ((parameters['tlbEntries'] + 1) << 30) | 0x100, False, physical=base ^ (1 << 30))
+        demand(0, 0x100, True, physical=base ^ (1 << 30))
+        demand(1, 0x100, False, write=True, atomic=True)
+        demand(1, 0x100, False)
+        body += '    invalidate = 1; tick(); invalidate = 0;\n'
+        demand(1, 0x100, True, atomic=True, flags=0x4f)
+        demand(1, 0x100, False, write=True, atomic=True, cause=15)
+        body += '    maintenance_valid = 1; maintenance_fence = 1; maintenance_addressValid = 0; maintenance_asidValid = 0; tick(); maintenance_valid = 0;\n'
+        demand(1, 0x100, True, atomic=True, maintain=True)
+        demand(1, 0x100, True, atomic=True, physical=base ^ (1 << 30))
+        demand(1, 0x100, False, write=True, atomic=True, physical=base ^ (1 << 30))
+        if parameters.get('asidBits'):
+            body += f"    state_satp = 64'h{(8 << 60) | (1 << 44) | root >> 12:x}; maintenance_valid = 1; maintenance_fence = 0; tick(); maintenance_valid = 0;\n"
+            demand(1, 0x100, True, atomic=True)
+    body += '    ports_0_request_bits_atomic = 0; ports_1_request_bits_atomic = 0;\n'
     body += '''    state_satp = 0; ports_0_request_bits_address = 'h40; ports_0_request_bits_fetch = 1;
     ports_1_request_bits_address = 'h80; ports_0_request_valid = 1; ports_1_request_valid = 1;
     ports_0_response_ready = 1; ports_1_response_ready = 1;
@@ -4836,7 +5492,7 @@ def translation_context_contract(parameters):
 
 
 def translated_consumer_contract(parameters, fetch):
-    physical = int(parameters['resetVector']) + 0x1000
+    physical = (int(parameters['resetVector']) + 0x1000) & (~3 if fetch else -1)
     body = '    reset = 1; tick(); reset = 0; tick(); privilege = 1;\n'
     if parameters['pmpEntries']:
         addresses = ((physical >> 2) | 0x1ff) | ((((physical + 0x1000) >> 2) | 0x1ff) << (parameters['physicalAddressBits'] - 2))
@@ -4854,7 +5510,7 @@ def translated_consumer_contract(parameters, fetch):
 '''
         body += f'''    {'privilege = 3;' if not fetch else ''}
     repeat (2) begin
-      check(translation_request_valid && translation_request_bits_address == 'h{virtual:x} && translation_request_bits_privilege == 1 && translation_request_bits_fetch == {int(fetch)} && translation_request_bits_write == {int(operation == 3)} && !memory_request_valid, "Retained virtual address and effective privilege"); tick();
+      check(translation_request_valid && translation_request_bits_address == 'h{virtual:x} && translation_request_bits_privilege == 1 && translation_request_bits_fetch == {int(fetch)} && translation_request_bits_write == {int(operation == 3)} && translation_request_bits_atomic == {int(not fetch and operation is not None)} && !memory_request_valid, "Retained virtual address and effective privilege"); tick();
     end
     translation_request_ready = 1; tick(); translation_request_ready = 0;
 '''
@@ -4913,7 +5569,7 @@ def translated_consumer_contract(parameters, fetch):
 
 def privilege_memory_contract(parameters, fetch, frontend=False):
     body = ''
-    address = int(parameters['resetVector']) + 0x100
+    address = (int(parameters['resetVector']) + 0x100) & (~3 if fetch else -1)
     for privilege in ((0, 1, 3) if parameters.get('enableSupervisorMode') else (0, 3)):
         if frontend:
             body += '    halt = 1; redirect = 0;\n'
@@ -4943,17 +5599,18 @@ def privilege_memory_contract(parameters, fetch, frontend=False):
     return body + '    reset = 1; tick(); reset = 0; tick(); privilege = 3;\n'
 
 
-def protection_contract(fetch):
-    prefix = '    reset = 1; tick(); reset = 0; tick();\n    pmp_config = 128\'h98; pmp_address = \'h40;\n'
+def protection_contract(fetch, base=0):
+    prefix = f"    reset = 1; tick(); reset = 0; tick();\n    pmp_config = 128'h98; pmp_address = 'h{(base + 0x100) >> 2:x};\n"
     if fetch:
-        return prefix + '''
+        return prefix + f'''
     output_ready = 0; memory_response_valid = 0; memory_request_ready = 0;
-    request_bits_pc = 'h100; request_valid = 1; tick(); request_valid = 0;
+    request_bits_pc = 'h{base + 0x100:x}; request_valid = 1; tick(); request_valid = 0;
     repeat (3) begin
-      check(output_valid && output_bits_fault && output_bits_cause == 1 && output_bits_tval == 'h100 && !memory_request_valid, "Denied fetch escaped"); tick();
+      check(output_valid && output_bits_fault && output_bits_cause == 1 && output_bits_tval == 'h{base + 0x100:x} && !memory_request_valid, "Denied fetch escaped"); tick();
     end
     output_ready = 1; tick(); output_ready = 0;
-    pmp_config = 0; request_valid = 1; tick(); request_valid = 0; pmp_config = 'h98;
+    pmp_config = 0; request_valid = 1; tick(); request_valid = 0;
+    while (!memory_request_valid) tick(); pmp_config = 'h98;
     repeat (3) begin check(memory_request_valid, "Policy update withdrew a presented fetch"); tick(); end
     cancel = 1; tick(); cancel = 0;
     memory_request_ready = 1; tick(); memory_request_ready = 0;
@@ -5118,7 +5775,7 @@ def shared_cache_contract(parameters):
     prot = 0 if region['readable'] and region.get('dataCacheable') else 4
     body = ''
 
-    def read(address, miss, count=1, access_size=size, lock=False, error=-1, wrong_id=-1, chunks=None, version=0, cache=14):
+    def read(address, miss, count=1, access_size=size, lock=False, error=-1, wrong_id=-1, chunks=None, version=0, cache=14, maintain=False):
         nonlocal body
         body += f'''    upstream_ar_bits_addr = {parameters['physicalAddressBits']}'h{address:x}; upstream_ar_bits_id = 1;
     upstream_ar_bits_len = {count-1}; upstream_ar_bits_size = {access_size}; upstream_ar_bits_burst = 1;
@@ -5137,6 +5794,8 @@ def shared_cache_contract(parameters):
     downstream_ar_ready = 1; tick(); downstream_ar_ready = 0;
 '''
         actual = count if chunks is None else chunks
+        if maintain:
+            body += f"    maintenance_valid = 1; maintenance_bits = 64'h{address & -64:x}; upstream_ar_valid = 1;\n"
         for beat in range(actual):
             physical = (address & -beat_bytes) + beat * beat_bytes
             value = sum(((physical + 8 * word + version + 19) * 0x0102030405060709 & MASK) << (64 * word) for word in range(width // 64))
@@ -5148,15 +5807,19 @@ def shared_cache_contract(parameters):
             body += f'''    while (!upstream_r_valid) begin check(!downstream_ar_valid, "Hit issued an external read"); tick(); end
     repeat (3) begin
       check(upstream_r_valid && upstream_r_bits_data == {width}'h{value:x} && upstream_r_bits_id == {identity} &&
-        upstream_r_bits_resp == {response} && upstream_r_bits_last == {last} && !upstream_ar_ready && !downstream_ar_valid,
-        "Read bytes, identity and terminal framing held"); tick();
+        upstream_r_bits_resp == {response} && upstream_r_bits_last == {last} && !upstream_ar_ready && !downstream_ar_valid{(' && !maintenance_ready' if maintain else '')},
+                    "Read bytes, identity and terminal framing held"); tick();
     end
     upstream_r_ready = 1; tick(); upstream_r_ready = 0;
 '''
             if miss:
                 body += '    downstream_r_valid = 0;\n'
+        if maintain:
+            body += '''    check(maintenance_ready && !upstream_ar_ready && !downstream_ar_valid,
+      "Maintenance waits until the old refill drains"); tick(); maintenance_valid = 0; upstream_ar_valid = 0;
+'''
 
-    def write(address, order, response=0):
+    def write(address, order, response=0, maintain=False):
         nonlocal body
         body += f'''    upstream_aw_bits_addr = {parameters['physicalAddressBits']}'h{address:x}; upstream_aw_bits_id = 1;
     upstream_aw_bits_len = 0; upstream_aw_bits_size = 0; upstream_aw_bits_burst = 1;
@@ -5176,15 +5839,32 @@ def shared_cache_contract(parameters):
 '''
             if both:
                 body += '    upstream_w_valid = 0;\n'
+            if maintain:
+                body += f"    maintenance_valid = 1; maintenance_bits = 64'h{address & -64:x};\n"
         body += f'''    downstream_aw_ready = 0; downstream_w_ready = 0;
     downstream_b_bits_id = 1; downstream_b_bits_resp = {response}; downstream_b_valid = 1;
     upstream_ar_valid = 1;
     repeat (3) begin
       check(upstream_b_valid && upstream_b_bits_id == 1 && upstream_b_bits_resp == {response} &&
-        !downstream_b_ready && !upstream_ar_ready && !downstream_ar_valid, "Write response and invalidation ordered before new reads"); tick();
+        !downstream_b_ready && !upstream_ar_ready && !downstream_ar_valid{(' && !maintenance_ready' if maintain else '')}, "Write response and invalidation ordered before new reads"); tick();
     end
     upstream_b_ready = 1; tick(); upstream_b_ready = 0; downstream_b_valid = 0; upstream_ar_valid = 0;
 '''
+        if maintain:
+            body += '    check(maintenance_ready, "Maintenance drains both partial write channels and response"); tick(); maintenance_valid = 0;\n'
+
+    def management():
+        nonlocal body
+        if not parameters.get('enableZicbom'):
+            return
+        body += f"    maintenance_valid = 1; maintenance_bits = 64'h{base:x};\n"
+        body += '    check(maintenance_ready && !upstream_ar_ready, "Idle maintenance excludes a new read"); tick(); maintenance_valid = 0;\n'
+        read(base, True, beats, maintain=True)
+        read(base, True, beats, version=1)
+        read(base, False, beats, version=1)
+        for order in (0, 1):
+            write(base, order, maintain=True)
+            read(base, True, beats, version=order+2)
 
     read(base, True, beats)
     for cache in (0, 1, 2, 3):
@@ -5202,6 +5882,7 @@ def shared_cache_contract(parameters):
         read(base, True, beats, lock=True)
         read(base, True, beats)
         read(base, False, beats)
+        management()
         return body
     write(base, 0)
     for address in (base, base + parameters['l2CacheBytes'] - 64):
@@ -5237,6 +5918,7 @@ def shared_cache_contract(parameters):
             read(int(r['base']), True)
             read(int(r['base']), True)
             break
+    management()
     return body
 
 
@@ -5245,7 +5927,7 @@ def verify(rtl, directory, modules=None):
     manifest = json.loads((rtl / 'ditdah_a1_config.json').read_text())
     parameters = manifest['parameters']
     def emitted_source(name): return (rtl / (name + '.sv')).read_text() if (rtl / (name + '.sv')).is_file() else ''
-    if not parameters.get('enableMisaligned'):
+    if not (parameters.get('enableMisaligned') or parameters.get('enableZicboz') or parameters.get('enableZicbom')):
         assert not re.search(r'\breg\s+(?:\[[^]]+\]\s+)?(?:splitting|offset)(?:_\d+)?\s*[;,=]', emitted_source('DitDahA1Lsu')), 'Disabled fragment state was emitted'
     verified = []
     enabled = parameters['pmpEntries'] != 0
@@ -5269,9 +5951,11 @@ def verify(rtl, directory, modules=None):
                        ('DitDahA1MemoryArbiter', arbiter_contract(parameters)),
                        ('DitDahA1Memory', memory_contract(parameters)),
                        ('DitDahA1Axi', axi_contract(parameters['axiDataBits'], parameters['hartCount'], parameters.get('enableA', True)) +
+                        (cache_management_axi_contract() if parameters.get('enableZicbom') else '') +
                         (burst_axi_contract(parameters) if parameters.get('enableBurstRefill') else '') +
                         (burst_axi_contract(parameters, False) if parameters.get('dCacheRefillBytes') == 64 else '')),
-                       ('DitDahA1MemoryFabric', fabric_contract(parameters)))
+                       ('DitDahA1MemoryFabric', fabric_contract(parameters) + cache_management_fabric_contract(parameters)
+                        if not modules or 'DitDahA1MemoryFabric' in modules else ''))
     if parameters.get('floatingPointBits'):
         suites += (('DitDahA1Fpu', floating_contract(parameters, directory)),)
     if parameters.get('fabricReadSlots') or parameters['hartCount'] > 1:
@@ -5311,7 +5995,8 @@ def verify(rtl, directory, modules=None):
         suites += (('DitDahA1Translation', translation_contract(parameters) + translation_context_contract(parameters)),)
         suites += (('DitDahA1Fetch', translated_consumer_contract(parameters, True)),
                    ('DitDahA1Lsu', lsu_queue_contract(parameters) if parameters.get('loadQueueEntries', 1) == 2 else
-                    translated_consumer_contract(parameters, False) + lsu_refill_contract(parameters)))
+                    translated_consumer_contract(parameters, False) + lsu_refill_contract(parameters) +
+                    (lsu_reservation_contract(parameters) if parameters.get('enableA', True) else '')))
         suites += (('DitDahA1Frontend', frontend_group_contract(parameters)),)
     if cached and parameters['issueWidth'] > 1:
         suites = tuple((name, body + (wide_fetch_contract(parameters) if name == 'DitDahA1Fetch' else '')) for name, body in suites)
@@ -5322,6 +6007,12 @@ def verify(rtl, directory, modules=None):
                         if name in ('DitDahA1Fetch', 'DitDahA1Frontend') else body) for name, body in suites)
     if parameters.get('enableMisaligned'):
         suites = tuple((name, body + (misaligned_lsu_contract(parameters) if name == 'DitDahA1Lsu' else '')) for name, body in suites)
+    if parameters.get('enableZicboz'):
+        suites = tuple((name, body + (cache_zero_lsu_contract(parameters) if name == 'DitDahA1Lsu' else '')) for name, body in suites)
+    if parameters.get('enableZicboz') or parameters.get('enableZicbom'):
+        suites = tuple((name, body + (cache_environment_csr_contract(parameters) if name == 'DitDahA1Csr' else '')) for name, body in suites)
+    if parameters.get('enableZicbom'):
+        suites = tuple((name, body + (cache_management_lsu_contract(parameters) if name == 'DitDahA1Lsu' else '')) for name, body in suites)
     assert not modules or set(modules) <= {name for name, _ in suites}, 'Unsupported contract selection'
     for name, body in suites:
         if name == 'DitDahA1MulDiv' and not parameters.get('enableM', True):
@@ -5342,7 +6033,9 @@ def verify(rtl, directory, modules=None):
                 body = re.sub(r'\bdut\.(instruction|decoded|issued|result|memory|commit)Valid\b',
                               r'(dut.\1Count != 0)', body)
                 body += backend_group_contract(parameters) + (backend_branch_contract() if parameters.get('loadQueueEntries', 1) == 1 else '') + backend_memory_group_contract(parameters)
-        source = bench(module, body, 4 + 69 * body.count('MulDiv resource reuse')) if name == 'DitDahA1MulDiv' else bench(module, body, 60000 if name == 'DitDahA1Lsu' and parameters.get('enableMisaligned') else 10000)
+        cycles = (10000 + 12500 * bool(parameters.get('enableMisaligned')) * (3 if parameters.get('floatingPointBits') else 2) + 35000 * bool(parameters.get('enableZicboz')) +
+                  10000 * bool(parameters.get('enableZicbom'))) if name == 'DitDahA1Lsu' else 10000
+        source = bench(module, body, 4 + 69 * body.count('MulDiv resource reuse') if name == 'DitDahA1MulDiv' else cycles)
         if name == 'DitDahA1Backend' and parameters.get('enableCounters'):
             slots = '+'.join(f"integer'(dut.commitCount>{lane} && !dut.commitPackets_{lane}_instruction_fault)" for lane in range(parameters['issueWidth']))
             source = source.replace('  initial begin', f'''  reg [{parameters['issueWidth']}:0] count_seen=0;
@@ -5418,6 +6111,32 @@ def verify(rtl, directory, modules=None):
         result = subprocess.run(['vvp', str(binary)], capture_output=True, text=True, timeout=30)
         (directory / (name + '.log')).write_text(result.stdout + result.stderr)
         assert result.returncode == 0 and 'PASS' in result.stdout, result.stdout + result.stderr
+        if name == 'DitDahA1Lsu' and parameters.get('enableA', True):
+            original = module.read_text()
+            update = re.search(r'reserved <=\s*\n[^;]+;', original).group()
+            replay = '(memory_response_valid && memory_response_ready && !memory_response_bits_fault && output_bits_atomic && output_bits_instruction_instruction[31:27] == 2)'
+            mask = re.search(r'assign reservation_mask\s*=[^;]+;', original).group()
+            negatives = []
+            mutations = [('loss', update, update.replace('reservation_invalidate', "1'h0")),
+                         ('reply', update, update[:-1] + ' | ' + replay + ';'),
+                         ('mask', mask, "assign reservation_mask = 8'h0;")]
+            if parameters.get('loadQueueEntries', 1) == 1:
+                mutations.append(('neighbor', mask, "assign reservation_mask = 8'hff;"))
+            for defect, before, replacement in mutations:
+                work = directory / ('reservation-' + defect)
+                work.mkdir(exist_ok=True)
+                changed = work / module.name
+                changed.write_text(original.replace(before, replacement))
+                binary = work / name
+                subprocess.run(['iverilog', '-g2012', '-s', 'contract_tb', '-o', str(binary),
+                                str(changed), *map(str, dependencies), str(test)], check=True)
+                negative = subprocess.run(['vvp', str(binary)], capture_output=True, text=True, timeout=30)
+                (work / 'simulation.log').write_text(negative.stdout + negative.stderr)
+                assert negative.returncode != 0 and any(message in negative.stdout for message in
+                    ('Reservation request capture', 'Endpoint write prevents delayed LR resurrection', 'Reservation byte range')), negative.stdout + negative.stderr
+                negatives.append(dict(defect=defect, actualExit=negative.returncode,
+                    sourceHash=hashlib.sha256(changed.read_bytes()).hexdigest()))
+            (directory / 'reservation-negatives.json').write_text(json.dumps(negatives, indent=2)+'\n')
         print(f'  {name} interface contracts passed', flush=True)
         verified.append(name)
     if (parameters.get('dCacheWriteback') and parameters['hartCount'] == 2 and

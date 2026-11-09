@@ -23,6 +23,11 @@ object DitDahA1ParameterCheck:
       assert(DitDahA1Config.parameter(DitDahA1Config.document(selected)) == selected)
     for id <- Seq(-1L, 0L, 2L, 0x100000001L) do
       rejects { baseline.copy(jtagIdcode = Some(id)); () }
+    val firstBlockHalf = MemoryRegion(size = 32, executable = false)
+    val secondBlockHalf = firstBlockHalf.copy(base = 32)
+    assert(baseline.copy(memoryRegions = Seq(secondBlockHalf, firstBlockHalf)).blockMemoryRegions == Seq(firstBlockHalf.copy(size = 64)))
+    for second <- Seq(secondBlockHalf.copy(writable = false), secondBlockHalf.copy(dataCacheable = true), secondBlockHalf.copy(base = 40)) do
+      assert(baseline.copy(memoryRegions = Seq(firstBlockHalf, second)).blockMemoryRegions.size == 2)
     for enabled <- Seq(false, true) do
       val selected = DitDahA1Parameter.uncached.copy(enableJtag = enabled)
       selected.validateCore()
@@ -129,6 +134,12 @@ object DitDahA1ParameterCheck:
     rtl.copy(fabricReadSlots = Some(1)).validateFabric()
     rtl.copy(fabricReadSlots = Some(2)).validateFabric()
     rejects { rtl.copy(fabricReadSlots = Some(3)).validateFabric() }
+    for enabled <- Seq(false, true) do
+      val selected = rtl.copy(enableZawrs = enabled)
+      selected.validateRtl()
+      assert(DitDahA1Config.parameter(DitDahA1Config.document(selected)) == selected)
+      assert(DitDahA1Isa.instructions(selected).contains("wrs.nto") == enabled)
+    rejects { rtl.copy(enableA = false, enableZawrs = true); () }
     for enabled <- Seq(false, true) do
       val selected = rtl.copy(enableMisaligned = enabled)
       selected.validateRtl()

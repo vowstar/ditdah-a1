@@ -34,25 +34,27 @@ object DitDahA1Coherence extends Generator[DitDahA1Parameter, DitDahA1UnitLayers
     val acquire = request.cacheOperation === 1.U(2)
     val release = request.cacheOperation === 2.U(2)
     val special = acquire | release
+    val maintenance = parameter.enableZicbom.B & (request.cacheOperation === 3.U(2))
     val cacheable = DitDahA1Memory.dataCacheable(parameter, request.address, 1)
     val releaseAllowed = parameter.memoryRegions.filter(r => r.readable && r.dataCacheable && !r.device).foldLeft[Referable[Bool]](false.B) { (allowed, region) =>
       allowed | ((request.address >= (region.base & ~BigInt(63)).U(64)) &
         (request.address <= ((region.base + region.size - 1) & ~BigInt(63)).U(64)))
     }
-    val authorized = (if parameter.dCacheWriteback then release else false.B).?(releaseAllowed,
-      cacheable & DitDahA1Memory.permitted(parameter, request))
+    val authorized = maintenance.?(DitDahA1Memory.managementPermitted(parameter, request),
+      (if parameter.dCacheWriteback then release else false.B).?(releaseAllowed,
+        cacheable & DitDahA1Memory.permitted(parameter, request)))
     val invalidOperation = (request.cacheOperation =/= 0.U(2)) &
-      (if parameter.dCacheWriteback then !special | request.atomic | request.fetch |
+      maintenance.?(!authorized, (if parameter.dCacheWriteback then !special | request.atomic | request.fetch |
         (acquire & !request.write) | (release & (request.write | (request.size =/= 3.U(3)) |
           (request.address.asBits.bits(5, 0) =/= 0.B(6)))) |
-        !authorized else true.B)
+        !authorized else true.B))
     val coherent = authorized &
-      (if parameter.dCacheWriteback then true.B else request.write)
-    val invalidate = request.write | release | request.atomic
+      (maintenance | (if parameter.dCacheWriteback then true.B else request.write))
+    val invalidate = request.write | release | request.atomic | maintenance
     val targets = (0 until parameter.hartCount).reverse.map { hart =>
       val owner = io.hartId === hart.U(4)
-      (if parameter.dCacheWriteback then release.?(owner, (!acquire | !owner))
-        else request.atomic | !owner).asBits
+      (maintenance | (if parameter.dCacheWriteback then release.?(owner, (!acquire | !owner))
+        else request.atomic | !owner)).asBits
     }.reduce(_ ## _)
     val acknowledged = (0 until parameter.hartCount).reverse.map(hart =>
       (io.probe(hart).request.valid & io.probe(hart).request.ready).asBits).reduce(_ ## _)
@@ -82,8 +84,9 @@ object DitDahA1Coherence extends Generator[DitDahA1Parameter, DitDahA1UnitLayers
       ((state === 0.U(3)) & invalidOperation) | ((state === 4.U(3)) & special)
     down.request.valid := ((state === 2.U(3)) | forwarding) & up.request.valid
     down.request.bits :<= request
-    down.request.bits.cacheOperation := 0.U(2)
+    down.request.bits.cacheOperation := maintenance.?(3.U(2), 0.U(2))
     when(state === 2.U(3)) {
+      down.request.bits.cacheOperation := 0.U(2)
       down.request.bits.debug.foreach(_ := false.B)
       down.request.bits.address := (request.address.asBits.bits(63, 6) ## frame.word.asBits ## 0.B(3)).asUInt
       down.request.bits.data := frame.data

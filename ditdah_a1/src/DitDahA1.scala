@@ -18,6 +18,8 @@ object DitDahA1Module extends Generator[DitDahA1Parameter, DitDahA1Layers, DitDa
       DitDahA1Core.instantiate(parameter)
     }
     val fabric = DitDahA1MemoryFabric.instantiate(parameter)
+    val writes = Option.when(parameter.enableA)(Seq.fill(1 + (if parameter.dCacheWriteback then parameter.hartCount else 0))(
+      Wire(new MemoryWriteEvent)))
     val processorReset = if !parameter.enableJtag then io.reset else
       val dtm = DitDahA1JtagDtm.instantiate(parameter)
       val bridge = DitDahA1DmiBridge.instantiate(parameter)
@@ -70,6 +72,7 @@ object DitDahA1Module extends Generator[DitDahA1Parameter, DitDahA1Layers, DitDa
         cache.io.upstream :<>= core.io.data
         fabric.io.data(hart) :<>= cache.io.downstream
         cache.io.probe :<>= fabric.io.probe.get(hart)
+        cache.io.writeEvent.foreach(event => writes.get(hart + 1) :<= event)
     fabric.io.clock := io.clock
     fabric.io.reset := processorReset
     if parameter.localInterruptBase.nonEmpty then fabric.io.timeTick.get := io.timeTick.get
@@ -79,7 +82,16 @@ object DitDahA1Module extends Generator[DitDahA1Parameter, DitDahA1Layers, DitDa
       sharedCache.io.clock := io.clock
       sharedCache.io.reset := processorReset
       sharedCache.io.upstream :<>= fabric.io.axi
+      sharedCache.io.maintenance.foreach(_ :<>= fabric.io.maintenance.get)
       io.axi :<>= sharedCache.io.downstream
+    writes.foreach { events =>
+      events.head :<= fabric.io.writeEvent.get
+      for (core, hart) <- cores.zipWithIndex do
+        val reservation = core.io.reservation.get
+        reservation.begin := io.axi.ar.valid & io.axi.ar.ready & io.axi.ar.bits.lock & (io.axi.ar.bits.id === hart.U(parameter.axiIdBits))
+        reservation.invalidate := events.map(event => event.valid & (event.address === reservation.address) &
+          ((event.mask.asBits & reservation.mask.asBits) =/= 0.B(8))).reduce(_ | _)
+    }
     io.status.trap := cores.map[Referable[Bool]](_.io.status.trap).reduce(_ | _)
     io.status.busy := cores.map[Referable[Bool]](_.io.status.busy).reduce(_ | _)
     io.status.sleep := cores.map[Referable[Bool]](_.io.status.sleep).reduce(_ & _)
@@ -101,6 +113,7 @@ object DitDahA1MemoryFabric extends Generator[DitDahA1Parameter, DitDahA1UnitLay
     axi.io.clock := io.clock
     axi.io.reset := io.reset
     axi.io.hartId := arbiter.io.hartId
+    io.writeEvent.foreach(_ :<= axi.io.writeEvent.get)
     val exclusive = readers.map { queue =>
       given ClockScope = ClockScope.posedge(io.clock)
       given ResetScope = ResetScope.syncActiveHigh(io.reset)
@@ -187,12 +200,38 @@ object DitDahA1MemoryFabric extends Generator[DitDahA1Parameter, DitDahA1UnitLay
         memory.io.upstream :<>= serialized
         coherence.io.upstream :<>= memory.io.downstream
         coherence.io.downstream
-    if parameter.localInterruptBase.isEmpty then axi.io.memory :<>= physical
+    val controlled = if !parameter.enableZicbom then physical else
+      given ClockScope = ClockScope.posedge(io.clock)
+      given ResetScope = ResetScope.syncActiveHigh(io.reset)
+      val up = physical
+      val down = Wire(new MemoryPort(parameter))
+      val completed = RegInit(false.B)
+      val tag = Reg(UInt(8))
+      val maintenance = up.request.bits.cacheOperation === 3.U(2)
+      val ready = io.maintenance.map(_.ready).getOrElse(true.B)
+      io.maintenance.foreach { port =>
+        port.valid := up.request.valid & maintenance & !completed
+        port.bits := up.request.bits.address
+      }
+      down.request.bits :<= up.request.bits
+      down.request.valid := up.request.valid & !maintenance & !completed
+      up.request.ready := !completed & maintenance.?(ready, down.request.ready)
+      up.response.valid := completed | down.response.valid
+      up.response.bits :<= down.response.bits
+      when(completed) {
+        up.response.bits.data := 0.U(64); up.response.bits.fault := false.B
+        up.response.bits.tag := tag; up.response.bits.last := true.B
+      }
+      down.response.ready := up.response.ready & !completed
+      when(up.request.valid & up.request.ready & maintenance) { completed := true.B; tag := up.request.bits.tag }
+      when(completed & up.response.ready) { completed := false.B }
+      down
+    if parameter.localInterruptBase.isEmpty then axi.io.memory :<>= controlled
     else
       given ClockScope = ClockScope.posedge(io.clock)
       given ResetScope = ResetScope.syncActiveHigh(io.reset)
       val localInterrupts = DitDahA1LocalInterrupts.instantiate(parameter)
-      val port = physical
+      val port = controlled
       val base = parameter.localInterruptBase.get
       val selected = (port.request.bits.address >= base.U(64)) & (port.request.bits.address < (base + 65536).U(64))
       val responseLocal = RegInit(false.B)

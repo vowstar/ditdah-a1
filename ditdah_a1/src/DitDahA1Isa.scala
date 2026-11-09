@@ -12,7 +12,10 @@ object DitDahA1Isa:
       Seq("w", "wu", "l", "lu").flatMap(integer => Seq(s"fcvt.$integer.$format", s"fcvt.$format.$integer")) ++
       (if format == "s" then Seq("flw", "fsw", "fmv.x.w", "fmv.w.x") else Seq("fld", "fsd", "fmv.x.d", "fmv.d.x", "fcvt.s.d", "fcvt.d.s"))
   })
-  def additionalInstructions(p: DitDahA1Parameter) = Seq("pause", "ntl.p1", "ntl.pall", "ntl.s1", "ntl.all") ++
+  def additionalInstructions(p: DitDahA1Parameter) = Seq("pause", "ntl.p1", "ntl.pall", "ntl.s1", "ntl.all", "prefetch.i", "prefetch.r", "prefetch.w") ++
+    (if p.enableZicboz then Seq("cbo.zero") else Seq.empty) ++
+    (if p.enableZicbom then Seq("cbo.clean", "cbo.inval", "cbo.flush") else Seq.empty) ++
+    (if p.enableZawrs then Seq("wrs.nto", "wrs.sto") else Seq.empty) ++
     (if p.enableC then Seq("c.ntl.p1", "c.ntl.pall", "c.ntl.s1", "c.ntl.all") else Seq.empty) ++
     (if p.enableZimop then (0 until 32).map(n => s"mop.r.$n") ++ (0 until 8).map(n => s"mop.rr.$n") else Seq.empty) ++
     (if p.enableZcmop then (1 to 15 by 2).map(n => s"c.mop.$n") else Seq.empty) ++

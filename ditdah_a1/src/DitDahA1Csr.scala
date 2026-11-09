@@ -40,6 +40,10 @@ class DitDahA1CsrIO(parameter: DitDahA1Parameter) extends HWBundle(parameter):
   val translationState = Option.when(parameter.enableTranslation)(Aligned(new TranslationState))
   val sfenceLegal = Aligned(Bool())
   val wfiLegal = Aligned(Bool())
+  val waitTimeout = Option.when(parameter.enableZawrs)(Aligned(Bool()))
+  val zeroLegal = Option.when(parameter.enableZicboz)(Aligned(Bool()))
+  val cleanLegal = Option.when(parameter.enableZicbom)(Aligned(Bool()))
+  val invalidateLegal = Option.when(parameter.enableZicbom)(Aligned(Bool()))
   val write = Flipped(Bool())
   val writeAddress = Flipped(UInt(12))
   val writeData = Flipped(UInt(64))
@@ -96,6 +100,7 @@ object DitDahA1Csr extends Generator[DitDahA1Parameter, DitDahA1UnitLayers, DitD
     val savedPrivilege = mode.getOrElse(user.map(_.?(0.U(2), 3.U(2))).getOrElse(3.U(2)))
     val privilege = if parameter.enableJtag then debugging.?(3.U(2), savedPrivilege) else savedPrivilege
     io.privilege := privilege
+    io.waitTimeout.foreach(_ := (privilege =/= 3.U(2)) & status.asBits.bit(21))
     io.dataPrivilege := (if parameter.enableUserMode then
       ((privilege === 3.U(2)) & status.asBits.bit(17)).?(status.asBits.bits(12, 11).asUInt, privilege)
     else 3.U(2))
@@ -177,6 +182,29 @@ object DitDahA1Csr extends Generator[DitDahA1Parameter, DitDahA1UnitLayers, DitD
         when(io.readAddress === 0x30a.U(12)) { io.readData := (stce.get.asBits ## 0.B(63)).asUInt; io.legal := true.B }
         when(io.write & (io.writeAddress === 0x14d.U(12)) & allowed) { stimecmp.get := io.writeData }
         when(io.write & (io.writeAddress === 0x30a.U(12))) { stce.get := io.writeData.asBits.bit(63) }
+    if parameter.enableZicboz || parameter.enableZicbom then
+      val machineEnable = Option.when(parameter.enableUserMode)(RegInit(0.U(4)))
+      val supervisorEnable = Option.when(parameter.enableSupervisorMode)(RegInit(0.U(4)))
+      val machine = machineEnable.getOrElse(0.U(4)).asBits
+      val supervisor = supervisorEnable.getOrElse(15.U(4)).asBits
+      val unrestricted = privilege === 3.U(2)
+      val supervisorMode = privilege === 1.U(2)
+      io.zeroLegal.foreach(_ := unrestricted | (machine.bit(3) & (supervisorMode | supervisor.bit(3))))
+      io.cleanLegal.foreach(_ := unrestricted | (machine.bit(2) & (supervisorMode | supervisor.bit(2))))
+      io.invalidateLegal.foreach(_ := unrestricted | ((machine.bits(1, 0) =/= 0.B(2)) &
+        (supervisorMode | (supervisor.bits(1, 0) =/= 0.B(2)))))
+      val cbie = io.writeData.asBits.bits(5, 4)
+      val fields = (io.writeData.asBits.bits(7, 6) ## (cbie === 2.B(2)).?(0.B(2), cbie)) &
+        ((if parameter.enableZicboz then 8 else 0) | (if parameter.enableZicbom then 7 else 0)).B(4)
+      if parameter.enableUserMode then
+        when(io.readAddress === 0x30a.U(12)) {
+          io.readData := (stce.getOrElse(false.B).asBits ## 0.B(55) ## machine ## 0.B(4)).asUInt
+          io.legal := true.B
+        }
+        when(io.write & (io.writeAddress === 0x30a.U(12))) { machineEnable.get := fields.asUInt }
+      if parameter.enableSupervisorMode then
+        when(io.readAddress === 0x10a.U(12)) { io.readData := (0.B(56) ## supervisor ## 0.B(4)).asUInt }
+        when(io.write & (io.writeAddress === 0x10a.U(12))) { supervisorEnable.get := fields.asUInt }
     val mtvec = RegInit(0.U(64))
     val mscratch = RegInit(0.U(64))
     val alignment = if parameter.enableC then 1 else 2

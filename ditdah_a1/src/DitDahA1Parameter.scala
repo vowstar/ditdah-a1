@@ -27,6 +27,9 @@ case class DitDahA1Parameter(
   loadQueueEntries: Int = 1,
   enableM: Boolean = true,
   enableA: Boolean = true,
+  enableZawrs: Boolean = false,
+  enableZicboz: Boolean = false,
+  enableZicbom: Boolean = false,
   enableMisaligned: Boolean = false,
   enableC: Boolean = false,
   floatingPointBits: Int = 0,
@@ -84,6 +87,7 @@ case class DitDahA1Parameter(
   require(hpmCounters >= 0 && hpmCounters <= 29, "hpmCounters must be between zero and 29")
   require(Set(0, 32, 64).contains(floatingPointBits), "floatingPointBits must be zero, 32 or 64")
   require(!(enableZcb || enableZcmop) || enableC, "Compressed extensions require C")
+  require(!enableZawrs || enableA, "Zawrs requires A")
   require(!(enableZfa || enableZfhmin) || floatingPointBits != 0, "Floating extensions require F")
   require(issueWidth >= 1 && issueWidth <= 3, "issueWidth must be between 1 and 3")
   require(Set(0, 8, 16).contains(branchPredictorEntries), "branchPredictorEntries must be zero, eight or sixteen")
@@ -155,9 +159,18 @@ case class DitDahA1Parameter(
     }
 
   def enableTranslation: Boolean = virtualAddressBits == 39 && enableSupervisorMode
+  def blockMemoryRegions: Seq[MemoryRegion] =
+    memoryRegions.sortBy(_.base).foldLeft(Vector.empty[MemoryRegion]) { (regions, region) =>
+      regions.lastOption match
+        case Some(previous) if previous.base + previous.size == region.base &&
+          previous.copy(base = region.base, size = region.size) == region =>
+          regions.dropRight(1) :+ previous.copy(size = previous.size + region.size)
+        case _ => regions :+ region
+    }
   def enableDebugMemory: Boolean = enableJtag && debugBase.nonEmpty
-  def preciseTranslationMaintenance: Boolean = hasTranslationCache && (asidBits != 0 || iTlbEntries != 0 || dTlbEntries != 0)
-  def hasTranslationCache: Boolean = tlbEntries != 0 || iTlbEntries != 0 || dTlbEntries != 0
+  def atomicTranslationEntries: Int = if enableTranslation && enableA && dTlbEntries == 0 then 1 else 0
+  def preciseTranslationMaintenance: Boolean = hasTranslationCache && (asidBits != 0 || iTlbEntries != 0 || dTlbEntries != 0 || atomicTranslationEntries != 0)
+  def hasTranslationCache: Boolean = tlbEntries != 0 || iTlbEntries != 0 || dTlbEntries != 0 || atomicTranslationEntries != 0
   def enableDataBurstRefill: Boolean = dCacheRefillBytes == 64
   def enableLineRefill: Boolean = enableBurstRefill || enableDataBurstRefill
 

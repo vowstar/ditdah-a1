@@ -8,6 +8,9 @@ static struct { uint32_t neighbor; uint32_t counter; } state
 static uint32_t lock __attribute__((aligned(64)));
 static uint32_t done __attribute__((aligned(64)));
 static uint32_t seen[16] __attribute__((aligned(64)));
+#if defined(__riscv_zicbom) || defined(__riscv_zicboz) || defined(__riscv_zawrs)
+static volatile uint64_t blocks[DITDAH_HART_COUNT][8] __attribute__((aligned(64)));
+#endif
 static const uint64_t products[16] = {
     15, 24, 35, 48, 63, 80, 99, 120, 143, 168, 195, 224, 255, 288, 323, 360
 };
@@ -24,6 +27,25 @@ int main(void)
     volatile uint64_t product = (hart + 3) * (hart + 5);
     if (product != products[hart] || product / (hart + 3) != hart + 5 || product % (hart + 3))
         return 1;
+#if defined(__riscv_zicbom) || defined(__riscv_zicboz) || defined(__riscv_zawrs)
+    volatile uint64_t *block = blocks[hart];
+    (void)block[0];
+    for (unsigned i = 0; i < 8; ++i) block[i] = hart + i + 1;
+    __asm__ volatile ("ori zero, %0, 0; ori zero, %0, 1; ori zero, %0, 3" :: "r"(~0UL));
+#if defined(__riscv_zicbom)
+    __asm__ volatile ("cbo.clean 0(%0); cbo.inval 0(%0); cbo.flush 0(%0)" :: "r"(block) : "memory");
+    for (unsigned i = 0; i < 8; ++i)
+        if (block[i] != hart + i + 1) return 14;
+#endif
+#if defined(__riscv_zicboz)
+    __asm__ volatile ("cbo.zero 0(%0)" :: "r"(block) : "memory");
+    for (unsigned i = 0; i < 8; ++i)
+        if (block[i] != 0) return 15;
+#endif
+#if defined(__riscv_zawrs)
+    __asm__ volatile ("lr.d t0, (%0); wrs.sto; lr.d t0, (%0); wrs.nto" :: "r"(block) : "t0", "memory");
+#endif
+#endif
 #if defined(__riscv_zba) && defined(__riscv_zbb) && defined(__riscv_zbs)
     uint64_t address, rotated, toggled;
     __asm__ volatile ("sh3add %0, %1, %2" : "=r"(address) : "r"(hart), "r"(0x8000000000000001UL));

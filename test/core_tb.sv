@@ -166,6 +166,11 @@ module core_tb;
   logic write_exclusive = 0, exclusive_success, write_success;
   integer reservation_max = 0;
   integer exclusive_failures;
+  task automatic store_byte(input logic [63:0] address, input logic [7:0] value);
+    memory[integer'(address - base_address)] <= value;
+    for (integer h = 0; h < HARTS; h++)
+      if (reservation_address[h] <= address && address < reservation_address[h] + (64'd1 << reservation_size[h])) reservation_valid[h] <= 0;
+  endtask
   integer writeback_failures = 0;
   bit writeback_fault;
   logic [31:0] random_state;
@@ -436,7 +441,7 @@ module core_tb;
           interference_value = 0;
           for (integer i = 0; i < 8; i++) interference_value[i*8 +: 8] = memory[integer'(write_address - base_address) + i];
           interference_value = interference_value + interference;
-          for (integer i = 0; i < 8; i++) memory[integer'(write_address - base_address) + i] <= interference_value[i*8 +: 8];
+          for (integer i = 0; i < 8; i++) store_byte(write_address + i, interference_value[i*8 +: 8]);
           exclusive_failures <= exclusive_failures - 1;
           write_success = 0;
           bresp <= 0;
@@ -444,11 +449,7 @@ module core_tb;
           $display("INTERFERE %016h %016h", write_address, interference_value);
         end else if (!console_address(write_address) && write_success)
           for (integer i = 0; i < DW/8; i++)
-            if (write_mask[i]) memory[integer'((write_address - base_address) & ~(64'(DW/8) - 1)) + i] <= write_data[i*8 +: 8];
-        if (write_success || (write_exclusive && exclusive_success && exclusive_failures > 0 && write_address != fault_write))
-          for (integer h = 0; h < HARTS; h++)
-            if (write_address < reservation_address[h] + (1 << reservation_size[h]) &&
-                reservation_address[h] < write_address + (1 << write_size)) reservation_valid[h] <= 0;
+            if (write_mask[i]) store_byte((write_address & ~(64'(DW/8) - 1)) + i, write_data[i*8 +: 8]);
         if (write_exclusive && write_address != fault_write) reservation_valid[write_id] <= 0;
         write_pending <= 1;
         write_delay <= integer'(random_state[11:8]);
@@ -461,6 +462,10 @@ module core_tb;
         end
       end
       if (bvalid && bready) begin
+`ifdef ENABLE_A
+        $display("WRITE_ACK %0d %016h %02h %01h %01h", write_id, write_address & ~64'd7,
+          8'(write_mask >> ((write_address & ~64'd7) % (DW/8))), bresp, write_exclusive);
+`endif
         if (write_exclusive) begin
           if (HARTS > 1) $write("HART %0d ", bus_owner / 2);
           $display("WRITE %016h %01h", write_address, bresp);
@@ -555,7 +560,7 @@ module core_tb;
         if (HARTS > 1) $write("HART %0d ", source / 2);
         emit_source(context_index);
         $display("REQUEST %s %016h %0d %016h %02h %01h",
-          requests[source].atomic ? "atomic" : (source % 2 == 0 ? "fetch" : (requests[source].write ? "write" : "read")),
+          requests[source].cacheOperation == 3 ? "management" : requests[source].atomic ? "atomic" : (source % 2 == 0 ? "fetch" : (requests[source].write ? "write" : "read")),
           requests[source].address, 1 << requests[source].size,
           requests[source].write ? requests[source].data & access_mask(requests[source].size) : 64'b0,
           requests[source].tag, requests[source].cacheOperation);

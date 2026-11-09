@@ -84,6 +84,9 @@ class DitDahA1ExecuteIO(parameter: DitDahA1Parameter) extends HWBundle(parameter
   val csrLegal = Flipped(Bool())
   val privilege = Flipped(UInt(2))
   val wfiLegal = Flipped(Bool())
+  val zeroLegal = Option.when(parameter.enableZicboz)(Flipped(Bool()))
+  val cleanLegal = Option.when(parameter.enableZicbom)(Flipped(Bool()))
+  val invalidateLegal = Option.when(parameter.enableZicbom)(Flipped(Bool()))
   val sretLegal = Flipped(Bool())
   val sfenceLegal = Flipped(Bool())
 
@@ -122,6 +125,12 @@ object DitDahA1Execute extends Generator[DitDahA1Parameter, DitDahA1UnitLayers, 
     out.unsignedLoad := (op === Lwu.U(operationBits)) | ((op === Load.U(operationBits)) & funct3.bit(2))
     out.address := addImm
     out.storeData := b
+    val zero = parameter.enableZicboz.B & (op === Fence.U(operationBits)) &
+      ((encoding & BigInt("fff07fff", 16).B(32)) === 0x0040200f.B(32))
+    val management = parameter.enableZicbom.B & (op === Fence.U(operationBits)) &
+      ((encoding & BigInt("ffc07fff", 16).B(32)) === 0x0000200f.B(32)) & (encoding.bits(21, 20) =/= 3.B(2))
+    val managementLegal = (encoding.bits(21, 20) === 0.B(2)).?(io.invalidateLegal.getOrElse(true.B), io.cleanLegal.getOrElse(true.B))
+    when(zero | management) { out.store := true.B; out.address := a; out.storeData := 0.U(64) }
     out.csrAddress := io.csrAddress
     val csr = (op === Csrrw.U(operationBits)) | (op === Csrrs.U(operationBits)) | (op === Csr.U(operationBits))
     val csrAction = (op === Csrrw.U(operationBits)).?(1.B(2), (op === Csrrs.U(operationBits)).?(2.B(2), funct3.bits(1, 0)))
@@ -134,7 +143,7 @@ object DitDahA1Execute extends Generator[DitDahA1Parameter, DitDahA1UnitLayers, 
     out.sfenceVma := parameter.enableTranslation.B & (op === Fence.U(operationBits)) &
       ((encoding & BigInt("fe007fff", 16).B(32)) === 0x12000073.B(32))
     if parameter.preciseTranslationMaintenance then when(out.sfenceVma) { out.address := a }
-    out.wfi := op === Wfi.U(operationBits)
+    out.wfi := (op === Wfi.U(operationBits)) & (encoding === 0x10500073.B(32))
     when(csr) { out.value := io.csrValue }
     val jump = (op === Jal.U(operationBits)) | (op === Jalr.U(operationBits))
     val branchCondition = Wire(Bool())
@@ -154,7 +163,8 @@ object DitDahA1Execute extends Generator[DitDahA1Parameter, DitDahA1UnitLayers, 
       val returnLegal = if parameter.enableJtag then
         (encoding === 0x7b200073L.B(32)).?(io.debugMode.get, machine) else machine
       when((op === Illegal.U(operationBits)) | fpIllegal | (out.sfenceVma & !io.sfenceLegal) | ((op === Mret.U(operationBits)) & !returnLegal) |
-        ((op === Wfi.U(operationBits)) & !wfiLegal) |
+        (out.wfi & !wfiLegal) | (zero & !io.zeroLegal.getOrElse(true.B)) |
+        (management & !managementLegal) |
         ((op === Sret.U(operationBits)) & !io.sretLegal) |
         (csr & (!io.csrLegal | (out.csrWrite & (io.csrAddress.asBits.bits(11, 10) === 3.B(2)))))) {
         out.instruction.fault := true.B

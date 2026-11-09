@@ -12,8 +12,19 @@ module memory_tb;
 `ifdef ENABLE_DEBUG
   logic debug_halt_req, debug_mode;
 `endif
+`ifdef ENABLE_A
+  wire [63:0] reservation_address;
+  wire [7:0] reservation_mask, written_mask = service[1].captured.mask << service[1].captured.address[2:0];
+  wire reservation_begin = physical_port[1].request_valid && physical_port[1].request_ready && physical_port[1].request.atomic && physical_port[1].request.atomicOperation == 2;
+  wire reservation_invalidate = physical_port[1].response_valid && physical_port[1].response_ready && physical_port[1].response.last && !physical_port[1].response.fault &&
+    service[1].captured.write && (!service[1].captured.atomic || service[1].captured.atomicOperation != 3 || (service[1].captured.scEligible && physical_port[1].response.data == 0)) &&
+    (service[1].captured.address & ~64'd7) == reservation_address && (written_mask & reservation_mask) != 0;
+`endif
   DitDahA1Core dut(.clock(clock), .reset(reset), .hartId(4'b0), `PORT(instruction, core_port[0]),
     `PORT(data, core_port[1]),
+`ifdef ENABLE_A
+    .reservation_address(reservation_address), .reservation_mask(reservation_mask), .reservation_begin(reservation_begin), .reservation_invalidate(reservation_invalidate),
+`endif
 `ifdef ENABLE_DEBUG
     .debug_haltReq(debug_halt_req), .debug_entryPc(base_address + 64'h1000),
     .debug_exceptionPc(base_address + 64'h1800), .debug_mode(debug_mode),
@@ -103,7 +114,9 @@ module memory_tb;
       if (core_port[p].request_valid && !core_port[p].request_ready) stalls <= stalls + 1;
       if (core_port[p].request_valid && core_port[p].request_ready) begin
         if (core_pending[p]) $fatal(1, "Overlapping requests on one port");
-        if (core_port[p].request.cacheOperation != 0 || core_port[p].request.fetch != (p == 0) ||
+        if ((core_port[p].request.cacheOperation != 0 && core_port[p].request.cacheOperation != 3) || core_port[p].request.fetch != (p == 0) ||
+            (core_port[p].request.cacheOperation == 3 && (p != 1 || core_port[p].request.write || core_port[p].request.atomic ||
+             core_port[p].request.address[5:0] != 0 || core_port[p].request.size != 3 || core_port[p].request.mask != 0)) ||
             (p == 0 ? (core_port[p].request.size != 2 && core_port[p].request.size != 6 && !(`COMPRESSED && core_port[p].request.size == 1)) : core_port[p].request.size > 3) ||
             core_port[p].request.mask != (core_port[p].request.write ? ((1 << (1 << core_port[p].request.size)) - 1) : 0) ||
             (p == 0 && (core_port[p].request.write || core_port[p].request.atomic)) ||
@@ -114,9 +127,10 @@ module memory_tb;
         requests <= requests + 1;
         if (p == 0 && requests != 0 && core_port[p].request.tag == 0) wraps <= wraps + 1;
         if (!physical_port[p].request_valid) rejected <= rejected + 1;
-        $display("REQUEST %s %016h %0d %016h", core_port[p].request.atomic ? "atomic" : (p == 0 ? "fetch" : (core_port[p].request.write ? "write" : "read")),
+        $display("REQUEST %s %016h %0d %016h %02h %01h", core_port[p].request.cacheOperation == 3 ? "management" : core_port[p].request.atomic ? "atomic" : (p == 0 ? "fetch" : (core_port[p].request.write ? "write" : "read")),
           core_port[p].request.address, 1 << core_port[p].request.size,
-          core_port[p].request.write ? core_port[p].request.data & access_mask(core_port[p].request.size) : 64'b0);
+          core_port[p].request.write ? core_port[p].request.data & access_mask(core_port[p].request.size) : 64'b0,
+          core_port[p].request.tag, core_port[p].request.cacheOperation);
         $display("ACCESS_PRIVILEGE %01h", core_port[p].request.privileged);
         if (core_port[p].request.atomic)
           $display("ATOMIC %02h %01h", core_port[p].request.atomicOperation, core_port[p].request.scEligible);
@@ -139,6 +153,7 @@ module memory_tb;
         service_fault = physical_port[p].request.write ? physical_port[p].request.address == fault_write :
           physical_port[p].request.address <= (p == 0 ? fault_fetch : fault_read) &&
           (p == 0 ? fault_fetch : fault_read) < physical_port[p].request.address + (64'd1 << physical_port[p].request.size);
+        if (physical_port[p].request.cacheOperation == 3) service_fault = 0;
         if (physical_port[p].request.atomic) begin
           case (physical_port[p].request.atomicOperation)
             2: service_fault = (physical_port[p].request.address <= fault_read && fault_read < physical_port[p].request.address + (1 << physical_port[p].request.size)) || physical_port[p].request.address == fault_exclusive;
@@ -147,6 +162,7 @@ module memory_tb;
           endcase
         end
         physical_port[p].response.fault <= service_fault;
+        if (physical_port[p].request.cacheOperation == 0)
         $display("BUS %s %016h %0d %016h", physical_port[p].request.atomic ? "atomic" : (p == 0 ? "fetch" : (physical_port[p].request.write ? "write" : "read")),
           physical_port[p].request.address, 1 << physical_port[p].request.size,
           physical_port[p].request.write ? physical_port[p].request.data & access_mask(physical_port[p].request.size) : 64'b0);
@@ -186,18 +202,18 @@ module memory_tb;
           endcase
         end
         if (successful_write) begin
-          if (physical_port[p].request.address < reservation_address + (1 << reservation_size) &&
-              reservation_address < physical_port[p].request.address + (1 << physical_port[p].request.size)) reservation_valid <= 0;
           for (integer i = 0; i < 8; i++)
-            if (physical_port[p].request.mask[i]) memory[integer'(physical_port[p].request.address - base_address) + i] <=
-              updated_data[i*8 +: 8];
+            if (physical_port[p].request.mask[i]) begin
+              if (reservation_address <= physical_port[p].request.address + i && physical_port[p].request.address + i < reservation_address + (64'd1 << reservation_size)) reservation_valid <= 0;
+              memory[integer'(physical_port[p].request.address - base_address) + i] <= updated_data[i*8 +: 8];
+            end
         end
       end
       if (pending && !physical_port[p].response_valid) begin
         if (delay > 0) begin delay <= delay - 1; delayed <= delayed + 1; end
         else begin
           physical_port[p].response.data <= captured.atomic ? atomic_result : 0;
-          if (!captured.write && !captured.atomic)
+          if (!captured.write && !captured.atomic && captured.cacheOperation == 0)
             for (integer i = 0; i < (captured.size == 6 ? 8 : (1 << captured.size)); i++)
               physical_port[p].response.data[i*8 +: 8] <= memory[integer'(captured.address - base_address) + 8 * chunk + i];
           physical_port[p].response.last <= captured.size != 6 || chunk == 7;

@@ -60,8 +60,9 @@ def main():
     parser.add_argument('--issue-width', type=int, choices=(1, 2, 3))
     parser.add_argument('--isa', choices=tuple('rv64i' + m + a + fp + c for m in ('', 'm') for a in ('', 'a') for fp in ('', 'f', 'fd') for c in ('', 'c')), default='rv64i')
     parser.add_argument('--bitmanip', nargs='+', choices=('Zba', 'Zbb', 'Zbs'), default=[])
-    parser.add_argument('--scalar', nargs='+', choices=('Zicond', 'Zimop', 'Zcb', 'Zcmop', 'Zfa', 'Zfhmin'), default=[])
+    parser.add_argument('--scalar', nargs='+', choices=('Zicond', 'Zimop', 'Zcb', 'Zcmop', 'Zfa', 'Zfhmin', 'Zawrs', 'Zicbom', 'Zicboz'), default=[])
     parser.add_argument('--program', type=Path, default=Path('software/tests/console.S'))
+    parser.add_argument('--zero-page-tables', action='store_true')
     parser.add_argument('--output', type=Path, default=Path('result/software/console'))
     parser.add_argument('--tool-prefix', default=os.environ.get('RISCV_PREFIX', 'riscv64-unknown-elf-'))
     parser.add_argument('--stack-bytes', type=int, default=1024)
@@ -112,15 +113,18 @@ def main():
     assert all((config.get('floatingPointBits', 0) >= (64 if name == 'D' else 32) if name in ('F', 'D') else config.get('enable' + name, name in ('M', 'A'))) for name in required_extensions), 'Software requires a disabled extension'
     assert not set(args.scalar) & {'Zcb', 'Zcmop'} or 'c' in args.isa[5:], 'Compressed scalar instructions require C'
     assert not set(args.scalar) & {'Zfa', 'Zfhmin'} or 'f' in args.isa[5:], 'Floating scalar instructions require F'
+    assert 'Zawrs' not in args.scalar or 'a' in args.isa[5:], 'Reservation waits require A'
     counter_extensions = ['Zicntr', 'Zihpm'] if config.get('enableCounters') else []
     required_extensions += counter_extensions + (['Sscounterenw'] if counter_extensions and config.get('enableSupervisorMode') else [])
     required_extensions += (['Sscofpmf'] if counter_extensions and config.get('hpmCounters', 0) > 0 and config.get('enableInterrupts') else []) + (['Sstc'] if config.get('enableSstc') else [])
     counter_program = args.program.resolve() == Path('software/tests/counters.S').resolve()
     assert not counter_program or config.get('pmpEntries', 0) > 0 and {'Sscofpmf', 'Sstc'} <= set(required_extensions), 'Counter software requires protection, overflow and supervisor timers'
     command = [args.tool_prefix + 'gcc', '-march=' + args.isa + '_zicsr_zifencei' + ''.join('_' + name.lower() for name in sorted(set(args.bitmanip) | set(args.scalar)) + counter_extensions),
+               *(['-DDITDAH_ZERO_PAGE_TABLES'] if args.zero_page_tables else []),
                f'-DDITDAH_HART_COUNT={harts}',
                f'-DDITDAH_RAM_BASE={base}', f'-DDITDAH_RAM_BYTES={int(ram["size"])}',
                f'-DDITDAH_ASID_BITS={config.get("asidBits", 0)}',
+               f'-DDITDAH_PMP_ENTRIES={config.get("pmpEntries", 0)}',
                f'-DDITDAH_CONSOLE_BASE={console}', '-mabi=lp64', '-mcmodel=medany',
                '-Os', '-ffreestanding', '-fno-builtin', '-fno-stack-protector', '-msmall-data-limit=0',
                '-nostdlib', '-nostartfiles', '-Wl,--no-relax', '-T', str(runtime / 'link.ld'),
@@ -141,12 +145,14 @@ def main():
     assert all(hashlib.sha256(Path(name).read_bytes()).hexdigest() == expected for name, expected in hashes.items()), 'Software sources changed during build'
     assert args.config.read_bytes() == configuration_bytes, 'Configuration changed during build'
     required_instructions = []
-    if args.program.resolve() == Path('software/tests/atomic.c').resolve():
+    atomic_program = args.program.resolve() == Path('software/tests/atomic.c').resolve()
+    if atomic_program or args.program.resolve() == Path('software/tests/virtual_memory.S').resolve():
         witnesses = {'Zicond': ('czero.eqz', 'czero.nez', 'pause', 'ntl.p1'), 'Zimop': ('mop.r.0', 'mop.rr.0'),
                      'Zcb': ('c.zext.b', 'c.mul'), 'Zcmop': ('c.mop.7',), 'Zfa': ('fli.s', 'froundnx.s'),
-                     'Zfhmin': ('flh', 'fsh', 'fmv.x.h', 'fmv.h.x')}
-        required_instructions = [name for extension in args.scalar for name in witnesses[extension]]
-        if 'D' in required_extensions:
+                     'Zfhmin': ('flh', 'fsh', 'fmv.x.h', 'fmv.h.x'), 'Zawrs': ('wrs.nto', 'wrs.sto'),
+                     'Zicbom': ('cbo.inval', 'cbo.clean', 'cbo.flush'), 'Zicboz': ('cbo.zero',)}
+        required_instructions = [name for extension in args.scalar if atomic_program or extension in ('Zawrs', 'Zicbom', 'Zicboz') for name in witnesses[extension]]
+        if atomic_program and 'D' in required_extensions:
             required_instructions += (['fcvtmod.w.d'] if 'Zfa' in args.scalar else []) + (['fcvt.h.d', 'fcvt.d.h'] if 'Zfhmin' in args.scalar else [])
     manifest = dict(sourceHashes=hashes, configurationHash=hashlib.sha256(configuration_bytes).hexdigest(),
                     imageHash=hashlib.sha256(image.read_bytes()).hexdigest(), symbols=symbols, commands=[command],
@@ -154,6 +160,8 @@ def main():
                     target=subprocess.check_output([args.tool_prefix + 'gcc', '-dumpmachine'], text=True).strip(),
                     expectedInterruptCauses=args.expected_interrupt, entryAddress=base,
                     requiredCsrs=[0x320, 0xb00, 0xb02, 0xc00, 0xc02, 0x306, 0x106, 0x30a, 0x323, 0xb03, 0x14d, 0xc01, 0xda0, 0x144] if counter_program else [],
+                    requiredWaitingHarts=list(range(harts)) if 'Zawrs' in args.scalar and args.program.resolve() in
+                        [Path('software/tests/' + name).resolve() for name in ('atomic.c', 'virtual_memory.S', 'reservation.S')] else [],
                     clockHz=args.clock_hz, timebaseHz=args.timebase_hz)
     (args.output / 'manifest.json').write_text(json.dumps(manifest, indent=2) + '\n')
     print(image)

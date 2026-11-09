@@ -16,7 +16,7 @@ import xml.etree.ElementTree as ET
 
 import cocotb
 from cocotb.clock import Clock
-from cocotb.triggers import Combine, FallingEdge, RisingEdge, Timer
+from cocotb.triggers import ClockCycles, Combine, FallingEdge, RisingEdge, Timer
 from cocotb_tools.runner import get_runner
 
 from model import ExclusiveMonitor
@@ -146,6 +146,45 @@ async def endpoint(dut):
     await bus.read(ram, identity=3, lock=1)
     assert await bus.write(ram+8, 29, identity=3, lock=1) == (0, 3)
     assert await bus.write(ram, 31, identity=3, lock=1) == (0, 3)
+    for previous, replacement, written in ((ram+8, ram+64, ram), (ram, ram+64, ram), (ram, ram+64, ram+64)):
+        await bus.read(previous, identity=8, lock=1)
+        aw = cocotb.start_soon(bus.send('aw', dict(addr=written, size=3, id=9, lock=0, burst=1, len=0)))
+        w = cocotb.start_soon(bus.send('w', dict(data=33, strb=255, last=1)))
+        await Combine(aw, w)
+        assert int(dut.axi_aw_ready.value) == int(dut.axi_w_ready.value) == 0
+        await bus.send('ar', dict(addr=replacement, size=3, id=8, lock=1, burst=1, len=0), wait=False)
+        monitor.reserve(8, replacement, 8)
+        monitor.write(written, 8)
+        assert (await bus.receive('r'))[1:] == (1, 8, 1)
+        assert await bus.receive('b') == (0, 9)
+        expected = int(monitor.conditional(8, replacement, 8))
+        actual = await bus.write(replacement, 35, identity=8, lock=1)
+        dut._log.info('reservation old=%x new=%x write=%x expected=%d actual=%s',
+                      previous, replacement, written, expected, actual)
+        assert actual == (expected, 8), 'Disjoint old write cleared the replacement reservation'
+    for size in (2, 3):
+        await bus.read(ram+128, size=size, identity=10, lock=1)
+        await bus.read(ram+128, size=size, identity=11, lock=1)
+        assert await bus.write(ram+128, 1, size=size, identity=12, lock=1) == (0, 12)
+        assert await bus.write(ram+128+(1 << size), 3, size=size, identity=9) == (0, 9)
+        assert await bus.write(ram+128, 5, size=size, identity=10, lock=1) == (1, 10)
+        assert await bus.write(ram+128, 7, size=size, identity=11, lock=1) == (0, 11)
+    await bus.send('ar', dict(addr=ram+192, size=3, id=13, lock=1, burst=1, len=0))
+    held = cocotb.start_soon(bus.receive('r', hold=32))
+    assert await bus.write(ram+192, 41, identity=14) == (0, 14)
+    assert not held.done(), 'LR response must remain held through the interfering write'
+    assert int(dut.axi_r_valid.value) == 1 and int(dut.axi_r_ready.value) == 0
+    assert (await held)[1:] == (1, 13, 1)
+    assert await bus.write(ram+192, 43, identity=13, lock=1) == (0, 13)
+    for size, offset, mask in ((2, 0, 0xf0), (2, 4, 0x0f), (2, 0, 0x0f), (3, 0, 0xf0), (2, 0, 0)):
+        assert await bus.write(ram+256, 0x0123456789abcdef) == (0, 0)
+        assert (await bus.read(ram+256+offset, size=size, identity=8, lock=1))[0][1] == 1
+        monitor.reserve(8, ram+256+offset, 1 << size)
+        assert await bus.write(ram+256, 0xfedcba9876543210, identity=9, strobe=mask) == (0, 9)
+        for byte in range(8):
+            if mask >> byte & 1: monitor.write(ram+256+byte, 1)
+        assert (await bus.read(ram+256))[0][0] == sum((((0xfedcba9876543210 if mask >> byte & 1 else 0x0123456789abcdef) >> (8*byte)) & 255) << (8*byte) for byte in range(8))
+        assert await bus.write(ram+256+offset, 7, size=size, identity=8, lock=1) == (int(monitor.conditional(8, ram+256+offset, 1 << size)), 8)
     aw = cocotb.start_soon(bus.send('aw', dict(addr=ram, size=3, id=6, lock=0, burst=1, len=0)))
     w = cocotb.start_soon(bus.send('w', dict(data=37, strb=255, last=1)))
     await Combine(aw, w)
@@ -191,8 +230,9 @@ async def system(dut):
     root = Path(os.environ['A1_PLATFORM_ROOT'])
     platform = json.loads((root / 'platform.json').read_text())
     config = platform['processor']['parameters']
+    virtual = bool(platform.get('virtualMemoryTest'))
     config_path = Path(os.environ['A1_PLATFORM_RTL']) / 'input.json'
-    _, program, _ = load_software(root / 'software/software.elf', config_path)
+    _, program, manifest = load_software(root / 'software/software.elf', config_path)
     assert (program.software['clockHz'], program.software['timebaseHz']) == (platform['clockHz'], platform['timebaseHz'])
     harts, output = config['hartCount'], []
     dut.reset.value, dut.systemReset.value = 1, 0
@@ -229,7 +269,11 @@ async def system(dut):
     await jtag.memory(local+0x4000, (1<<64)-1)
     bss_start, bss_end = program.software['bss']
     poison = 0xa5a5a5a5a5a5a5a5
-    for address in range(bss_start, bss_end, 8):
+    stride = 4096 if virtual else 8
+    poisoned = {*range(bss_start, bss_end, stride), bss_end-8}
+    if virtual:
+        poisoned.add(manifest['symbols']['__atomic_count'])
+    for address in poisoned:
         await jtag.memory(address, poison)
     assert await jtag.memory(bss_start) == await jtag.memory(bss_end-8) == poison
     with socket.socket() as listener, socket.socket() as reservation:
@@ -242,14 +286,32 @@ async def system(dut):
         script = ['set confirm off', 'set pagination off', f'set remotetimeout {max(30, 5*harts)}',
                   f'file {root / "software/software.elf"}', f'target extended-remote 127.0.0.1:{port}',
                   'load', 'compare-sections',
-                  f'if *(unsigned long long*){bss_start} != {poison:#x} || *(unsigned long long*){bss_end-8} != {poison:#x}', 'quit 1', 'end']
+                  f'if *(unsigned long long*){bss_start} != {poison:#x} || *(unsigned long long*){bss_end-8} != {poison:#x}' +
+                  (f' || *(unsigned long long*)&__atomic_count != {poison:#x}' if virtual else ''), 'quit 1', 'end']
         script += [f'monitor if {{[llength [target names]] != {harts}}} {{error "Hart count mismatch"}}',
                    'monitor foreach target [target names] {targets $target; reg pc '+str(program.entry)+'}',
                    'monitor targets ditdah.hart0', 'maintenance flush register-cache', 'continue']
+        if virtual:
+            script.insert(-1, 'echo ALL_HART_ENTRY_SET\\n')
+            script += ['thread 1', 'maintenance flush register-cache', 'set $result_failure = 0']
+            script += [f'if *(unsigned long long*)&__atomic_count != {harts}', 'quit 1', 'end',
+                       'echo ALL_HART_ATOMICS_MATCHED\\n']
         for hart in range(harts):
             address = program.software['results']+8*hart
             script += [f'set $result = *(unsigned long long*){address}',
-                       f'printf "hart {hart:x} result=%llu\\n", $result', 'if $result != 1', 'quit 1', 'end']
+                       f'printf "hart {hart:x} result=%llu\\n", $result']
+            if virtual:
+                script += [f'set $result_{hart} = $result', 'if $result != 1', 'set $result_failure = 1', 'end']
+            else:
+                script += ['if $result != 1', 'quit 1', 'end']
+        if virtual:
+            for hart in range(harts):
+                address = program.software['results']+8*hart
+                script += [f'if $result_{hart} != 1', 'thread 1',
+                    f'printf "hart {hart:x} observer=0 result=%llu\\n", *(unsigned long long*){address}',
+                    f'thread {hart+1}',
+                    f'printf "hart {hart:x} observer={hart:x} result=%llu\\n", *(unsigned long long*){address}', 'thread 1', 'end']
+            script += ['if $result_failure', 'quit 1', 'end']
         script += ['echo ALL_HART_RESULTS_MATCHED\\n', 'disconnect', 'quit']
         (root / 'gdb.commands').write_text('\n'.join(script)+'\n')
         bridge = cocotb.start_soon(remote_bitbang(dut, listener))
@@ -264,21 +326,35 @@ async def system(dut):
                     await Timer(100, unit='ns')
                 debugger = subprocess.Popen([os.environ['A1_PLATFORM_GDB'], '-q', '-nx', '-batch', '-x', root / 'gdb.commands'], stdout=debug_log, stderr=subprocess.STDOUT)
                 deadline = time.monotonic()+180+60*harts
+                if virtual:
+                    while 'ALL_HART_ENTRY_SET' not in (root / 'gdb.log').read_text().splitlines():
+                        assert debugger.poll() is None and time.monotonic() < deadline, 'Software entry preparation did not finish'
+                        time.sleep(0.0001)
+                        await Timer(100, unit='ns')
+                    deadline = time.monotonic()+1800
                 expected = ''.join(program.software['expectedConsole']).encode()
                 while len(output) < len(expected):
                     assert debugger.poll() is None and time.monotonic() < deadline, 'Serial software did not finish'
                     time.sleep(0.0001)
                     await Timer(100, unit='ns')
                 assert bytes(output) == expected
-                (root / 'console.log').write_bytes(bytes(output))
+                if virtual: await ClockCycles(dut.clock, 8192 * harts)
                 debugger.send_signal(signal.SIGINT)
                 await process_done(debugger, 120+30*harts)
+                assert bytes(output) == expected
             text = (root / 'gdb.log').read_text()
             assert 'matched.' in text and 'MIS-MATCHED!' not in text and 'ALL_HART_RESULTS_MATCHED' in text
+            assert not virtual or 'ALL_HART_ATOMICS_MATCHED' in text
             (root / 'system-summary.json').write_text(json.dumps(dict(harts=harts, bootRom=True,
                 allHartResume=True, serialConsole=True, coherentResults=True, localInterrupts=True,
                 nonzeroBss=True, softwareAtomics=bool(config['enableA']),
                 clockHz=platform['clockHz'], timebaseHz=platform['timebaseHz']))+'\n')
+        except AssertionError:
+            if virtual and debugger is not None and debugger.poll() is None:
+                debugger.send_signal(signal.SIGINT)
+                try: await process_done(debugger, 120+30*harts)
+                except AssertionError as diagnostic: dut._log.warning(str(diagnostic))
+            raise
         finally:
             for process in (debugger, server):
                 if process is not None and process.poll() is None:
@@ -291,12 +367,14 @@ async def system(dut):
                         process.kill()
                     process.wait()
             bridge.cancel()
+            (root / 'console.log').write_bytes(bytes(output))
 
 
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--output', type=Path, required=True)
     parser.add_argument('--rtl', type=Path)
+    parser.add_argument('--virtual-memory', action='store_true')
     parser.add_argument('--gdb', type=Path)
     parser.add_argument('--openocd', type=Path)
     parser.add_argument('--mutation', choices=('exclusive-read',))
@@ -304,8 +382,11 @@ def main():
     assert not args.mutation or args.rtl, 'Select a platform for the negative control'
     root = args.output.resolve()
     root.mkdir(parents=True, exist_ok=True)
+    assert not args.virtual_memory or not args.mutation
     paths = [Path(name) for name in ('test/platform_system.py', 'test/model.py', 'rtl/DitDahA1PlatformMemory.sv',
              'test/debug_system.py', 'test/debug_module.py', 'test/formal.py', 'test/programs.py', 'test/verify.py')]
+    program = 'software/tests/virtual_memory.S' if args.virtual_memory else 'software/tests/serial.c'
+    paths += [Path(program), Path('software/platform.json'), Path('scripts/build_platform.py')]
     hashes = {str(p): hashlib.sha256(p.read_bytes()).hexdigest() for p in paths}
     for name in ('endpoint-summary.json', 'system-summary.json', 'summary.json'):
         (root / name).unlink(missing_ok=True)
@@ -313,10 +394,26 @@ def main():
     sources = [Path('rtl/DitDahA1PlatformMemory.sv').resolve()]
     tools = {}
     top, parameters, build_args, kind = 'DitDahA1PlatformMemory', dict(ID_BITS=4, HARTS=16), ['--assert', '-j', '2'], 'endpoint'
+    if args.virtual_memory:
+        assert args.gdb and args.openocd
+        config = json.loads(Path('software/platform.json').read_text())
+        config.update(hartCount=16, virtualAddressBits=39, enableSupervisorMode=True, enableUserMode=True,
+            enableA=True, issueWidth=3, loadQueueEntries=2, fabricReadSlots=2, iCacheBytes=8192,
+            dCacheBytes=8192, dCacheWays=2, dCacheRefillBytes=64, dCacheWriteback=True,
+            l2CacheBytes=131072, tlbEntries=4, iTlbEntries=4, dTlbEntries=2, asidBits=4)
+        (root / 'input.json').write_text(json.dumps(config)+'\n')
+        if args.rtl is None:
+            args.rtl = root / 'rtl'
+            run(['python3', 'scripts/build_platform.py', '--config', root / 'input.json', '--harts', '16',
+                 '--clock-hz', '10000000', '--jtag-idcode', '0xa126afff', '--output', args.rtl], root / 'rtl-build.log')
     if args.rtl:
         assert args.gdb and args.openocd
         rtl = args.rtl.resolve()
         platform = json.loads((rtl / 'manifest.json').read_text())
+        if args.virtual_memory:
+            assert platform['clockHz'] == 10000000 and platform['timebaseHz'] == 1000000 and platform['applicationEntry'] == int(config['resetVector'])
+            assert all(platform['processor']['parameters'][k] == v for k, v in config.items() if k not in ('resetVector', 'enableTrace', 'memoryRegions'))
+            assert platform['processor']['parameters']['memoryRegions'][:len(config['memoryRegions'])] == config['memoryRegions']
         assert all(hashlib.sha256(Path(p).read_bytes()).hexdigest() == digest for section in
                    (platform['sourceHashes'], platform['processor']['sourceHashes']) for p, digest in section.items())
         if args.mutation and not platform['processor']['parameters']['enableA']:
@@ -324,13 +421,16 @@ def main():
                 reason='atomic instructions disabled', sourceHashes=hashes))+'\n')
             return
         assert not args.mutation or platform['processor']['parameters']['hartCount'] == 1
+        platform['virtualMemoryTest'] = args.virtual_memory
         (root / 'platform.json').write_text(json.dumps(platform, indent=2)+'\n')
         console = platform['parameters']['CONSOLE_BASE']
         run(['python3', 'scripts/build_software.py', '--config', rtl / 'input.json', '--ram-base', str(platform['applicationEntry']),
              '--isa', 'rv64ia' if platform['processor']['parameters']['enableA'] else 'rv64i',
              '--clock-hz', str(platform['clockHz']), '--timebase-hz', str(platform['timebaseHz']),
-             '--console-base', str(console), '--program', 'software/tests/serial.c', '--output', root / 'software'], root / 'software-build.log')
-        assert ('amoadd.d' in (root / 'software/software.dump').read_text()) == platform['processor']['parameters']['enableA']
+             '--console-base', str(console), '--program', program, *(['--zero-page-tables'] if args.virtual_memory else []),
+             '--output', root / 'software'], root / 'software-build.log')
+        dump = (root / 'software/software.dump').read_text()
+        assert (all(op in dump for op in ('lr.d', 'sc.d')) if args.virtual_memory else 'amoadd.d' in dump) == platform['processor']['parameters']['enableA']
         sources = [rtl / name for name in (rtl / 'filelist.f').read_text().splitlines()]
         if args.mutation:
             name = 'DitDahA1PlatformMemory.sv'

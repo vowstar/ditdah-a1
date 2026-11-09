@@ -16,6 +16,9 @@ SCALAR_ENCODINGS = {
     'czero.eqz': ('Zicond', 0x0e005033, 0xfe00707f),
     'czero.nez': ('Zicond', 0x0e007033, 0xfe00707f),
     'pause': ('Zihintpause', 0x0100000f, 0xffffffff),
+    **{f'cbo.{name}': ('Zicboz' if operation == 4 else 'Zicbom', operation << 20 | 0x200f, 0xfff07fff)
+       for operation, name in ((0, 'inval'), (1, 'clean'), (2, 'flush'), (4, 'zero'))},
+    **{f'wrs.{name}': ('Zawrs', encoding, 0xffffffff) for name, encoding in (('nto', 0x00d00073), ('sto', 0x01d00073))},
     **{f'mop.r.{n}': ('Zimop', 0x81c04073 | ((n & 3) << 20) | ((n & 12) << 24) | ((n & 16) << 26), 0xfff0707f) for n in range(32)},
     **{f'mop.rr.{n}': ('Zimop', 0x82004073 | ((n & 3) << 26) | ((n & 4) << 28), 0xfe00707f) for n in range(8)},
     **{f'ntl.{name}': ('Zihintntl', (n << 20) | 0x33, 0xffffffff) for n, name in enumerate(('p1', 'pall', 's1', 'all'), 2)},
@@ -276,7 +279,7 @@ def fragment_ranges(address, size):
 
 
 def pmp_allowed(configs, addresses, address, size, kind, pa, privilege=3):
-    permission = {'fetch': 4, 'read': 1, 'write': 2, 'atomic': 3}[kind]
+    permission = {'fetch': 4, 'read': 1, 'write': 2, 'atomic': 3, 'management': 3}[kind]
     if address < 0 or address + size > 1 << pa:
         return False
     for index, config in enumerate(configs):
@@ -296,8 +299,25 @@ def pmp_allowed(configs, addresses, address, size, kind, pa, privilege=3):
             high = low + width
         matches = [low <= byte < high for byte in range(address, address + size)]
         if any(matches):
-            return all(matches) and (privilege == 3 and not config & 128 or config & permission == permission)
+            permitted = bool(config & permission) if kind == 'management' else config & permission == permission
+            return all(matches) and (privilege == 3 and not config & 128 or permitted)
     return privilege == 3 or not configs
+
+
+def cache_block_allowed(config, protection, address, zero, privilege):
+    base = address & -64
+    regions = [next((r for r in config['memoryRegions'] if int(r['base']) <= base + offset and
+                    base + offset + 8 <= int(r['base']) + int(r['size'])), None) for offset in range(0, 64, 8)]
+    if any(region is None for region in regions):
+        return False
+    attributes = [{key: value for key, value in region.items() if key not in ('base', 'size')} for region in regions]
+    if any(value != attributes[0] for value in attributes[1:]):
+        return False
+    region = regions[0]
+    if not region['readable'] or zero and (not region['writable'] or region['device']):
+        return False
+    return all(pmp_allowed(*protection, base + offset, 8, 'write' if zero else 'management',
+                           config['physicalAddressBits'], privilege) for offset in range(0, 64, 8))
 
 
 class Fault(Exception):
@@ -308,7 +328,7 @@ class Fault(Exception):
 def sv39_walk(address, kind, privilege, satp, status, read_pte):
     if privilege == 3 or satp >> 60 == 0:
         return address
-    page_cause, access_cause = {'fetch': (12, 1), 'read': (13, 5), 'write': (15, 7), 'atomic': (15, 7)}[kind]
+    page_cause, access_cause = {'fetch': (12, 1), 'read': (13, 5), 'write': (15, 7), 'atomic': (15, 7), 'management': (15, 7)}[kind]
     if (signed(address, 39) & MASK) != address:
         raise Fault(page_cause, address)
     table = (satp & ((1 << 44) - 1)) << 12
@@ -324,6 +344,8 @@ def sv39_walk(address, kind, privilege, satp, status, read_pte):
             user = bool(flags & 16)
             permitted = (bool(flags & 8) if kind == 'fetch' else bool(flags & 4) if kind in ('write', 'atomic')
                          else bool(flags & 2 or flags & 8 and status & (1 << 19)))
+            if kind == 'management':
+                permitted |= bool(flags & 4)
             permitted &= (user if privilege == 0 else not user or kind != 'fetch' and bool(status & (1 << 18)))
             if not permitted or not flags & 64 or kind in ('write', 'atomic') and not flags & 128 or ppn & ((1 << (9 * level)) - 1):
                 raise Fault(page_cause, address)
@@ -478,7 +500,6 @@ class Model:
     def access(self, address, size, kind, data=0, fragment=False):
         virtual = address
         permission_kind = {2: 'read', 3: 'write'}.get(self.atomic_operation, 'atomic') if kind == 'atomic' else kind
-        cause = {'fetch': 1, 'read': 5, 'write': 7, 'atomic': 7}[permission_kind]
         data &= (1 << (8 * size)) - 1
         if address % size:
             if self.config.get('enableMisaligned') and kind in ('read', 'write'):
@@ -494,6 +515,11 @@ class Model:
             if kind == 'fetch':
                 self.local_fetch_faults.add(self.order)
             raise
+        return self.physical_access(virtual, address, size, kind, data, fragment)
+
+    def physical_access(self, virtual, address, size, kind, data=0, fragment=False):
+        permission_kind = {2: 'read', 3: 'write'}.get(self.atomic_operation, 'atomic') if kind == 'atomic' else kind
+        cause = {'fetch': 1, 'read': 5, 'write': 7, 'atomic': 7, 'management': 7}[permission_kind]
         if fragment and not any(not r['device'] and int(r['base']) <= address and
                                 address + size <= int(r['base']) + int(r['size']) for r in self.config['memoryRegions']):
             raise Fault(cause, virtual)
@@ -510,13 +536,14 @@ class Model:
             raise Fault(cause, virtual)
         self.requests.append((kind, address, size, data if kind in ('write', 'atomic') else 0))
         self.request_privileges.append(self.privilege if kind == 'fetch' else self.data_privilege())
-        permission = {'fetch': 'executable', 'read': 'readable', 'write': 'writable', 'atomic': 'atomic'}[kind]
+        permission = {'fetch': 'executable', 'read': 'readable', 'write': 'writable', 'atomic': 'atomic', 'management': 'readable'}[kind]
         allowed = any(int(r['base']) <= address and address + size <= int(r['base']) + int(r['size'])
                       and r.get(permission, False) and (kind != 'atomic' or (r['readable'] and r['writable'] and not r['device']))
                       for r in self.config['memoryRegions'])
         if not allowed:
             raise Fault(cause, virtual)
-        self.bus.append((kind, address, size, data if kind in ('write', 'atomic') else 0))
+        if kind != 'management':
+            self.bus.append((kind, address, size, data if kind in ('write', 'atomic') else 0))
         if kind != 'fetch' and self.external_access is not None:
             try:
                 return self.external_access(address, size, kind, data)
@@ -529,6 +556,8 @@ class Model:
         if failed or (kind == 'atomic' and any(
                 address <= self.faults.get(k, -1) < address + size if k == 'read' else address == self.faults.get(k) for k in stages)):
             raise Fault(cause, virtual)
+        if kind == 'management':
+            return 0
         old = sum(self.memory.get(address + i, 0) << (8 * i) for i in range(size))
         if kind == 'atomic':
             if self.atomic_operation == 2:
@@ -541,6 +570,8 @@ class Model:
                 data = atomic_value(self.atomic_operation, old, data, size)
         if kind in ('write', 'atomic'):
             self.monitor.write(address, size)
+            if self.local_reservation and self.csrs[0xf14] not in self.monitor.reservations:
+                self.local_reservation = None
             for i in range(size):
                 self.memory[address + i] = (data >> (8 * i)) & 255
             return old if kind == 'atomic' and self.atomic_operation != 3 else 0
@@ -645,8 +676,13 @@ class Model:
         if address == 0x14d:
             self.csrs[address] = value & MASK
             return
-        if address == 0x30a and self.config.get('enableSstc'):
-            self.csrs[address] = value & (1 << 63)
+        if address in (0x10a, 0x30a):
+            mask = (0x80 if self.config.get('enableZicboz') else 0) | (0x70 if self.config.get('enableZicbom') else 0)
+            if address == 0x30a and self.config.get('enableSstc'):
+                mask |= 1 << 63
+            if value >> 4 & 3 == 2:
+                value &= ~0x30
+            self.csrs[address] = value & mask
             return
         if address in (1, 2, 3):
             self.csrs[3] = ((self.csrs[3] & 0xe0) | (value & 31)) if address == 1 else ((self.csrs[3] & 31) | ((value & 7) << 5)) if address == 2 else value & 255
@@ -786,10 +822,34 @@ class Model:
                 value, write = signed(self.access(a, 1 << funct3, 'atomic', b), 8 << funct3), True
                 if self.atomic_operation == 2:
                     self.local_reservation = self.last_physical_address, 1 << funct3
+            elif opcode == 0x0f and funct3 == 2:
+                operation = insn >> 20
+                zero = operation == 4
+                if insn & 0x00007fff != 0x200f or not (
+                        zero and self.config.get('enableZicboz') or operation < 3 and self.config.get('enableZicbom')):
+                    raise Fault(2, insn)
+                controls = [self.csrs.get(0x30a, 0)] if self.privilege < 3 else []
+                if self.privilege == 0 and self.config.get('enableSupervisorMode'):
+                    controls.append(self.csrs[0x10a])
+                permission = 0x80 if zero else 0x30 if operation == 0 else 0x40
+                if any(not control & permission for control in controls):
+                    raise Fault(2, insn)
+                physical = self.translate(a, 'write' if zero else 'management')
+                protection = ([self.pmp_config(i) for i in range(self.config['pmpEntries'])],
+                              [self.csrs[0x3b0 + i] for i in range(self.config['pmpEntries'])])
+                if not cache_block_allowed(self.config, protection, physical, zero, self.data_privilege()):
+                    raise Fault(7, a)
+                for offset in (range(0, 64, 8) if zero else (0,)):
+                    self.physical_access(a, (physical & -64) + offset, 8, 'write' if zero else 'management')
             elif opcode == 0x0f and funct3 in (0, 1):
                 pass
             elif insn & 0xfe007fff == 0x12000073 and self.config.get('virtualAddressBits') == 39:
                 if self.privilege == 0 or self.privilege == 1 and self.csrs[0x300] & (1 << 20):
+                    raise Fault(2, insn)
+            elif insn in (0x00d00073, 0x01d00073) and self.config.get('enableZawrs'):
+                if (insn == 0x00d00073 and self.local_reservation and self.privilege < 3
+                        and self.csrs[0x300] & (1 << 21)
+                        and not self.csrs[0x304] & self.read_csr(0x344)):
                     raise Fault(2, insn)
             elif insn == 0x10500073:
                 if (self.config.get('enableSupervisorMode') and self.privilege == 0 or

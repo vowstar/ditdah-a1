@@ -21,6 +21,7 @@ object DitDahA1Core extends Generator[DitDahA1Parameter, DitDahA1Layers, DitDahA
     backend.io.clock := io.clock
     backend.io.reset := io.reset
     backend.io.hartId := io.hartId
+    io.reservation.foreach(_ :<>= backend.io.reservation.get)
     backend.io.timeValue.foreach(_ := io.timeValue.get)
     backend.io.debug.foreach { debug =>
       debug.haltReq := io.debug.get.haltReq
@@ -161,6 +162,7 @@ object DitDahA1Backend extends Generator[DitDahA1Parameter, DitDahA1Layers, DitD
     csr.io.timeValue.foreach(_ := io.timeValue.get)
     if parameter.enableInterrupts then csr.io.interrupts.get :<= io.interrupts.get
     lsu.io.clock := io.clock
+    io.reservation.foreach(_ :<>= lsu.io.reservation.get)
     lsu.io.reset := io.reset
     mulDiv.foreach { resource => resource.io.clock := io.clock; resource.io.reset := io.reset }
     fpu.foreach { resource => resource.io.clock := io.clock; resource.io.reset := io.reset }
@@ -171,6 +173,9 @@ object DitDahA1Backend extends Generator[DitDahA1Parameter, DitDahA1Layers, DitD
     execute.io.csrLegal := csr.io.legal
     execute.io.privilege := csr.io.privilege
     execute.io.wfiLegal := csr.io.wfiLegal
+    execute.io.zeroLegal.foreach(_ := csr.io.zeroLegal.get)
+    execute.io.cleanLegal.foreach(_ := csr.io.cleanLegal.get)
+    execute.io.invalidateLegal.foreach(_ := csr.io.invalidateLegal.get)
     execute.io.sretLegal := csr.io.sretLegal
     execute.io.sfenceLegal := csr.io.sfenceLegal
     if parameter.enableTranslation then
@@ -187,8 +192,28 @@ object DitDahA1Backend extends Generator[DitDahA1Parameter, DitDahA1Layers, DitD
       (if concurrent then !extraValid & !(memoryValid & (memoryPacket.load | memoryPacket.store)) else true.B) &
       !(commitValid & (commitPacket.load | commitPacket.store | commitPacket.instruction.fault))
     val interruptCause = if parameter.enableInterrupts then csr.io.interruptCause.get else 0.U(64)
-    commit.io.input.valid := (if parameter.enableInterrupts then commitValid & !takeInterrupt else commitValid)
+    val waitStall = Wire(Bool())
+    val waitFault = Wire(Bool())
+    waitStall := false.B
+    waitFault := false.B
+    if parameter.enableZawrs then
+      val elapsed = RegInit(0.U(6))
+      val encoding = commitPacket.instruction.instruction
+      val waiting = commitValid & !commitPacket.instruction.fault &
+        ((encoding === 0x00d00073.U(32)) | (encoding === 0x01d00073.U(32))) &
+        lsu.io.reservationValid.get & !csr.io.wakeup.getOrElse(false.B) &
+        !debugging & !stepping & !stopDispatch & !takeInterrupt
+      val expired = elapsed === 63.U(6)
+      waitStall := waiting & !expired
+      waitFault := waiting & expired & (encoding === 0x00d00073.U(32)) & csr.io.waitTimeout.get
+      elapsed := waitStall.?((elapsed + 1.U(6)).asBits.bits(5, 0).asUInt, 0.U(6))
+    commit.io.input.valid := commitValid & !takeInterrupt & !waitStall
     commit.io.input.bits :<= commitPacket
+    when(waitFault) {
+      commit.io.input.bits.instruction.fault := true.B
+      commit.io.input.bits.instruction.cause := 2.U(64)
+      commit.io.input.bits.instruction.tval := commitPacket.instruction.instruction
+    }
     when(commitCsr & !commitPacket.instruction.fault) {
       commit.io.input.bits.value := csr.io.readData
       val action = commitPacket.instruction.instruction.asBits.bits(13, 12)

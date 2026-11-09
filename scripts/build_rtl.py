@@ -64,6 +64,7 @@ def main():
         manifest["implementation"]["tlbEntries"] = manifest["parameters"]["tlbEntries"] if args.top in ("DitDahA1", "DitDahA1Core", "DitDahA1Translation") else 0
         for key in ("iTlbEntries", "dTlbEntries"):
             manifest["implementation"][key] = manifest["parameters"][key] if args.top in ("DitDahA1", "DitDahA1Core", "DitDahA1Translation") else 0
+        manifest["implementation"]["atomicTranslationEntries"] = int(manifest["parameters"]["enableA"] and manifest["parameters"]["virtualAddressBits"] == 39 and manifest["parameters"]["dTlbEntries"] == 0 and args.top in ("DitDahA1", "DitDahA1Core", "DitDahA1Translation"))
         manifest["implementation"]["asidBits"] = manifest["parameters"]["asidBits"] if args.top in ("DitDahA1", "DitDahA1Core", "DitDahA1Backend", "DitDahA1Csr", "DitDahA1Translation") else 0
         manifest["implementation"]["enableBurstRefill"] = bool(manifest["parameters"]["enableBurstRefill"] and args.top in ("DitDahA1", "DitDahA1Core", "DitDahA1Frontend", "DitDahA1Fetch", "DitDahA1InstructionCache", "DitDahA1MemoryFabric", "DitDahA1Memory", "DitDahA1Axi"))
         manifest["implementation"]["dCacheBytes"] = manifest["parameters"]["dCacheBytes"] if args.top in ("DitDahA1", "DitDahA1DataCache") else 0

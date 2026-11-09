@@ -19,7 +19,7 @@ class DitDahA1TranslationIO(parameter: DitDahA1Parameter) extends HWBundle(param
   val clock = Flipped(Clock())
   val reset = Flipped(Reset())
   val state = Flipped(new TranslationState)
-  val ports = Flipped(Vec(2, new TranslationPort))
+  val ports = Flipped(Vec(2, new TranslationPort(parameter)))
   val cancelInstruction = Flipped(Bool())
   val invalidate = Option.when(parameter.hasTranslationCache)(Flipped(Bool()))
   val maintenance = Option.when(parameter.preciseTranslationMaintenance)(Flipped(new TranslationMaintenance(parameter)))
@@ -37,7 +37,7 @@ object DitDahA1Translation extends Generator[DitDahA1Parameter, DitDahA1UnitLaye
     val state = RegInit(0.U(3))
     val owner = Reg(Bool())
     val next = RegInit(false.B)
-    val request = Reg(new TranslationRequest)
+    val request = Reg(new TranslationRequest(parameter))
     val sum = Reg(Bool())
     val mxr = Reg(Bool())
     val address = Reg(UInt(64))
@@ -53,14 +53,16 @@ object DitDahA1Translation extends Generator[DitDahA1Parameter, DitDahA1UnitLaye
     val replacement = Option.when(tlb.isDefined)(RegInit(0.U(replacementBits)))
     val instructionTlb = Option.when(parameter.iTlbEntries != 0)(Reg(Vec(parameter.iTlbEntries, new TranslationEntry)))
     val dataTlb = Option.when(parameter.dTlbEntries != 0)(Reg(Vec(parameter.dTlbEntries, new TranslationEntry)))
-    val capacities = Seq(parameter.tlbEntries, parameter.iTlbEntries, parameter.dTlbEntries)
-    val banks = Seq(tlb, instructionTlb, dataTlb)
+    val atomicTlb = Option.when(parameter.atomicTranslationEntries != 0)(Reg(Vec(1, new TranslationEntry)))
+    val capacities = Seq(parameter.tlbEntries, parameter.iTlbEntries, parameter.dTlbEntries, parameter.atomicTranslationEntries)
+    val banks = Seq(tlb, instructionTlb, dataTlb, atomicTlb)
     val instructionValid = Option.when(instructionTlb.isDefined)(RegInit(0.B(parameter.iTlbEntries)))
     val dataValid = Option.when(dataTlb.isDefined)(RegInit(0.B(parameter.dTlbEntries)))
+    val atomicValid = Option.when(atomicTlb.isDefined)(RegInit(0.B(1)))
     val instructionReplacement = Option.when(instructionTlb.isDefined)(RegInit(0.U(Integer.numberOfTrailingZeros(parameter.iTlbEntries))))
     val dataReplacement = Option.when(dataTlb.isDefined)(RegInit(0.U(Integer.numberOfTrailingZeros(parameter.dTlbEntries))))
-    val valid = Seq(tlbValid, instructionValid, dataValid)
-    val positions = Seq(replacement, instructionReplacement, dataReplacement)
+    val valid = Seq(tlbValid, instructionValid, dataValid, atomicValid)
+    val positions = Seq(replacement, instructionReplacement, dataReplacement, None)
     val refillAllowed = Option.when(parameter.hasTranslationCache)(RegInit(false.B))
     val currentAsid = if parameter.asidBits == 0 then 0.U(1) else io.state.satp.asBits.bits(43 + parameter.asidBits, 44).asUInt
     val walkAsid = Option.when(parameter.asidBits != 0 && tlb.isDefined)(Reg(UInt(parameter.asidBits)))
@@ -71,9 +73,11 @@ object DitDahA1Translation extends Generator[DitDahA1Parameter, DitDahA1UnitLaye
     val pageCause = request.fetch.?(12.U(64), request.write.?(15.U(64), 13.U(64)))
     def leafDenied(pte: Referable[Bits], access: Referable[TranslationRequest], accessSum: Referable[Bool],
       accessMxr: Referable[Bool])(using Arena, Context, Block, InstanceContext): Referable[Bool] =
-      val permitted = access.fetch.?(pte.bit(3), access.write.?(pte.bit(2), pte.bit(1) | (accessMxr & pte.bit(3))))
+      val management = access.management.getOrElse(false.B)
+      val permitted = management.?(pte.bit(1) | pte.bit(2) | (accessMxr & pte.bit(3)),
+        access.fetch.?(pte.bit(3), access.write.?(pte.bit(2), pte.bit(1) | (accessMxr & pte.bit(3)))))
       val user = (access.privilege === 0.U(2)).?(pte.bit(4), !pte.bit(4) | (accessSum & !access.fetch))
-      !permitted | !user | !pte.bit(6) | (access.write & !pte.bit(7))
+      !permitted | !user | !pte.bit(6) | (access.write & !management & !pte.bit(7))
     def mapped(pte: Referable[Bits], pageLevel: Referable[UInt], va: Referable[UInt])
       (using Arena, Context, Block, InstanceContext): Referable[UInt] =
       (pageLevel === 2.U(2)).?((0.B(8) ## pte.bits(53, 28) ## va.asBits.bits(29, 0)).asUInt,
@@ -86,9 +90,9 @@ object DitDahA1Translation extends Generator[DitDahA1Parameter, DitDahA1UnitLaye
     def update(bank: Int, vpn: Referable[UInt], pte: Referable[UInt], pageLevel: Referable[UInt], allocate: Referable[Bool], asid: Referable[UInt])
       (using Arena, Context, Block, InstanceContext): Unit =
       banks(bank).foreach { entries =>
-        val bits = Integer.numberOfTrailingZeros(capacities(bank))
+        val bits = Integer.numberOfTrailingZeros(capacities(bank)).max(1)
         val retained = (0 until capacities(bank)).reverse.map { n =>
-          val selected = allocate & (positions(bank).get === n.U(bits))
+          val selected = allocate & positions(bank).map(_ === n.U(bits)).getOrElse(true.B)
           val sameSpace = entries(n).asid.map(_ === asid).getOrElse(true.B) | entries(n).pte.asBits.bit(5) | pte.asBits.bit(5)
           val overlap = sameSpace & (matches(entries(n).vpn, vpn, entries(n).level) | matches(entries(n).vpn, vpn, pageLevel))
           when(selected) {
@@ -97,8 +101,10 @@ object DitDahA1Translation extends Generator[DitDahA1Parameter, DitDahA1UnitLaye
           }
           (selected | (valid(bank).get.bit(n) & !overlap)).asBits
         }.reduce(_ ## _)
-        valid(bank).get := retained
-        when(allocate) { positions(bank).get := (positions(bank).get + 1.U(bits)).asBits.bits(bits - 1, 0).asUInt }
+        when(allocate) {
+          valid(bank).get := retained
+          positions(bank).foreach(position => position := (position + 1.U(bits)).asBits.bits(bits - 1, 0).asUInt)
+        }
       }
     val available = (0 until 2).map { i =>
       !held(i) & !((state =/= 0.U(3)) & (owner === (i == 1).B)) &
@@ -111,7 +117,9 @@ object DitDahA1Translation extends Generator[DitDahA1Parameter, DitDahA1UnitLaye
       val canonical = incoming.address.asBits.bits(63, 39) ===
         incoming.address.asBits.bit(38).?(((BigInt(1) << 25) - 1).B(25), 0.B(25))
       val invalid = paged & ((mode =/= 8.U(4)) | !canonical)
-      val choices = Seq(i + 1, 0).flatMap(bank => banks(bank).toSeq.flatMap(entries =>
+      val localBanks = Seq(i + 1) ++ Option.when(i == 1)(3)
+      val localCount = localBanks.map(capacities).sum
+      val choices = (localBanks :+ 0).flatMap(bank => banks(bank).toSeq.flatMap(entries =>
         (0 until capacities(bank)).map(n => (entries(n), valid(bank).get.bit(n)))))
       val hits = choices.map { (entry, active) => active &
         matches(entry.vpn, incoming.address.asBits.bits(38, 12).asUInt, entry.level) &
@@ -126,8 +134,8 @@ object DitDahA1Translation extends Generator[DitDahA1Parameter, DitDahA1UnitLaye
       result.address := (paged & hit & !failed).?(mapped(pte, pageLevel, incoming.address), incoming.address)
       result.fault := failed
       result.cause := failed.?(incoming.fetch.?(12.U(64), incoming.write.?(15.U(64), 13.U(64))), 0.U(64))
-      val promote = paged & !failed & !hits.take(capacities(i + 1)).reduceOption(_ | _).getOrElse(false.B) &
-        hits.drop(capacities(i + 1)).reduceOption(_ | _).getOrElse(false.B)
+      val promote = paged & !failed & !hits.take(localCount).reduceOption(_ | _).getOrElse(false.B) &
+        hits.drop(localCount).reduceOption(_ | _).getOrElse(false.B)
       (!paged | invalid | hit, result, promote, pte.asUInt, pageLevel)
     }
     val misses = (0 until 2).map(i => io.ports(i).request.valid & available(i) & !lookups(i)._1)
@@ -151,8 +159,10 @@ object DitDahA1Translation extends Generator[DitDahA1Parameter, DitDahA1UnitLaye
         heldResponse(i) :<= lookups(i)._2
       }
       when(held(i) & port.response.ready) { held(i) := false.B }
-      when(port.request.valid & port.request.ready & lookups(i)._3 & !(io.memory.response.valid & io.memory.response.ready)) {
-        update(i + 1, port.request.bits.address.asBits.bits(38, 12).asUInt, lookups(i)._4, lookups(i)._5, true.B, currentAsid)
+      when(port.request.valid & port.request.ready & lookups(i)._3) {
+        for bank <- Seq(i + 1) ++ Option.when(i == 1)(3) do
+          update(bank, port.request.bits.address.asBits.bits(38, 12).asUInt, lookups(i)._4, lookups(i)._5,
+            (bank != 3).B | port.request.bits.atomic, currentAsid)
       }
       when(port.request.valid & port.request.ready & !fast) {
         val incoming = port.request.bits
@@ -186,6 +196,7 @@ object DitDahA1Translation extends Generator[DitDahA1Parameter, DitDahA1UnitLaye
       pmp.io.write := false.B
       pmp.io.fetch := false.B
       pmp.io.atomic := false.B
+      pmp.io.management.foreach(_ := false.B)
       pmp.io.privilege := 1.U(2)
       pmp.io.allowed
     val allowed = ordinary & protectedRead &
@@ -241,8 +252,9 @@ object DitDahA1Translation extends Generator[DitDahA1Parameter, DitDahA1UnitLaye
                 when(refillAllowed.get & !maintaining) {
                   val vpn = request.address.asBits.bits(38, 12).asUInt
                   for bank <- banks.indices do
+                    val allocate = if bank == 3 then owner & request.atomic else (bank == 0).B | (owner === (bank == 2).B)
                     update(bank, vpn, (pte | globalMapping.getOrElse(false.B).?(32.B(64), 0.B(64))).asUInt,
-                      level, (bank == 0).B | (owner === (bank == 2).B), walkAsid.getOrElse(currentAsid))
+                      level, allocate, walkAsid.getOrElse(currentAsid))
                 }
             }.otherwise {
               globalMapping.foreach(_ := globalMapping.get | pte.bit(5))
@@ -277,7 +289,7 @@ object DitDahA1Translation extends Generator[DitDahA1Parameter, DitDahA1UnitLaye
       when(invalidate) {
         for bank <- banks.indices if banks(bank).isDefined do
           valid(bank).get := 0.B(capacities(bank))
-          positions(bank).get := 0.U(Integer.numberOfTrailingZeros(capacities(bank)))
+          positions(bank).foreach(_ := 0.U(Integer.numberOfTrailingZeros(capacities(bank)).max(1)))
         refillAllowed.get := false.B
       }
     }

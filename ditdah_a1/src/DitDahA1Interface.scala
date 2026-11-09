@@ -71,6 +71,15 @@ class MemoryResponse(dataBits: Int = 64, countBits: Int = 0) extends Bundle:
 class MemoryPort(parameter: DitDahA1Parameter) extends Bundle:
   val request = Aligned(new Decoupled(new MemoryRequest(parameter)))
   val response = Flipped(new Decoupled(new MemoryResponse))
+class MemoryWriteEvent extends Bundle:
+  val valid = Aligned(Bool())
+  val address = Aligned(UInt(64))
+  val mask = Aligned(UInt(8))
+class ReservationPort extends Bundle:
+  val address = Aligned(UInt(64))
+  val mask = Aligned(UInt(8))
+  val begin = Flipped(Bool())
+  val invalidate = Flipped(Bool())
 class CacheProbeRequest extends Bundle:
   val address = Aligned(UInt(64))
   val invalidate = Aligned(Bool())
@@ -98,17 +107,19 @@ class TranslationMaintenance(parameter: DitDahA1Parameter) extends Bundle:
   val address = Aligned(UInt(64))
   val asidValid = Aligned(Bool())
   val asid = Aligned(UInt(parameter.asidBits.max(1)))
-class TranslationRequest extends Bundle:
+class TranslationRequest(parameter: DitDahA1Parameter) extends Bundle:
+  val management = Option.when(parameter.enableZicbom)(Aligned(Bool()))
   val address = Aligned(UInt(64))
   val privilege = Aligned(UInt(2))
   val fetch = Aligned(Bool())
   val write = Aligned(Bool())
+  val atomic = Aligned(Bool())
 class TranslationResponse extends Bundle:
   val address = Aligned(UInt(64))
   val fault = Aligned(Bool())
   val cause = Aligned(UInt(64))
-class TranslationPort extends Bundle:
-  val request = Aligned(new Decoupled(new TranslationRequest))
+class TranslationPort(parameter: DitDahA1Parameter) extends Bundle:
+  val request = Aligned(new Decoupled(new TranslationRequest(parameter)))
   val response = Flipped(new Decoupled(new TranslationResponse))
 
 class PmpState(parameter: DitDahA1Parameter) extends Bundle:
@@ -228,6 +239,7 @@ class DitDahA1Probe(parameter: DitDahA1Parameter) extends DVBundle[DitDahA1Param
   val pipelineStall = ProbeRead(Bool(), dv)
 
 class DitDahA1CoreIO(parameter: DitDahA1Parameter) extends HWBundle(parameter):
+  val reservation = Option.when(parameter.enableA)(Aligned(new ReservationPort))
   val timeValue = Option.when(parameter.enableCounters)(Flipped(UInt(64)))
   val debug = Option.when(parameter.enableJtag)(Aligned(new DebugHartPort))
   val hartId = Flipped(UInt(4))
@@ -241,7 +253,7 @@ class DitDahA1CoreIO(parameter: DitDahA1Parameter) extends HWBundle(parameter):
 class DitDahA1FrontendIO(parameter: DitDahA1Parameter) extends HWBundle(parameter):
   val debugMode = Option.when(parameter.enableDebugMemory)(Flipped(Bool()))
   val prediction = Option.when(parameter.branchPredictorEntries != 0)(Flipped(new BranchUpdate))
-  val translation = Option.when(parameter.enableTranslation)(Aligned(new TranslationPort))
+  val translation = Option.when(parameter.enableTranslation)(Aligned(new TranslationPort(parameter)))
   val privilege = Flipped(UInt(2))
   val pmp = Option.when(parameter.pmpEntries != 0)(Flipped(new PmpState(parameter)))
   val invalidate = Option.when(parameter.iCacheBytes != 0)(Flipped(Bool()))
@@ -254,6 +266,8 @@ class DitDahA1FrontendIO(parameter: DitDahA1Parameter) extends HWBundle(paramete
   val memory = Aligned(new MemoryPort(parameter))
 
 class DitDahA1MemoryFabricIO(parameter: DitDahA1Parameter) extends HWBundle(parameter):
+  val maintenance = Option.when(parameter.enableZicbom && parameter.l2CacheBytes != 0)(Aligned(new Decoupled(UInt(64))))
+  val writeEvent = Option.when(parameter.enableA)(Aligned(new MemoryWriteEvent))
   val timeValue = Option.when(parameter.enableCounters && parameter.localInterruptBase.nonEmpty)(Aligned(UInt(64)))
   val debugMemory = Option.when(parameter.enableDebugMemory)(Aligned(new MemoryPort(parameter)))
   val debugHart = Option.when(parameter.enableDebugMemory)(Aligned(UInt(4)))
@@ -267,10 +281,11 @@ class DitDahA1MemoryFabricIO(parameter: DitDahA1Parameter) extends HWBundle(para
   val axi = Aligned(new AxiBundle(parameter))
 
 class DitDahA1BackendIO(parameter: DitDahA1Parameter) extends HWBundle(parameter):
+  val reservation = Option.when(parameter.enableA)(Aligned(new ReservationPort))
   val timeValue = Option.when(parameter.enableCounters)(Flipped(UInt(64)))
   val debug = Option.when(parameter.enableJtag)(Aligned(new DebugHartPort))
   val prediction = Option.when(parameter.branchPredictorEntries != 0)(Aligned(new BranchUpdate))
-  val translation = Option.when(parameter.enableTranslation)(Aligned(new TranslationPort))
+  val translation = Option.when(parameter.enableTranslation)(Aligned(new TranslationPort(parameter)))
   val translationState = Option.when(parameter.enableTranslation)(Aligned(new TranslationState))
   val translationMaintenance = Option.when(parameter.enableTranslation && parameter.preciseTranslationMaintenance)(Aligned(new TranslationMaintenance(parameter)))
   val invalidateTranslation = Option.when(parameter.enableTranslation && parameter.hasTranslationCache)(Aligned(Bool()))

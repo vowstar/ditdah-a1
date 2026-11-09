@@ -10,6 +10,7 @@ import java.lang.foreign.Arena
 import org.llvm.mlir.scalalib.capi.ir.{Block, Context}
 
 class DitDahA1DataCacheIO(parameter: DitDahA1Parameter) extends HWBundle(parameter):
+  val writeEvent = Option.when(parameter.enableA && parameter.dCacheWriteback)(Aligned(new MemoryWriteEvent))
   val clock = Flipped(Clock())
   val reset = Flipped(Reset())
   val upstream = Flipped(new MemoryPort(parameter))
@@ -148,6 +149,11 @@ object DitDahA1DataCache extends Generator[DitDahA1Parameter, DitDahA1Layers, Di
     val storeComplete = (state === 3.U(3)) & responding & !releaseActive & request.write
     val storeUpdating = storeComplete & storeHit & !responseFault & !fault & !invalidated & !collision
     val storeFailed = if parameter.dCacheWriteback then false.B else storeComplete & responseFault
+    io.writeEvent.foreach { event =>
+      event.valid := storeUpdating & acquireActive
+      event.address := (request.address.asBits.bits(63, 3) ## 0.B(3)).asUInt
+      event.mask := (request.mask << request.address.asBits.bits(2, 0).asUInt).asBits.bits(7, 0).asUInt
+    }
     val filling = wordFilling | lineFilling | storeUpdating
     val reading = up.request.valid & up.request.ready
     val tag = request.address.asBits.bits(parameter.physicalAddressBits - 1, indexBits + 6).asUInt

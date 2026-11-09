@@ -1097,6 +1097,80 @@ def floating_extension_cases(base, flen, config):
 
 def scalar_cases(base, config):
     from model import SCALAR_ENCODINGS
+    blocks = config.get('enableZicboz') or config.get('enableZicbom')
+    if not blocks:
+        p = Program(base)
+        p.required_memory = []
+        for operation in (0, 1, 2, 4):
+            instruction = operation << 20 | 0x200f
+            p.required_memory.append((base + p.offset, instruction, True))
+            p.emit(instruction)
+        p.expected_registers = {23: 4}
+        yield 'cbo_disabled', p.finish()
+    for operation, name in (((0, 'inval'), (1, 'clean'), (2, 'flush'), (4, 'zero')) if blocks else ()):
+        enabled = bool(config.get('enableZicboz' if operation == 4 else 'enableZicbom'))
+        p = Program(base)
+        p.address(8, 0x1800)
+        p.emit(ld(3, 8), addi(2, 0, 90), *(sd(2, 8, offset) for offset in range(0, 64, 8)), addi(8, 8, 31))
+        instruction = operation << 20 | 8 << 15 | 0x200f
+        p.required_memory = [(base + p.offset, instruction, not enabled)]
+        p.emit(instruction, addi(8, 8, -31), *(ld(10 + lane, 8, 8 * lane) for lane in range(8)), ld(18, 8, -8), ld(19, 8, 64))
+        p.memory[base + 0x17f8], p.memory[base + 0x1840] = 0xa5, 0x6c
+        p.expected_registers = {**{10 + lane: 0 if operation == 4 and enabled else 90 for lane in range(8)},
+                                18: 0xa5, 19: 0x6c, 23: int(not enabled)}
+        yield 'cbo_' + name, p.finish()
+        if operation < 3:
+            for target, suffix in ((0x4000, 'readonly'), (0x5000, 'device'), (0x6000, 'denied')):
+                p = Program(base)
+                p.address(8, target + 63)
+                p.required_memory = [(base + p.offset, instruction, not enabled or suffix == 'denied')]
+                p.emit(instruction, addi(10, 0, 1))
+                p.expected_registers = {10: 1, 23: int(not enabled or suffix == 'denied')}
+                yield f'cbo_{name}_{suffix}', p.finish()
+    for instruction in (0x00d00073, 0x01d00073):
+        for reservation in ('none', 'valid', 'cleared') if config.get('enableZawrs') else ('none',):
+            p = Program(base)
+            if reservation != 'none':
+                p.address(8, 0x1800)
+                p.emit(amo(2, 9, 8))
+                if reservation == 'cleared':
+                    p.emit(sd(0, 8))
+            p.emit(instruction, addi(10, 0, 1))
+            p.expected_registers = {10: 1, 23: int(not config.get('enableZawrs'))}
+            yield f'wrs_{"nto" if instruction == 0x00d00073 else "sto"}_{reservation}', p.finish()
+    if config.get('enableZawrs') and config.get('enableUserMode'):
+        for instruction in (0x00d00073, 0x01d00073):
+            p = Program(base)
+            if config.get('pmpEntries'):
+                user_protection(p, data_top=0x2000)
+            p.address(8, 0x1800)
+            p.emit(0x002200b7, csr(0, 0x300, 1), amo(2, 9, 8), instruction, addi(10, 0, 1))
+            p.expected_registers = {10: 1, 23: 0}
+            yield f'wrs_{"nto" if instruction == 0x00d00073 else "sto"}_mprv', p.finish()
+        modes = ((3, 1), (0, 0), (0, 1)) + (((1, 0), (1, 1)) if config.get('enableSupervisorMode') else ())
+        for mode, tw in modes:
+            privilege = {0: 'u', 1: 's', 3: 'm'}[mode]
+            for instruction in (0x00d00073, 0x01d00073):
+                for reservation in ('none', 'valid', 'cleared'):
+                    p = Program(base)
+                    if config.get('pmpEntries'):
+                        user_protection(p, data_top=0x2000)
+                    p.address(1, 0x200)
+                    p.emit(csr(0, 0x341, 1), addi(1, 0, tw), alu(1, 1, 21, 1, immediate=True),
+                           addi(2, 0, mode), alu(2, 2, 11, 1, immediate=True), alu(1, 1, 2, 6),
+                           csr(0, 0x300, 1), 0x30200073)
+                    p.offset = 0x200
+                    if reservation != 'none':
+                        p.address(8, 0x1800)
+                        p.emit(amo(2, 9, 8))
+                        if reservation == 'cleared':
+                            p.emit(sd(0, 8))
+                    trapped = instruction == 0x00d00073 and mode != 3 and tw and reservation == 'valid'
+                    if trapped:
+                        p.required_traps = [(base + p.offset, instruction)]
+                    p.emit(instruction, addi(10, 0, 1))
+                    p.expected_registers = {10: 1, 23: int(trapped)}
+                    yield f'wrs_{"nto" if instruction == 0x00d00073 else "sto"}_{privilege}_tw{tw}_{reservation}', p.finish()
     for extension in ('Zicond', 'Zimop', 'Zcb', 'Zcmop', 'Zihintpause', 'Zihintntl'):
         if extension not in ('Zihintpause', 'Zihintntl') and not config.get('enable' + extension):
             raw = next(encoding for owner, encoding, _ in SCALAR_ENCODINGS.values() if owner == extension)
@@ -1320,15 +1394,18 @@ def atomic_cases(base, protection=False):
         p.emit(amoadd(3, 10, 1))
     p.emit(addi(10, 0, -8), amoadd(3, 10, 1), amoadd(3, 10, 1) | (5 << 27), amoadd(3, 10, 1) ^ (1 << 12))
     yield 'atomic_denied', p.finish()
-    for kind in ('read', 'write', 'exclusive', 'retry'):
+    for kind, size in (('read', 3), ('write', 3), ('exclusive', 3), ('retry', 3), ('retry_word', 2)):
         p = Program(base)
         p.address(10, 0x1000)
-        p.emit(addi(2, 0, 7), amoadd(3, 10, 2, 3), addi(4, 3, 1))
-        if kind == 'retry':
+        p.emit(addi(2, 0, 7), amo(0, 3, 10, 2, 3, size), addi(4, 3, 1))
+        if kind.startswith('retry'):
             p.exclusive_failures, p.interference = 2, 0
         else:
             p.faults[kind] = base + 0x1000
-        yield 'atomic_' + ('retry' if kind == 'retry' else 'fault_' + kind), p.finish()
+        if size == 2:
+            for byte in range(4): p.memory[base + 0x1004 + byte] = (0x89abcdef >> (8*byte)) & 255
+            p.emit(ld(5, 10))
+        yield 'atomic_' + (kind if kind.startswith('retry') else 'fault_' + kind), p.finish()
     p = Program(base)
     p.address(10, 0x1000)
     p.address(11, 0x1800)
@@ -1504,7 +1581,25 @@ def interrupt_cases(base, protection):
         yield 'interrupt_' + ('divide' if function else name), p
 
 
-def multicore_cases(base, harts, protection=False, interrupts=False, user=False, writeback=False):
+def store_buffering_program(base, ordered):
+    p = Program(base)
+    p.emit(csr(2, 0xf14, 0, True), alu(3, 2, 6, 1, immediate=True), alu(4, 3, 64, 4, immediate=True))
+    p.address(10, 0x1800)
+    p.address(11, 0x1800)
+    p.emit(add(10, 10, 3), add(11, 11, 4), addi(6, 0, 1), ld(0, 10), sd(6, 10))
+    if ordered: p.emit(fence(reserved=0x03300000))
+    p.memory_outcomes = dict(loadPc=base + p.offset, addresses=(base + 0x1800, base + 0x1840),
+                             allowed=((0, 1), (1, 0), (1, 1)) + (() if ordered else ((0, 0),)))
+    p.emit(ld(5, 11))
+    for address in p.memory_outcomes['addresses']:
+        for byte in range(8): p.memory[address + byte] = 0
+    return p.finish()
+
+
+def multicore_cases(base, harts, protection=False, interrupts=False, user=False, writeback=False, collision=False):
+    if harts == 2:
+        for ordered in (False, True):
+            yield 'store_buffering_fence' if ordered else 'store_buffering', store_buffering_program(base, ordered)
     yield 'load_window', load_window_program(base, harts)
     yield 'load_cancel', load_window_program(base, harts, cancel=True)
     if writeback:
@@ -1563,7 +1658,7 @@ def multicore_cases(base, harts, protection=False, interrupts=False, user=False,
         p.data_cache = dict(minHits=0, minReservedStores=1,
             finalRegisters=[{'6': 0x11, '8': 1, '9': 0x22}, {'6': 0x11, '7': 0x22}, *({} for _ in range(harts - 2))])
         yield 'cache_reservation', p.finish()
-    yield from atomic_multicore_cases(base, harts, interrupts)
+    yield from atomic_multicore_cases(base, harts, interrupts, writeback, collision)
     for name in ('exchange', *(('protection',) if protection else ()), *(('interrupt',) if interrupts else ())):
         p = Program(base)
         p.emit(csr(2, 0xf14, 0, True), addi(3, 0, 64), mul(3, 2, 3))
@@ -1864,8 +1959,13 @@ def synchronization_program(base, harts, writeback=False):
     return p.finish()
 
 
-def atomic_multicore_cases(base, harts, interrupts):
-    for size, shared in ((size, shared) for size in (2, 3) for shared in (True, False)):
+def atomic_multicore_cases(base, harts, interrupts, writeback=False, collision=False):
+    assert not collision or writeback and harts == 2, 'SC collision requires two writeback harts'
+    variants = [(size, shared, False, 0) for size in (2, 3) for shared in (True, False)]
+    if writeback and harts == 2:
+        variants.append((2, True, True, 0))
+        if collision: variants.append((2, True, False, 2))
+    for size, shared, window, padding in variants:
         p = Program(base)
         p.emit(csr(2, 0xf14, 0, True))
         p.address(10, 0x1804 if size == 2 else 0x1800)
@@ -1873,14 +1973,24 @@ def atomic_multicore_cases(base, harts, interrupts):
             p.emit(alu(3, 2, 3, 1, immediate=True), add(10, 10, 3))
         if size == 2:
             p.emit(ld(5, 10, -4), addi(4, 0, 87), sw(4, 10, -4))
+        if window:
+            p.emit(beq(2, 0, 32), addi(12, 0, 32))
+            repeat = p.offset
+            p.emit(amo(2, 13, 10, size=2), ld(13, 10, -4), sw(4, 10, -4), addi(12, 12, -1),
+                   beq(12, 0, 8), jal(0, repeat - (p.offset + 20)))
         p.address(11, 0x2000)
         p.emit(alu(3, 2, 5, 1, immediate=True), add(11, 11, 3))
+        delay = [word for _ in range(5) for word in (beq(0, 0, 8), addi(7, 7, 0))] + [addi(7, 7, 0)] if window else ()
+        if padding: delay = [beq(2, 0, 4 * (padding + 1)), *([addi(7, 7, 0)] * padding)]
         for iteration in range(2):
             loop = p.offset
-            p.emit(amo(2, 6, 10, aqrl=2, size=size), addi(7, 6, 1), amo(3, 8, 10, 7, 1, size),
-                   beq(8, 0, 8), jal(0, loop - (p.offset + 16)), sd(6, 11, iteration * 8))
+            p.emit(amo(2, 6, 10, aqrl=2, size=size), addi(7, 6, 1),
+                   *delay, amo(3, 8, 10, 7, 1, size),
+                   beq(8, 0, 8), jal(0, loop - (p.offset + 16 + 4 * len(delay))), sd(6, 11, iteration * 8))
         p.lrsc = dict(shared=shared, rounds=2, counter=base + (0x1804 if size == 2 else 0x1800), size=1 << size, witnesses=base + 0x2000, stride=32)
-        yield 'atomic_lrsc_' + ('shared' if shared else 'private') + ('_word' if size == 2 else ''), p.finish()
+        if window: p.lrsc['neighborWindow'] = True
+        name = 'atomic_lrsc_neighbor' if window else 'atomic_lrsc_' + ('shared' if shared else 'private') + ('_word' if size == 2 else '')
+        yield ('atomic_lrsc_collision' if padding else name), p.finish()
     for name in ('atomic', *(('atomic_interrupt',) if interrupts else ())):
         p = Program(base)
         p.emit(csr(2, 0xf14, 0, True), addi(3, 0, 64), mul(3, 2, 3), addi(4, 2, 1), addi(5, 0, 1))

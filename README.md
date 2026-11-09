@@ -19,9 +19,9 @@ PMP is configurable to zero or sixteen entries per hart; the default uncached co
 Optional M uses shared iterative multiplication and division with retained instruction ownership through completion or cancellation draining. Multiplication takes 64 iterations, or 32 for MULW.
 Branches recover in EX while retaining older work; `enableBranchPrediction` enables static backward-branch and direct-jump prediction.
 `branchPredictorEntries` selects 0/8/16 direct-mapped entries with two-bit direction counters and last indirect targets; nonzero requires prediction enabled. This does not implement a return stack.
-The manifest lists I/Zicsr/Zifencei, Zihintpause/Zihintntl/Zkt and optional M/A/C, F/D, Zba/Zbb/Zbs, Zicond/Zimop/Zcb/Zcmop, Zfa/Zfhmin and counter/timer extensions. `floatingPointBits` selects 0/32/64. FPRs and FCSR/FS update at retirement. Sv48 remains a target.
-Core composes Frontend and Backend; Frontend owns PC sequencing and Backend owns execution and retirement. `enableC` adds serial halfword fetch and two/four-byte packets with halfword-aligned PCs; raw encodings survive retirement and each parcel receives its own translation and permission check.
-Core exposes separate instruction/data memory ports; the physical fabric owns shared arbitration and AXI.
+The manifest lists I/Zicsr/Zifencei, Zihintpause/Zihintntl/Zicbop/Zkt and optional M/A/C, F/D, Zba/Zbb/Zbs, Zicond/Zimop/Zcb/Zcmop, Zfa/Zfhmin, Zawrs/Zicbom/Zicboz and counter/timer extensions. `floatingPointBits` selects 0/32/64. FPRs and FCSR/FS update at retirement. Sv48 remains a target.
+Core composes Frontend and Backend; Frontend owns PC sequencing and Backend owns execution and retirement. `enableC` supports halfword-aligned PCs and two/four-byte packets. Word-aligned 32-bit instructions use one authorized word snapshot; other 32-bit instructions use separately checked halfword parcels. Raw encodings survive retirement.
+`enableZawrs` requires A and adds bounded reservation waits. `enableZicbom` manages 64-byte blocks through flush. `enableZicboz` clears a block through ordinary writes. These options default to false. Core exposes separate instruction/data memory ports; the physical fabric owns shared arbitration and AXI.
 Instruction permissions apply before cache lookup and to the complete refill request; region checks also protect external accesses.
 `loadQueueEntries` selects one or two ordinary data-read contexts per hart; replies retain their instruction owner and complete in order.
 The fabric permits one instruction read and the configured data-read count per hart through 1–4 `fabricReadSlots` (at most `hartCount * (1 + loadQueueEntries)`; default two for multiple harts, zero for the single-hart bridge); writes, atomics and devices wait for all response fragments and execute exclusively.
@@ -96,5 +96,5 @@ Reachability and mutation checks exercise properties; simulation checks general 
 - [RISC-V specifications](https://riscv.org/specifications/ratified/): instruction and privilege contracts.
 - [LLVM](https://github.com/llvm/llvm-project), [CIRCT](https://github.com/llvm/circt) and [YosysHQ](https://github.com/YosysHQ): compiler and verification tools.
 - [Berkeley HardFloat](https://www.jhauser.us/arithmetic/HardFloat.html): IEEE 754 arithmetic.
-- [RISC-V architectural tests](https://github.com/riscv-non-isa/riscv-arch-test), [Sail](https://github.com/riscv/sail-riscv) and [RVFI instruction models](https://github.com/YosysHQ/riscv-formal): executable architectural checks.
+- [RISC-V architectural tests](https://github.com/riscv-non-isa/riscv-arch-test), [Sail](https://github.com/riscv/sail-riscv), [RVFI instruction models](https://github.com/YosysHQ/riscv-formal) and [herdtools7](https://github.com/herd/herdtools7): architectural and memory-model checks.
 - [Zephyr](https://github.com/zephyrproject-rtos/zephyr): multicore software tests.

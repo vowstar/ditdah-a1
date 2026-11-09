@@ -8,6 +8,7 @@ import me.jiuyang.zaozi.reftpe.*
 import me.jiuyang.zaozi.valuetpe.*
 
 class DitDahA1SharedCacheIO(parameter: DitDahA1Parameter) extends HWBundle(parameter):
+  val maintenance = Option.when(parameter.enableZicbom)(Flipped(new Decoupled(UInt(64))))
   val clock = Flipped(Clock())
   val reset = Flipped(Reset())
   val upstream = Flipped(new AxiBundle(parameter))
@@ -83,7 +84,9 @@ object DitDahA1SharedCache extends Generator[DitDahA1Parameter, DitDahA1UnitLaye
     val storedTag = StorageArray("sharedTags", parameter.l2CacheBytes / 64, parameter.physicalAddressBits - capacityBits,
       up.ar.bits.addr.asBits.bits(capacityBits - 1, 6).asUInt, set, tag, publish, readAccepted, io.clock)
     val hit = cacheable & (storedTag === tag) & ((valid & requested) === requested)
-    up.ar.ready := idle & !writing & !up.aw.valid & !up.w.valid
+    val maintaining = io.maintenance.map(_.valid).getOrElse(false.B)
+    val allowWrite = !maintaining | writing
+    up.ar.ready := idle & !writing & !up.aw.valid & !up.w.valid & !maintaining
     down.ar.valid := state === 2.U(3)
     down.ar.bits :<= address
     up.r.valid := (state === 4.U(3)) | ((state === 3.U(3)) & down.r.valid)
@@ -95,12 +98,12 @@ object DitDahA1SharedCache extends Generator[DitDahA1Parameter, DitDahA1UnitLaye
       up.r.bits.last := beat === address.len
     }
     down.r.ready := (state === 3.U(3)) & up.r.ready
-    down.aw.valid := up.aw.valid & idle & !awDone
+    down.aw.valid := up.aw.valid & idle & !awDone & allowWrite
     down.aw.bits :<= up.aw.bits
-    up.aw.ready := down.aw.ready & idle & !awDone
-    down.w.valid := up.w.valid & idle & !wDone
+    up.aw.ready := down.aw.ready & idle & !awDone & allowWrite
+    down.w.valid := up.w.valid & idle & !wDone & allowWrite
     down.w.bits :<= up.w.bits
-    up.w.ready := down.w.ready & idle & !wDone
+    up.w.ready := down.w.ready & idle & !wDone & allowWrite
     up.b.valid := down.b.valid & awDone & wDone
     up.b.bits :<= down.b.bits
     down.b.ready := up.b.ready & awDone & wDone
@@ -129,3 +132,10 @@ object DitDahA1SharedCache extends Generator[DitDahA1Parameter, DitDahA1UnitLaye
     }
     when(dataAccepted) { writing := true.B; when(up.w.bits.last) { wDone := true.B } }
     when(up.b.valid & up.b.ready) { writing := false.B; awDone := false.B; wDone := false.B }
+    io.maintenance.foreach { port =>
+      port.ready := idle & !writing
+      val set = port.bits.asBits.bits(capacityBits - 1, 6).asUInt
+      val shift = if beatBits == 6 then set else (set.asBits ## 0.B(6 - beatBits)).asUInt
+      val mask = (((1 << sectors) - 1).U(rows) << shift).asBits.bits(rows - 1, 0)
+      when(port.valid & port.ready) { valid := valid & ~mask }
+    }

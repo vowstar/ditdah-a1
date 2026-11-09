@@ -100,12 +100,14 @@ module DitDahA1PlatformMemory #(
         if (write_fire && write_exclusive) valid[write_id] <= 0;
         for (integer id = 0; id < (1<<ID_BITS); id++) begin
           if (write_effect && write_ram &&
-              {1'b0,write_address} < {1'b0,address[id]} + (33'd1 << size[id]) &&
-              {1'b0,address[id]} < {1'b0,write_address} + (33'd1 << write_size)) valid[id] <= 0;
+              !(axi_ar_valid && axi_ar_ready && axi_ar_bits_lock &&
+                axi_ar_bits_id == ID_BITS'(id)) &&
+              write_address[31:3] == address[id][31:3] &&
+              (write_strobe & 8'(((32'd1 << (1 << size[id]))-1) << address[id][2:0])) != 0) valid[id] <= 0;
           if (write_effect && write_ram && axi_ar_valid && axi_ar_ready && axi_ar_bits_lock &&
               axi_ar_bits_id == ID_BITS'(id) &&
-              {1'b0,write_address} < {1'b0,axi_ar_bits_addr} + (33'd1 << axi_ar_bits_size) &&
-              {1'b0,axi_ar_bits_addr} < {1'b0,write_address} + (33'd1 << write_size)) valid[id] <= 0;
+              write_address[31:3] == axi_ar_bits_addr[31:3] &&
+              (write_strobe & 8'(((32'd1 << (1 << axi_ar_bits_size))-1) << axi_ar_bits_addr[2:0])) != 0) valid[id] <= 0;
         end
       end
     end

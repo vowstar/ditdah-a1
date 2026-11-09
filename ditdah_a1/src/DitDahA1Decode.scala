@@ -84,6 +84,8 @@ object DitDahA1Decode extends Generator[DitDahA1Parameter, DitDahA1UnitLayers, D
     if parameter.enableSupervisorMode then
       when(insn === 0x10200073L.B(32)) { out.operation := Sret.U(operationBits) }
     when(insn === 0x10500073L.B(32)) { out.operation := Wfi.U(operationBits) }
+    if parameter.enableZawrs then
+      when((insn === 0x00d00073.B(32)) | (insn === 0x01d00073.B(32))) { out.operation := Wfi.U(operationBits) }
     when((opcode === 0x0f.B(7)) & (funct3 === 0.B(3))) { out.operation := Fence.U(operationBits) }
     when((opcode === 0x0f.B(7)) & (funct3 === 1.B(3))) { out.operation := FenceI.U(operationBits) }
     for (_, mask, encoding) <- DitDahA1BitManip.encodings(parameter) do
@@ -137,6 +139,16 @@ object DitDahA1Decode extends Generator[DitDahA1Parameter, DitDahA1UnitLayers, D
     val both = (operation === Add.U(operationBits)) | (operation === Arithmetic.U(operationBits)) | branch | store | (operation === AmoaddD.U(operationBits)) | (operation === AluRegister.U(operationBits)) | (operation === AluWordRegister.U(operationBits))
     out.usesRs1 := !in.fault & (both | (operation === Addi.U(operationBits)) | (operation === AluImmediate.U(operationBits)) | (operation === AluWordImmediate.U(operationBits)) | (operation === Jalr.U(operationBits)) | (operation === Ld.U(operationBits)) | (operation === Lw.U(operationBits)) | (operation === Lwu.U(operationBits)) | (operation === Load.U(operationBits)) | (csr & !funct3.bit(2)))
     out.usesRs2 := !in.fault & both
+    if parameter.enableZicbom then
+      when(((insn & BigInt("ffc07fff", 16).B(32)) === 0x0000200f.B(32)) & (insn.bits(21, 20) =/= 3.B(2))) {
+        out.operation := Fence.U(operationBits)
+        out.usesRs1 := !in.fault
+      }
+    if parameter.enableZicboz then
+      when((insn & BigInt("fff07fff", 16).B(32)) === 0x0040200f.B(32)) {
+        out.operation := Fence.U(operationBits)
+        out.usesRs1 := !in.fault
+      }
     when(operation === Atomic.U(operationBits)) {
       out.usesRs1 := !in.fault
       out.usesRs2 := !in.fault & !lr

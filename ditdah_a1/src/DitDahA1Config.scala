@@ -29,7 +29,9 @@ object DitDahA1Config:
       "status" -> "development",
       "implementation" -> ujson.Obj(
         "extensions" -> ujson.Arr.from(Seq("I", "Zicsr", "Zifencei", "Zihintpause", "Zihintntl", "Zkt") ++ (if parameter.enableM then Seq("M") else Seq.empty) ++ (if parameter.enableA then Seq("A") else Seq.empty) ++ (if parameter.enableC then Seq("C") else Seq.empty) ++ (if parameter.floatingPointBits == 64 then Seq("F", "D") else if parameter.floatingPointBits == 32 then Seq("F") else Seq.empty) ++ Seq("Zba" -> parameter.enableZba, "Zbb" -> parameter.enableZbb, "Zbs" -> parameter.enableZbs, "Zicond" -> parameter.enableZicond, "Zimop" -> parameter.enableZimop, "Zcb" -> parameter.enableZcb, "Zcmop" -> parameter.enableZcmop, "Zfa" -> parameter.enableZfa, "Zfhmin" -> parameter.enableZfhmin,
-          "Zicntr" -> parameter.enableCounters, "Zihpm" -> parameter.enableCounters, "Sscounterenw" -> (parameter.enableCounters && parameter.enableSupervisorMode),
+          "Zicbop" -> true, "Zicboz" -> parameter.enableZicboz, "Zicbom" -> parameter.enableZicbom,
+          "Zic64b" -> (parameter.enableZicboz || parameter.enableZicbom),
+          "Zawrs" -> parameter.enableZawrs, "Zicntr" -> parameter.enableCounters, "Zihpm" -> parameter.enableCounters, "Sscounterenw" -> (parameter.enableCounters && parameter.enableSupervisorMode),
           "Sscofpmf" -> (parameter.enableCounters && parameter.hpmCounters > 0 && parameter.enableInterrupts),
           "Sstc" -> (parameter.enableSstc && parameter.enableCounters && parameter.enableSupervisorMode && parameter.enableInterrupts)).collect { case (name, true) => name }),
         "instructions" -> ujson.Arr.from(DitDahA1Isa.instructions(parameter) ++ (if parameter.enableSupervisorMode then DitDahA1Isa.supervisorInstructions else Seq.empty) ++ (if parameter.enableTranslation then Seq("sfence.vma") else Seq.empty) ++ (if parameter.enableJtag then DitDahA1Isa.debugInstructions else Seq.empty)),
@@ -41,6 +43,7 @@ object DitDahA1Config:
         "asidBits" -> (if parameter.enableTranslation then parameter.asidBits else 0),
         "iTlbEntries" -> (if parameter.enableTranslation then parameter.iTlbEntries else 0),
         "dTlbEntries" -> (if parameter.enableTranslation then parameter.dTlbEntries else 0),
+        "atomicTranslationEntries" -> parameter.atomicTranslationEntries,
         "fabricReadSlots" -> parameter.resolvedFabricReadSlots,
         "loadQueueEntries" -> parameter.loadQueueEntries,
         "enableMisaligned" -> parameter.enableMisaligned,

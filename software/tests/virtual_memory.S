@@ -107,6 +107,10 @@ main:
     csrw pmpaddr3, t0
     li t0, 0x0b000f00
     csrw pmpcfg0, t0
+#if defined(__riscv_zicbom) || defined(__riscv_zicboz)
+    li t0, 0xf0
+    csrs menvcfg, t0
+#endif
     srli t0, s1, 12
     li t1, 0x8000000000000000
     or t0, t0, t1
@@ -122,6 +126,44 @@ main:
     csrs mstatus, t0
     mret
 .Lsupervisor:
+#if defined(__riscv_zicbom) || defined(__riscv_zicboz) || defined(__riscv_zawrs)
+    la t0, .Lblocks
+    slli t1, s0, 6
+    add t0, t0, t1
+    ld t1, 0(t0)
+    addi t3, s0, 1
+    mv t2, t0
+    li t1, 8
+.Lblock_fill:
+    sd t3, 0(t2)
+    addi t2, t2, 8
+    addi t1, t1, -1
+    bnez t1, .Lblock_fill
+#if defined(__riscv_zicbom)
+    cbo.clean 0(t0)
+    cbo.inval 0(t0)
+    cbo.flush 0(t0)
+    ld t1, 0(t0)
+    bne t1, t3, .Lfail_supervisor
+#endif
+#if defined(__riscv_zicboz)
+    cbo.zero 0(t0)
+    mv t2, t0
+    li t1, 8
+.Lblock_zero_check:
+    ld t3, 0(t2)
+    bnez t3, .Lfail_supervisor
+    addi t2, t2, 8
+    addi t1, t1, -1
+    bnez t1, .Lblock_zero_check
+#endif
+#if defined(__riscv_zawrs)
+    lr.d t1, (t0)
+    wrs.sto
+    lr.d t1, (t0)
+    wrs.nto
+#endif
+#endif
 #ifdef __riscv_compressed
     .option rvc
     c.nop
@@ -202,6 +244,21 @@ main:
     jalr ra, t0, 0
     li t0, 2
     bne a0, t0, .Lfail_supervisor
+#ifdef __riscv_atomic
+    la t0, __atomic_count
+.Latomic_retry:
+    lr.d t1, (t0)
+    addi t1, t1, 1
+    sc.d t2, t1, (t0)
+    bnez t2, .Latomic_retry
+.Latomic_wait:
+    ld t1, 0(t0)
+    bne t1, s6, .Latomic_wait
+#endif
+    la t0, .Lconsole_turn
+.Lconsole_wait:
+    ld t1, 0(t0)
+    bne t1, s0, .Lconsole_wait
     slli a1, s0, 2
     la t0, __console_base
     add a1, a1, t0
@@ -215,6 +272,10 @@ main:
     sw t1, 0(a1)
     la a0, .Lsuffix
     call .Lprint
+    fence iorw, iorw
+    la t0, .Lconsole_turn
+    addi t1, s0, 1
+    sd t1, 0(t0)
 .Ldone:
     ecall
 .Lfail_supervisor:
@@ -358,12 +419,28 @@ main:
 .Lhart_count:
     .dword __hart_count
 .section .bss,"aw",@nobits
+#if defined(__riscv_zicbom) || defined(__riscv_zicboz) || defined(__riscv_zawrs)
+.balign 64
+.Lblocks:
+    .zero 64 * DITDAH_HART_COUNT
+#endif
 .balign 8
 .Lready:
     .zero 128
 .Lacknowledged:
     .zero 128
+#ifdef __riscv_atomic
+.balign 64
+.globl __atomic_count
+__atomic_count:
+    .zero 8
+#endif
+.balign 64
+.Lconsole_turn:
+    .zero 8
+#ifndef DITDAH_ZERO_PAGE_TABLES
 .section .data,"aw",@progbits
+#endif
 .balign 4096
 .Lspaces:
     .zero 16 * 20480

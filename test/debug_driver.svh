@@ -23,6 +23,9 @@ always @(negedge clock) if (!reset) begin
       3: debug_halt_req = status_sleep;
       4: debug_halt_req = service[1].pending && service[1].captured.atomic;
       5: debug_halt_req = service[1].pending && !service[1].captured.write;
+      8: debug_halt_req = dut.backend.commitCount != 0 && !dut.backend.commit.output_valid &&
+        (dut.backend.commitPackets_0_instruction_instruction == 'h00d00073 ||
+         dut.backend.commitPackets_0_instruction_instruction == 'h01d00073);
 `ifdef ENABLE_FLOATING
       7: debug_halt_req = dut.backend.fpu.input_valid && dut.backend.fpu.input_ready;
 `endif
