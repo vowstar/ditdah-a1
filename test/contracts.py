@@ -11,7 +11,7 @@ import subprocess
 
 from floating import FLOATING_ENCODINGS, FLOATING_FEATURES, floating_decode, floating_value
 from programs import addi, alu, amo, beq, jal, csr, sd, mul, muldiv, ld, lw, sw, load, store, fence
-from model import BITMANIP_ENCODINGS, SCALAR_ENCODINGS, ATOMIC_OPERATIONS, Fault, LocalInterrupts, Model, MASK, atomic_value, compressed_instruction, is_mop, muldiv_value, pmp_allowed, signed, sv39_walk
+from model import BITMANIP_ENCODINGS, SCALAR_ENCODINGS, ATOMIC_OPERATIONS, Fault, LocalInterrupts, Model, MASK, atomic_value, compressed_instruction, is_mop, muldiv_value, pmp_allowed, pointer_address, signed, sv39_walk
 
 
 def atomic_translation_entries(parameters):
@@ -498,33 +498,46 @@ def lsu_queue_contract(parameters):
     user = parameters.get('enableUserMode', False)
     pmp_address = (1 << (parameters['physicalAddressBits'] - 2)) - 1
 
-    def submit(address, pc, rd, operation=None, physical=None, overlap=False):
+    def submit(address, pc, rd, operation=None, physical=None, overlap=False, memory_type=0, pointer_mask=False):
         instruction = ld(rd, 1) if operation is None else amo(operation, rd, 1, 0 if operation == 2 else 2)
-        body = f'''    privilege = {0 if user else 3}; input_bits_instruction_pc = 'h{pc:x}; input_bits_instruction_tag = 73;
+        virtual = pointer_address(address, pointer_mask, translated)
+        body = f'    pointerMask = {int(pointer_mask)};\n' if parameters.get('enableSsnpm') else ''
+        if parameters.get('enableSsnpm') and translated:
+            body += '    virtualPointers = 1;\n'
+        body += f'''    privilege = {0 if user else 3}; input_bits_instruction_pc = 'h{pc:x}; input_bits_instruction_tag = 73;
     input_bits_instruction_instruction = 32'h{instruction:x}; input_bits_instruction_length = 4;
     input_bits_address = 'h{address:x}; input_bits_rd = {rd}; input_bits_rdWrite = 1;
     input_bits_load = {int(operation != 3)}; input_bits_store = {int(operation is not None and operation != 2)};
     input_bits_atomic = {int(operation is not None)}; input_bits_memorySize = 3;
     input_valid = 1; #1; while (!input_ready) tick(); tick(); input_valid = 0;
 '''
+        if parameters.get('enableSsnpm'):
+            body += '    pointerMask = 0;\n'
+            if translated:
+                body += '    virtualPointers = 0;\n'
         if overlap:
             body += '    memory_response_valid = 0;\n'
         if translated:
+            if parameters.get('enableSvpbmt'):
+                body += f'    translation_response_bits_pbmt = {memory_type};\n'
             body += f'''    while (!translation_request_valid) tick();
-    check(translation_request_bits_address == 'h{address:x} && translation_request_bits_atomic == {int(operation is not None)}, "Translation retains its input owner");
+    check(translation_request_bits_address == 'h{virtual:x} && translation_request_bits_atomic == {int(operation is not None)}, "Translation retains its input owner");
     translation_request_ready = 1; tick(); translation_request_ready = 0;
-    translation_response_bits_address = 'h{address if physical is None else physical:x}; translation_response_valid = 1;
+    translation_response_bits_address = 'h{virtual if physical is None else physical:x}; translation_response_valid = 1;
     while (!translation_response_ready) tick(); tick(); translation_response_valid = 0;
 '''
+            if parameters.get('enableSvpbmt'):
+                body += '    translation_response_bits_pbmt = 0;\n'
         return body
 
-    def issue(index, address, write=False):
+    def issue(index, address, write=False, memory_type=0):
         reservation = (f'    if (memory_request_bits_atomic && memory_request_bits_atomicOperation == 2) begin check(reservation_address == 64\'h{address & ~7:x} && reservation_mask == 8\'hff, "Reservation byte range"); end\n'
                        if parameters.get('enableA', True) else '')
         return f'''    while (!memory_request_valid) tick();
     bus_id[{index}] = memory_request_bits_tag; privilege = 3;
 {reservation}    repeat (3) begin
       check(memory_request_valid && memory_request_bits_address == 'h{address:x} && memory_request_bits_tag == bus_id[{index}] && memory_request_bits_write == {int(write)} && memory_request_bits_privileged == {int(not user)}, "Memory offer retains context and effective privilege"); tick();
+{f'''      check(memory_request_bits_pbmt == {memory_type}, "Memory offer retains its accepted type");''' if parameters.get('enableSvpbmt') else ''}
     end
     memory_request_ready = 1; tick(); memory_request_ready = 0;
 '''
@@ -551,6 +564,10 @@ def lsu_queue_contract(parameters):
 '''
     if parameters['pmpEntries']:
         body += f"    pmp_config = 'h1f; pmp_address = 'h{pmp_address:x};\n"
+    if parameters.get('enableSsnpm'):
+        for fault in (False, True):
+            body += submit(0xaa00000000001000, 0x100, 5, pointer_mask=True) + issue(0, 0x1000)
+            body += respond(0, 101, fault) + complete(0x100, 5, 101, fault)
     for fault in (False, True):
         body += submit(0x1000, 0x100, 5) + issue(0, 0x1000)
         body += submit(0x1040, 0x104, 6) + issue(1, 0x1040)
@@ -586,20 +603,22 @@ def lsu_queue_contract(parameters):
         body += '    repeat (4) begin check(!memory_request_valid, "Virtual aliases serialize by their physical word"); tick(); end\n'
         body += respond(0, 101, True) + issue(1, 0x3000) + respond(1, 202)
         body += complete(0x100, 5, 101, True) + complete(0x104, 6, 202)
-    devices = [int(region['base']) for region in parameters['memoryRegions'] if region['device']]
-    if devices:
-        body += submit(devices[0], 0x100, 5) + '    storeAllowed = 0;\n' + issue(0, devices[0])
+    devices = [(int(region['base']), 0) for region in parameters['memoryRegions'] if region['device']]
+    if parameters.get('enableSvpbmt'):
+        devices.append((0x3040, 2))
+    for device, memory_type in devices:
+        body += submit(device, 0x100, 5, memory_type=memory_type) + '    storeAllowed = 0;\n' + issue(0, device, memory_type=memory_type)
         body += respond(0, 707) + complete(0x100, 5, 707) + '    storeAllowed = 1;\n'
         body += submit(0x1000, 0x100, 5) + issue(0, 0x1000)
-        body += '    storeAllowed = 0;\n' + submit(devices[0], 0x104, 6)
+        body += '    storeAllowed = 0;\n' + submit(device, 0x104, 6, memory_type=memory_type)
         body += '    repeat (3) begin check(!memory_request_valid, "Device read waits behind its older owner"); tick(); end\n'
         body += respond(0, 101) + complete(0x100, 5, 101)
         body += '''    repeat (3) begin check(!memory_request_valid, "Oldest device read still needs effect permission"); tick(); end
     storeAllowed = 1; tick(); storeAllowed = 0;
 '''
-        body += issue(1, devices[0]) + respond(1, 202) + complete(0x104, 6, 202) + '    storeAllowed = 1;\n'
+        body += issue(1, device, memory_type=memory_type) + respond(1, 202) + complete(0x104, 6, 202) + '    storeAllowed = 1;\n'
         body += submit(0x1000, 0x100, 5) + issue(0, 0x1000)
-        body += '    storeAllowed = 0;\n' + submit(devices[0], 0x104, 6)
+        body += '    storeAllowed = 0;\n' + submit(device, 0x104, 6, memory_type=memory_type)
         body += '    repeat (4) begin check(!memory_request_valid, "Younger device read has no effect permission"); tick(); end\n'
         body += respond(0, 101, True)
         body += '''    check(output_valid && output_bits_instruction_fault, "Older fault precedes device cancellation");
@@ -1041,15 +1060,25 @@ def decode_contract(parameters, directory):
             body += '    check(output_bits_rs1==0 && output_bits_immediate==0, "MOP has a zero source and immediate");\n'
         if word in (0x00000073, 0x00100073):
             body += '    check(output_bits_operation == 12, "Environment exception operation class");\n'
-    if parameters.get('virtualAddressBits') == 39:
+    if parameters.get('virtualAddressBits') == 39 or parameters.get('enableSvinval'):
         precise = atomic_translation_entries(parameters) or any(parameters.get(key) for key in ('tlbEntries', 'iTlbEntries', 'dTlbEntries')) and any(parameters.get(key) for key in ('asidBits', 'iTlbEntries', 'dTlbEntries'))
-        for rs1, rs2 in ((0, 0), (1, 0), (0, 31), (31, 31)):
-            word = 0x12000073 | (rs1 << 15) | (rs2 << 20)
-            body += f'''    input_bits_instruction = 32'h{word:x};
+        for encoding in (0x12000073, *((0x16000073,) if parameters.get('enableSvinval') else ())):
+            for rs1, rs2 in ((0, 0), (1, 0), (0, 31), (31, 31)):
+                word = encoding | (rs1 << 15) | (rs2 << 20)
+                body += f'''    input_bits_instruction = 32'h{word:x};
     check(output_bits_operation == 16 && output_bits_serializing && output_bits_usesRs1 == {int(precise)} && output_bits_usesRs2 == output_bits_usesRs1 && !output_bits_writesRd, "SFENCE selector dependencies");
 '''
-        for word in (0x120000f3, 0x12001073, 0x14000073):
+        for word in (0x120000f3, 0x12001073, 0x14000073, 0x160000f3, 0x16001073, 0x18008073, 0x181000f3):
             body += f"    input_bits_instruction = 32'h{word:x}; check(output_bits_operation != 16, \"SFENCE requires its complete standard encoding\");\n"
+    for word in (0x16000073, 0x18000073, 0x18100073):
+        enabled = int(bool(parameters.get('enableSvinval')))
+        operands = enabled and word == 0x16000073 and bool(atomic_translation_entries(parameters) or
+            any(parameters.get(key) for key in ('tlbEntries', 'iTlbEntries', 'dTlbEntries')) and
+            any(parameters.get(key) for key in ('asidBits', 'iTlbEntries', 'dTlbEntries')))
+        body += f'''    input_bits_instruction = 32'h{word:x};
+    check(output_bits_operation == {16 if enabled else 0} && output_bits_serializing == {enabled} &&
+      output_bits_usesRs1 == {int(operands)} && output_bits_usesRs2 == {int(operands)} && !output_bits_writesRd, "Invalidate encoding and dependencies");
+'''
     for operation in range(4):
         for rs1 in (0, 8, 31):
             word = operation << 20 | rs1 << 15 | 0x200f
@@ -1309,6 +1338,20 @@ def execute_contract(parameters):
     check(output_bits_instruction_cause == 1 && output_bits_instruction_tval == 'habc, "Prior fetch fault precedes breakpoint");
     input_bits_decoded_instruction_fault = 0; privilege = 3;
 '''
+    if parameters.get('enableSvinval'):
+        for word in (0x12000073, 0x16000073, 0x18000073, 0x18100073):
+            maintenance = word in (0x12000073, 0x16000073)
+            for privilege in (0, 1, 3):
+                for legal in (0, 1):
+                    fault = not legal if maintenance else privilege == 0
+                    body += f'''    privilege = {privilege}; sfenceLegal = {legal}; input_valid = 1; output_ready = 1;
+    input_bits_decoded_operation = 16; input_bits_decoded_writesRd = 0;
+    input_bits_decoded_instruction_instruction = 32'h{word:x};
+    check(output_valid && output_bits_sfenceVma == {int(maintenance)} && !output_bits_rdWrite &&
+      output_bits_instruction_fault == {int(fault)} && (!output_bits_instruction_fault ||
+      output_bits_instruction_cause == 2 && output_bits_instruction_tval == 'h{word:x}), "Translation ordering privilege and TVM distinction");
+'''
+        body += '    privilege = 3; sfenceLegal = 1;\n'
     if parameters.get('enableZicboz'):
         for address in (0, 0x103f, MASK):
             for legal in (0, 1):
@@ -1351,6 +1394,10 @@ def cache_management_lsu_contract(parameters):
     input_bits_memorySize = 3; input_bits_rdWrite = 0; input_bits_instruction_pc = 'h120;
     input_bits_instruction_tag = 81; input_bits_instruction_fault = 0;
 '''
+    if translated:
+        body += '    translation_response_bits_fault = 0; translation_response_bits_cause = 0;\n'
+        if parameters.get('enableSvpbmt'):
+            body += '    translation_response_bits_pbmt = 0;\n'
     if parameters['pmpEntries']:
         body += f"    privilege = 0; pmp_config = 'h19; pmp_address = 'h{(1 << (parameters['physicalAddressBits'] - 2)) - 1:x};\n"
     for operation in range(3):
@@ -1511,16 +1558,16 @@ def axi_cache_attributes(parameters):
             if r['device']:
                 continue
             lower = f"address >= 64'd{int(r['base'])} && " if int(r['base']) else ''
-            regions += f'''    if ({lower}address + bytes <= 64'd{int(r['base']) + int(r['size'])})
+            regions += f'''    if ((bytes == 1 || bytes == 2 || bytes == 4 || bytes == 8 || bytes == 64) && bytes <= {int(r['size'])} && {lower}address <= 64'd{int(r['base']) + int(r['size'])} - bytes)
       expected_cache = !locked && (fetch ? {int(r['executable'])} : {int(r['readable'] and r.get('dataCacheable', False))}) ? (write_access ? 6 : 14) : 2;
 '''
     return '''  function automatic logic [3:0] expected_cache(input logic [63:0] address,
-      input integer bytes, input bit fetch, write_access, locked);
+      input integer bytes, input bit fetch, write_access, locked, input logic [1:0] pbmt = 0);
     expected_cache = 0;
-''' + regions + '  endfunction\n'
+''' + regions + '    if (pbmt != 0) expected_cache = pbmt == 1 ? 2 : 0;\n  endfunction\n'
 
 
-def axi_contract(width, harts, enable_a=True):
+def axi_contract(width, harts, enable_a=True, enable_pbmt=False):
     bus_bytes = width // 8
     read_data = sum((0xa0 + byte) << (8 * byte) for byte in range(bus_bytes))
     write_data = 0x8877665544332211
@@ -1558,6 +1605,24 @@ def axi_contract(width, harts, enable_a=True):
       check(memory_response_valid && !memory_response_bits_fault && memory_response_bits_tag == {tag} && memory_response_bits_data == 64'h{expected:x}, "AXI response tag and zero extension {tag}");
       tick();
     end
+    memory_response_ready = 1; tick(); memory_response_ready = 0;
+'''
+    if enable_pbmt:
+        for memory_type in (1, 2):
+            for write in (False, True):
+                body += f'''    memory_request_bits_address = 'h1000; memory_request_bits_size = 3;
+    memory_request_bits_write = {int(write)}; memory_request_bits_mask = {255 if write else 0};
+    memory_request_bits_tag = 37; memory_request_bits_pbmt = {memory_type}; memory_request_valid = 1;
+    tick(); memory_request_valid = 0; memory_request_bits_pbmt = 0;
+    repeat (3) begin check(axi_{'aw' if write else 'ar'}_valid &&
+      axi_{'aw' if write else 'ar'}_bits_cache == {2 if memory_type == 1 else 0}, "Accepted memory type reaches AXI"); tick(); end
+'''
+                body += ('''    axi_aw_ready = 1; axi_w_ready = 1; tick(); axi_aw_ready = 0; axi_w_ready = 0;
+    axi_b_valid = 1; tick(); axi_b_valid = 0;
+''' if write else '''    axi_ar_ready = 1; tick(); axi_ar_ready = 0;
+    axi_r_bits_data = 19; axi_r_bits_last = 1; axi_r_valid = 1; tick(); axi_r_valid = 0;
+''')
+                body += '''    check(memory_response_valid && !memory_response_bits_fault && memory_response_bits_tag == 37, "Typed response retains owner");
     memory_response_ready = 1; tick(); memory_response_ready = 0;
 '''
     return body + (axi_atomic_contract(width) + axi_reservation_contract(width, harts) if enable_a else '')
@@ -1853,6 +1918,27 @@ def instruction_cache_contract(parameters):
     upstream_request_bits_tag = {65+beat}; upstream_request_valid = {int(beat != 63)};
     check(upstream_request_ready, "Full-bank response blocked the next lookup"); tick();
 '''
+    if parameters.get('enableSvpbmt'):
+        body += '    upstream_response_ready = 1; tick(); upstream_response_ready = 0;\n'
+        for memory_type in (1, 2):
+            for address in (base, base + 128, base + 128):
+                body += f'''    upstream_request_bits_pbmt = {memory_type}; upstream_request_bits_address = 'h{address:x};
+    upstream_request_bits_size = 2; upstream_request_bits_tag = 19; upstream_request_valid = 1;
+    while (!upstream_request_ready) tick(); tick(); upstream_request_valid = 0; upstream_response_ready = 0;
+    upstream_request_bits_pbmt = 0;
+    while (!downstream_request_valid) begin check(!upstream_response_valid, "Non-cacheable fetch cannot hit"); tick(); end
+    repeat (2) begin
+      check(downstream_request_bits_pbmt == {memory_type} && downstream_request_bits_address == 'h{address:x} &&
+        downstream_request_bits_size == 2, "Non-cacheable fetch retains exact demand and type"); tick();
+    end
+    downstream_request_ready = 1; tick(); downstream_request_ready = 0;
+    downstream_response_bits_data = 'h13; downstream_response_bits_tag = 19;
+    downstream_response_bits_last = 1; downstream_response_valid = 1;
+    while (!downstream_response_ready) tick(); tick(); downstream_response_valid = 0;
+    while (!upstream_response_valid) tick();
+    check(!upstream_response_bits_fault && upstream_response_bits_data == 'h13{(' && upstream_response_bits_count == 1' if banks > 1 else '')}, "Non-cacheable fetch completes one demand");
+    upstream_response_ready = 1; tick();
+'''
     return body + f'''
     upstream_response_ready = 1; upstream_request_valid = 1;
     upstream_request_bits_address = 'h{base+64:x}; upstream_request_bits_tag = 8; upstream_request_bits_size = 2; tick();
@@ -1979,6 +2065,7 @@ def frontend_group_contract(parameters):
       integer held_count;
       bus_pending = 0; held_offer = 0; full_count = 0; partial_count = 0;
       halt = 0; privilege = 3; memory_request_ready = 0; memory_response_valid = 0;
+      {'backendIdle = 1;' if parameters.get('enableSvpbmt') else ''}
       {'pmp_config = 0; pmp_address = 0;' if parameters['pmpEntries'] else ''}
       reset = 1; tick(); tick(); reset = 0;
       for (phase = 0; phase < 6; phase += 1) begin
@@ -2444,6 +2531,29 @@ def data_cache_queue_contract(parameters):
     upstream_response_ready = 1; tick(); upstream_response_ready = 0;
 '''
         body += '    end\n'
+    if parameters.get('enableSvpbmt'):
+        body += '    reset = 1; tick(); reset = 0; tick(); upstream_response_ready = 0;\n'
+        for memory_type, address in ((0, base), (1, base), (2, base),
+                                     (1, base + 256), (2, base + 256), (0, base + 256)):
+            body += f'''    upstream_request_bits_address = 64'h{address:x}; upstream_request_bits_size = 3;
+    upstream_request_bits_refillSize = 0; upstream_request_bits_tag = 85;
+    upstream_request_bits_pbmt = {memory_type}; upstream_request_valid = 1;
+    while (!upstream_request_ready) tick(); tick(); upstream_request_valid = 0;
+    upstream_request_bits_pbmt = 0;
+    while (!downstream_request_valid) begin check(!upstream_response_valid, "Non-cacheable demand cannot hit or allocate"); tick(); end
+    repeat (3) begin
+      check(downstream_request_bits_address == 64'h{address:x} && downstream_request_bits_size == 3 &&
+        downstream_request_bits_pbmt == {memory_type} && downstream_request_bits_tag == 85,
+        "Captured cache bypass type and exact range"); tick();
+    end
+    downstream_request_ready = 1; tick(); downstream_request_ready = 0;
+    downstream_response_bits_tag = 85; downstream_response_bits_data = 23;
+    downstream_response_bits_fault = 0; downstream_response_bits_last = 1; downstream_response_valid = 1;
+    while (!downstream_response_ready) tick(); tick(); downstream_response_valid = 0;
+    while (!upstream_response_valid) tick();
+    check(upstream_response_bits_data == 23 && !upstream_response_bits_fault && upstream_response_bits_tag == 85,
+      "Typed cache bypass completion"); upstream_response_ready = 1; tick(); upstream_response_ready = 0;
+'''
     return body
 
 
@@ -2452,6 +2562,8 @@ def data_cache_contract(parameters):
     base, size = int(region['base']), parameters['dCacheBytes']
     fields = dict(cacheOperation=2, address=64, data=64, size=3, mask=8, tag=8, write=1, fetch=1,
                   privileged=1, atomic=1, atomicOperation=5, scEligible=1, refillSize=3)
+    if parameters.get('enableSvpbmt'):
+        fields['pbmt'] = 2
     current = {}
 
     def request(address, **options):
@@ -2482,6 +2594,8 @@ def data_cache_contract(parameters):
         if operation == 2:
             physical.update(address=physical_address, size=3, data=0, mask=0, write=0, fetch=0,
                             atomic=0, atomicOperation=0, scEligible=0, refillSize=0)
+            if parameters.get('enableSvpbmt'):
+                physical['pbmt'] = 0
         if fallback:
             physical['refillSize'] = 0
         body += '      check(' + ' && '.join(f"downstream_request_bits_{key} == {fields[key]}'h{value:x}" for key, value in physical.items())
@@ -2542,6 +2656,12 @@ downstream_response_valid = 1; check(downstream_response_ready, "Line response o
 
 
     geometry = ''
+    if parameters.get('enableSvpbmt'):
+        geometry += request(base) + bus(17) + reply(17)
+        for memory_type in (1, 2):
+            for address in (base, base + 128, base + 128):
+                geometry += request(address, pbmt=memory_type, refillSize=6) + bus(23) + reply(23)
+        geometry += '    reset = 1; tick(); reset = 0; tick();\n'
     limit = min(size, int(region['size']))
     for offset in (limit - 16, limit - 8):
         geometry += request(base + offset) + bus(offset ^ 0x71) + reply(offset ^ 0x71)
@@ -4726,7 +4846,7 @@ def pmp_contract(parameters):
         for config in (0, 0x99, 0x98, 0x94, 0x89):
             for kind in ('read', 'write', 'atomic'):
                 tests.append(([config, 0x9f] + [0] * 14, [0x407, (1 << width) - 1] + [0] * 14, address, 6, kind))
-    block = bool(parameters.get('iCacheBytes')) and parameters['issueWidth'] == 3
+    block = bool(parameters.get('iCacheBytes')) and parameters['issueWidth'] == 3 and not parameters.get('enableC', False)
     for address in (0xff4, 0xffc, 0x1000, 0x1004, 0x100c, (1 << pa) - 16, (1 << pa) - 4, (1 << 64) - 4):
         for config in (0, 0x9f, 0x9c, 0x98, 0x94, 0x8c):
             for kind in ('fetch', 'read', 'write', 'atomic'):
@@ -4895,9 +5015,11 @@ def supervisor_csr_contract(parameters):
 '''
         if model.interrupt_cause():
             body += f'    check(interruptCause == 64\'h{model.interrupt_cause():x}, "Target privilege precedes interrupt source priority");\n'
-        body += f'    check(sfenceLegal == {int(parameters.get("virtualAddressBits") == 39 and (model.privilege == 3 or model.privilege == 1 and not status & (1 << 20)))}, "SFENCE minimum privilege and TVM");\n'
+        body += f'    check(sfenceLegal == {int((parameters.get("virtualAddressBits") == 39 or parameters.get("enableSvinval")) and (model.privilege == 3 or model.privilege == 1 and not status & (1 << 20)))}, "SFENCE minimum privilege and TVM");\n'
+        if parameters.get('enableSsnpm'):
+            body += f'    check(pointerMask == {int(model.pointer_mask())}, "Effective U pointer mask and MXR");\n'
         for address in (0x100, 0x104, 0x105, 0x106, 0x10a, 0x140, 0x141, 0x142, 0x143, 0x144,
-                        0x180, 0x300, 0x302, 0x303, 0x304, 0x305, 0x340, 0x341, 0x342, 0x343, 0x344):
+                        0x180, 0x300, 0x302, 0x303, 0x304, 0x305, 0x30a, 0x340, 0x341, 0x342, 0x343, 0x344):
             legal = model.csr_legal(address)
             body += f"    readAddress = 'h{address:x}; check(legal == {int(legal)}"
             body += (f" && readData == 64'h{model.read_csr(address):x}" if legal else '') + ', "CSR privilege, aliases and trap bank");\n'
@@ -4922,6 +5044,23 @@ def supervisor_csr_contract(parameters):
         state()
 
     state()
+    if parameters.get('virtualAddressBits') == 39:
+        for machine, supervisor in ((0, 1), (1, 0), (1, 1), (0, 0)):
+            write(0x30a, machine)
+            write(0x10a, supervisor)
+            state()
+    if parameters.get('enableSvpbmt'):
+        for value in (0, 1 << 62, MASK, 1 << 63, 0):
+            write(0x30a, value)
+            state()
+            body += f'    check(translationState_pbmte == {int(bool(value & (1 << 62)))}, "PBMTE reset and write control");\n'
+    if parameters.get('enableSsnpm'):
+        for pmm in (0, 2, 1, 2, 3, 0):
+            write(0x10a, (pmm << 32) | 0xf1)
+            for status in (0x20000, 0xa0000, 0x20800, 0):
+                write(0x300, status)
+                state()
+        write(0x10a, 0)
     for address, value in ((0x302, MASK), (0x303, MASK), (0x300, MASK), (0x100, MASK),
                            (0x105, 0x203), (0x305, 0x803), (0x141, 0x347), (0x341, 0x567),
                            (0x106, MASK), (0x10a, MASK), (0x180, MASK), (0x140, 0x1234),
@@ -5173,23 +5312,42 @@ def translation_contract(parameters):
         vectors.append((0, 'read', 1, 0xcf, 0, address, None))
     for nonleaf in (0x11, 0x41, 0x81):
         vectors.append((0, 'read', 1, 0xcf, 0, 0x12345100, nonleaf))
-    for index, (level, kind, privilege, flags, status, address, nonleaf) in enumerate(vectors):
+    vectors = [(*entry, 0) for entry in vectors]
+    for nibble in range(16):
+        vectors.append((0, 'read', 1, (1 << 63) | (nibble << 10) | 0xcf, 0, 0x12345100, None, 0))
+    for level in (1, 2):
+        vectors.append((level, 'read', 1, (1 << 63) | 0x20cf, 0, 0x12345100, None, 0))
+    vectors.append((0, 'read', 1, 0xcf, 0, 0x12345100, (1 << 63) | 1, 0))
+    for enabled in (0, 1) if parameters.get('enableSvpbmt') else (0,):
+        for memory_type in range(1, 4):
+            for level in range(3):
+                for kind in ('fetch', 'read', 'write'):
+                    vectors.append((level, kind, 1, (memory_type << 61) | 0xcf, 0, 0x12345100, None, enabled))
+            vectors.append((0, 'read', 1, 0xcf, 0, 0x12345100, (memory_type << 61) | 1, enabled))
+    for index, (level, kind, privilege, flags, status, address, nonleaf, enabled) in enumerate(vectors):
         vpn = [(address >> (12 + 9 * i)) & 511 for i in range(3)]
         entries = {root + vpn[2] * 8: ((middle >> 12) << 10) | (nonleaf or 1),
                    middle + vpn[1] * 8: ((bottom >> 12) << 10) | 1,
                    bottom + vpn[0] * 8: ((base >> 12) << 10) | flags}
         entries[(root, middle, bottom)[2 - level] + vpn[level] * 8] = ((base >> 12) << 10) | flags
+        if level == 0 and flags >> 63:
+            for subpage in range(16):
+                entries[bottom + ((vpn[0] & ~15) + subpage) * 8] = ((base >> 12) << 10) | flags
         reads = []
         def read_pte(physical):
             reads.append((physical, entries.get(physical, 0)))
             return entries.get(physical, 0)
         fault, cause, physical = False, 0, address
         try:
-            physical = sv39_walk(address, kind, privilege, (8 << 60) | root >> 12, status, read_pte)
+            physical = sv39_walk(address, kind, privilege, (8 << 60) | root >> 12, status, read_pte,
+                                 svpbmt=parameters.get('enableSvpbmt', False), pbmte=bool(enabled),
+                                 svnapot=parameters.get('enableSvnapot', False))
         except Fault as error:
             fault, cause = True, error.cause
         port = index % 2
         body += flush
+        if parameters.get('enableSvpbmt'):
+            body += f'    state_pbmte = {enabled};\n'
         body += f'''    state_satp = 64'h{(8 << 60) | root >> 12:x}; state_sum = {int(bool(status & (1 << 18)))}; state_mxr = {int(bool(status & (1 << 19)))};
     ports_{port}_request_bits_address = 64'h{address:x}; ports_{port}_request_bits_privilege = {privilege};
     ports_{port}_request_bits_fetch = {int(kind == 'fetch')}; ports_{port}_request_bits_write = {int(kind in ('write', 'management'))};
@@ -5197,30 +5355,43 @@ def translation_contract(parameters):
     ports_{port}_request_valid = 1; #1; while (!ports_{port}_request_ready) tick(); tick(); ports_{port}_request_valid = 0;
     state_satp = 0; state_sum = !state_sum; state_mxr = !state_mxr; ports_{port}_request_bits_address = '1;
 '''
+        if parameters.get('enableSvpbmt'):
+            body += '    state_pbmte = !state_pbmte;\n'
         for pte_address, pte in reads:
             body += f'''    while (!memory_request_valid) tick();
     repeat (2) begin
       check(memory_request_bits_address == 64'h{pte_address:x} && memory_request_bits_size == 3 && memory_request_bits_data == 0 && memory_request_bits_mask == 0 && memory_request_bits_tag == 0 && memory_request_bits_privileged && !memory_request_bits_fetch && !memory_request_bits_write && !memory_request_bits_atomic, "PTE identity and ordinary S read"); tick();
+{'''      check(memory_request_bits_pbmt == 0, "Implicit PTE read keeps its own attributes");''' if parameters.get('enableSvpbmt') else ''}
     end
     memory_request_ready = 1; tick(); memory_request_ready = 0;
     memory_response_bits_data = 64'h{pte:x}; memory_response_bits_tag = 0; memory_response_valid = 1;
     check(memory_response_ready, "PTE response owner"); tick(); memory_response_valid = 0;
 '''
+        expected_type = (reads[-1][1] >> 61) & 3 if reads and not fault else 0
         body += f'''    while (!ports_{port}_response_valid) tick();
     repeat (2) begin
       check(!ports_{1-port}_response_valid && ports_{port}_response_bits_fault == {int(fault)} && ports_{port}_response_bits_cause == {cause} && ports_{port}_response_bits_address == 64'h{physical:x} && !memory_request_valid, "Independent page walk and retained response"); tick();
+{f'''      check(ports_{port}_response_bits_pbmt == {expected_type}, "Retained leaf type and fault attribution");''' if parameters.get('enableSvpbmt') else ''}
     end
     ports_{port}_response_ready = 1; tick(); ports_{port}_response_ready = 0;
 '''
         if (parameters.get('tlbEntries') or parameters.get(('iTlbEntries', 'dTlbEntries')[port])) and reads and not fault:
             hit_address = address + (8 if address <= MASK - 15 and address % 4096 < 4088 else 0)
-            for hit_kind, hit_privilege, hit_status in ((kind, privilege, status), ('write', privilege, status),
-                    ('read', privilege, status ^ (1 << 19)), (kind, 1 - privilege, status ^ (1 << 18))):
+            hits = [(hit_address, k, p, s) for k, p, s in ((kind, privilege, status), ('write', privilege, status),
+                    ('read', privilege, status ^ (1 << 19)), (kind, 1 - privilege, status ^ (1 << 18)))]
+            if flags >> 63:
+                hits += [((address & ~65535) + 4096 * subpage + 256, kind, privilege, status) for subpage in range(16)]
+            for hit_address, hit_kind, hit_privilege, hit_status in hits:
                 hit_fault, hit_cause, hit_physical = False, 0, hit_address
                 try:
-                    hit_physical = sv39_walk(hit_address, hit_kind, hit_privilege, (8 << 60) | root >> 12, hit_status, lambda physical: entries.get(physical, 0))
+                    hit_physical = sv39_walk(hit_address, hit_kind, hit_privilege, (8 << 60) | root >> 12, hit_status, lambda physical: entries.get(physical, 0),
+                                            svpbmt=parameters.get('enableSvpbmt', False), pbmte=bool(enabled),
+                                            svnapot=parameters.get('enableSvnapot', False))
                 except Fault as error:
                     hit_fault, hit_cause = True, error.cause
+                if parameters.get('enableSvpbmt'):
+                    body += f'    state_pbmte = {enabled};\n'
+                expected_type = (flags >> 61) & 3 if not hit_fault else 0
                 body += f'''    state_satp = 64'h{(8 << 60) | root >> 12:x}; state_sum = {int(bool(hit_status & (1 << 18)))}; state_mxr = {int(bool(hit_status & (1 << 19)))};
     ports_{port}_request_bits_address = 64'h{hit_address:x}; ports_{port}_request_bits_privilege = {hit_privilege};
     ports_{port}_request_bits_fetch = {int(hit_kind == 'fetch')}; ports_{port}_request_bits_write = {int(hit_kind in ('write', 'management'))};
@@ -5229,6 +5400,7 @@ def translation_contract(parameters):
     while (!ports_{port}_response_valid) begin check(!memory_request_valid, "Warm translation repeated page-table service"); tick(); end
     repeat (2) begin
       check(!memory_request_valid && ports_{port}_response_bits_fault == {int(hit_fault)} && ports_{port}_response_bits_cause == {hit_cause} && ports_{port}_response_bits_address == 64'h{hit_physical:x}, "Cached page size, offset and current permissions"); tick();
+{f'''      check(ports_{port}_response_bits_pbmt == {expected_type}, "TLB retains leaf type");''' if parameters.get('enableSvpbmt') else ''}
     end
     ports_{port}_response_ready = 1; tick(); ports_{port}_response_ready = 0;
 '''
@@ -5424,10 +5596,11 @@ def translation_context_contract(parameters):
     maintenance_address = 64'h{(address or 0):x}; maintenance_asidValid = {int(asid is not None)}; maintenance_asid = {asid or 0};
     #1; check(!ports_0_request_ready && !ports_1_request_ready, "Maintenance blocks new ownership"); tick(); maintenance_valid = 0;
 ''')
-    def demand(asid, page, miss, global_page=False, port=1, page_root=root, switch=True):
+    def demand(asid, page, miss, global_page=False, port=1, page_root=root, switch=True, napot=False, subpage=0):
         if switch:
             context(asid, page_root)
-        virtual, physical = (page << 30) | 0x100, base + (asid if not global_page else 0) * 0x1000 + 0x100
+        virtual = (page << 30) | (subpage << 12) | 0x100
+        physical = base + (asid if not global_page else 0) * (65536 if napot else 4096) + subpage * 4096 + 0x100
         body.append(f'''    ports_{port}_request_bits_address = 64'h{virtual:x}; ports_{port}_request_bits_privilege = 1;
     ports_{port}_request_bits_fetch = {int(port == 0)}; ports_{port}_request_bits_write = 0;
     ports_{port}_request_valid = 1; #1; while (!ports_{port}_request_ready) tick(); tick(); ports_{port}_request_valid = 0;
@@ -5435,7 +5608,7 @@ def translation_context_contract(parameters):
         if miss:
             tables = [(page_root + page * 8, ((root + 0x1000) >> 12) << 10 | 1 | (32 if global_page else 0)),
                       (root + 0x1000, ((root + 0x2000) >> 12) << 10 | 1),
-                      (root + 0x2000, ((physical >> 12) << 10) | 0xcf)]
+                      (root + 0x2000 + subpage * 8, (((physical >> 12) & ~15) << 10 | (1 << 63) | 0x20cf) if napot else ((physical >> 12) << 10) | 0xcf)]
             for address, pte in tables:
                 body.append(f'''    while (!memory_request_valid) begin check(!ports_{port}_response_valid, "Context miss requires PTE service"); tick(); end
     check(memory_request_bits_address == 64'h{address:x}, "ASID walk root and page ownership");
@@ -5474,20 +5647,44 @@ def translation_context_contract(parameters):
     fence(0, 1)
     demand(1, 0, True, port=0, switch=False)
     demand(1, 0, False, port=1, switch=False)
-    for phase in ('waiting', 'leaf'):
+    for napot in (False, True) if parameters.get('enableSvnapot') else (False,):
+        for phase in ('waiting', 'leaf'):
+            body.append('    invalidate = 1; tick(); invalidate = 0;\n')
+            context(1)
+            body.append("    ports_1_request_bits_address = 'h100; ports_1_request_bits_privilege = 1; ports_1_request_bits_fetch = 0; ports_1_request_valid = 1; #1; while (!ports_1_request_ready) tick(); tick(); ports_1_request_valid = 0;\n")
+            physical = base + (65536 if napot else 4096)
+            leaf = (physical >> 2) | ((1 << 63) | 0x20cf if napot else 0xcf)
+            for n, (address, pte) in enumerate(((root, (root + 0x1000) >> 2 | 1),
+                    (root + 0x1000, (root + 0x2000) >> 2 | 1), (root + 0x2000, leaf))):
+                body.append(f"    while (!memory_request_valid) tick(); check(memory_request_bits_address == 'h{address:x}, \"In-flight walk context\"); memory_request_ready = 1; tick(); memory_request_ready = 0;\n")
+                if n == 0 and phase == 'waiting':
+                    fence(None, 1)
+                if n == 2 and phase == 'leaf':
+                    body.append('    maintenance_valid = 1; maintenance_fence = 1; maintenance_addressValid = 0; maintenance_asidValid = 0;\n')
+                body.append(f"    memory_response_bits_data = 'h{pte:x}; memory_response_valid = 1; tick(); memory_response_valid = 0; maintenance_valid = 0;\n")
+            body.append(f"    while (!ports_1_response_valid) tick(); check(!ports_1_response_bits_fault && ports_1_response_bits_address == 'h{physical + 256:x}, \"Old response retains accepted context\"); ports_1_response_ready = 1; tick(); ports_1_response_ready = 0;\n")
+            demand(1, 0, True, switch=False, napot=napot)
+    if parameters.get('enableSvnapot'):
+        for subpage in range(16):
+            body.append('    invalidate = 1; tick(); invalidate = 0;\n')
+            demand(1, 0, True, napot=True)
+            fence((subpage << 12) | 256, 1)
+            demand(1, 0, True, napot=True, switch=False)
         body.append('    invalidate = 1; tick(); invalidate = 0;\n')
-        context(1)
-        body.append("    ports_1_request_bits_address = 'h100; ports_1_request_bits_privilege = 1; ports_1_request_bits_fetch = 0; ports_1_request_valid = 1; #1; while (!ports_1_request_ready) tick(); tick(); ports_1_request_valid = 0;\n")
-        for n, (address, pte) in enumerate(((root, (root + 0x1000) >> 2 | 1),
-                (root + 0x1000, (root + 0x2000) >> 2 | 1), (root + 0x2000, (base + 0x1000) >> 2 | 0xcf))):
-            body.append(f"    while (!memory_request_valid) tick(); check(memory_request_bits_address == 'h{address:x}, \"In-flight walk context\"); memory_request_ready = 1; tick(); memory_request_ready = 0;\n")
-            if n == 0 and phase == 'waiting':
-                fence(None, 1)
-            if n == 2 and phase == 'leaf':
-                body.append('    maintenance_valid = 1; maintenance_fence = 1; maintenance_addressValid = 0; maintenance_asidValid = 0;\n')
-            body.append(f"    memory_response_bits_data = 'h{pte:x}; memory_response_valid = 1; tick(); memory_response_valid = 0; maintenance_valid = 0;\n")
-        body.append(f"    while (!ports_1_response_valid) tick(); check(!ports_1_response_bits_fault && ports_1_response_bits_address == 'h{base + 0x1100:x}, \"Old response retains accepted context\"); ports_1_response_ready = 1; tick(); ports_1_response_ready = 0;\n")
-        demand(1, 0, True, switch=False)
+        demand(1, 0, True, global_page=True, napot=True)
+        fence(15 << 12, 1)
+        demand(2, 0, False, global_page=True, napot=True, subpage=15)
+        fence(7 << 12)
+        demand(2, 0, True, global_page=True, napot=True, subpage=7)
+        body.append('    invalidate = 1; tick(); invalidate = 0;\n')
+        for page in range(5):
+            demand(1, page, True, napot=True)
+        demand(1, 0, True, napot=True)
+        body.append('    invalidate = 1; tick(); invalidate = 0;\n')
+        demand(0, 0, True)
+        demand(0, 0, True, napot=True, subpage=1, switch=False)
+        body.append('    check($countones(dut.tlbValid) == 1, "Consistent overlapping fills retain one shared entry");\n')
+        demand(0, 0, False, napot=True, switch=False)
     return ''.join(body)
 
 
@@ -5516,17 +5713,29 @@ def translated_consumer_contract(parameters, fetch):
 '''
         if fetch:
             body += '    request_valid = 0; privilege = 3;\n'
-    def translated(address, cause=0):
+    def translated(address, cause=0, memory_type=0):
         nonlocal body
+        if parameters.get('enableSvpbmt'):
+            body += f'    translation_response_bits_pbmt = {memory_type};\n'
         body += f'''    translation_response_bits_address = 64'h{address:x}; translation_response_bits_fault = {int(bool(cause))}; translation_response_bits_cause = {cause}; translation_response_valid = 1;
+'''
+        if fetch and memory_type == 2:
+            body += '''    allowNonIdempotent = 0;
+    repeat (3) begin check(!translation_response_ready && !memory_request_valid && !output_valid, "IO fetch waits until older instructions drain"); tick(); end
+    allowNonIdempotent = 1;
+'''
+        body += '''
     check(translation_response_ready, "Translation response ownership"); tick(); translation_response_valid = 0;
 '''
-    def complete(virtual, address, operation=None, eligible=False):
+        if parameters.get('enableSvpbmt'):
+            body += '    translation_response_bits_pbmt = 0;\n'
+    def complete(virtual, address, operation=None, eligible=False, memory_type=0):
         nonlocal body
-        burst = fetch and parameters['iCacheBytes'] and parameters.get('enableBurstRefill')
-        for word in range(1 if burst else 16 if fetch and parameters['iCacheBytes'] else 1):
+        burst = fetch and parameters['iCacheBytes'] and parameters.get('enableBurstRefill') and not memory_type
+        for word in range(1 if burst or memory_type else 16 if fetch and parameters['iCacheBytes'] else 1):
             body += f'''    while (!memory_request_valid) tick();
     check(memory_request_bits_address == 64'h{address + 4*word:x} && memory_request_bits_privileged && memory_request_bits_scEligible == {int(eligible)}, "Physical request address and reservation qualification");
+{f'''    check(memory_request_bits_pbmt == {memory_type}, "Physical request retains translated type");''' if parameters.get('enableSvpbmt') else ''}
     memory_request_ready = 1; tick(); memory_request_ready = 0;
     memory_response_bits_tag = 37;
 '''
@@ -5544,6 +5753,12 @@ def translated_consumer_contract(parameters, fetch):
             start(virtual, operation)
             translated(address)
             complete(virtual, address, operation, eligible)
+    if parameters.get('enableSvpbmt'):
+        for memory_type in (1, 2):
+            for address in (physical, physical + 128, physical + 128):
+                start(0x100)
+                translated(address, memory_type=memory_type)
+                complete(0x100, address, memory_type=memory_type)
     for cause in ((12, 1) if fetch else (13, 5)):
         start(0x300)
         translated(0x300, cause)
@@ -5950,7 +6165,7 @@ def verify(rtl, directory, modules=None):
                         (backend_interrupt_contract() if parameters['enableInterrupts'] else '')),
                        ('DitDahA1MemoryArbiter', arbiter_contract(parameters)),
                        ('DitDahA1Memory', memory_contract(parameters)),
-                       ('DitDahA1Axi', axi_contract(parameters['axiDataBits'], parameters['hartCount'], parameters.get('enableA', True)) +
+                       ('DitDahA1Axi', axi_contract(parameters['axiDataBits'], parameters['hartCount'], parameters.get('enableA', True), parameters.get('enableSvpbmt', False)) +
                         (cache_management_axi_contract() if parameters.get('enableZicbom') else '') +
                         (burst_axi_contract(parameters) if parameters.get('enableBurstRefill') else '') +
                         (burst_axi_contract(parameters, False) if parameters.get('dCacheRefillBytes') == 64 else '')),
@@ -6036,6 +6251,11 @@ def verify(rtl, directory, modules=None):
         cycles = (10000 + 12500 * bool(parameters.get('enableMisaligned')) * (3 if parameters.get('floatingPointBits') else 2) + 35000 * bool(parameters.get('enableZicboz')) +
                   10000 * bool(parameters.get('enableZicbom'))) if name == 'DitDahA1Lsu' else 10000
         source = bench(module, body, 4 + 69 * body.count('MulDiv resource reuse') if name == 'DitDahA1MulDiv' else cycles)
+        if name == 'DitDahA1Frontend' and parameters.get('enableSvpbmt'):
+            source = source.replace('  initial begin', '''  always @(posedge clock) if (!reset && dut.fetch.allowNonIdempotent)
+    if (!backendIdle || dut.queued != 0 || dut.held != 0 || dut.fetch.output_valid)
+      $fatal(1, "Non-idempotent permission passed an older frontend instruction");
+  initial begin''', 1)
         if name == 'DitDahA1Backend' and parameters.get('enableCounters'):
             slots = '+'.join(f"integer'(dut.commitCount>{lane} && !dut.commitPackets_{lane}_instruction_fault)" for lane in range(parameters['issueWidth']))
             source = source.replace('  initial begin', f'''  reg [{parameters['issueWidth']}:0] count_seen=0;
@@ -6068,12 +6288,18 @@ def verify(rtl, directory, modules=None):
         if name in ('DitDahA1Axi', 'DitDahA1ReadQueue'):
             prefix = 'axi_' if name == 'DitDahA1Axi' else ''
             checks = axi_cache_attributes(parameters)
+            typed = name == 'DitDahA1Axi' and parameters.get('enableSvpbmt')
+            if typed:
+                checks += '''  reg [1:0] accepted_pbmt;
+  always @(posedge clock) if (reset) accepted_pbmt <= 0;
+    else if (memory_request_valid && memory_request_ready) accepted_pbmt <= memory_request_bits_pbmt;
+'''
             for channel in ('ar', 'aw') if name == 'DitDahA1Axi' else ('ar',):
                 signal = prefix + channel
                 checks += f'''  always @(posedge clock) if (!reset && {signal}_valid)
     if ({signal}_bits_cache != expected_cache({signal}_bits_addr,
       (1 << {signal}_bits_size) * (1 + integer'({signal}_bits_len)), {signal}_bits_prot[2],
-      {int(channel == 'aw')}, {signal}_bits_lock)) $fatal(1, "AXI memory type and allocation attributes");
+      {int(channel == 'aw')}, {signal}_bits_lock{', accepted_pbmt' if typed else ''})) $fatal(1, "AXI memory type and allocation attributes");
 '''
             source = source.replace('  initial begin', checks + '  initial begin', 1)
         test.write_text(source)

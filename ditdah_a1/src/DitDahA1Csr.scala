@@ -37,7 +37,8 @@ class DitDahA1CsrIO(parameter: DitDahA1Parameter) extends HWBundle(parameter):
   val legal = Aligned(Bool())
   val privilege = Aligned(UInt(2))
   val dataPrivilege = Aligned(UInt(2))
-  val translationState = Option.when(parameter.enableTranslation)(Aligned(new TranslationState))
+  val pointerMask = Option.when(parameter.enableSsnpm)(Aligned(Bool()))
+  val translationState = Option.when(parameter.enableTranslation)(Aligned(new TranslationState(parameter)))
   val sfenceLegal = Aligned(Bool())
   val wfiLegal = Aligned(Bool())
   val waitTimeout = Option.when(parameter.enableZawrs)(Aligned(Bool()))
@@ -91,7 +92,12 @@ object DitDahA1Csr extends Generator[DitDahA1Parameter, DitDahA1UnitLayers, DitD
           fs := 3.U(2)
         }
     val satp = Option.when(parameter.enableTranslation)(RegInit(0.U(64)))
+    val pbmte = Option.when(parameter.enableSvpbmt)(RegInit(false.B))
+    val userPointerMask = Option.when(parameter.enableSsnpm)(RegInit(false.B))
+    val machineFiom = Option.when(parameter.enableTranslation)(RegInit(false.B))
+    val supervisorFiom = Option.when(parameter.enableTranslation)(RegInit(false.B))
     if parameter.enableTranslation then
+      io.translationState.get.pbmte.foreach(_ := pbmte.get)
       io.translationState.get.satp := satp.get
       io.translationState.get.sum := status.asBits.bit(18)
       io.translationState.get.mxr := status.asBits.bit(19)
@@ -104,12 +110,13 @@ object DitDahA1Csr extends Generator[DitDahA1Parameter, DitDahA1UnitLayers, DitD
     io.dataPrivilege := (if parameter.enableUserMode then
       ((privilege === 3.U(2)) & status.asBits.bit(17)).?(status.asBits.bits(12, 11).asUInt, privilege)
     else 3.U(2))
+    io.pointerMask.foreach(_ := userPointerMask.get & (io.dataPrivilege === 0.U(2)) & !status.asBits.bit(19))
     io.wfiLegal := (if parameter.enableSupervisorMode then
       (privilege === 3.U(2)) | ((privilege === 1.U(2)) & !status.asBits.bit(21))
     else if parameter.enableUserMode then (privilege === 3.U(2)) | !status.asBits.bit(21) else true.B)
     io.sretLegal := (if parameter.enableSupervisorMode then
       (privilege === 3.U(2)) | ((privilege === 1.U(2)) & !status.asBits.bit(22)) else false.B)
-    io.sfenceLegal := (if parameter.enableTranslation then
+    io.sfenceLegal := (if parameter.enableTranslation || parameter.enableSvinval then
       (privilege === 3.U(2)) | ((privilege === 1.U(2)) & !status.asBits.bit(20)) else false.B)
     val overflowRequest = Option.when(parameter.hpmCounters > 0)(RegInit(false.B))
     val overflowPending = Option.when(parameter.hpmCounters > 0)(RegInit(false.B))
@@ -179,12 +186,11 @@ object DitDahA1Csr extends Generator[DitDahA1Parameter, DitDahA1UnitLayers, DitD
       if parameter.enableSstc then
         val allowed = (privilege === 3.U(2)) | ((privilege === 1.U(2)) & stce.get & mcounteren.get.asBits.bit(1))
         when(io.readAddress === 0x14d.U(12)) { io.readData := stimecmp.get; io.legal := allowed }
-        when(io.readAddress === 0x30a.U(12)) { io.readData := (stce.get.asBits ## 0.B(63)).asUInt; io.legal := true.B }
         when(io.write & (io.writeAddress === 0x14d.U(12)) & allowed) { stimecmp.get := io.writeData }
         when(io.write & (io.writeAddress === 0x30a.U(12))) { stce.get := io.writeData.asBits.bit(63) }
+    val machineEnable = Option.when(parameter.enableUserMode && (parameter.enableZicboz || parameter.enableZicbom))(RegInit(0.U(4)))
+    val supervisorEnable = Option.when(parameter.enableSupervisorMode && (parameter.enableZicboz || parameter.enableZicbom))(RegInit(0.U(4)))
     if parameter.enableZicboz || parameter.enableZicbom then
-      val machineEnable = Option.when(parameter.enableUserMode)(RegInit(0.U(4)))
-      val supervisorEnable = Option.when(parameter.enableSupervisorMode)(RegInit(0.U(4)))
       val machine = machineEnable.getOrElse(0.U(4)).asBits
       val supervisor = supervisorEnable.getOrElse(15.U(4)).asBits
       val unrestricted = privilege === 3.U(2)
@@ -197,14 +203,26 @@ object DitDahA1Csr extends Generator[DitDahA1Parameter, DitDahA1UnitLayers, DitD
       val fields = (io.writeData.asBits.bits(7, 6) ## (cbie === 2.B(2)).?(0.B(2), cbie)) &
         ((if parameter.enableZicboz then 8 else 0) | (if parameter.enableZicbom then 7 else 0)).B(4)
       if parameter.enableUserMode then
-        when(io.readAddress === 0x30a.U(12)) {
-          io.readData := (stce.getOrElse(false.B).asBits ## 0.B(55) ## machine ## 0.B(4)).asUInt
-          io.legal := true.B
-        }
         when(io.write & (io.writeAddress === 0x30a.U(12))) { machineEnable.get := fields.asUInt }
       if parameter.enableSupervisorMode then
-        when(io.readAddress === 0x10a.U(12)) { io.readData := (0.B(56) ## supervisor ## 0.B(4)).asUInt }
         when(io.write & (io.writeAddress === 0x10a.U(12))) { supervisorEnable.get := fields.asUInt }
+    if parameter.enableUserMode then
+      when(io.readAddress === 0x30a.U(12)) {
+        io.readData := (stce.getOrElse(false.B).asBits ## pbmte.getOrElse(false.B).asBits ## 0.B(54) ## machineEnable.getOrElse(0.U(4)).asBits ## 0.B(3) ## machineFiom.getOrElse(false.B).asBits).asUInt
+      }
+    if parameter.enableSupervisorMode then
+      when(io.readAddress === 0x10a.U(12)) {
+        io.readData := (0.B(30) ## userPointerMask.getOrElse(false.B).asBits ## 0.B(25) ## supervisorEnable.getOrElse(0.U(4)).asBits ## 0.B(3) ## supervisorFiom.getOrElse(false.B).asBits).asUInt
+      }
+    userPointerMask.foreach { enabled =>
+      when(io.write & (io.writeAddress === 0x10a.U(12))) { enabled := io.writeData.asBits.bits(33, 32) === 2.B(2) }
+    }
+    for (field, csr) <- Seq(machineFiom -> 0x30a, supervisorFiom -> 0x10a) do field.foreach { value =>
+      when(io.write & (io.writeAddress === csr.U(12))) { value := io.writeData.asBits.bit(0) }
+    }
+    pbmte.foreach { enabled =>
+      when(io.write & (io.writeAddress === 0x30a.U(12))) { enabled := io.writeData.asBits.bit(62) }
+    }
     val mtvec = RegInit(0.U(64))
     val mscratch = RegInit(0.U(64))
     val alignment = if parameter.enableC then 1 else 2
@@ -295,12 +313,13 @@ object DitDahA1Csr extends Generator[DitDahA1Parameter, DitDahA1UnitLayers, DitD
         val mpp = io.writeData.asBits.bits(12, 11)
         val savedPrivilege = (mpp === 3.B(2)).?(0x1800.B(64),
           (parameter.enableSupervisorMode.B & (mpp === 1.B(2))).?(0x800.B(64), 0.B(64)))
-        val mask = if parameter.enableTranslation then 0x7e01aa else if parameter.enableSupervisorMode then 0x7201aa else 0x220088
+        val mask = (if parameter.enableTranslation then 0x7e01aa else if parameter.enableSupervisorMode then 0x7201aa else 0x220088) |
+          (if parameter.enableSsnpm then 0x80000 else 0)
         status := ((io.writeData.asBits & mask.B(64)) | savedPrivilege).asUInt
       else status := (io.writeData.asBits & 0x88.B(64)).asUInt
     }
     if parameter.enableSupervisorMode then
-      val supervisorMask = if parameter.enableTranslation then 0xc0122 else 0x122
+      val supervisorMask = (if parameter.enableTranslation then 0xc0122 else 0x122) | (if parameter.enableSsnpm then 0x80000 else 0)
       when(io.readAddress === 0x100.U(12)) {
         io.readData := ((status.asBits & supervisorMask.B(64)) | BigInt("200000000", 16).B(64) | fpStatus.asBits).asUInt
         io.legal := true.B

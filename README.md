@@ -16,6 +16,7 @@ It uses an eight-stage, in-order pipeline with one to three issue lanes.
 
 The default uses one single-issue, M-mode hart with M/A, Bare addressing, and no caches, PMP, interrupts or JTAG.
 Atomic accesses require a qualified memory region and end-to-end exclusive monitoring.
+Optional Svnapot, Svpbmt, Svinval and host U-mode pointer masking extend the supervisor memory system.
 Sv48, H and vector execution are not implemented. RVA23S64 remains a target.
 Linux and FPGA operation have not been validated.
 

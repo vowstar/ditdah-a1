@@ -11,6 +11,22 @@ object DitDahA1ParameterCheck:
 
   def run(): Unit =
     val baseline = DitDahA1Parameter()
+    val supervisorMemory = DitDahA1Parameter.uncached.copy(enableSupervisorMode = true, enableUserMode = true, enableInterrupts = true)
+    supervisorMemory.copy(enableSvinval = true).validateRtl()
+    rejects { DitDahA1Parameter.uncached.copy(enableSvinval = true).validateCore() }
+    for enabled <- Seq(false, true) do
+      val selected = supervisorMemory.copy(enableSvinval = enabled)
+      assert(DitDahA1Config.parameter(DitDahA1Config.document(selected)) == selected)
+      assert(DitDahA1Config.document(selected)("implementation")("extensions").arr.exists(_.str == "Svinval") == enabled)
+    supervisorMemory.copy(enableSsnpm = true).validateRtl()
+    rejects { DitDahA1Parameter.uncached.copy(enableSsnpm = true).validateCore() }
+    for mask <- 0 until 8 do
+      val selected = supervisorMemory.copy(virtualAddressBits = 39, enableSvnapot = (mask & 1) != 0,
+        enableSvpbmt = (mask & 2) != 0, enableSsnpm = (mask & 4) != 0)
+      selected.validateRtl()
+      assert(DitDahA1Config.parameter(DitDahA1Config.document(selected)) == selected)
+    rejects { supervisorMemory.copy(enableSvnapot = true).validateCore() }
+    rejects { supervisorMemory.copy(enableSvpbmt = true).validateCore() }
     assert(DitDahA1Config.document(baseline)("implementation")("extensions").arr.exists(_.str == "Zkt"))
     val debugWindow = DitDahA1Parameter.uncached.copy(debugBase = Some(65536))
     assert(DitDahA1Config.parameter(DitDahA1Config.document(debugWindow)) == debugWindow)

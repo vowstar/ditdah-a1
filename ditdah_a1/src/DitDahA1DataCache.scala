@@ -131,7 +131,7 @@ object DitDahA1DataCache extends Generator[DitDahA1Parameter, DitDahA1Layers, Di
         refill.size := 6.U(3)
         refill.refillSize := 6.U(3)
       }
-    val cacheable = (request.cacheOperation === 0.U(2)) & !request.fetch & !request.atomic & (request.size <= 3.U(3)) &
+    val cacheable = (request.pbmt.getOrElse(0.U(2)) === 0.U(2)) & (request.cacheOperation === 0.U(2)) & !request.fetch & !request.atomic & (request.size <= 3.U(3)) &
       DitDahA1Memory.permitted(parameter, request) &
         DitDahA1Memory.dataCacheable(parameter, (request.address.asBits.bits(63, 3) ## 0.B(3)).asUInt, 8)
     val eligible = !request.write & cacheable
@@ -312,6 +312,7 @@ object DitDahA1DataCache extends Generator[DitDahA1Parameter, DitDahA1Layers, Di
         down.request.bits.atomicOperation := 0.U(5)
         down.request.bits.scEligible := false.B
         down.request.bits.refillSize := 0.U(3)
+        down.request.bits.pbmt.foreach(_ := 0.U(2))
       }
     when(transmitFault) { down.request.bits.refillSize := 0.U(3) }
     down.response.ready := ((state === 3.U(3)) | (if parameter.enableDataBurstRefill then state === 5.U(3) else false.B)) & !probeActive
@@ -389,9 +390,7 @@ object DitDahA1DataCache extends Generator[DitDahA1Parameter, DitDahA1Layers, Di
       val extraMatch = parkedValid.get & (down.response.bits.tag === extra.request.tag)
       val unknown = !currentMatch & !extraMatch
       def ordinary(value: Referable[MemoryRequest])(using Arena, Context, Block, InstanceContext): Referable[Bool] =
-        val device = parameter.memoryRegions.filter(_.device).foldLeft[Referable[Bool]](false.B) { (selected, region) =>
-          selected | ((value.address >= region.base.U(64)) & (value.address < (region.base + region.size).U(64)))
-        }
+        val device = DitDahA1Memory.device(parameter, value.address, value.pbmt.getOrElse(0.U(2)))
         !value.write & !value.atomic & !value.fetch & (value.cacheOperation === 0.U(2)) & (value.size <= 3.U(3)) & !device
       val park = waiting & !parkedValid.get & !down.response.valid & ordinary(request) & ordinary(up.request.bits) &
         (up.request.bits.tag =/= request.tag) & (up.request.bits.address.asBits.bits(indexBits + 5, 6).asUInt =/= index)

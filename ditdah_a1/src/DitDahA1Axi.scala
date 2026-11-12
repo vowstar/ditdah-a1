@@ -39,6 +39,9 @@ object DitDahA1Axi extends Generator[DitDahA1Parameter, DitDahA1UnitLayers, DitD
             (request.address <= (region.base + region.size - bytes).U(64))) {
             channel.cache := cacheable.?(request.write.?(6.U(4), 14.U(4)), 2.U(4))
           }
+    request.pbmt.foreach { value =>
+      when(value =/= 0.U(2)) { channel.cache := (value === 1.U(2)).?(2.U(4), 0.U(4)) }
+    }
     val privileged = if parameter.enableUserMode then request.privileged else true.B
     channel.prot := (request.fetch.asBits ## 0.B(1) ## privileged.asBits).asUInt
     channel.qos := 0.U(4)

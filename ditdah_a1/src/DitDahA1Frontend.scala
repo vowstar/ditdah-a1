@@ -39,6 +39,7 @@ object DitDahA1Frontend extends Generator[DitDahA1Parameter, DitDahA1UnitLayers,
     val queued = RegInit(0.U(countBits))
     val buffer = Reg(Vec(capacity, new FetchPacket))
     val held = RegInit(0.U(32 - Integer.numberOfLeadingZeros(width)))
+    fetch.io.allowNonIdempotent.foreach(_ := io.backendIdle.get & (queued === 0.U) & (held === 0.U) & !fetch.io.output.valid)
     val pending = RegInit(false.B)
     val pendingPc = Reg(UInt(64))
     val reserved = Reg(UInt(parameter.fetchCountBits))

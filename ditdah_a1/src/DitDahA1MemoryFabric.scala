@@ -35,13 +35,12 @@ object DitDahA1MemoryFabric extends Generator[DitDahA1Parameter, DitDahA1UnitLay
       val ports = (0 until 2 * parameter.hartCount).map(i => if i % 2 == 0 then io.instruction(i / 2) else io.data(i / 2))
       val ordinary = ports.map { port =>
         val request = port.request.bits
-        val device = parameter.memoryRegions.filter(_.device).foldLeft[Referable[Bool]](false.B) { (selected, region) =>
-          selected | ((request.address >= region.base.U(64)) & (request.address < (region.base + region.size).U(64)))
-        }
+        val device = DitDahA1Memory.device(parameter, request.address, request.pbmt.getOrElse(0.U(2)))
         val coherent = if parameter.dCacheWriteback then DitDahA1Memory.dataCacheable(parameter, request.address, 1) else false.B
         val debug = DitDahA1Memory.debugWindow(parameter, request.address, 0.U(3))
+        val local = if parameter.enableSvpbmt then DitDahA1Memory.localInterruptWindow(parameter, request.address) else false.B
         (request.cacheOperation === 0.U(2)) & !request.write & !request.atomic &
-          ((request.size <= 3.U(3)) | DitDahA1Axi.lineRead(parameter, request)) & !device & !coherent & !debug
+          ((request.size <= 3.U(3)) | DitDahA1Axi.lineRead(parameter, request)) & !device & !coherent & !debug & !local
       }
       val readWaiting = ports.indices.map(i => ports(i).request.valid & ordinary(i)).reduce(_ | _)
       val exclusiveWaiting = ports.indices.map(i => ports(i).request.valid & !ordinary(i)).reduce(_ | _)
@@ -143,8 +142,7 @@ object DitDahA1MemoryFabric extends Generator[DitDahA1Parameter, DitDahA1UnitLay
       given ResetScope = ResetScope.syncActiveHigh(io.reset)
       val localInterrupts = DitDahA1LocalInterrupts.instantiate(parameter)
       val port = controlled
-      val base = parameter.localInterruptBase.get
-      val selected = (port.request.bits.address >= base.U(64)) & (port.request.bits.address < (base + 65536).U(64))
+      val selected = DitDahA1Memory.localInterruptWindow(parameter, port.request.bits.address)
       val responseLocal = RegInit(false.B)
       localInterrupts.io.clock := io.clock
       localInterrupts.io.reset := io.reset

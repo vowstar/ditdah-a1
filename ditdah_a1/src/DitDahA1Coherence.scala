@@ -35,7 +35,7 @@ object DitDahA1Coherence extends Generator[DitDahA1Parameter, DitDahA1UnitLayers
     val release = request.cacheOperation === 2.U(2)
     val special = acquire | release
     val maintenance = parameter.enableZicbom.B & (request.cacheOperation === 3.U(2))
-    val cacheable = DitDahA1Memory.dataCacheable(parameter, request.address, 1)
+    val cacheable = (request.pbmt.getOrElse(0.U(2)) === 0.U(2)) & DitDahA1Memory.dataCacheable(parameter, request.address, 1)
     val releaseAllowed = parameter.memoryRegions.filter(r => r.readable && r.dataCacheable && !r.device).foldLeft[Referable[Bool]](false.B) { (allowed, region) =>
       allowed | ((request.address >= (region.base & ~BigInt(63)).U(64)) &
         (request.address <= ((region.base + region.size - 1) & ~BigInt(63)).U(64)))
@@ -100,6 +100,7 @@ object DitDahA1Coherence extends Generator[DitDahA1Parameter, DitDahA1UnitLayers
       down.request.bits.scEligible := false.B
       down.request.bits.privileged := true.B
       down.request.bits.refillSize := 0.U(3)
+      down.request.bits.pbmt.foreach(_ := 0.U(2))
     }
     up.response.valid := (state === 5.U(3)) | ((state === 6.U(3)) & down.response.valid)
     up.response.bits :<= down.response.bits

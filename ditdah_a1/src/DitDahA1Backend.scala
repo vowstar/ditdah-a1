@@ -56,6 +56,8 @@ object DitDahA1Backend extends Generator[DitDahA1Parameter, DitDahA1Layers, DitD
     val extraPending = Option.when(concurrent)(RegInit(false.B))
     val extraValid = extraCount.map(_ =/= 0.U).getOrElse(false.B)
     val executePending = Option.when(parameter.enableM || parameter.floatingPointBits != 0)(RegInit(false.B))
+    io.idle.foreach(_ := (instructionCount === 0.U) & !decodedValid & !issuedValid & !resultValid &
+      !memoryValid & !commitValid & !extraValid & !executePending.getOrElse(false.B))
     val resumePc = Option.when(parameter.enableInterrupts || parameter.enableJtag)(RegInit(parameter.resetVector.U(64)))
     val debugBreakPending = Option.when(parameter.enableJtag)(RegInit(false.B))
     val stepIssued = Option.when(parameter.enableJtag)(RegInit(false.B))
@@ -113,6 +115,8 @@ object DitDahA1Backend extends Generator[DitDahA1Parameter, DitDahA1Layers, DitD
       io.translation.get :<>= lsu.io.translation.get
     io.privilege := csr.io.privilege
     lsu.io.privilege := csr.io.dataPrivilege
+    lsu.io.pointerMask.foreach(_ := csr.io.pointerMask.get)
+    lsu.io.virtualPointers.foreach(_ := csr.io.translationState.get.satp.asBits.bits(63, 60) =/= 0.B(4))
     csr.io.readAddress := commitCsr.?(commitPacket.csrAddress, execute.io.csrAddress)
     // Completed data operations keep ownership until their architectural event.
     val interruptEligible = if parameter.enableInterrupts then

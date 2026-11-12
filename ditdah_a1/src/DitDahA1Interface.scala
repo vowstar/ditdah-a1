@@ -48,6 +48,7 @@ class AxiBundle(parameter: DitDahA1Parameter) extends Bundle:
   val r = Flipped(new Decoupled(new AxiRead(parameter)))
 
 class MemoryRequest(parameter: DitDahA1Parameter) extends Bundle:
+  val pbmt = Option.when(parameter.enableSvpbmt)(Aligned(UInt(2)))
   val debug = Option.when(parameter.enableDebugMemory)(Aligned(Bool()))
   val cacheOperation = Aligned(UInt(2))
   val address = Aligned(UInt(64))
@@ -96,7 +97,8 @@ class InstructionCachePort(parameter: DitDahA1Parameter) extends Bundle:
   val response = Flipped(new Decoupled(new MemoryResponse(math.max(64, 32 * parameter.fetchWords),
     if parameter.fetchWords > 1 then parameter.fetchCountBits else 0)))
 
-class TranslationState extends Bundle:
+class TranslationState(parameter: DitDahA1Parameter) extends Bundle:
+  val pbmte = Option.when(parameter.enableSvpbmt)(Aligned(Bool()))
   val satp = Aligned(UInt(64))
   val sum = Aligned(Bool())
   val mxr = Aligned(Bool())
@@ -114,13 +116,14 @@ class TranslationRequest(parameter: DitDahA1Parameter) extends Bundle:
   val fetch = Aligned(Bool())
   val write = Aligned(Bool())
   val atomic = Aligned(Bool())
-class TranslationResponse extends Bundle:
+class TranslationResponse(parameter: DitDahA1Parameter) extends Bundle:
+  val pbmt = Option.when(parameter.enableSvpbmt)(Aligned(UInt(2)))
   val address = Aligned(UInt(64))
   val fault = Aligned(Bool())
   val cause = Aligned(UInt(64))
 class TranslationPort(parameter: DitDahA1Parameter) extends Bundle:
   val request = Aligned(new Decoupled(new TranslationRequest(parameter)))
-  val response = Flipped(new Decoupled(new TranslationResponse))
+  val response = Flipped(new Decoupled(new TranslationResponse(parameter)))
 
 class PmpState(parameter: DitDahA1Parameter) extends Bundle:
   val config = Aligned(UInt(parameter.pmpEntries * 8))
@@ -251,6 +254,7 @@ class DitDahA1CoreIO(parameter: DitDahA1Parameter) extends HWBundle(parameter):
   val status = Aligned(new StatusBundle)
 
 class DitDahA1FrontendIO(parameter: DitDahA1Parameter) extends HWBundle(parameter):
+  val backendIdle = Option.when(parameter.enableSvpbmt)(Flipped(Bool()))
   val debugMode = Option.when(parameter.enableDebugMemory)(Flipped(Bool()))
   val prediction = Option.when(parameter.branchPredictorEntries != 0)(Flipped(new BranchUpdate))
   val translation = Option.when(parameter.enableTranslation)(Aligned(new TranslationPort(parameter)))
@@ -281,12 +285,13 @@ class DitDahA1MemoryFabricIO(parameter: DitDahA1Parameter) extends HWBundle(para
   val axi = Aligned(new AxiBundle(parameter))
 
 class DitDahA1BackendIO(parameter: DitDahA1Parameter) extends HWBundle(parameter):
+  val idle = Option.when(parameter.enableSvpbmt)(Aligned(Bool()))
   val reservation = Option.when(parameter.enableA)(Aligned(new ReservationPort))
   val timeValue = Option.when(parameter.enableCounters)(Flipped(UInt(64)))
   val debug = Option.when(parameter.enableJtag)(Aligned(new DebugHartPort))
   val prediction = Option.when(parameter.branchPredictorEntries != 0)(Aligned(new BranchUpdate))
   val translation = Option.when(parameter.enableTranslation)(Aligned(new TranslationPort(parameter)))
-  val translationState = Option.when(parameter.enableTranslation)(Aligned(new TranslationState))
+  val translationState = Option.when(parameter.enableTranslation)(Aligned(new TranslationState(parameter)))
   val translationMaintenance = Option.when(parameter.enableTranslation && parameter.preciseTranslationMaintenance)(Aligned(new TranslationMaintenance(parameter)))
   val invalidateTranslation = Option.when(parameter.enableTranslation && parameter.hasTranslationCache)(Aligned(Bool()))
   val privilege = Aligned(UInt(2))

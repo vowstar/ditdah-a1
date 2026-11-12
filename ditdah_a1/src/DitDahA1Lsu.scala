@@ -16,6 +16,8 @@ class DitDahA1LsuIO(parameter: DitDahA1Parameter) extends HWBundle(parameter):
   val clock = Flipped(Clock())
   val reset = Flipped(Reset())
   val privilege = Flipped(UInt(2))
+  val pointerMask = Option.when(parameter.enableSsnpm)(Flipped(Bool()))
+  val virtualPointers = Option.when(parameter.enableSsnpm && parameter.enableTranslation)(Flipped(Bool()))
   val input = Flipped(new Decoupled(new ResultPacket(parameter)))
   val output = Aligned(new Decoupled(new ResultPacket(parameter)))
   val storeAllowed = Flipped(Bool())
@@ -34,6 +36,10 @@ object DitDahA1Lsu extends Generator[DitDahA1Parameter, DitDahA1UnitLayers, DitD
     val lineRefill = parameter.dCacheBytes != 0 && parameter.enableDataBurstRefill
     val cacheBlocks = parameter.enableZicboz || parameter.enableZicbom
     val fragments = parameter.enableMisaligned || cacheBlocks
+    val pointerMask = Option.when(parameter.enableSsnpm && fragments)(Reg(Bool()))
+    val virtualPointers = Option.when(parameter.enableSsnpm && fragments && parameter.enableTranslation)(Reg(Bool()))
+    val inputAddress = DitDahA1Memory.maskedAddress(parameter, io.input.bits.address,
+      io.pointerMask.getOrElse(false.B), io.virtualPointers.getOrElse(false.B))
     val offsetBits = if cacheBlocks then 6 else 3
     val stateBits = if parameter.enableTranslation || checkRefill || fragments then 3 else 2
     val state = RegInit(0.U(stateBits))
@@ -78,7 +84,9 @@ object DitDahA1Lsu extends Generator[DitDahA1Parameter, DitDahA1UnitLayers, DitD
     val offset = Option.when(fragments)(RegInit(0.U(offsetBits)))
     val split = splitting.getOrElse(false.B)
     val baseAddress = block.?((current.address.asBits.bits(63, 6) ## 0.B(6)).asUInt, current.address)
-    val serviceAddress = offset.map(n => (baseAddress + n).asBits.bits(63, 0).asUInt).getOrElse(current.address)
+    val serviceAddress = DitDahA1Memory.maskedAddress(parameter,
+      offset.map(n => (baseAddress + n).asBits.bits(63, 0).asUInt).getOrElse(current.address),
+      pointerMask.getOrElse(false.B), virtualPointers.getOrElse(false.B))
     val faultAddress = block.?(current.address, serviceAddress)
     val serviceSize = Wire(UInt(3))
     serviceSize := current.memorySize
@@ -108,6 +116,7 @@ object DitDahA1Lsu extends Generator[DitDahA1Parameter, DitDahA1UnitLayers, DitD
     val privilege = Option.when(parameter.enableTranslation || checkRefill || fragments)(Reg(UInt(2)))
     val debugOrigin = Option.when(parameter.enableDebugMemory)(Reg(Bool()))
     val physicalAddress = Option.when(parameter.enableTranslation)(Reg(UInt(64)))
+    val pbmt = Option.when(parameter.enableSvpbmt)(Reg(UInt(2)))
     val refillSize = Option.when(parameter.dCacheBytes != 0)(RegInit(0.U(3)))
     val reserved = Option.when(parameter.enableA)(RegInit(false.B))
     io.reservationValid.foreach(_ := reserved.get & !io.reservation.get.invalidate)
@@ -126,17 +135,18 @@ object DitDahA1Lsu extends Generator[DitDahA1Parameter, DitDahA1UnitLayers, DitD
     val heldAddress = physicalAddress.map(a => if cacheBlocks then
       block.?(((a.asBits.bits(63, 6) ## 0.B(6)).asUInt + offset.get).asBits.bits(63, 0).asUInt, a) else a).getOrElse(serviceAddress)
     val translatedAddress = io.translation.map(t => block.?((t.response.bits.address.asBits.bits(63, 6) ## 0.B(6)).asUInt, t.response.bits.address))
-    val demandAddress = translatedAddress.map(a => preparing.?(heldAddress, a)).getOrElse(preparing.?(serviceAddress, io.input.bits.address))
+    val demandAddress = translatedAddress.map(a => preparing.?(heldAddress, a)).getOrElse(preparing.?(serviceAddress, inputAddress))
+    val demandPbmt = if parameter.enableSvpbmt then (preparing | refilling | exact).?(pbmt.get, io.translation.get.response.bits.pbmt.get) else 0.U(2)
     val demandSize = if parameter.enableTranslation then serviceSize else preparing.?(serviceSize, io.input.bits.memorySize)
     val demandStore = if parameter.enableTranslation then current.store else preparing.?(current.store, io.input.bits.store)
     val demandLoad = if parameter.enableTranslation then current.load else preparing.?(current.load, io.input.bits.load)
     val demandAtomic = if parameter.enableTranslation then current.atomic else preparing.?(current.atomic, io.input.bits.atomic)
     val refillCandidate = if parameter.dCacheBytes != 0 then
-      demandLoad & !demandStore & !demandAtomic & !split & (if parameter.enableTranslation then true.B else !inputSplit) & (demandSize < 3.U(3)) &
+      (demandPbmt === 0.U(2)) & demandLoad & !demandStore & !demandAtomic & !split & (if parameter.enableTranslation then true.B else !inputSplit) & (demandSize < 3.U(3)) &
         DitDahA1Memory.dataCacheable(parameter, (demandAddress.asBits.bits(63, 3) ## 0.B(3)).asUInt, 8)
     else false.B
     val lineCandidate = if lineRefill then
-      demandLoad & !demandStore & !demandAtomic & !split & (if parameter.enableTranslation then true.B else !inputSplit) & (demandSize <= 3.U(3)) &
+      (demandPbmt === 0.U(2)) & demandLoad & !demandStore & !demandAtomic & !split & (if parameter.enableTranslation then true.B else !inputSplit) & (demandSize <= 3.U(3)) &
         DitDahA1Memory.dataCacheable(parameter, (demandAddress.asBits.bits(63, 6) ## 0.B(6)).asUInt, 64)
     else false.B
     val initialSize = if lineRefill then lineCandidate.?(6.U(3), refillCandidate.?(3.U(3), demandSize)) else demandSize
@@ -178,7 +188,8 @@ object DitDahA1Lsu extends Generator[DitDahA1Parameter, DitDahA1UnitLayers, DitD
     }
     val mixedPermissions = blockPermissions.map(p => block & (state === 7.U(stateBits)) &
       (offset.get =/= 0.U(offsetBits)) & (pmpPermissions =/= p)).getOrElse(false.B)
-    val denied = (!permitted & (if lineRefill then !lineCandidate & !refillCandidate else true.B)) | (split & !splitAllowed) | mixedPermissions
+    val denied = (!permitted & (if lineRefill then !lineCandidate & !refillCandidate else true.B)) | (split &
+      (!splitAllowed | (!block & DitDahA1Memory.device(parameter, demandAddress, demandPbmt)))) | mixedPermissions
     val initialGrant = if lineRefill then permitted.?(lineCandidate.?(6.U(3), refillCandidate.?(3.U(3), 0.U(3))), 0.U(3))
       else if !checkRefill then refillCandidate.?(3.U(3), 0.U(3)) else 0.U(3)
     io.input.ready := (state === 0.U(stateBits)) & (io.input.bits.instruction.fault | !io.input.bits.store | io.storeAllowed)
@@ -211,9 +222,7 @@ object DitDahA1Lsu extends Generator[DitDahA1Parameter, DitDahA1UnitLayers, DitD
       when(io.input.valid & io.input.ready) { owner.get := tail.get; tail.get := (~tail.get.asBits).asUInt }
       when(io.output.valid & io.output.ready) { head.get := (~head.get.asBits).asUInt }
       when(state === 3.U(stateBits)) { state := 0.U(stateBits) }
-      val device = parameter.memoryRegions.filter(_.device).foldLeft[Referable[Bool]](false.B) { (selected, region) =>
-        selected | ((heldAddress >= region.base.U(64)) & (heldAddress < (region.base + region.size).U(64)))
-      }
+      val device = DitDahA1Memory.device(parameter, heldAddress, pbmt.getOrElse(0.U(2)))
       val cancelled = io.cancel.get | (0 until 2).map(n => (owner.get === n.U(1)) & killed.get(n)).reduce(_ | _)
       val alias = (0 until 2).map(n => pending.get(n) & (owner.get =/= n.U(1)) &
         (address.map(_(n)).getOrElse(packets(n).address.asBits.bits(63, 3).asUInt) === heldAddress.asBits.bits(63, 3).asUInt)).reduce(_ | _)
@@ -242,6 +251,7 @@ object DitDahA1Lsu extends Generator[DitDahA1Parameter, DitDahA1UnitLayers, DitD
     request.bits.cacheOperation := management.?(3.U(2), 0.U(2))
     request.bits.scEligible := scEligible.getOrElse(false.B)
     request.bits.refillSize := refillSize.getOrElse(0.U(3))
+    request.bits.pbmt.foreach(_ := pbmt.get)
     request.bits.debug.foreach(_ := debugOrigin.get)
     response.ready := state === 2.U(stateBits)
     io.translation.foreach { t =>
@@ -255,6 +265,7 @@ object DitDahA1Lsu extends Generator[DitDahA1Parameter, DitDahA1UnitLayers, DitD
       t.response.ready := state === 5.U(stateBits)
       when(t.request.valid & t.request.ready) { state := 5.U(stateBits) }
       when(t.response.valid & t.response.ready) {
+        pbmt.foreach(_ := t.response.bits.pbmt.get)
         physicalAddress.get := t.response.bits.address
         scEligible.foreach(value => value := value & (t.response.bits.address === reservedAddress))
         updated.instruction.fault := t.response.bits.fault
@@ -291,12 +302,15 @@ object DitDahA1Lsu extends Generator[DitDahA1Parameter, DitDahA1UnitLayers, DitD
       debugOrigin.foreach(_ := io.debugMode.get)
       privilege.foreach(_ := io.privilege)
       updated :<= io.input.bits
+      updated.address := inputAddress
+      pointerMask.foreach(_ := io.pointerMask.get)
+      virtualPointers.foreach(_ := io.virtualPointers.get)
       splitting.foreach(_ := inputSplit)
       offset.foreach(_ := 0.U(offsetBits))
       when(inputSplit) { updated.value := 0.U(64) }
       refillSize.foreach(_ := (if !parameter.enableTranslation then initialGrant else 0.U(3)))
       scEligible.foreach(_ := io.input.bits.atomic & (inputOperation === 3.U(5)) & reserved.get & !io.reservation.get.invalidate &
-        (if parameter.enableTranslation then true.B else io.input.bits.address === reservedAddress) &
+        (if parameter.enableTranslation then true.B else inputAddress === reservedAddress) &
         (io.input.bits.memorySize === reservedDoubleword.get.?(3.U(3), 2.U(3))))
       when(io.input.bits.atomic) { reserved.foreach(_ := false.B) }
       state := (if parameter.enableTranslation then 4.U(stateBits) else initialState)
@@ -304,14 +318,14 @@ object DitDahA1Lsu extends Generator[DitDahA1Parameter, DitDahA1UnitLayers, DitD
         when(!io.input.bits.instruction.fault & !inputSplit & denied) {
           updated.instruction.fault := true.B
           updated.instruction.cause := io.input.bits.store.?(7.U(64), 5.U(64))
-          updated.instruction.tval := io.input.bits.address
+          updated.instruction.tval := inputAddress
           state := 3.U(stateBits)
         }
       if fragments then when(inputSplit) { state := inputBlock.?((if parameter.enableTranslation then 4 else if parameter.pmpEntries != 0 then 7 else 6).U(stateBits), 4.U(stateBits)) }
       when(!io.input.bits.instruction.fault & misaligned & !inputSplit) {
         updated.instruction.fault := true.B
         updated.instruction.cause := io.input.bits.store.?(6.U(64), 4.U(64))
-        updated.instruction.tval := io.input.bits.address
+        updated.instruction.tval := inputAddress
         state := 3.U(stateBits)
       }
       when(io.input.bits.instruction.fault) { state := 3.U(stateBits) }

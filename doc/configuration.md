@@ -33,6 +33,8 @@ Add `--trace` to retain separate DV bind files; `--no-trace` omits them.
 | `tlbEntries`, `iTlbEntries`, `dTlbEntries`, `asidBits` | 0/2/4 entries per bank; 0/4 ASID bits |
 | `branchPredictorEntries` | 0/8/16; nonzero requires `enableBranchPrediction` |
 | `floatingPointBits`, `hpmCounters` | 0/32/64 FP bits; 0–29 implemented HPM counters |
+| `enableSvnapot`, `enableSvpbmt` | Optional 64 KiB mappings and page memory types; both require Sv39 |
+| `enableSvinval`, `enableSsnpm` | Optional supervisor invalidation and host U-mode pointer masking; both require supervisor mode |
 
 The generated default has one M-mode hart, M/A enabled, Bare addressing and AXI128.
 Caches, PMP, interrupts, prediction and JTAG are disabled; RAM is 64 KiB at zero with `atomic=false`.
@@ -98,6 +100,14 @@ Local I/D translation entries clear on satp writes; ASID-tagged shared entries c
 Where configured, selective SFENCE.VMA handles VA/ASID/global mappings; other configurations invalidate more entries.
 Maintenance excludes stale refills while accepted requests drain.
 Sv39/A retains one atomic translation when the private data TLB is absent; it also participates in maintenance.
+Svnapot, Svpbmt, Svinval and Ssnpm default to false. Svpbmt uses `menvcfg.PBMTE` and preserves leaf attributes through memory service.
+NC/IO accesses bypass cache allocation and use exact demands; IO also requires architectural authorization before issuing.
+PMP and static access permissions remain independent of page memory types.
+Cacheable/noncacheable aliases require `fence iorw,iorw; cbo.flush; fence iorw,iorw` when switching attributes.
+SINVAL.VMA uses the existing maintenance service; both invalidation-ordering instructions serialize execution.
+Host `senvcfg.PMM` supports encodings 00/10 for PMLEN 0/7; unsupported encodings select zero.
+Masking covers effective U-mode explicit data accesses, including MPRV, and is disabled by MXR in Bare and Sv39.
+Instruction fetch, page-table reads and translation-maintenance operands retain their original addresses. Hypervisor controls are not implemented.
 Successful PMP writes restart younger execution and clear translation layers while accepted fetches drain.
 
 ## Time and interrupts

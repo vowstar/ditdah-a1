@@ -18,6 +18,19 @@ class DitDahA1MemoryIO(parameter: DitDahA1Parameter) extends HWBundle(parameter)
 @generator
 object DitDahA1Memory extends Generator[DitDahA1Parameter, DitDahA1UnitLayers, DitDahA1MemoryIO, DitDahA1UnitProbe]:
   override def moduleName(parameter: DitDahA1Parameter): String = "DitDahA1Memory"
+  def maskedAddress(parameter: DitDahA1Parameter, address: Referable[UInt], enabled: Referable[Bool], virtual: Referable[Bool])
+    (using Arena, Context, Block, InstanceContext): Referable[UInt] =
+    if !parameter.enableSsnpm then address else
+      enabled.?(((virtual & address.asBits.bit(56)).?(127.B(7), 0.B(7)) ## address.asBits.bits(56, 0)).asUInt, address)
+  def device(parameter: DitDahA1Parameter, address: Referable[UInt], pbmt: Referable[UInt])
+    (using Arena, Context, Block, InstanceContext): Referable[Bool] =
+    val physical = parameter.memoryRegions.filter(_.device).foldLeft[Referable[Bool]](false.B) { (selected, region) =>
+      selected | ((address >= region.base.U(64)) & (address < (region.base + region.size).U(64)))
+    }
+    (pbmt === 2.U(2)) | ((pbmt === 0.U(2)) & physical)
+  def localInterruptWindow(parameter: DitDahA1Parameter, address: Referable[UInt])
+    (using Arena, Context, Block, InstanceContext): Referable[Bool] =
+    parameter.localInterruptBase.map(base => (address >= base.U(64)) & (address < (base + 65536).U(64))).getOrElse(false.B)
   def debugWindow(parameter: DitDahA1Parameter, address: Referable[UInt], size: Referable[UInt])
     (using Arena, Context, Block, InstanceContext): Referable[Bool] =
     if !parameter.enableDebugMemory then false.B else
@@ -78,6 +91,7 @@ object DitDahA1Memory extends Generator[DitDahA1Parameter, DitDahA1UnitLayers, D
       when(!request.fetch & !request.write & !request.atomic & (request.size === 6.U(3)) &
         (request.address.asBits.bits(5, 0) === 0.B(6))) { allowed := dataCacheable(parameter, request.address, 64) }
     when(request.cacheOperation === 3.U(2)) { allowed := managementPermitted(parameter, request) }
+    request.pbmt.foreach(value => when((value === 3.U(2)) | ((value =/= 0.U(2)) & (request.size > 3.U(3)))) { allowed := false.B })
     allowed
   def architecture(parameter: DitDahA1Parameter) =
     val io = summon[Interface[DitDahA1MemoryIO]]

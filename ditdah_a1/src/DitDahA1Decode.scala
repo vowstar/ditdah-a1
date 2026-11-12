@@ -153,13 +153,16 @@ object DitDahA1Decode extends Generator[DitDahA1Parameter, DitDahA1UnitLayers, D
       out.usesRs1 := !in.fault
       out.usesRs2 := !in.fault & !lr
     }
-    if parameter.enableTranslation then
-      when((in.instruction.asBits & BigInt("fe007fff", 16).B(32)) === 0x12000073.B(32)) {
+    if parameter.enableTranslation || parameter.enableSvinval then
+      val function = in.instruction.asBits & BigInt("fe007fff", 16).B(32)
+      when((function === 0x12000073.B(32)) | (parameter.enableSvinval.B & (function === 0x16000073.B(32)))) {
         out.operation := Fence.U(operationBits)
         if parameter.preciseTranslationMaintenance then
           out.usesRs1 := !in.fault
           out.usesRs2 := !in.fault
       }
+      if parameter.enableSvinval then
+        when((insn === 0x18000073.B(32)) | (insn === 0x18100073.B(32))) { out.operation := Fence.U(operationBits) }
     out.writesRd := !in.fault & (operation =/= Illegal.U(operationBits)) & !branch & !store & (operation =/= Ecall.U(operationBits)) & (operation =/= Mret.U(operationBits)) & (operation =/= Sret.U(operationBits)) & (operation =/= Fence.U(operationBits)) & (operation =/= FenceI.U(operationBits)) & (operation =/= Wfi.U(operationBits))
     out.serializing := !in.fault & (csr | (operation === Mret.U(operationBits)) | (operation === Sret.U(operationBits)) | (operation === Fence.U(operationBits)) | (operation === FenceI.U(operationBits)) | (operation === Wfi.U(operationBits)))
     if parameter.floatingPointBits != 0 then

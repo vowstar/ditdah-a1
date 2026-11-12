@@ -325,11 +325,18 @@ class Fault(Exception):
         self.cause, self.value = cause, value
 
 
-def sv39_walk(address, kind, privilege, satp, status, read_pte):
+def pointer_address(address, enabled, virtual):
+    if not enabled:
+        return address & MASK
+    address &= (1 << 57) - 1
+    return signed(address, 57) & MASK if virtual else address
+
+
+def sv39_walk(address, kind, privilege, satp, status, read_pte, *, svpbmt=False, pbmte=False, svnapot=False):
     if privilege == 3 or satp >> 60 == 0:
         return address
     page_cause, access_cause = {'fetch': (12, 1), 'read': (13, 5), 'write': (15, 7), 'atomic': (15, 7), 'management': (15, 7)}[kind]
-    if (signed(address, 39) & MASK) != address:
+    if satp >> 60 != 8 or (signed(address, 39) & MASK) != address:
         raise Fault(page_cause, address)
     table = (satp & ((1 << 44) - 1)) << 12
     for level in (2, 1, 0):
@@ -337,8 +344,11 @@ def sv39_walk(address, kind, privilege, satp, status, read_pte):
             pte = read_pte(table + ((address >> (12 + 9 * level)) & 511) * 8)
         except Fault:
             raise Fault(access_cause, address) from None
-        flags, ppn = pte & 1023, pte >> 10
-        if pte >> 54 or not flags & 1 or flags & 6 == 4:
+        flags, ppn, pbmt = pte & 1023, (pte >> 10) & ((1 << 44) - 1), (pte >> 61) & 3
+        napot = bool(pte >> 63)
+        if (napot and (not svnapot or level != 0 or not flags & 10 or ppn & 15 != 8) or
+                pte >> 54 & 127 or pbmt and (not svpbmt or not pbmte or not flags & 10) or
+                pbmt == 3 or not flags & 1 or flags & 6 == 4):
             raise Fault(page_cause, address)
         if flags & 10:
             user = bool(flags & 16)
@@ -349,7 +359,9 @@ def sv39_walk(address, kind, privilege, satp, status, read_pte):
             permitted &= (user if privilege == 0 else not user or kind != 'fetch' and bool(status & (1 << 18)))
             if not permitted or not flags & 64 or kind in ('write', 'atomic') and not flags & 128 or ppn & ((1 << (9 * level)) - 1):
                 raise Fault(page_cause, address)
-            offset_bits = 12 + 9 * level
+            offset_bits = 16 if napot else 12 + 9 * level
+            if napot:
+                ppn &= ~15
             return (ppn << 12) | (address & ((1 << offset_bits) - 1))
         if not level or flags & 0xd0:
             raise Fault(page_cause, address)
@@ -480,6 +492,7 @@ class Model:
             self.counter_mode = self.privilege
 
     def translate(self, address, kind, privilege=None):
+        self.translation_pbmt = 0
         if self.config.get('virtualAddressBits') != 39:
             return address
         privilege = (self.privilege if kind == 'fetch' else self.data_privilege()) if privilege is None else privilege
@@ -494,10 +507,17 @@ class Model:
                 raise Fault(5, physical)
             if physical <= self.faults.get('read', -1) < physical + 8:
                 raise Fault(5, physical)
-            return sum(self.memory.get(physical + i, 0) << (8 * i) for i in range(8))
-        return sv39_walk(address, kind, privilege, self.csrs[0x180], self.csrs[0x300], read_pte)
+            pte = sum(self.memory.get(physical + i, 0) << (8 * i) for i in range(8))
+            if pte & 10:
+                self.translation_pbmt = (pte >> 61) & 3
+            return pte
+        return sv39_walk(address, kind, privilege, self.csrs[0x180], self.csrs[0x300], read_pte,
+                         svpbmt=self.config.get('enableSvpbmt', False), pbmte=bool(self.csrs.get(0x30a, 0) & (1 << 62)),
+                         svnapot=self.config.get('enableSvnapot', False))
 
     def access(self, address, size, kind, data=0, fragment=False):
+        if kind != 'fetch':
+            address = self.masked_address(address)
         virtual = address
         permission_kind = {2: 'read', 3: 'write'}.get(self.atomic_operation, 'atomic') if kind == 'atomic' else kind
         data &= (1 << (8 * size)) - 1
@@ -520,8 +540,8 @@ class Model:
     def physical_access(self, virtual, address, size, kind, data=0, fragment=False):
         permission_kind = {2: 'read', 3: 'write'}.get(self.atomic_operation, 'atomic') if kind == 'atomic' else kind
         cause = {'fetch': 1, 'read': 5, 'write': 7, 'atomic': 7, 'management': 7}[permission_kind]
-        if fragment and not any(not r['device'] and int(r['base']) <= address and
-                                address + size <= int(r['base']) + int(r['size']) for r in self.config['memoryRegions']):
+        if fragment and (getattr(self, 'translation_pbmt', 0) == 2 or not any(not r['device'] and int(r['base']) <= address and
+                                address + size <= int(r['base']) + int(r['size']) for r in self.config['memoryRegions'])):
             raise Fault(cause, virtual)
         self.last_physical_address = address
         if kind == 'atomic' and self.atomic_operation == 3:
@@ -592,6 +612,13 @@ class Model:
     def data_privilege(self):
         return (self.csrs[0x300] >> 11) & 3 if self.privilege == 3 and self.csrs[0x300] & (1 << 17) else self.privilege
 
+    def pointer_mask(self):
+        return bool(self.config.get('enableSsnpm') and self.data_privilege() == 0 and
+                    self.csrs.get(0x10a, 0) >> 32 & 3 == 2 and not self.csrs[0x300] & (1 << 19))
+
+    def masked_address(self, address):
+        return pointer_address(address, self.pointer_mask(), bool(self.csrs.get(0x180, 0) >> 60))
+
     def trap(self, pc, cause, value):
         code = cause & ((1 << 63) - 1)
         delegated = self.csrs.get(0x303 if cause >> 63 else 0x302, 0)
@@ -637,7 +664,10 @@ class Model:
         if address == 0x300:
             return self.csrs[address] | fp_status
         if address == 0x100:
-            return (self.csrs[0x300] & ((3 << 32) | 0x122 | (0xc0000 if self.config.get('virtualAddressBits') == 39 else 0))) | fp_status
+            mask = (3 << 32) | 0x122 | (0xc0000 if self.config.get('virtualAddressBits') == 39 else 0)
+            if self.config.get('enableSsnpm'):
+                mask |= 1 << 19
+            return (self.csrs[0x300] & mask) | fp_status
         if address in (0x104, 0x144):
             return self.read_csr(address + 0x200) & self.csrs[0x303]
         return self.csrs[address]
@@ -678,8 +708,16 @@ class Model:
             return
         if address in (0x10a, 0x30a):
             mask = (0x80 if self.config.get('enableZicboz') else 0) | (0x70 if self.config.get('enableZicbom') else 0)
+            if self.config.get('virtualAddressBits') == 39:
+                mask |= 1
+            if address == 0x10a and self.config.get('enableSsnpm'):
+                mask |= 2 << 32
+                if value >> 32 & 3 != 2:
+                    value &= ~(3 << 32)
             if address == 0x30a and self.config.get('enableSstc'):
                 mask |= 1 << 63
+            if address == 0x30a and self.config.get('enableSvpbmt'):
+                mask |= 1 << 62
             if value >> 4 & 3 == 2:
                 value &= ~0x30
             self.csrs[address] = value & mask
@@ -693,12 +731,13 @@ class Model:
         if address == 0x300:
             previous = (value >> 11) & 3
             if self.config.get('enableSupervisorMode'):
-                self.csrs[address] = (10 << 32) | (value & (0x7e01aa if self.config.get('virtualAddressBits') == 39 else 0x7201aa)) | ((previous if previous in (0, 1, 3) else 0) << 11)
+                mask = (0x7e01aa if self.config.get('virtualAddressBits') == 39 else 0x7201aa) | (0x80000 if self.config.get('enableSsnpm') else 0)
+                self.csrs[address] = (10 << 32) | (value & mask) | ((previous if previous in (0, 1, 3) else 0) << 11)
             else:
                 self.csrs[address] = ((2 << 32) | (value & 0x220088) | (0x1800 if previous == 3 else 0)
                                       if self.config.get('enableUserMode') else 0x1800 | (value & 0x88))
         elif address == 0x100:
-            mask = 0xc0122 if self.config.get('virtualAddressBits') == 39 else 0x122
+            mask = (0xc0122 if self.config.get('virtualAddressBits') == 39 else 0x122) | (0x80000 if self.config.get('enableSsnpm') else 0)
             self.csrs[0x300] = (self.csrs[0x300] & ~mask) | (value & mask)
         elif address in (0x302, 0x303):
             self.csrs[address] = value & ((0xb3ff if self.config.get('virtualAddressBits') == 39 else 0x3ff) if address == 0x302 else 0x222 | (0x2000 if self.config.get('hpmCounters') else 0))
@@ -834,6 +873,7 @@ class Model:
                 permission = 0x80 if zero else 0x30 if operation == 0 else 0x40
                 if any(not control & permission for control in controls):
                     raise Fault(2, insn)
+                a = self.masked_address(a)
                 physical = self.translate(a, 'write' if zero else 'management')
                 protection = ([self.pmp_config(i) for i in range(self.config['pmpEntries'])],
                               [self.csrs[0x3b0 + i] for i in range(self.config['pmpEntries'])])
@@ -843,8 +883,12 @@ class Model:
                     self.physical_access(a, (physical & -64) + offset, 8, 'write' if zero else 'management')
             elif opcode == 0x0f and funct3 in (0, 1):
                 pass
-            elif insn & 0xfe007fff == 0x12000073 and self.config.get('virtualAddressBits') == 39:
+            elif (insn & 0xfe007fff == 0x12000073 and (self.config.get('virtualAddressBits') == 39 or self.config.get('enableSvinval')) or
+                  insn & 0xfe007fff == 0x16000073 and self.config.get('enableSvinval')):
                 if self.privilege == 0 or self.privilege == 1 and self.csrs[0x300] & (1 << 20):
+                    raise Fault(2, insn)
+            elif insn in (0x18000073, 0x18100073) and self.config.get('enableSvinval'):
+                if self.privilege == 0:
                     raise Fault(2, insn)
             elif insn in (0x00d00073, 0x01d00073) and self.config.get('enableZawrs'):
                 if (insn == 0x00d00073 and self.local_reservation and self.privilege < 3

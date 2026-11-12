@@ -8,6 +8,7 @@ import me.jiuyang.zaozi.reftpe.*
 import me.jiuyang.zaozi.valuetpe.*
 
 class DitDahA1FetchIO(parameter: DitDahA1Parameter) extends HWBundle(parameter):
+  val allowNonIdempotent = Option.when(parameter.enableSvpbmt)(Flipped(Bool()))
   val debugMode = Option.when(parameter.enableDebugMemory)(Flipped(Bool()))
   val pmp = Option.when(parameter.pmpEntries != 0)(Flipped(new PmpState(parameter)))
   val clock = Flipped(Clock())
@@ -47,17 +48,21 @@ object DitDahA1Fetch extends Generator[DitDahA1Parameter, DitDahA1UnitLayers, Di
     val debugOrigin = Option.when(parameter.enableDebugMemory)(Reg(Bool()))
     val debugging = accepting.?(io.debugMode.getOrElse(false.B), debugOrigin.getOrElse(false.B))
     val physicalAddress = Option.when(parameter.enableTranslation)(Reg(UInt(64)))
+    val pbmt = Option.when(parameter.enableSvpbmt)(Reg(UInt(2)))
     val cache = Option.when(parameter.iCacheBytes != 0)(DitDahA1InstructionCache.instantiate(parameter))
     val request = cache.map(_.io.upstream.request).getOrElse(io.memory.request)
     val response = cache.map(_.io.upstream.response).getOrElse(io.memory.response)
     val rechecking = if wide then state === 6.U(stateBits) else false.B
     val translating = if parameter.enableTranslation then state === 5.U(stateBits) else false.B
     val checkingDemand = accepting | translating | rechecking | parcelCheck
-    val demandAddress = io.translation.map(t => (accepting | translating).?(t.response.bits.address,
+    val demandAddress = io.translation.map(t => (accepting | translating | parcelCheck).?(t.response.bits.address,
       physicalAddress.get)).getOrElse(accepting.?(io.request.bits.pc, parcelAddress))
-    val checkedAddress = if wide then rechecking.?(demandAddress,
+    val demandPbmt = if parameter.enableSvpbmt then (accepting | translating | parcelCheck).?(io.translation.get.response.bits.pbmt.get, pbmt.get) else 0.U(2)
+    val narrowDemand = rechecking | (demandPbmt =/= 0.U(2))
+    val allowDemand = (demandPbmt =/= 2.U(2)) | io.allowNonIdempotent.getOrElse(true.B)
+    val checkedAddress = if wide then narrowDemand.?(demandAddress,
       (demandAddress.asBits.bits(63, bankBits + 2) ## 0.B(bankBits + 2)).asUInt) else demandAddress
-    val checkedSize = if wide then rechecking.?(2.U(3), (bankBits + 2).U(3)) else demandSize
+    val checkedSize = if wide then narrowDemand.?(2.U(3), (bankBits + 2).U(3)) else demandSize
     val pmpPermitted = if parameter.pmpEntries == 0 then true.B else
       val pmp = DitDahA1Pmp.instantiate(parameter)
       pmp.io.state :<= io.pmp.get
@@ -82,7 +87,7 @@ object DitDahA1Fetch extends Generator[DitDahA1Parameter, DitDahA1UnitLayers, Di
       c.io.allowed := (pmpPermitted & narrow) | (debugging & DitDahA1Memory.debugWindow(parameter, c.io.checkAddress, c.io.checkSize))
       io.memory :<>= c.io.downstream
     }
-    val ordinaryDemand = if wide then rechecking.?(DitDahA1Memory.executable(parameter, demandAddress, 4),
+    val ordinaryDemand = if wide then narrowDemand.?(DitDahA1Memory.executable(parameter, demandAddress, 4),
       DitDahA1Memory.executable(parameter, checkedAddress, 4 * parameter.fetchWords))
       else if parameter.enableC then wordSnapshot.?(DitDahA1Memory.executable(parameter, demandAddress, 4),
         DitDahA1Memory.executable(parameter, demandAddress, 2))
@@ -120,10 +125,10 @@ object DitDahA1Fetch extends Generator[DitDahA1Parameter, DitDahA1UnitLayers, Di
     val direct = (io.request.valid & accepting & aligned) |
       (if parameter.enableTranslation then translating & !killed else false.B)
     request.valid := (state === 1.U(stateBits)) |
-      (if pipelined then direct & !flush & demandPermitted & translated else false.B)
+      (if pipelined then direct & !flush & demandPermitted & translated & allowDemand else false.B)
     request.bits.address := (if pipelined then demandAddress else physicalAddress.getOrElse(parcelAddress))
     request.bits.data := 0.U(64)
-    request.bits.size := (if wide then (accepting | translating).?(true.B, wholeBlock.get).?((bankBits + 2).U(3), 2.U(3)) else demandSize)
+    request.bits.size := (if wide then ((demandPbmt === 0.U(2)) & (accepting | translating).?(true.B, wholeBlock.get)).?((bankBits + 2).U(3), 2.U(3)) else demandSize)
     request.bits.mask := 0.U(8)
     request.bits.tag := (if pipelined then accepting.?(io.request.bits.tag, packet.tag) else packet.tag)
     request.bits.fetch := true.B
@@ -136,6 +141,7 @@ object DitDahA1Fetch extends Generator[DitDahA1Parameter, DitDahA1UnitLayers, Di
     request.bits.cacheOperation := 0.U(2)
     request.bits.scEligible := false.B
     request.bits.refillSize := 0.U(3)
+    request.bits.pbmt.foreach(_ := demandPbmt)
     request.bits.debug.foreach(_ := (if pipelined then debugging else debugOrigin.get))
     response.ready := (state === 2.U(stateBits)) & (if pipelined then killed | flush | io.output.ready else true.B)
     io.translation.foreach { t =>
@@ -146,7 +152,8 @@ object DitDahA1Fetch extends Generator[DitDahA1Parameter, DitDahA1UnitLayers, Di
       t.request.bits.write := false.B
       t.request.bits.atomic := false.B
       t.request.bits.management.foreach(_ := false.B)
-      t.response.ready := translating | (((accepting & io.request.valid & aligned) | (parcelCheck & !killed)) & !flush)
+      t.response.ready := (translating | (((accepting & io.request.valid & aligned) | (parcelCheck & !killed)) & !flush)) &
+        (allowDemand | t.response.bits.fault | killed | flush)
       when(parcelCheck & t.request.valid & t.request.ready) { state := 5.U(stateBits) }
     }
     if wide then
@@ -230,6 +237,8 @@ object DitDahA1Fetch extends Generator[DitDahA1Parameter, DitDahA1UnitLayers, Di
     }
     io.translation.foreach { t =>
       when(t.response.valid & t.response.ready) {
+        pbmt.foreach(_ := t.response.bits.pbmt.get)
+        wholeBlock.foreach(value => when(t.response.bits.pbmt.getOrElse(0.U(2)) =/= 0.U(2)) { value := false.B })
         val va = accepting.?(io.request.bits.pc, parcelAddress)
         physicalAddress.get := t.response.bits.address
         packet.fault := t.response.bits.fault

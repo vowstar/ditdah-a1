@@ -476,22 +476,68 @@ def cases(base, protection=False, interrupts=False, user=False, local_interrupt_
         yield from user_cases(base, protection, interrupts, local_interrupt_base, floating_point_bits or 0, supervisor)
     if supervisor:
         yield from supervisor_cases(base, protection)
+        if (scalar or {}).get('enableSsnpm'):
+            yield from pointer_cases(base, protection, sv39, scalar)
+        for privilege in (0, 1, 3):
+            for tvm in (0, 1):
+                p = Program(base)
+                if protection:
+                    user_protection(p)
+                p.address(1, 0x200)
+                p.emit(csr(0, 0x341, 1), addi(1, 0, privilege), alu(1, 1, 11, 1, immediate=True),
+                       addi(2, 0, tvm), alu(2, 2, 20, 1, immediate=True), alu(1, 1, 2, 6),
+                       csr(0, 0x300, 1), 0x30200073)
+                p.offset = 0x200
+                p.emit(0x12000073, 0x18000073, 0x16000073, 0x18100073, addi(12, 0, 1))
+                yield f'svinval_p{privilege}_tvm{tvm}', p.finish()
     if sv39:
         yield from sv39_cases(base, protection, writeback, bool(scalar and scalar.get('enableMisaligned')))
+        if (scalar or {}).get('enableSvpbmt'):
+            for memory_type, label in ((1, 'nc'), (2, 'io')):
+                for name, program in sv39_cases(base, protection, writeback, memory_type=memory_type):
+                    if name in ('sv39_integer_stream', 'sv39_data', 'sv39_reuse', 'sv39_protection', 'sv39_sum', 'sv39_mxr', 'sv39_device', 'sv39_atomic'):
+                        yield f'pbmt_{label}_' + name[5:], program
+            for outcome in ('success', 'fault'):
+                _, program = next(sv39_cases(base, protection, writeback, memory_type=2, fetch_load=outcome))
+                yield 'pbmt_io_fetch_' + outcome, program
+        if (scalar or {}).get('enableSvinval'):
+            for name, program in sv39_cases(base, protection, writeback, invalidation=True):
+                if name in ('sv39_working_set', 'sv39_asid', 'sv39_context'):
+                    yield 'svinval_' + name[5:], program
+        if (scalar or {}).get('enableSsnpm'):
+            _, program = next(sv39_cases(base, protection, writeback, fetch_virtual=0xffffffc000000000))
+            yield 'sv39_high_fetch', program
+            if (scalar or {}).get('enableMisaligned'):
+                flen = (scalar or {}).get('floatingPointBits', 0)
+                for floating in [None] + ([(2, flen)] if flen else []) + ([(3, flen)] if flen == 64 else []):
+                    for name, program in sv39_cases(base, protection, writeback, True, floating, masked=True):
+                        if name.endswith(('misaligned_success', 'misaligned_missing', 'misaligned_pmp')):
+                            yield 'pointer_' + name, program
 
 
-def sv39_cases(base, protection, writeback=False, misaligned=False, floating=None):
+def sv39_cases(base, protection, writeback=False, misaligned=False, floating=None, invalidation=False, memory_type=0, masked=False, fetch_virtual=0x40000000, fetch_load=None):
+    maintenance = 0x16000073 if invalidation else 0x12000073
     p = Program(base)
-    root, middle, leaf, virtual = base + 0x1000, base + 0x2000, base + 0x3000, 0x40000000
-    values = [(root + 8, ((middle >> 12) << 10) | 1), (middle, ((leaf >> 12) << 10) | 1),
-              (leaf, ((base >> 12) << 10) | 0xcf), (base + 0x600, (8 << 60) | root >> 12), (base + 0x610, 0x800)]
+    if memory_type:
+        p.emit(addi(2, 0, 1), alu(2, 2, 62, 1, immediate=True), csr(0, 0x30a, 2))
+    root, middle, leaf, virtual = base + 0x1000, base + 0x2000, base + 0x3000, fetch_virtual
+    values = [(root + ((virtual >> 30) & 511) * 8, ((middle >> 12) << 10) | 1), (middle, ((leaf >> 12) << 10) | 1),
+              (leaf, ((base >> 12) << 10) | (memory_type << 61) | 0xcf), (base + 0x600, (8 << 60) | root >> 12), (base + 0x610, 0x800)]
     if protection:
         p.emit(addi(2, 0, -1), csr(0, 0x3b0, 2), addi(2, 0, 0x1f), csr(0, 0x3a0, 2))
     p.address(10, 0x600)
-    p.emit(ld(2, 10), csr(0, 0x180, 2), 0x12000073, ld(2, 10, 16), csr(0, 0x300, 2),
+    p.emit(ld(2, 10), csr(0, 0x180, 2), maintenance, ld(2, 10, 16), csr(0, 0x300, 2),
            ld(2, 10, 8), csr(0, 0x341, 2), 0x30200073)
     values.append((base + 0x608, virtual + p.offset))
-    integer_stream(p)
+    if fetch_load is None:
+        integer_stream(p)
+    else:
+        fault = fetch_load == 'fault'
+        values += [(leaf + 8, ((base + 0x7000) >> 2) | 0xcf), (base + 0x7000, 0x123)]
+        p.required_memory = [(virtual + p.offset + 4, ld(3, 11), fault)]
+        p.emit(0x400015b7, ld(3, 11), addi(12, 0, 1))
+        p.expected_registers = {12: 1, 23: int(fault), **({20: 5, 21: 0x40001000} if fault else {3: 0x123})}
+        if fault: p.faults['read'] = base + 0x7000
     stop = virtual + p.offset
     for address, value in values:
         p.memory.update((address + byte, (value >> (8 * byte)) & 255) for byte in range(8))
@@ -514,28 +560,39 @@ def sv39_cases(base, protection, writeback=False, misaligned=False, floating=Non
     if misaligned:
         variants += tuple(('misaligned_' + kind, 0xcf, 0x20800, 0x40000ffd, 0)
                           for kind in ('success', 'missing', 'accessed', 'dirty', 'readonly', 'pmp'))
+    if memory_type:
+        variants += (('device', 0xcf, 0x20800, 0x40000100, 0),)
     size, flen = floating or (3, 64)
     if floating: variants = tuple(v for v in variants if v[0] in ('misaligned_success', 'misaligned_missing', 'misaligned_pmp'))
     for name, flags, status, address, levels in variants:
         if name in ('protection', 'misaligned_pmp') and not protection:
             continue
         p = Program(base)
+        if masked:
+            flags |= 16
+            status &= ~0x1800
+            p.emit(addi(2, 0, 2), alu(2, 2, 32, 1, immediate=True), csr(0, 0x10a, 2))
+        if memory_type:
+            flags |= memory_type << 61
+            p.emit(addi(2, 0, 1), alu(2, 2, 62, 1, immediate=True), csr(0, 0x30a, 2))
         def word(physical, value):
             for byte in range(8):
                 p.memory[physical + byte] = (value >> (byte * 8)) & 255
         root, middle, leaf = base + 0x1000, base + 0x2000, base + 0x3000
         word(root + 8, ((base >> 12) << 10) | flags if levels == 2 else ((middle >> 12) << 10) | 1)
         word(middle, ((base >> 12) << 10) | flags if levels == 1 else ((leaf >> 12) << 10) | 1)
-        word(leaf, ((base >> 12) << 10) | flags)
-        word(base + 0x100, 0x12345678)
+        data_base = base + (0x5000 if name == 'device' else 0)
+        word(leaf, ((data_base >> 12) << 10) | flags)
+        word(data_base + 0x100, 0x12345678)
         if protection:
             p.emit(addi(2, 0, -1), csr(0, 0x3b0, 2), addi(2, 0, 0x1f), csr(0, 0x3a0, 2))
         split = name.startswith('misaligned_')
         read_fault = name in ('misaligned_missing', 'misaligned_accessed', 'misaligned_pmp')
         if floating: address, status = 0x40000fff, status | 0x4000
+        if masked: address |= 0xaa << 56
         if split:
             word(leaf + 8, ((base + 0x7000) >> 2) | {'misaligned_missing': 0, 'misaligned_accessed': 0x8f,
-                 'misaligned_dirty': 0x4f, 'misaligned_readonly': 0xcb}.get(name, 0xcf))
+                 'misaligned_dirty': 0x4f, 'misaligned_readonly': 0xcb}.get(name, 0xcf) | (16 if masked else 0))
             word(base + 0xff8, 0x80f7e6d5c4b3a291)
             word(base + 0x7000, 0x8877665544332211)
             if name == 'misaligned_pmp':
@@ -551,7 +608,7 @@ def sv39_cases(base, protection, writeback=False, misaligned=False, floating=Non
         word(base + 0x600, (8 << 60) | (root >> 12))
         word(base + 0x608, address)
         word(base + 0x610, status)
-        p.emit(ld(2, 10), csr(0, 0x180, 2), 0x12000073, ld(11, 10, 8), ld(2, 10, 16), csr(0, 0x300, 2))
+        p.emit(ld(2, 10), csr(0, 0x180, 2), maintenance, ld(11, 10, 8), ld(2, 10, 16), csr(0, 0x300, 2))
         if name == 'reuse':
             p.emit(addi(4, 0, 32), ld(3, 11), addi(4, 4, -1), beq(4, 0, -8) ^ (1 << 12))
         else:
@@ -617,7 +674,7 @@ def sv39_cases(base, protection, writeback=False, misaligned=False, floating=Non
     if protection:
         p.emit(addi(2, 0, -1), csr(0, 0x3b0, 2), addi(2, 0, 0x1f), csr(0, 0x3a0, 2))
     p.address(10, 0x600)
-    p.emit(ld(11, 10, 24), ld(12, 10, 32), ld(13, 10, 40), ld(2, 10), csr(0, 0x180, 2), 0x12000073,
+    p.emit(ld(11, 10, 24), ld(12, 10, 32), ld(13, 10, 40), ld(2, 10), csr(0, 0x180, 2), maintenance,
            ld(2, 10, 16), csr(0, 0x300, 2), ld(2, 10, 8), csr(0, 0x341, 2), 0x30200073)
     word(base + 0x608, virtual + p.offset)
     p.emit(addi(6, 0, 32))
@@ -643,13 +700,13 @@ def sv39_cases(base, protection, writeback=False, misaligned=False, floating=Non
     if protection:
         p.emit(addi(2, 0, -1), csr(0, 0x3b0, 2), addi(2, 0, 0x1f), csr(0, 0x3a0, 2))
     p.address(10, 0x600)
-    p.emit(ld(2, 10), ld(3, 10, 8), ld(11, 10, 16), ld(12, 10, 24), ld(14, 10, 32), addi(15, 0, 0), 0x12000073)
+    p.emit(ld(2, 10), ld(3, 10, 8), ld(11, 10, 16), ld(12, 10, 24), ld(14, 10, 32), addi(15, 0, 0), maintenance)
     def access(context):
         p.emit(csr(0, 0x180, context), csr(0, 0x300, 12), ld(14 + context, 11), csr(0, 0x300, 0))
     for context in (2, 3, 2, 2):
         access(context)
     for selectors in ((15, 0), (0, 15), (0, 14), (0, 0)):
-        p.emit(0x12000073 | selectors[0] << 15 | selectors[1] << 20)
+        p.emit(maintenance | selectors[0] << 15 | selectors[1] << 20)
         for context in ((2, 3, 2) if selectors == (0, 14) else (2, 3)):
             access(context)
     p.translation = {16: 0x11, 17: 0x22}
@@ -675,12 +732,12 @@ def sv39_cases(base, protection, writeback=False, misaligned=False, floating=Non
     p.address(10, 0x600)
     p.address(13, changed - base)
     p.emit(ld(2, 10), ld(3, 10, 8), ld(11, 10, 16), ld(12, 10, 24), ld(14, 10, 32),
-           csr(0, 0x180, 2), 0x12000073, csr(0, 0x300, 12), ld(4, 11), csr(0, 0x300, 0),
+           csr(0, 0x180, 2), maintenance, csr(0, 0x300, 12), ld(4, 11), csr(0, 0x300, 0),
            csr(0, 0x180, 3), 0x12358073, csr(0, 0x300, 12), ld(5, 11), csr(0, 0x300, 0))
     if writeback:
         p.emit(ld(15, 13))
         p.dirty_pte = changed, ((alternate >> 12) << 10) | 0xcf
-    p.emit(sd(14, 13), 0x12000073, csr(0, 0x300, 12), ld(6, 11), csr(0, 0x300, 0), csr(0, 0x180, 0))
+    p.emit(sd(14, 13), maintenance, csr(0, 0x300, 12), ld(6, 11), csr(0, 0x300, 0), csr(0, 0x180, 0))
     p.translation = {4: 0x11, 5: 0x22, 6: 0x33}
     yield 'sv39_context', p.finish()
 
@@ -690,6 +747,89 @@ def user_protection(p, execute_top=0x1000, data_top=0x1008):
         p.address(1, top)
         p.emit(alu(1, 1, 2, 5, immediate=True), csr(0, 0x3b0 + index, 1))
     p.emit(addi(1, 0, 0xb), alu(1, 1, 8, 1, immediate=True), addi(1, 1, 0xc), csr(0, 0x3a0, 1))
+
+
+def pointer_cases(base, protection, paged, features):
+    for pmm, privilege, mxr, tag in ((0, 0, 0, 0xaa), (2, 0, 0, 0xaa), (2, 0, 1, 0xaa),
+                                    (2, 1, 0, 0xaa), (2, 3, 0, 0xaa), (2, 0, 0, 0xab), (2, 0, 0, 0)):
+        p = Program(base)
+        def word(address, value):
+            for byte in range(8):
+                p.memory[address + byte] = value >> (8 * byte) & 255
+        root, middle, leaf, data = (base + offset for offset in (0x1000, 0x2000, 0x3000, 0x7000))
+        if protection:
+            p.emit(addi(2, 0, -1), csr(0, 0x3b0, 2), addi(2, 0, 0x1f), csr(0, 0x3a0, 2))
+        if paged:
+            for address, value in ((root + 8, (middle >> 2) | 1), (middle, (leaf >> 2) | 1),
+                                   (leaf, (data >> 2) | 0xdf)):
+                word(address, value)
+        p.address(10, 0x600)
+        pointer = (0x40000100 if paged else data + 256) | (tag << 56)
+        for offset, value in ((0, pointer), (8, (8 << 60) | root >> 12),
+                              (16, (1 << 17) | privilege << 11 | mxr << 19), (24, pmm << 32)):
+            word(base + 0x600 + offset, value)
+        word(data + 256, 77)
+        p.emit(ld(11, 10), ld(2, 10, 24), csr(0, 0x10a, 2))
+        if paged:
+            p.emit(ld(2, 10, 8), csr(0, 0x180, 2), 0x12000073)
+        p.emit(ld(2, 10, 16), csr(0, 0x300, 2), ld(3, 11), csr(0, 0x300, 0))
+        yield f'pointer_pmm{pmm}_prv{privilege}_mxr{mxr}_tag{tag:x}', p.finish()
+    for privilege, machine_fiom, supervisor_fiom in ((0, 0, 0), (0, 1, 0), (0, 0, 1), (0, 1, 1), (1, 0, 0), (1, 1, 0)) if paged else ((0, 0, 0),):
+        p = Program(base)
+        def word(address, value):
+            p.memory.update((address + byte, value >> (8 * byte) & 255) for byte in range(8))
+        root, middle, leaf = (base + offset for offset in (0x1000, 0x2000, 0x3000))
+        flags = 0xcf | (16 if privilege == 0 else 0)
+        typed = paged and features.get('enableSvpbmt')
+        if paged:
+            for address, value in ((root + 8, (middle >> 2) | 1), (middle, (leaf >> 2) | 1),
+                                   (leaf, (base >> 2) | flags), (leaf + 8, (base >> 2) | flags | ((2 << 61) if typed else 0))):
+                word(address, value)
+        if protection:
+            p.emit(addi(2, 0, -1), csr(0, 0x3b0, 2), addi(2, 0, 0x1f), csr(0, 0x3a0, 2))
+        virtual = 0x40000000 if paged else base
+        pointer = virtual + (0x1400 if paged else 0x400) | ((0xaa << 56) if privilege == 0 else 0)
+        values = (pointer, machine_fiom | ((1 << 62) if typed else 0), (2 << 32) | supervisor_fiom,
+                  privilege << 11, (8 << 60) | root >> 12, virtual + 0xa00)
+        for index, value in enumerate(values): word(base + 0x600 + 8 * index, value)
+        word(base + 0x400, 77)
+        p.address(10, 0x600)
+        p.emit(ld(11, 10), ld(2, 10, 8), csr(0, 0x30a, 2), ld(2, 10, 16), csr(0, 0x10a, 2))
+        if paged: p.emit(ld(2, 10, 32), csr(0, 0x180, 2), 0x12000073)
+        p.emit(ld(2, 10, 24), csr(0, 0x300, 2), ld(2, 10, 40), csr(0, 0x341, 2), 0x30200073)
+        p.offset = 0xa00
+        p.required_memory = [(virtual + p.offset, ld(3, 11), False)]
+        p.emit(ld(3, 11), 0x0cc0000f, sd(3, 11))
+        if features.get('enableA', True):
+            for aqrl in (1, 2, 3):
+                instruction = amo(0, 4, 11, 0, aqrl, 3)
+                p.required_memory.append((virtual + p.offset, instruction, False))
+                p.emit(instruction)
+        p.expected_registers = {3: 77, **({4: 77} if features.get('enableA', True) else {})}
+        stop = virtual + p.offset
+        p.finish(); p.stop = stop
+        yield f'pointer_order_prv{privilege}_fiom{machine_fiom}{supervisor_fiom}', p
+    p = Program(base)
+    if protection:
+        p.emit(addi(2, 0, -1), csr(0, 0x3b0, 2), addi(2, 0, 0x1f), csr(0, 0x3a0, 2))
+    p.address(12, 0x400)
+    p.emit(addi(11, 0, 0xaa), alu(11, 11, 56, 1, immediate=True), alu(11, 11, 12, 6),
+           csr(0, 0x10a, 0), csr(0, 0x300, 0))
+    p.address(2, 0xa00)
+    p.emit(csr(0, 0x341, 2), 0x30200073)
+    p.memory.update((base + 0x400 + byte, 77 if byte == 0 else 0) for byte in range(8))
+    p.offset = 0xa00
+    p.emit(addi(10, 0, 2), 0x73)
+    p.required_memory = [(base + p.offset, ld(3, 11), False)]
+    p.emit(ld(3, 11), addi(10, 0, 0), 0x73)
+    p.required_memory.append((base + p.offset, ld(4, 12), False))
+    p.emit(ld(4, 12))
+    p.finish()
+    p.offset = 0x800
+    p.emit(csr(20, 0x342, 0, True), csr(22, 0x341, 0, True), addi(23, 23, 1),
+           alu(2, 10, 32, 1, immediate=True), csr(0, 0x10a, 2), addi(22, 22, 4), csr(0, 0x341, 22), 0x30200073)
+    p.expected_registers = {3: 77, 4: 77, 20: 8, 23: 2}
+    yield 'pointer_user_select', p
 
 
 def supervisor_cases(base, protection=False):
@@ -1127,6 +1267,17 @@ def scalar_cases(base, config):
                 p.emit(instruction, addi(10, 0, 1))
                 p.expected_registers = {10: 1, 23: int(not enabled or suffix == 'denied')}
                 yield f'cbo_{name}_{suffix}', p.finish()
+    if config.get('enableSsnpm') and config.get('enableZicbom'):
+        p = Program(base)
+        p.address(8, 0x603f)
+        p.emit(addi(2, 0, 2), alu(2, 2, 32, 1, immediate=True), csr(0, 0x10a, 2),
+               addi(2, 0, 0xaa), alu(2, 2, 56, 1, immediate=True), alu(8, 8, 2, 6),
+               addi(2, 0, 1), alu(2, 2, 17, 1, immediate=True), csr(0, 0x300, 2))
+        instruction = 0x0024200f
+        p.required_memory = [(base + p.offset, instruction, True)]
+        p.emit(instruction, csr(0, 0x300, 0))
+        p.expected_registers = {20: 7, 21: base + 0x603f, 23: 1}
+        yield 'pointer_cbo_fault', p.finish()
     for instruction in (0x00d00073, 0x01d00073):
         for reservation in ('none', 'valid', 'cleared') if config.get('enableZawrs') else ('none',):
             p = Program(base)

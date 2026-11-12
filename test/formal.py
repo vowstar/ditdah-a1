@@ -12,7 +12,7 @@ import re
 import subprocess
 
 import click
-from contracts import backend_control_signals, translation_banks, atomic_translation_entries, __file__ as binding_helper_file
+from contracts import axi_cache_attributes, backend_control_signals, translation_banks, atomic_translation_entries, __file__ as binding_helper_file
 from model import BITMANIP_ENCODINGS, SCALAR_ENCODINGS, Model, __file__ as model_file
 from programs import amo, sd
 
@@ -1054,7 +1054,7 @@ def pipeline_witness(parameters, mode):
 
 def protection_cases(parameters):
     width = parameters['physicalAddressBits'] - 2
-    fetch_sizes = ([4] if parameters.get('iCacheBytes') and parameters['issueWidth'] == 3 else []) + ([6] if parameters.get('enableBurstRefill') else [])
+    fetch_sizes = ([4] if parameters.get('iCacheBytes') and parameters['issueWidth'] == 3 and not parameters.get('enableC', False) else []) + ([6] if parameters.get('enableBurstRefill') else [])
     line_size = ''.join(f' || (size == {size} && fetch && !write && !atomic)' for size in fetch_sizes)
     data_line = parameters.get('dCacheRefillBytes', 8) == 64
     span_sizes = sorted(set(fetch_sizes + ([6] if data_line else [])))
@@ -1132,6 +1132,7 @@ def protection_cases(parameters):
     cover(overlap && !contained && size == EXTRA);
   end
 '''.replace('OFFSET', str(max(span_sizes)-1)).replace('SUPPORTED', supported).replace('EXTRA', str(max(span_sizes)))
+    management = 'management ? state_config[i*8] || state_config[i*8+1] : ' if parameters.get('enableZicbom') else ''
     pmp = f'''
   wire [1039:0] decoded_low = {{{low_signals}}};
   wire [1039:0] decoded_high = {{{high_signals}}};
@@ -1154,7 +1155,7 @@ def protection_cases(parameters):
         assume(!any_byte || every_byte == (start >= decoded_low[i*65 +: 65] && end_0 <= decoded_high[i*65 +: 65]));
       end
       if (any_byte) expected = every_byte && (({machine}) && !state_config[i*8+7] ||
-        (atomic ? state_config[i*8] && state_config[i*8+1] :
+        ({management}atomic ? state_config[i*8] && state_config[i*8+1] :
           fetch ? state_config[i*8+2] : write ? state_config[i*8+1] : state_config[i*8]));
     end
     assert(allowed == (expected && (size <= 3{line_size}) &&
@@ -1603,6 +1604,37 @@ def supervisor_cases(parameters):
     cover($past(write && writeAddress == 12'h180 && writeData[63:60] != 0 && writeData[63:60] != 8) && $stable(translationState_satp));
   end
 '''
+    if parameters.get('enableSsnpm') and parameters.get('virtualAddressBits') != 39:
+        csr = csr.replace("64'h122", "64'h80122").replace("64'h7219aa", "64'h7a19aa")
+    if parameters.get('enableSvinval') and parameters.get('virtualAddressBits') != 39:
+        csr += "  always @* if (supervisor_past) assert(sfenceLegal == (privilege == 3 || privilege == 1 && !status[20]));\n"
+    controls = []
+    if parameters.get('virtualAddressBits') == 39:
+        controls += [('machineFiom', 0x30a, 'writeData[0]', 'readData[0]'),
+                     ('supervisorFiom', 0x10a, 'writeData[0]', 'readData[0]')]
+    if parameters.get('enableSvpbmt'):
+        controls += [('pbmte', 0x30a, 'writeData[62]', 'readData[62]')]
+    if parameters.get('enableSsnpm'):
+        controls += [('userPointerMask', 0x10a, "writeData[33:32] == 2'b10", 'readData[33]')]
+        csr += '''  always @* if (supervisor_past) begin
+    assert(pointerMask == (userPointerMask && dataPrivilege == 0 && !status[19]));
+    if (legal && readAddress == 12'h10a) assert(!readData[32]);
+    cover(pointerMask && privilege == 3);
+    cover(userPointerMask && dataPrivilege == 0 && status[19] && !pointerMask);
+  end
+'''
+    for field, address, written, returned in controls:
+        csr += f'''  always @(posedge clock) if (supervisor_past) begin
+    assert({field} == (!$past(reset) && ($past(write && writeAddress == 12'h{address:x}) ?
+      $past({written}) : $past({field}))));
+    if (legal && readAddress == 12'h{address:x}) assert({returned} == {field});
+    cover({field});
+  end
+'''
+    if parameters.get('floatingPointBits'):
+        floating_status = "{49'd0, fs, 13'd0} | (fs == 3 ? 64'h8000000000000000 : 0) | "
+        csr = csr.replace("64'ha00000000 | status", "64'ha00000000 | " + floating_status + 'status')
+        csr = csr.replace("64'h200000000 | (status", "64'h200000000 | " + floating_status + '(status')
     execute = r'''
   wire [4:0] s_op = input_bits_decoded_operation;
   wire s_prior_fault = input_bits_decoded_instruction_fault;
@@ -1625,9 +1657,11 @@ def supervisor_cases(parameters):
     cover(input_valid && !s_prior_fault && s_op == 12 && input_bits_decoded_instruction_instruction == 32'h00100073 && privilege == 1);
   end
 '''
-    if parameters.get('virtualAddressBits') == 39:
-        execute += r'''
-  wire s_sfence = s_op == 16 && (input_bits_decoded_instruction_instruction & 32'hfe007fff) == 32'h12000073;
+    if parameters.get('virtualAddressBits') == 39 or parameters.get('enableSvinval'):
+        invalidation = "(input_bits_decoded_instruction_instruction & 32'hfe007fff) == 32'h12000073"
+        if parameters.get('enableSvinval'):
+            invalidation += " || (input_bits_decoded_instruction_instruction & 32'hfe007fff) == 32'h16000073"
+        execute += '  wire s_sfence = s_op == 16 && (' + invalidation + ');\n' + r'''
   always @* begin
     assert(output_bits_sfenceVma == s_sfence);
     if (s_sfence) begin
@@ -1639,8 +1673,23 @@ def supervisor_cases(parameters):
     cover(input_valid && s_sfence && !s_prior_fault && !sfenceLegal);
   end
 '''
+    if parameters.get('enableSvinval'):
+        execute += r'''
+  wire s_order = s_op == 16 && (input_bits_decoded_instruction_instruction == 32'h18000073 ||
+    input_bits_decoded_instruction_instruction == 32'h18100073);
+  always @* if (s_order) begin
+    assert(!output_bits_sfenceVma);
+    assert(output_bits_instruction_fault == (s_prior_fault || privilege == 0));
+    if (!s_prior_fault && privilege == 0) assert(output_bits_instruction_cause == 2 &&
+      output_bits_instruction_tval == {32'd0, input_bits_decoded_instruction_instruction});
+    cover(input_valid && privilege == 1 && !sfenceLegal && !s_prior_fault && !output_bits_instruction_fault);
+    cover(input_valid && privilege == 0 && !s_prior_fault && output_bits_instruction_fault);
+  end
+'''
     if translation_banks(parameters) and (atomic_translation_entries(parameters) or any(parameters.get(key) for key in ('asidBits', 'iTlbEntries', 'dTlbEntries'))):
         execute += "  always @* if (s_sfence) assert(output_bits_address == input_bits_operand1 && output_bits_storeData == input_bits_operand2);\n"
+    if parameters.get('floatingPointBits'):
+        execute += '  always @* assume(!input_bits_decoded_floating);\n'
     fetch = r'''
   reg context_past = 0, context_owned = 0, context_cancelled = 0;
   reg [1:0] retained_fetch_mode;
@@ -1696,8 +1745,11 @@ def translation_case(parameters):
     invalidating = ('invalidate' + (' || maintenance_valid' if precise else '')) if banks else "1'b0"
     current_asid = f'state_satp[{43+asid_bits}:44]' if asid_bits else "1'b0"
 
-    def vpn_matches(left, right, level):
-        return f'(({level}) == 3 || (({left}) >> 18) == (({right}) >> 18) && (({level}) == 2 || (({left}) >> 9) == (({right}) >> 9) && (({level}) == 1 || ({left}) == ({right}))))'
+    def vpn_matches(left, right, level, pte):
+        page = f'(({left}) == ({right}))'
+        if parameters.get('enableSvnapot'):
+            page = f'((({pte}) >> 63) ? (({left}) >> 4) == (({right}) >> 4) : {page})'
+        return f'((({left}) >> 18) == (({right}) >> 18) && (({level}) == 2 || (({left}) >> 9) == (({right}) >> 9) && (({level}) == 1 || {page})))'
 
     ordinary = ' || '.join(f"(walk_address >= 64'h{int(region['base']):x} && walk_address <= 64'h{int(region['base']) + int(region['size']) - 8:x})"
                           for region in parameters['memoryRegions'] if region['readable'] and not region['device'] and int(region['size']) >= 8) or "1'b0"
@@ -1711,7 +1763,8 @@ def translation_case(parameters):
   reg bus_owned, offered, denied, done, expected_fault, expected_page_fault, completed_leaf;
   reg [63:0] virtual_address, walk_address, expected_address;
   reg [1:0] effective_privilege, walk_level;
-  reg fetch_access, write_access, allow_sum, allow_mxr;
+  reg fetch_access, write_access, management_access, allow_sum, allow_mxr, allow_pbmt;
+  reg [1:0] expected_pbmt;
   wire cancel_now = translation_cancelled || cancelInstruction && !client;
   wire [63:0] access_cause = fetch_access ? 1 : write_access ? 7 : 5;
   wire [63:0] page_cause = fetch_access ? 12 : write_access ? 15 : 13;
@@ -1720,21 +1773,32 @@ def translation_case(parameters):
   wire access_allowed = fetch_access ? formal_pte[3] : write_access ? formal_pte[2] : formal_pte[1] || allow_mxr && formal_pte[3];
   wire mode_allowed = effective_privilege == 0 ? formal_pte[4] : !formal_pte[4] || allow_sum && !fetch_access;
   wire bad_alignment = walk_level == 2 && formal_pte[27:10] != 0 || walk_level == 1 && formal_pte[18:10] != 0;
-  wire bad_pte = !formal_pte[0] || !formal_pte[1] && formal_pte[2] || formal_pte[63:54] != 0 ||
+  wire bad_pte = !formal_pte[0] || !formal_pte[1] && formal_pte[2] || PTE_RESERVED ||
     (leaf_pte ? !access_allowed || !mode_allowed || bad_alignment || !formal_pte[6] || write_access && !formal_pte[7] :
       walk_level == 0 || formal_pte[4] || formal_pte[6] || formal_pte[7]);
   wire [63:0] page_mask = walk_level == 2 ? 64'h3fffffff : walk_level == 1 ? 64'h1fffff : 64'hfff;
-  wire [63:0] leaf_address = ((formal_pte >> 10 << 12) & ~page_mask) | (virtual_address & page_mask);
+  wire [63:0] leaf_address = ({8'd0, formal_pte[53:10], 12'd0} & ~page_mask) | (virtual_address & page_mask);
   wire [63:0] next_address = ((formal_pte >> 10) & 64'hfffffffffff) * 4096 +
     ((walk_level == 2 ? (virtual_address >> 21) : (virtual_address >> 12)) & 511) * 8;
   wire any_response = ports_0_response_valid || ports_1_response_valid;
   wire walk_response = active && (done || denied);
 '''
+    bad_napot = 'formal_pte[63]'
+    if parameters.get('enableSvnapot'):
+        bad_napot += " && (!leaf_pte || walk_level != 0 || formal_pte[13:10] != 8)"
+        body = body.replace("page_mask = walk_level", "page_mask = formal_pte[63] ? 64'hffff : walk_level")
+    bad_type = 'formal_pte[62:61] != 0'
+    if parameters.get('enableSvpbmt'):
+        bad_type = 'formal_pte[62:61] == 3 || (formal_pte[62:61] != 0 && (!leaf_pte || !allow_pbmt))'
+    body = body.replace('PTE_RESERVED', f'formal_pte[60:54] != 0 || ({bad_napot}) || ({bad_type})')
+    if parameters.get('enableZicbom'):
+        body = body.replace('access_allowed = fetch_access', 'access_allowed = management_access ? formal_pte[1] || formal_pte[2] || allow_mxr && formal_pte[3] : fetch_access')
+        body = body.replace('write_access && !formal_pte[7]', 'write_access && !management_access && !formal_pte[7]')
     for port in range(2):
         q = f'ports_{port}_request_bits'
         choices = [(f'{prefix}_{i}', f'{valid}[{i}]') for prefix, valid, position, size, owner in sorted(banks, key=lambda b: b[4] != port)
                    if owner in (None, port) for i in range(size)]
-        hit = [f"({valid} && {vpn_matches(q + '_address[38:12]', entry + '_vpn', entry + '_level')}" +
+        hit = [f"({valid} && {vpn_matches(q + '_address[38:12]', entry + '_vpn', entry + '_level', entry + '_pte')}" +
                (f" && ({entry}_asid == {current_asid} || {entry}_pte[5])" if entry.startswith('tlb_') and asid_bits else '') + ')'
                for entry, valid in choices]
         local_count = sum(size for _, _, _, size, owner in banks if owner == port)
@@ -1745,6 +1809,7 @@ def translation_case(parameters):
   reg formal_held_{port};
   reg [63:0] formal_held_address_{port}, formal_held_cause_{port};
   reg formal_held_fault_{port};
+  reg [1:0] formal_held_type_{port};
   wire {p}_available = !formal_held_{port} && !(active && client == {port}) && !formal_invalidate {'&& !cancelInstruction' if port == 0 else ''};
   wire {p}_paged = {q}_privilege != 3 && state_satp[63:60] != 0;
   wire {p}_invalid = {p}_paged && (state_satp[63:60] != 8 || {q}_address[63:39] != {{25{{{q}_address[38]}}}});
@@ -1752,18 +1817,21 @@ def translation_case(parameters):
   wire {p}_local = {' || '.join(hit[:local_count]) or "1'b0"};
   wire [63:0] {p}_pte = {cached_pte};
   wire [1:0] {p}_level = {cached_level};
-  wire [63:0] {p}_mask = {p}_level == 2 ? 64'h3fffffff : {p}_level == 1 ? 64'h1fffff : 64'hfff;
+  wire [63:0] {p}_mask = {f"{p}_pte[63] ? 64'hffff : " if parameters.get('enableSvnapot') else ''}{p}_level == 2 ? 64'h3fffffff : {p}_level == 1 ? 64'h1fffff : 64'hfff;
   wire {p}_access = {q}_fetch ? {p}_pte[3] : {q}_write ? {p}_pte[2] : {p}_pte[1] || state_mxr && {p}_pte[3];
   wire {p}_mode = {q}_privilege == 0 ? {p}_pte[4] : !{p}_pte[4] || state_sum && !{q}_fetch;
   wire {p}_denied = !{p}_access || !{p}_mode || !{p}_pte[6] || {q}_write && !{p}_pte[7];
   wire {p}_fast = !{p}_paged || {p}_invalid || {p}_hit;
   wire {p}_fault = {p}_invalid || {p}_paged && {p}_hit && {p}_denied;
   wire [63:0] {p}_address = {p}_paged && {p}_hit && !{p}_fault ?
-    (({p}_pte >> 10 << 12) & ~{p}_mask) | ({q}_address & {p}_mask) : {q}_address;
+    (({{8'd0, {p}_pte[53:10], 12'd0}}) & ~{p}_mask) | ({q}_address & {p}_mask) : {q}_address;
   wire [63:0] {p}_cause = {p}_fault ? ({q}_fetch ? 12 : {q}_write ? 15 : 13) : 0;
   wire {p}_miss = ports_{port}_request_valid && {p}_available && !{p}_fast;
   wire {p}_response = ports_{port}_request_valid && {p}_available && {p}_fast;
 '''
+        if parameters.get('enableZicbom'):
+            body = body.replace(f'{p}_access = {q}_fetch', f'{p}_access = {q}_management ? {p}_pte[1] || {p}_pte[2] || state_mxr && {p}_pte[3] : {q}_fetch')
+            body = body.replace(f'{q}_write && !{p}_pte[7]', f'{q}_write && !{q}_management && !{p}_pte[7]')
     body += r'''
   wire data_selected = formal_lookup_1_miss && (!formal_lookup_0_miss || priority_client);
   always @(posedge clock) begin
@@ -1814,7 +1882,7 @@ def translation_case(parameters):
         if (!cancel_now) begin
           if (memory_response_bits_fault || memory_response_bits_tag != 0) expected_fault <= 1;
           else if (bad_pte) begin expected_fault <= 1; expected_page_fault <= 1; end
-          else if (leaf_pte) begin expected_address <= leaf_address; completed_leaf <= 1; end
+          else if (leaf_pte) begin expected_address <= leaf_address; expected_pbmt <= formal_pte[62:61]; completed_leaf <= 1; end
           else begin walk_address <= next_address; walk_level <= walk_level - 1; done <= 0; end
         end
       end
@@ -1856,7 +1924,9 @@ def translation_case(parameters):
       virtual_address <= {q}_address;
       effective_privilege <= {q}_privilege;
       fetch_access <= {q}_fetch; write_access <= {q}_write;
+      management_access <= {q + '_management' if parameters.get('enableZicbom') else "1'b0"};
       allow_sum <= state_sum; allow_mxr <= state_mxr; walk_level <= 2;
+      allow_pbmt <= {"state_pbmte" if parameters.get('enableSvpbmt') else "1'b0"}; expected_pbmt <= 0;
       expected_address <= {q}_address;
       walk_address <= (state_satp & 64'hfffffffffff) * 4096 + (({q}_address >> 30) & 511) * 8;
     end
@@ -1870,6 +1940,7 @@ def translation_case(parameters):
         if (!ports_{port}_response_ready) begin
           formal_held_{port} <= 1;
           formal_held_address_{port} <= {p}_address; formal_held_fault_{port} <= {p}_fault; formal_held_cause_{port} <= {p}_cause;
+          formal_held_type_{port} <= {p}_paged && {p}_hit && !{p}_fault ? {p}_pte[62:61] : 0;
         end
       end
       if (formal_held_{port} && ports_{port}_response_ready) formal_held_{port} <= 0;
@@ -1890,7 +1961,18 @@ def translation_case(parameters):
       cover(formal_held_{port} {'&& formal_invalidate' if count else ''} && ports_{port}_response_ready);
     end
 '''
+        if parameters.get('enableSvpbmt'):
+            body += f'''    if (!reset && translation_past) begin
+      if (active) assert(pbmte == allow_pbmt && pbmt == expected_pbmt);
+      if (memory_request_valid) assert(memory_request_bits_pbmt == 0);
+      if (ports_{port}_response_valid) assert({response}_pbmt ==
+        (formal_held_{port} ? formal_held_type_{port} : active && client == {port} ?
+        ((expected_fault || !done) ? 0 : expected_pbmt) : ({p}_paged && {p}_hit && !{p}_fault ? {p}_pte[62:61] : 0)));
+    end
+'''
     body += '  end\n'
+    if parameters.get('enableZicbom'):
+        body += '  always @(posedge clock) if (!reset && translation_past && active) assert(request_management == management_access);\n'
     if atomic_translation_entries(parameters):
         body += '''\n  reg atomic_access;
   always @(posedge clock) begin
@@ -1950,12 +2032,12 @@ def translation_case(parameters):
             for i in range(size):
                 entry = f'{prefix}_{i}'
                 space = f'({entry}_asid == cache_asid || {entry}_pte[5] || {name}_pte[5]) && ' if owner is None and asid_bits else ''
-                overlap = f'({space}{vpn_matches(entry + "_vpn", name + "_vpn", f"{entry}_level > {name}_level ? {entry}_level : {name}_level")})'
+                overlap = f'({space}({vpn_matches(entry + "_vpn", name + "_vpn", entry + "_level", entry + "_pte")} || {vpn_matches(entry + "_vpn", name + "_vpn", name + "_level", name + "_pte")}))'
                 selected = f'({name}_allocate' + (f' && {position} == {i}' if position else '') + ')'
                 discard = "1'b0"
                 if precise:
                     identity = f'{entry}_asid' if owner is None and asid_bits else current_asid
-                    scope = f'(!maintenance_addressValid || maintenance_address[63:39] == {{25{{maintenance_address[38]}}}} && {vpn_matches("maintenance_address[38:12]", entry + "_vpn", entry + "_level")}) && (!maintenance_asidValid || !{entry}_pte[5] && {identity} == maintenance_asid)'
+                    scope = f'(!maintenance_addressValid || maintenance_address[63:39] == {{25{{maintenance_address[38]}}}} && {vpn_matches("maintenance_address[38:12]", entry + "_vpn", entry + "_level", entry + "_pte")}) && (!maintenance_asidValid || !{entry}_pte[5] && {identity} == maintenance_asid)'
                     discard = f'maintenance_valid && (maintenance_fence ? ({scope}) : {int(owner is not None)})'
                 body += f'''
       if ($past({discard})) assert(!{valid}[{i}]);
@@ -1979,7 +2061,9 @@ def translation_case(parameters):
                 entry = f'{prefix}_{i}'
                 body += f'''
   always @* if (translation_past && {valid}[{i}]) begin
-    assert({entry}_level <= 2 && {entry}_pte[63:54] == 0 && {entry}_pte[0] && {entry}_pte[6]);
+    assert({entry}_level <= 2 && {entry}_pte[60:54] == 0 && {entry}_pte[0] && {entry}_pte[6]);
+    assert({entry}_pte[62:61] {'!= 3' if parameters.get('enableSvpbmt') else '== 0'});
+    assert({f'!{entry}_pte[63] || ({entry}_level == 0 && {entry}_pte[13:10] == 8)' if parameters.get('enableSvnapot') else f'!{entry}_pte[63]'});
     assert(({entry}_pte[1] || {entry}_pte[3]) && ({entry}_pte[1] || !{entry}_pte[2]));
     assert({entry}_level != 2 || {entry}_pte[27:10] == 0);
     assert({entry}_level != 1 || {entry}_pte[18:10] == 0);
@@ -2625,6 +2709,17 @@ def line_lsu_contract(body, parameters):
     return declarations + body
 
 
+def pointer_contract(parameters):
+    if not parameters.get('enableSsnpm'):
+        return ''
+    virtual = 'virtualPointers' if parameters.get('virtualAddressBits') == 39 else "1'b0"
+    return f'''  function automatic [63:0] formal_pointer(input [63:0] address, input enabled, paged);
+    formal_pointer = enabled ? {{{{7{{paged && address[56]}}}}, address[56:0]}} : address;
+  endfunction
+  wire [63:0] formal_input_address = formal_pointer(input_bits_address, pointerMask, {virtual});
+'''
+
+
 def word_cases(parameters):
     decode = r'''
   wire [31:0] word = input_bits_instruction;
@@ -2914,6 +3009,8 @@ def word_cases(parameters):
     if parameters.get('enableMisaligned'):
         lsu += '  always @* assume(input_bits_atomic || word_aligned);\n'
         if not parameters.get('enableUserMode'): lsu += '  always @* assume(privilege == 3);\n'
+    if parameters.get('enableSsnpm'):
+        lsu = pointer_contract(parameters) + lsu.replace('input_bits_address', 'formal_input_address')
     return [('WordDecode', decode, 'assign output_bits_usesRs2 =', "assign output_bits_usesRs2 = 1'h0 &"),
             ('WordExecute', execute, 'assign output_bits_unsignedLoad =', "assign output_bits_unsignedLoad = 1'h0 &"),
             ('Lsu', lsu, 'assign memory_request_bits_size =', "assign memory_request_bits_size = 3'h3 |")]
@@ -2921,7 +3018,7 @@ def word_cases(parameters):
 
 def lsu_fragments_case(parameters):
     dual = parameters.get('loadQueueEntries', 1) == 2
-    ranges = ' || '.join(f"(f_address + f_offset >= 64'd{int(r['base'])} && f_address + f_offset < 64'd{int(r['base']) + int(r['size'])})"
+    ranges = ' || '.join(f"(f_current >= 64'd{int(r['base'])} && f_current < 64'd{int(r['base']) + int(r['size'])})"
                         for r in parameters['memoryRegions'] if not r['device'] and int(r['size']) >= 8) or "1'b0"
     fields = dict(instruction_pc=64, instruction_instruction=32, instruction_tag=8, instruction_length=3,
                   nextPc=64, rd=5, rdWrite=1, address=64, storeData=64, memorySize=3, unsignedLoad=1, load=1, store=1,
@@ -3135,8 +3232,20 @@ def lsu_fragments_case(parameters):
 '''
     if not parameters.get('enableA', True):
         body = body.replace('!scEligible', '!memory_request_bits_scEligible')
-    if dual and floating == 64 and parameters.get('enableZfhmin'):
+    if dual and floating:
         body += '  always @(posedge clock) if (!reset && f_owned) assert(output_bits_fpWrite == f_fp);\n'
+    if parameters.get('enableSsnpm'):
+        body = body.replace('input_bits_address', 'formal_input_address')
+        body = body.replace('f_current = f_address + f_offset;', "f_current = formal_pointer(f_address + f_offset, f_pointer_mask, 1'b0);")
+        body += '''  reg f_pointer_mask;
+  always @(posedge clock) if (f_accept) f_pointer_mask <= pointerMask;
+  always @(posedge clock) if (!reset && f_owned) begin
+    assert(pointerMask_0 == f_pointer_mask);
+    if (f_pointer_mask) assert(f_address[63:57] == 0);
+    cover(f_pointer_mask && f_address[63:57] == 0 && input_bits_address[63:57] != 0);
+  end
+'''
+        body = pointer_contract(parameters) + body
     return 'LsuFragments', body, 'assign memory_request_bits_size =', "assign memory_request_bits_size = 3'h3 |"
 
 
@@ -3342,12 +3451,16 @@ def integer_cases(parameters):
     if parameters.get('enableSupervisorMode'):
         decode = decode.replace("i_word == 32'h10500073 ? 29 : 0", "i_word == 32'h10500073 ? 29 : i_word == 32'h10200073 ? 31 : 0")
         decode = decode.replace("!input_bits_fault && i_word == 32'h10500073", "!input_bits_fault && (i_word == 32'h10500073 || i_word == 32'h10200073)")
-    if parameters.get('virtualAddressBits') == 39:
-        decode = decode.replace("i_word == 32'h10200073 ? 31 : 0", "i_word == 32'h10200073 ? 31 : (i_word & 32'hfe007fff) == 32'h12000073 ? 16 : 0")
-        decode = decode.replace("i_word == 32'h10200073)", "i_word == 32'h10200073 || (i_word & 32'hfe007fff) == 32'h12000073)")
+    if parameters.get('virtualAddressBits') == 39 or parameters.get('enableSvinval'):
+        invalidation = "(i_word & 32'hfe007fff) == 32'h12000073"
+        if parameters.get('enableSvinval'):
+            invalidation += " || (i_word & 32'hfe007fff) == 32'h16000073"
+        fence = invalidation + (" || i_word == 32'h18000073 || i_word == 32'h18100073" if parameters.get('enableSvinval') else '')
+        decode = decode.replace("i_word == 32'h10200073 ? 31 : 0", "i_word == 32'h10200073 ? 31 : (" + fence + ") ? 16 : 0")
+        decode = decode.replace("i_word == 32'h10200073)", "i_word == 32'h10200073 || " + fence + ")")
         if translation_banks(parameters) and (atomic_translation_entries(parameters) or any(parameters.get(key) for key in ('asidBits', 'iTlbEntries', 'dTlbEntries'))):
             decode = decode.replace('assert(!output_bits_usesRs1 && !output_bits_usesRs2 && !output_bits_writesRd);',
-                "assert(output_bits_usesRs1 == (!input_bits_fault && (i_word & 32'hfe007fff) == 32'h12000073) && output_bits_usesRs2 == output_bits_usesRs1 && !output_bits_writesRd);")
+                "assert(output_bits_usesRs1 == (!input_bits_fault && (" + invalidation + ")) && output_bits_usesRs2 == output_bits_usesRs1 && !output_bits_writesRd);")
     execute = r'''
   wire [4:0] i_op = input_bits_decoded_operation;
   wire [31:0] i_word = input_bits_decoded_instruction_instruction;
@@ -3461,6 +3574,8 @@ def integer_cases(parameters):
     decode = decode.replace('    if (i_checked) begin', classification + '    if (i_checked) begin')
     if excluded:
         execute = execute.replace('if (i_op >= 21', 'if (!(' + ' || '.join(excluded) + ') && i_op >= 21')
+    if parameters.get('floatingPointBits'):
+        decode += "  always @* if (i_opcode == 7'h73 || i_opcode == 7'h0f) assert(!output_bits_floating);\n"
     return [('IntegerDecode', decode, 'assign output_bits_usesRs1 =', "assign output_bits_usesRs1 = 1'h0 &"),
             ('IntegerExecute', execute, 'assign output_bits_csrData =', "assign output_bits_csrData = 64'h0 &")]
 
@@ -6091,6 +6206,18 @@ def axi_case(parameters):
         body = f'''  wire axi_request_line = !request_write && !request_atomic && request_size == 6 &&
     (request_fetch ? {int(bool(parameters.get('enableBurstRefill')))} : {int(parameters.get('dCacheRefillBytes') == 64)});
 ''' + body
+    if parameters.get('enableZicbom'):
+        body = '''  wire input_management = memory_request_bits_cacheOperation == 3;
+  reg formal_management;
+  always @(posedge clock) if (memory_request_valid && memory_request_ready) formal_management <= input_management;
+''' + body
+        body = body.replace('wire input_rejected = input_sc', 'wire input_rejected = input_management || input_sc')
+        body = body.replace('complete <= input_rejected; expected_fault <= 0;', 'complete <= input_rejected; expected_fault <= input_management;')
+        body = body.replace('old_value <= input_rejected ? 1 : 0;', 'old_value <= input_sc && !memory_request_bits_scEligible ? 1 : 0;')
+        body = body.replace('wire input_line =', 'wire input_line = !input_management &&')
+        body = body.replace('if (held) assert(!axi_request_line);', 'if (held && !formal_management) assert(!axi_request_line);')
+        body += '  always @(posedge clock) if (!reset && held && formal_management) assert(complete && expected_fault);\n'
+        body = body.replace('held && is_sc && !accepted_eligible)', 'held && is_sc && !accepted_eligible && !formal_management)')
     for channel, fields in (('ar', ('addr', 'id', 'len', 'size', 'burst', 'lock', 'cache', 'prot', 'qos')),
                             ('aw', ('addr', 'id', 'len', 'size', 'burst', 'lock', 'cache', 'prot', 'qos')),
                             ('w', ('data', 'strb', 'last'))):
@@ -6109,6 +6236,19 @@ def axi_case(parameters):
                         'assert($stable(memory_response_bits_data)); assert($stable({memory_response_bits_fault, memory_response_bits_tag, memory_response_bits_last}));')
     body = body.replace('assert($stable({axi_w_bits_data, axi_w_bits_strb, axi_w_bits_last}));',
                         'assert($stable({request_data, data, request_size, request_address, request_atomic, request_atomicOperation})); assert($stable(axi_w_bits_data)); assert($stable({axi_w_bits_strb, axi_w_bits_last}));')
+    if parameters.get('enableSvpbmt'):
+        body += axi_cache_attributes(parameters).replace('pbmt = 0', 'pbmt') + '''  reg [1:0] formal_type;
+  always @(posedge clock) begin
+    if (memory_request_valid && memory_request_ready) formal_type <= memory_request_bits_pbmt;
+    if (!reset && checked_past && state != 0) assert(request_pbmt == formal_type);
+    if (!reset && axi_ar_valid) assert(axi_ar_bits_cache == expected_cache(request_address,
+      1 << request_size, request_fetch, 0, request_atomic, formal_type));
+    if (!reset && axi_aw_valid) assert(axi_aw_bits_cache == expected_cache(request_address,
+      1 << request_size, request_fetch, 1, request_atomic, formal_type));
+    cover(!reset && axi_ar_valid && formal_type == 1);
+    cover(!reset && axi_aw_valid && formal_type == 2);
+  end
+'''
     return ('Axi', body, 'request_atomic <= memory_request_bits_atomic;', 'request_atomic <= 0;')
 
 
@@ -6192,18 +6332,23 @@ def read_queue_case(parameters):
         for amount in (*range(4), *((6,) if burst else ())):
             terms = []
             for region in parameters['memoryRegions']:
-                if region['device'] or int(region['size']) < 1 << amount:
+                if (region['device'] and not parameters.get('enableSvpbmt')) or int(region['size']) < 1 << amount:
                     continue
-                execute = region['executable'] and (amount != 6 or parameters.get('enableBurstRefill'))
+                execute = region['executable'] and not region['device'] and (amount != 6 or parameters.get('enableBurstRefill'))
                 read = region['readable'] and (amount != 6 or parameters.get('dCacheRefillBytes') == 64 and region.get('dataCacheable'))
-                terms.append(f"({address} >= 64'h{int(region['base']):x} && {address} <= 64'h{int(region['base'])+int(region['size'])-(1<<amount):x} && ({field('fetch')} ? 1'b{int(bool(execute))} : 1'b{int(bool(read))}))")
+                attribute = f" && {field('pbmt')} == 1" if region['device'] else ''
+                terms.append(f"({address} >= 64'h{int(region['base']):x} && {address} <= 64'h{int(region['base'])+int(region['size'])-(1<<amount):x}{attribute} && ({field('fetch')} ? 1'b{int(bool(execute))} : 1'b{int(bool(read))}))")
             ranges.append(f"({size} == 3'd{amount} && ({address} & 64'd{(1<<amount)-1}) == 0 && ({' || '.join(terms) or '0'}))")
         allowed = f"!{field('write')} && !{field('atomic')} && (" + ' || '.join(ranges) + ')'
         management = "1'b0"
         if parameters.get('enableZicbom'):
-            scope = management_ranges(parameters, address, ordinary=True) or "1'b0"
+            scope = management_ranges(parameters, address, ordinary=not parameters.get('enableSvpbmt')) or "1'b0"
             management = f"!{field('write')} && !{field('fetch')} && !{field('atomic')} && {size} == 3 && {field('mask')} == 0 && {address}[5:0] == 0 && ({scope})"
-        return f"({field('cacheOperation')} == 3 ? ({management}) : ({allowed}))"
+        result = f"({field('cacheOperation')} == 3 ? ({management}) : ({allowed}))"
+        if parameters.get('enableSvpbmt'):
+            devices = ' || '.join(f"({address} >= 64'd{int(r['base'])} && {address} < 64'd{int(r['base'])+int(r['size'])})" for r in parameters['memoryRegions'] if r['device']) or "1'b0"
+            result = f"({result} && {field('pbmt')} < 2 && ({field('pbmt')} != 0 || !({devices})) && ({field('pbmt')} == 0 || {size} <= 3))"
+        return result
     for slot, suffix in enumerate(suffixes):
         ready = ' || '.join(f'(rq_owner[{slot}] == {port} && ports_{port}_response_ready' +
                             (f' && ports_{port}_response_valid && ports_{port}_response_bits_tag == rq_tag[{slot}]' if dual else '') + ')'
@@ -6384,6 +6529,29 @@ def read_queue_case(parameters):
       end
 '''
     body += '    end\n  end\n'
+    if parameters.get('enableSvpbmt') or parameters.get('l2CacheBytes'):
+        body = body.replace(' && ar_bits_cache == 0', '')
+        body += axi_cache_attributes(parameters).replace('pbmt = 0', 'pbmt')
+        body += f'  reg [3:0] rq_cache [0:{depth-1}];\n  reg [1:0] rq_type [0:{depth-1}];\n'
+        for n, suffix in enumerate(suffixes):
+            current_type = 'request_pbmt' + suffix if parameters.get('enableSvpbmt') else "2'd0"
+            body += f'''  always @(posedge clock) if (!reset) begin
+    if (rq_owned[{n}]) begin
+      assert(rq_type[{n}] == {current_type});
+      assert(rq_cache[{n}] == expected_cache(request_address{suffix}, 1 << request_size{suffix}, request_fetch{suffix}, 0, 0, {current_type}));
+    end
+    if (ar_valid && ar_bits_id == {n}) assert(ar_bits_cache == rq_cache[{n}]);
+'''
+            for port in range(2 * harts):
+                select = ' && '.join([f'!rq_owned[{n}]', *(f'rq_owned[{m}]' for m in range(n))])
+                req = f'ports_{port}_request_bits_'
+                incoming_type = req + 'pbmt' if parameters.get('enableSvpbmt') else "2'd0"
+                body += f'''    if (rq_accept_{port} && ({select})) begin
+      rq_type[{n}] <= {incoming_type};
+      rq_cache[{n}] <= expected_cache({req}address, 1 << {req}size, {req}fetch, 0, 0, {incoming_type});
+    end
+'''
+            body += '  end\n'
     if dual and depth > 1:
         pairs = ' || '.join(f'(rq_owner[{n}] == rq_owner[{m}] && rq_owner[{n}][0] && rq_waiting[{n}] && rq_waiting[{m}])'
                             for n in range(depth) for m in range(n))
@@ -6572,7 +6740,7 @@ def verify(rtl, directory, modules=None, mutations=None, jobs=1, rvfi_dir=None):
   end
 '''
         machine = 'privilege != 0' if manifest['parameters'].get('enableUserMode') else "1'b1"
-        if name in ('Pmp', 'PmpDecode') and (manifest['parameters'].get('enableBurstRefill') or manifest['parameters'].get('dCacheRefillBytes', 8) == 64 or manifest['parameters'].get('iCacheBytes') and manifest['parameters']['issueWidth'] == 3):
+        if name in ('Pmp', 'PmpDecode') and (manifest['parameters'].get('enableBurstRefill') or manifest['parameters'].get('dCacheRefillBytes', 8) == 64 or manifest['parameters'].get('iCacheBytes') and manifest['parameters']['issueWidth'] == 3 and not manifest['parameters'].get('enableC', False)):
             span = re.search(r'&\s+(\w+\[size\]) > base', sources['DitDahA1Pmp.sv']).group(1)
             body = body.replace('end_0', span)
         if unit == 'Fetch' and name != 'WideFetch':
@@ -6751,7 +6919,7 @@ def verify(rtl, directory, modules=None, mutations=None, jobs=1, rvfi_dir=None):
             body += f"\n  always @* if ({machine}readAddress == 12'hf14) assert(legal && readData == {{60'd0, hartId}});\n"
             for address in (0x306, 0x30a, 0xf15):
                 legal = 'privilege == 3' if manifest['parameters'].get('enableUserMode') else str(int(address == 0xf15))
-                zero = not (address == 0x306 and manifest['parameters'].get('enableCounters') or address == 0x30a and manifest['parameters'].get('enableSstc'))
+                zero = not (address == 0x306 and manifest['parameters'].get('enableCounters') or address == 0x30a and any(manifest['parameters'].get(key) for key in ('enableSstc', 'virtualAddressBits', 'enableZicbom', 'enableZicboz')))
                 body += f"  always @* if (!reset && readAddress == 12'h{address:x}) assert(legal == ({legal}){' && readData == 0' if zero else ''});\n"
             if manifest['parameters'].get('enableUserMode') and not manifest['parameters'].get('enableSupervisorMode'):
                 body += '\n  always @* begin assume(!mret || privilege == 3); assume(!write || privilege == 3); end\n'
@@ -7492,9 +7660,10 @@ endmodule''', 1)
             if unit == 'Decode':
                 if manifest['parameters'].get('enableA', True):
                     shape = re.search(r"(?:input_bits_instruction|insn)\[6:0\] == 7'h2F & \([^)]*\)", sources[module + '.sv']).group()
+                    lr_source = re.search(r"(?:input_bits_instruction|insn)\[31:27\] == 5'h2\s*&\s*(?:(?:input_bits_instruction|insn)\[24:20\] == 5'h0|\w+)", sources[module + '.sv']).group()
                     checks += [('mutation-atomic-width', shape, "input_bits_instruction[6:0] == 7'h2F"),
-                               ('mutation-lr-source', "input_bits_instruction[24:20] == 5'h0", "1'h1"),
-                               ('mutation-atomic-operation', "input_bits_instruction[31:27] == 5'h8", "1'h1")]
+                               ('mutation-lr-source', lr_source, lr_source.split('&')[0].strip()),
+                               ('mutation-atomic-operation', re.search(r"(?:input_bits_instruction|insn)\[31:27\] == 5'h8\s*\|\s*(?:input_bits_instruction|insn)\[31:27\] == 5'hC", sources[module + '.sv']).group(), "1'h1")]
                 else:
                     checks += [('mutation-atomic-disabled', 'assign output_bits_operation =', "assign output_bits_operation = input_bits_instruction[6:0] == 7'h2F ? 5'h1E :")]
             else:
@@ -7516,6 +7685,11 @@ endmodule''', 1)
             checks += [('mutation-data', 'assign dataPrivilege =', 'assign dataPrivilege = 3 |'),
                        ('mutation-return', 'assign returnPc = sret ? sepc : mepc;', 'assign returnPc = mepc;'),
                        ('mutation-supervisor-bank', 'scause <= trapCause;', "scause <= 64'h0;")]
+            if manifest['parameters'].get('enableSsnpm'):
+                checks += [('mutation-pmm', "userPointerMask <= writeData[33:32] == 2'h2;", 'userPointerMask <= writeData[32];'),
+                           ('mutation-pointer-mxr', '& ~(status[19])', '')]
+            if manifest['parameters'].get('enableSvpbmt'):
+                checks += [('mutation-pbmte', 'pbmte <= writeData[62];', "pbmte <= 1'h1;")]
             if manifest['parameters'].get('virtualAddressBits') == 39:
                 checks += [('mutation-satp', 'assign translationState_satp = satp;', "assign translationState_satp = 64'h0;"),
                            ('mutation-sum', 'assign translationState_sum = status[18];', 'assign translationState_sum = status[19];'),
@@ -7527,10 +7701,15 @@ endmodule''', 1)
                     checks += [('mutation-satp-root', root, "1'h1")]
         if unit == 'Translation':
             original = sources[module + '.sv']
+            if manifest['parameters'].get('enableSvpbmt'):
+                checks += [('mutation-pbmte', 'pbmte <= state_pbmte;', "pbmte <= 1'h1;"),
+                           ('mutation-pbmt', 'pbmt <= memory_response_bits_data[62:61];', "pbmt <= 2'h0;")]
+            if manifest['parameters'].get('enableSvnapot'):
+                checks += [('mutation-napot-map', '{memory_response_bits_data[53:14], request_address[15:0]}', '{memory_response_bits_data[53:10], request_address[11:0]}')]
             translation_sizes = {prefix: size for prefix, _, _, size, _ in translation_banks(manifest['parameters'])}
             if atomic_translation_entries(manifest['parameters']) or any(manifest['parameters'].get(key) for key in ('iTlbEntries', 'dTlbEntries')):
                 checks[:1] = [(mode, before, after) for mode in ('prove-control', *('prove-' + bank for bank in translation_sizes))]
-            dirty = re.search(r'\|\s+request_write\s*&\s*~\(memory_response_bits_data\[7\]\)', original).group()
+            dirty = re.search(r'\|\s+request_write\s*&\s*(?:~request_management\s*&\s*)?~\(memory_response_bits_data\[7\]\)', original).group()
             checks += [('mutation-tag', '|{memory_response_bits_fault, memory_response_bits_tag}', 'memory_response_bits_fault'),
                        ('mutation-cancel', 'killed | cancelInstruction & ~owner', 'killed'),
                        ('mutation-dirty', dirty, ''),
@@ -7634,7 +7813,7 @@ endmodule''', 1)
             checks += [('mutation-terminal', terminal, '')]
         if name == 'PmpDecode' and (manifest['parameters'].get('enableBurstRefill') or manifest['parameters'].get('dCacheRefillBytes', 8) == 64):
             checks += [('mutation-line-range', "65'h40", "65'h8")]
-        if name == 'PmpDecode' and manifest['parameters'].get('iCacheBytes') and manifest['parameters']['issueWidth'] == 3:
+        if name == 'PmpDecode' and manifest['parameters'].get('iCacheBytes') and manifest['parameters']['issueWidth'] == 3 and not manifest['parameters'].get('enableC', False):
             checks += [('mutation-fetch-range', "+ 65'h10}", "+ 65'h8}")]
         if unit == 'Axi':
             original = sources[module + '.sv']
@@ -7688,6 +7867,8 @@ endmodule''', 1)
         if name == 'Pmp':
             checks += [('mutation-atomic-read', 'state_config[0] & state_config[1]', 'state_config[1]'),
                        ('mutation-atomic-write', 'state_config[0] & state_config[1]', 'state_config[0]')]
+            if manifest['parameters'].get('enableZicbom'):
+                checks += [('mutation-management', 'state_config[0] | state_config[1]', 'state_config[1]')]
         if name == 'Lsu':
             mask_assignment = re.search(r'assign memory_request_bits_mask\s*=\s*[^;]+;', sources[module + '.sv']).group(0)
             checks += [('mutation-mask', mask_assignment,
@@ -8287,15 +8468,17 @@ endmodule''', 1)
                 if unit == 'Translation' and filename == module + '.sv' and mode in ('mutation-tlb-isolation', 'mutation-tlb-promotion'):
                     base, root = int(manifest['parameters']['resetVector']), int(manifest['parameters']['resetVector']) + 4096
                     isolation = mode == 'mutation-tlb-isolation'
-                    address = "64'h1100" if isolation else "(tlbValid ? 64'h40000100 : 64'h100)"
+                    address = "64'h200100" if isolation else "(tlbValid ? 64'h40000100 : 64'h100)"
                     valids = ('!active && (|dataValid)', '!active && !(|dataValid)') if isolation else ('!active', 'bus_owned && !client && (|tlbValid)')
-                    pte = f"(client ? (walk_level == 2 ? 64'h{((root + 4096) >> 12) << 10 | 1:x} : walk_level == 1 ? 64'h{((root + 8192) >> 12) << 10 | 1:x} : 64'h{(base >> 12) << 10 | 0xcf:x}) : 64'h{(base >> 12) << 10 | 0xcf:x})" if isolation else f"(virtual_address[30] ? 64'h{((base ^ (1 << 30)) >> 12) << 10 | 0xcf:x} : 64'h{(base >> 12) << 10 | 0xcf:x})"
+                    pte = f"(client && walk_level == 2 ? 64'h{((root + 4096) >> 12) << 10 | 1:x} : 64'h{(base >> 12) << 10 | 0xcf:x})" if isolation else f"(virtual_address[30] ? 64'h{((base ^ (1 << 30)) >> 12) << 10 | 0xcf:x} : 64'h{(base >> 12) << 10 | 0xcf:x})"
                     text = text.replace('endmodule', f'''
   always @* begin
     assume(state_satp == 64'h{(8 << 60) | (root >> 12):x} && !state_sum && !state_mxr && !cancelInstruction && !invalidate && !maintenance_valid && formal_permit);
     assume(ports_0_request_valid == ({valids[0]}) && ports_1_request_valid == ({valids[1]}));
     assume(ports_0_request_bits_address == {address} && ports_1_request_bits_address == 64'h100);
     assume(ports_0_request_bits_privilege == 1 && ports_1_request_bits_privilege == 1 && !ports_1_request_bits_write);
+    assume(!ports_1_request_bits_atomic);
+    {"assume(!ports_1_request_bits_management);" if manifest['parameters'].get('enableZicbom') else ""}
     assume(ports_0_response_ready && ports_1_response_ready && memory_request_ready);
     assume(memory_response_valid == bus_owned && !memory_response_bits_fault && memory_response_bits_tag == 0 && memory_response_bits_data == {pte});
   end
@@ -8820,6 +9003,23 @@ endmodule''', 1)
                     mutation_sites = manifest['parameters'].get('loadQueueEntries', 1) if name == 'LsuFragments' and mode == 'mutation-offset' else 2 if name == 'Csr' else 1
                     assert text.count(before) == mutation_sites, (name, before)
                     text = text.replace(before, after, mutation_sites if name == 'LsuFragments' else 1)
+                if unit == 'Translation' and mode in ('mutation-napot-map', 'mutation-tag') and filename == module + '.sv':
+                    table = next((int(r['base']) + 4095) & ~4095 for r in manifest['parameters']['memoryRegions']
+                                 if r['readable'] and not r['device'] and ((int(r['base']) + 4095) & ~4095) + 0x3008 <= int(r['base']) + int(r['size']))
+                    leaf = (1 << 63) | ((((table + 0x10000) & ~0xffff) >> 12 | 8) << 10) | 0xdf
+                    if mode == 'mutation-tag': leaf = ((table + 0x10000) >> 2) | 0xdf
+                    text = text.replace('endmodule', f'''  always @* begin
+    assume(!ports_0_request_valid && ports_1_request_valid && ports_1_response_ready);
+    assume(ports_1_request_bits_address == 64'h40001000 && ports_1_request_bits_privilege == 0);
+    assume(!ports_1_request_bits_fetch && !ports_1_request_bits_write && !ports_1_request_bits_atomic);
+    assume(state_satp == 64'h{(8 << 60) | ((table + 0x1000) >> 12):x} && !state_sum && !state_mxr);
+    assume(!formal_invalidate && !cancelInstruction && formal_permit && memory_request_ready);
+    assume(memory_response_valid == bus_owned && !memory_response_bits_fault && memory_response_bits_tag == {int(mode == 'mutation-tag')} && memory_response_bits_last);
+    assume(memory_response_bits_data == (walk_level == 2 ? 64'h{((table + 0x2000) >> 2) | 1:x} :
+      walk_level == 1 ? 64'h{((table + 0x3000) >> 2) | 1:x} : 64'h{leaf:x}));
+    {"assume(!ports_1_request_bits_management);" if manifest['parameters'].get('enableZicbom') else ""}
+  end
+endmodule''', 1)
                 if name == 'WideFetch' and filename == module + '.sv':
                     for instance, prefix in (('DitDahA1InstructionCache', 'CACHE'), ('DitDahA1Pmp', 'PMP')):
                         connected = instance_ports(text, instance)
@@ -8896,8 +9096,10 @@ endmodule''', 1)
                 engine = 'smtbmc --syn --unroll z3'
             if unit == 'Backend' and task != 'prove':
                 engine = 'smtbmc --syn --unroll z3'
-            if name == 'LsuFragments' and manifest['parameters'].get('loadQueueEntries', 1) == 2 and proving: engine = 'smtbmc --syn --unroll z3'
-            if name == 'InterruptBackend' and manifest['parameters'].get('loadQueueEntries', 1) == 2 and proving: engine = 'smtbmc --syn --unroll z3'
+            if name in ('LsuFragments', 'InterruptBackend') and manifest['parameters'].get('loadQueueEntries', 1) == 2 and proving:
+                word_level = not enabled and not any(manifest['parameters'].get(key) for key in (
+                    'virtualAddressBits', 'floatingPointBits', 'enableSsnpm', 'enableSupervisorMode'))
+                engine = 'smtbmc --unroll z3' if word_level else 'smtbmc --syn --unroll z3'
             if name == 'FloatingBackend' and task != 'prove':
                 engine = 'smtbmc --nopresat --unroll z3' if mutating else 'smtbmc --unroll z3'
             if witness:
@@ -8905,6 +9107,8 @@ endmodule''', 1)
             if name in ('WfiBackend', 'SynchronizationBackend') and task == 'prove':
                 engine = 'smtbmc --syn --unroll z3'
             timeout = 90 if name == 'FloatingBackend' and task != 'prove' else 180 if name in ('SharedCache', 'InterruptBackend', 'SynchronizationBackend') and task == 'cover' else 60
+            if name == 'PipelineBackend' and mode == 'cover-recovery' and manifest['parameters'].get('enableC') and manifest['parameters']['issueWidth'] == 3:
+                timeout = 120
             if name == 'InterruptBackend' and task == 'cover' and manifest['parameters']['issueWidth'] == 3:
                 timeout = 600
             if name in ('InterruptBackend', 'PipelineBackend') and mutating and manifest['parameters']['issueWidth'] == 3:
@@ -8943,6 +9147,13 @@ endmodule''', 1)
                 timeout = 300 if port_modes else 120
             if unit == 'MemoryFabric' and mode.startswith('prove-stability-') and port_modes:
                 timeout = 120
+            if (unit == 'MemoryFabric' and mode == 'prove-control' and read_slots == 2 and
+                    manifest['parameters']['hartCount'] == 16 and manifest['parameters']['axiDataBits'] == 512 and
+                    manifest['parameters'].get('loadQueueEntries', 1) == 1 and manifest['parameters']['dCacheBytes'] > 0 and
+                    manifest['parameters'].get('dCacheRefillBytes', 8) == 64 and
+                    not any(manifest['parameters'].get(key) for key in ('dCacheWriteback', 'enableSvpbmt', 'l2CacheBytes')) and
+                    all(manifest['parameters'].get(key) is None for key in ('localInterruptBase', 'debugBase'))):
+                engine, timeout = 'smtbmc --unroll z3', 240
             if unit == 'MemoryFabric' and mutating and manifest['parameters']['hartCount'] == 16:
                 timeout = 180
             if unit == 'PlatformMemory':
@@ -8967,7 +9178,8 @@ endmodule''', 1)
                 depth = 1 if mode in ('prove-permission', 'prove-read-data') else 4
             if unit == 'MemoryFabric' and (mode == 'prove-control' or mode.startswith(('prove-ports-', 'prove-tags', 'prove-stability-'))):
                 depth = 4
-            if unit == 'Translation' and mode == 'prove-instructionTlb' and manifest['parameters'].get('asidBits'):
+            if unit == 'Translation' and (mode == 'prove-instructionTlb' and manifest['parameters'].get('asidBits') or
+                    mode == 'prove-control' and manifest['parameters'].get('enableSvnapot')):
                 engine = 'smtbmc --syn --unroll z3'
             if unit == 'Translation' and task == 'prove':
                 depth = 6

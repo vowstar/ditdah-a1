@@ -140,8 +140,11 @@ object DitDahA1Execute extends Generator[DitDahA1Parameter, DitDahA1UnitLayers, 
     out.mret := op === Mret.U(operationBits)
     out.sret := op === Sret.U(operationBits)
     out.fenceI := op === FenceI.U(operationBits)
-    out.sfenceVma := parameter.enableTranslation.B & (op === Fence.U(operationBits)) &
-      ((encoding & BigInt("fe007fff", 16).B(32)) === 0x12000073.B(32))
+    val translationFence = encoding & BigInt("fe007fff", 16).B(32)
+    out.sfenceVma := (parameter.enableTranslation || parameter.enableSvinval).B & (op === Fence.U(operationBits)) &
+      ((translationFence === 0x12000073.B(32)) | (parameter.enableSvinval.B & (translationFence === 0x16000073.B(32))))
+    val invalidateOrder = parameter.enableSvinval.B & (op === Fence.U(operationBits)) &
+      ((encoding === 0x18000073.B(32)) | (encoding === 0x18100073.B(32)))
     if parameter.preciseTranslationMaintenance then when(out.sfenceVma) { out.address := a }
     out.wfi := (op === Wfi.U(operationBits)) & (encoding === 0x10500073.B(32))
     when(csr) { out.value := io.csrValue }
@@ -162,7 +165,8 @@ object DitDahA1Execute extends Generator[DitDahA1Parameter, DitDahA1UnitLayers, 
     when(!insn.fault) {
       val returnLegal = if parameter.enableJtag then
         (encoding === 0x7b200073L.B(32)).?(io.debugMode.get, machine) else machine
-      when((op === Illegal.U(operationBits)) | fpIllegal | (out.sfenceVma & !io.sfenceLegal) | ((op === Mret.U(operationBits)) & !returnLegal) |
+      when((op === Illegal.U(operationBits)) | fpIllegal | (out.sfenceVma & !io.sfenceLegal) |
+        (invalidateOrder & !machine & (io.privilege =/= 1.U(2))) | ((op === Mret.U(operationBits)) & !returnLegal) |
         (out.wfi & !wfiLegal) | (zero & !io.zeroLegal.getOrElse(true.B)) |
         (management & !managementLegal) |
         ((op === Sret.U(operationBits)) & !io.sretLegal) |

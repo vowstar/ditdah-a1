@@ -48,6 +48,10 @@ case class DitDahA1Parameter(
   enableInterrupts: Boolean = false,
   enableUserMode: Boolean = false,
   enableSupervisorMode: Boolean = false,
+  enableSvinval: Boolean = false,
+  enableSvpbmt: Boolean = false,
+  enableSvnapot: Boolean = false,
+  enableSsnpm: Boolean = false,
   enableBurstRefill: Boolean = false,
   enableBranchPrediction: Boolean = false,
   branchPredictorEntries: Int = 0,
@@ -122,6 +126,10 @@ case class DitDahA1Parameter(
     validateBackend()
 
   def validateProtection(): Unit =
+    require(!enableSvinval || enableSupervisorMode, "Svinval requires supervisor mode")
+    require(!enableSvpbmt || enableTranslation, "Svpbmt requires Sv39")
+    require(!enableSvnapot || enableTranslation, "Svnapot requires Sv39")
+    require(!enableSsnpm || enableSupervisorMode, "Ssnpm requires supervisor mode")
     require(virtualAddressBits != 39 || enableSupervisorMode, "Sv39 requires supervisor mode")
     require(pmpEntries == 0 || pmpEntries == 16, "RTL supports zero or sixteen PMP entries")
     require(!enableSupervisorMode || (enableUserMode && enableInterrupts), "Supervisor mode requires user mode and interrupts")

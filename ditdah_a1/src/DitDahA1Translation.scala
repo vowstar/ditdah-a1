@@ -18,7 +18,7 @@ class TranslationEntry(asidBits: Int = 0) extends Bundle:
 class DitDahA1TranslationIO(parameter: DitDahA1Parameter) extends HWBundle(parameter):
   val clock = Flipped(Clock())
   val reset = Flipped(Reset())
-  val state = Flipped(new TranslationState)
+  val state = Flipped(new TranslationState(parameter))
   val ports = Flipped(Vec(2, new TranslationPort(parameter)))
   val cancelInstruction = Flipped(Bool())
   val invalidate = Option.when(parameter.hasTranslationCache)(Flipped(Bool()))
@@ -40,13 +40,15 @@ object DitDahA1Translation extends Generator[DitDahA1Parameter, DitDahA1UnitLaye
     val request = Reg(new TranslationRequest(parameter))
     val sum = Reg(Bool())
     val mxr = Reg(Bool())
+    val pbmte = Option.when(parameter.enableSvpbmt)(Reg(Bool()))
+    val pbmt = Option.when(parameter.enableSvpbmt)(Reg(UInt(2)))
     val address = Reg(UInt(64))
     val level = Reg(UInt(2))
     val fault = Reg(Bool())
     val pageFault = Reg(Bool())
     val killed = RegInit(false.B)
     val held = Seq.fill(2)(RegInit(false.B))
-    val heldResponse = Seq.fill(2)(Reg(new TranslationResponse))
+    val heldResponse = Seq.fill(2)(Reg(new TranslationResponse(parameter)))
     val tlb = Option.when(parameter.tlbEntries != 0)(Reg(Vec(parameter.tlbEntries, new TranslationEntry(parameter.asidBits))))
     val tlbValid = Option.when(tlb.isDefined)(RegInit(0.B(parameter.tlbEntries)))
     val replacementBits = if tlb.isDefined then Integer.numberOfTrailingZeros(parameter.tlbEntries) else 1
@@ -80,13 +82,16 @@ object DitDahA1Translation extends Generator[DitDahA1Parameter, DitDahA1UnitLaye
       !permitted | !user | !pte.bit(6) | (access.write & !management & !pte.bit(7))
     def mapped(pte: Referable[Bits], pageLevel: Referable[UInt], va: Referable[UInt])
       (using Arena, Context, Block, InstanceContext): Referable[UInt] =
-      (pageLevel === 2.U(2)).?((0.B(8) ## pte.bits(53, 28) ## va.asBits.bits(29, 0)).asUInt,
+      (parameter.enableSvnapot.B & pte.bit(63)).?((0.B(8) ## pte.bits(53, 14) ## va.asBits.bits(15, 0)).asUInt,
+        (pageLevel === 2.U(2)).?((0.B(8) ## pte.bits(53, 28) ## va.asBits.bits(29, 0)).asUInt,
         (pageLevel === 1.U(2)).?((0.B(8) ## pte.bits(53, 19) ## va.asBits.bits(20, 0)).asUInt,
-          (0.B(8) ## pte.bits(53, 10) ## va.asBits.bits(11, 0)).asUInt))
-    def matches(left: Referable[UInt], right: Referable[UInt], pageLevel: Referable[UInt])(using Arena, Context, Block, InstanceContext): Referable[Bool] =
+          (0.B(8) ## pte.bits(53, 10) ## va.asBits.bits(11, 0)).asUInt)))
+    def matches(left: Referable[UInt], right: Referable[UInt], pageLevel: Referable[UInt], pte: Referable[UInt])
+      (using Arena, Context, Block, InstanceContext): Referable[Bool] =
       (left.asBits.bits(26, 18) === right.asBits.bits(26, 18)) &
         ((pageLevel === 2.U(2)) | ((left.asBits.bits(17, 9) === right.asBits.bits(17, 9)) &
-          ((pageLevel === 1.U(2)) | (left.asBits.bits(8, 0) === right.asBits.bits(8, 0)))))
+          ((pageLevel === 1.U(2)) | (parameter.enableSvnapot.B & pte.asBits.bit(63)).?(
+            left.asBits.bits(8, 4) === right.asBits.bits(8, 4), left.asBits.bits(8, 0) === right.asBits.bits(8, 0)))))
     def update(bank: Int, vpn: Referable[UInt], pte: Referable[UInt], pageLevel: Referable[UInt], allocate: Referable[Bool], asid: Referable[UInt])
       (using Arena, Context, Block, InstanceContext): Unit =
       banks(bank).foreach { entries =>
@@ -94,7 +99,7 @@ object DitDahA1Translation extends Generator[DitDahA1Parameter, DitDahA1UnitLaye
         val retained = (0 until capacities(bank)).reverse.map { n =>
           val selected = allocate & positions(bank).map(_ === n.U(bits)).getOrElse(true.B)
           val sameSpace = entries(n).asid.map(_ === asid).getOrElse(true.B) | entries(n).pte.asBits.bit(5) | pte.asBits.bit(5)
-          val overlap = sameSpace & (matches(entries(n).vpn, vpn, entries(n).level) | matches(entries(n).vpn, vpn, pageLevel))
+          val overlap = sameSpace & (matches(entries(n).vpn, vpn, entries(n).level, entries(n).pte) | matches(entries(n).vpn, vpn, pageLevel, pte))
           when(selected) {
             entries(n).vpn := vpn; entries(n).pte := pte; entries(n).level := pageLevel
             entries(n).asid.foreach(_ := asid)
@@ -122,7 +127,7 @@ object DitDahA1Translation extends Generator[DitDahA1Parameter, DitDahA1UnitLaye
       val choices = (localBanks :+ 0).flatMap(bank => banks(bank).toSeq.flatMap(entries =>
         (0 until capacities(bank)).map(n => (entries(n), valid(bank).get.bit(n)))))
       val hits = choices.map { (entry, active) => active &
-        matches(entry.vpn, incoming.address.asBits.bits(38, 12).asUInt, entry.level) &
+        matches(entry.vpn, incoming.address.asBits.bits(38, 12).asUInt, entry.level, entry.pte) &
           (entry.asid.map(_ === currentAsid).getOrElse(true.B) | entry.pte.asBits.bit(5)) }
       val hit = hits.reduceOption(_ | _).getOrElse(false.B)
       val pte = choices.indices.reverse.foldLeft[Referable[UInt]](0.U(64))(
@@ -130,7 +135,8 @@ object DitDahA1Translation extends Generator[DitDahA1Parameter, DitDahA1UnitLaye
       val pageLevel = choices.indices.reverse.foldLeft[Referable[UInt]](0.U(2))(
         (value, n) => hits(n).?(choices(n)._1.level, value))
       val failed = invalid | (paged & hit & leafDenied(pte, incoming, io.state.sum, io.state.mxr))
-      val result = Wire(new TranslationResponse)
+      val result = Wire(new TranslationResponse(parameter))
+      result.pbmt.foreach(_ := (paged & hit & !failed).?(pte.bits(62, 61).asUInt, 0.U(2)))
       result.address := (paged & hit & !failed).?(mapped(pte, pageLevel, incoming.address), incoming.address)
       result.fault := failed
       result.cause := failed.?(incoming.fetch.?(12.U(64), incoming.write.?(15.U(64), 13.U(64))), 0.U(64))
@@ -149,6 +155,7 @@ object DitDahA1Translation extends Generator[DitDahA1Parameter, DitDahA1UnitLaye
       port.response.valid := held(i) | walked | fastResponse
       port.response.bits :<= lookups(i)._2
       when(walked) {
+        port.response.bits.pbmt.foreach(_ := fault.?(0.U(2), pbmt.get))
         port.response.bits.address := address
         port.response.bits.fault := fault
         port.response.bits.cause := fault.?(pageFault.?(pageCause, accessCause), 0.U(64))
@@ -165,6 +172,8 @@ object DitDahA1Translation extends Generator[DitDahA1Parameter, DitDahA1UnitLaye
             (bank != 3).B | port.request.bits.atomic, currentAsid)
       }
       when(port.request.valid & port.request.ready & !fast) {
+        pbmte.foreach(_ := io.state.pbmte.get)
+        pbmt.foreach(_ := 0.U(2))
         val incoming = port.request.bits
         owner := (i == 1).B
         request :<= incoming
@@ -218,6 +227,7 @@ object DitDahA1Translation extends Generator[DitDahA1Parameter, DitDahA1UnitLaye
     read.bits.debug.foreach(_ := false.B)
     read.bits.scEligible := false.B
     read.bits.refillSize := 0.U(3)
+    read.bits.pbmt.foreach(_ := 0.U(2))
     response.ready := state === 3.U(3)
     when(state === 1.U(3)) {
       state := 2.U(3)
@@ -237,7 +247,13 @@ object DitDahA1Translation extends Generator[DitDahA1Parameter, DitDahA1UnitLaye
         }.otherwise {
           val pte = response.bits.data.asBits
           val leaf = pte.bit(1) | pte.bit(3)
-          val invalid = !pte.bit(0) | (!pte.bit(1) & pte.bit(2)) | (pte.bits(63, 54) =/= 0.B(10))
+          val memoryType = pte.bits(62, 61).asUInt
+          val invalidType = if parameter.enableSvpbmt then (memoryType === 3.U(2)) |
+            ((memoryType =/= 0.U(2)) & (!pbmte.get | !leaf)) else memoryType =/= 0.U(2)
+          val invalidNapot = if parameter.enableSvnapot then pte.bit(63) &
+            (!leaf | (level =/= 0.U(2)) | (pte.bits(13, 10) =/= 8.B(4))) else pte.bit(63)
+          val invalid = !pte.bit(0) | (!pte.bit(1) & pte.bit(2)) | invalidNapot |
+            (pte.bits(60, 54) =/= 0.B(7)) | invalidType
           val aligned = ((level =/= 2.U(2)) | (pte.bits(27, 10) === 0.B(18))) &
             ((level =/= 1.U(2)) | (pte.bits(18, 10) === 0.B(9)))
           val leafFault = leafDenied(pte, request, sum, mxr) | !aligned
@@ -247,6 +263,7 @@ object DitDahA1Translation extends Generator[DitDahA1Parameter, DitDahA1UnitLaye
             pageFault := true.B
           }.otherwise {
             when(leaf) {
+              pbmt.foreach(_ := memoryType)
               address := mapped(pte, level, request.address)
               if parameter.hasTranslationCache then
                 when(refillAllowed.get & !maintaining) {
@@ -275,7 +292,7 @@ object DitDahA1Translation extends Generator[DitDahA1Parameter, DitDahA1UnitLaye
         for bank <- banks.indices do banks(bank).foreach { entries =>
           valid(bank).get := (0 until capacities(bank)).reverse.map { n =>
             val addressMatches = !maintenance.addressValid | (canonical &
-              matches(entries(n).vpn, maintenance.address.asBits.bits(38, 12).asUInt, entries(n).level))
+              matches(entries(n).vpn, maintenance.address.asBits.bits(38, 12).asUInt, entries(n).level, entries(n).pte))
             val asidMatches = !maintenance.asidValid | (!entries(n).pte.asBits.bit(5) &
               (entries(n).asid.getOrElse(currentAsid) === maintenance.asid))
             val discard = maintenance.fence.?(addressMatches & asidMatches, (bank != 0).B)

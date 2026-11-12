@@ -134,9 +134,7 @@ object DitDahA1ReadQueue extends Generator[DitDahA1Parameter, DitDahA1UnitLayers
     val unexpected = io.r.valid & io.r.ready & !known
     when(unexpected) { poisoned := true.B }
     for n <- 0 until depth do
-      val ordinary = parameter.memoryRegions.filter(!_.device).foldLeft[Referable[Bool]](false.B) { (allowed, region) =>
-        allowed | ((request(n).address >= region.base.U(64)) & (request(n).address < (region.base + region.size).U(64)))
-      }
+      val ordinary = !DitDahA1Memory.device(parameter, request(n).address, request(n).pbmt.getOrElse(0.U(2)))
       val permitted = !request(n).write & !request(n).atomic &
         ordinary & DitDahA1Memory.permitted(parameter, request(n))
       when((state(n) === 1.U(3)) & !permitted) {

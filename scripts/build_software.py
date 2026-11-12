@@ -118,9 +118,14 @@ def main():
     required_extensions += counter_extensions + (['Sscounterenw'] if counter_extensions and config.get('enableSupervisorMode') else [])
     required_extensions += (['Sscofpmf'] if counter_extensions and config.get('hpmCounters', 0) > 0 and config.get('enableInterrupts') else []) + (['Sstc'] if config.get('enableSstc') else [])
     counter_program = args.program.resolve() == Path('software/tests/counters.S').resolve()
+    supervisor_memory = args.program.resolve() == Path('software/tests/virtual_memory.S').resolve() and all(config.get('enable' + name) for name in ('Svinval', 'Svpbmt', 'Svnapot', 'Ssnpm'))
+    if supervisor_memory:
+        assert config.get('virtualAddressBits') == 39 and 'Zicbom' in args.scalar, 'Supervisor memory software requires Sv39 and cache-block management'
+        required_extensions += ['Svinval', 'Svpbmt', 'Svnapot', 'Ssnpm', 'Supm']
     assert not counter_program or config.get('pmpEntries', 0) > 0 and {'Sscofpmf', 'Sstc'} <= set(required_extensions), 'Counter software requires protection, overflow and supervisor timers'
     command = [args.tool_prefix + 'gcc', '-march=' + args.isa + '_zicsr_zifencei' + ''.join('_' + name.lower() for name in sorted(set(args.bitmanip) | set(args.scalar)) + counter_extensions),
                *(['-DDITDAH_ZERO_PAGE_TABLES'] if args.zero_page_tables else []),
+               *(['-DDITDAH_SUPERVISOR_MEMORY'] if supervisor_memory else []),
                f'-DDITDAH_HART_COUNT={harts}',
                f'-DDITDAH_RAM_BASE={base}', f'-DDITDAH_RAM_BYTES={int(ram["size"])}',
                f'-DDITDAH_ASID_BITS={config.get("asidBits", 0)}',
@@ -159,7 +164,7 @@ def main():
                     toolVersions=tool_versions, requiredExtensions=required_extensions, requiredInstructions=required_instructions,
                     target=subprocess.check_output([args.tool_prefix + 'gcc', '-dumpmachine'], text=True).strip(),
                     expectedInterruptCauses=args.expected_interrupt, entryAddress=base,
-                    requiredCsrs=[0x320, 0xb00, 0xb02, 0xc00, 0xc02, 0x306, 0x106, 0x30a, 0x323, 0xb03, 0x14d, 0xc01, 0xda0, 0x144] if counter_program else [],
+                    requiredCsrs=[0x320, 0xb00, 0xb02, 0xc00, 0xc02, 0x306, 0x106, 0x30a, 0x323, 0xb03, 0x14d, 0xc01, 0xda0, 0x144] if counter_program else [0x30a, 0x10a, 0x180, 0x300] if supervisor_memory else [],
                     requiredWaitingHarts=list(range(harts)) if 'Zawrs' in args.scalar and args.program.resolve() in
                         [Path('software/tests/' + name).resolve() for name in ('atomic.c', 'virtual_memory.S', 'reservation.S')] else [],
                     clockHz=args.clock_hz, timebaseHz=args.timebase_hz)

@@ -33,6 +33,7 @@ object DitDahA1InstructionCache extends Generator[DitDahA1Parameter, DitDahA1Uni
     val bankBits = Integer.numberOfTrailingZeros(banks)
     val state = RegInit(0.U(3))
     val address = Reg(UInt(64))
+    val pbmt = Option.when(parameter.enableSvpbmt)(Reg(UInt(2)))
     val tag = Reg(UInt(8))
     val privileged = Option.when(parameter.enableUserMode)(Reg(Bool()))
     val debugOrigin = Option.when(parameter.enableDebugMemory)(Reg(Bool()))
@@ -78,6 +79,7 @@ object DitDahA1InstructionCache extends Generator[DitDahA1Parameter, DitDahA1Uni
     down.request.bits.cacheOperation := 0.U(2)
     down.request.bits.scEligible := false.B
     down.request.bits.refillSize := 0.U(3)
+    down.request.bits.pbmt.foreach(_ := pbmt.get)
     down.request.bits.debug.foreach(_ := debugOrigin.get)
     down.response.ready := state === 4.U(3)
     val reading = up.request.valid & up.request.ready
@@ -111,7 +113,7 @@ object DitDahA1InstructionCache extends Generator[DitDahA1Parameter, DitDahA1Uni
     val tagRead = StorageArray("tags", lines, tagBits,
       up.request.bits.address.asBits.bits(indexBits + 5, 6).asUInt, index,
       address.asBits.bits(parameter.physicalAddressBits - 1, indexBits + 6).asUInt, filling & complete, reading, io.clock)
-    val hit = !DitDahA1Memory.debugWindow(parameter, address, 0.U(3)) & (valid.asUInt >> index).asBits.bit(0) &
+    val hit = (pbmt.getOrElse(0.U(2)) === 0.U(2)) & !DitDahA1Memory.debugWindow(parameter, address, 0.U(3)) & (valid.asUInt >> index).asBits.bit(0) &
       (tagRead === address.asBits.bits(parameter.physicalAddressBits - 1, indexBits + 6).asUInt)
     val lookupHit = (state === 1.U(3)) & hit & !abort
     up.response.valid := lookupHit | (state === 5.U(3))
@@ -188,6 +190,7 @@ object DitDahA1InstructionCache extends Generator[DitDahA1Parameter, DitDahA1Uni
     when((io.cancel | io.invalidate) & (state =/= 0.U(3))) { killed := true.B }
     when(io.invalidate) { valid := 0.B(lines) }
     when(reading) {
+      pbmt.foreach(_ := up.request.bits.pbmt.get)
       privileged.foreach(_ := up.request.bits.privileged)
       debugOrigin.foreach(_ := up.request.bits.debug.get)
       address := up.request.bits.address
@@ -197,7 +200,7 @@ object DitDahA1InstructionCache extends Generator[DitDahA1Parameter, DitDahA1Uni
       wide.foreach(_ := up.request.bits.size === (bankBits + 2).U(3))
       fault := false.B
       word := 0.U(4)
-      bypass := DitDahA1Memory.debugWindow(parameter, up.request.bits.address, up.request.bits.size)
+      bypass := (up.request.bits.pbmt.getOrElse(0.U(2)) =/= 0.U(2)) | DitDahA1Memory.debugWindow(parameter, up.request.bits.address, up.request.bits.size)
       halfword.foreach(_ := up.request.bits.size === 1.U(3))
       killed := false.B
       state := 1.U(3)

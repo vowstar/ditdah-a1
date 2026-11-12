@@ -39,6 +39,7 @@ module core_tb;
     logic scEligible;
     logic [2:0] refillSize;
     logic [1:0] cacheOperation;
+    logic [1:0] pbmt;
   } core_request_t;
   typedef struct packed { logic [63:0] data; logic fault; logic [7:0] tag; logic last; } core_response_t;
   core_request_t requests[2*HARTS];
@@ -320,7 +321,7 @@ module core_tb;
         delay_index = `LOAD_QUEUE_ENTRIES == 2 ? (read_source % (2*HARTS)) / 2 : 0;
         if (!console_address(64'(araddr)) && (64'(araddr) < base_address || 64'(araddr) + (1 << arsize) * (1 + integer'(arlen)) > base_address + MB)) $fatal(1, "Truncated or unexpected read address");
         if (arlen != (accepted_request[read_source].size == 6 ? 64 / (DW/8) - 1 : 0) || arburst != 1 || (arlock && arprot[2]) ||
-            arcache != expected_cache(64'(araddr), (1 << arsize) * (1 + integer'(arlen)), arprot[2], 0, arlock) || arqos != 0) $fatal(1, "Read attributes");
+            arcache != expected_cache(64'(araddr), (1 << arsize) * (1 + integer'(arlen)), arprot[2], 0, arlock, accepted_request[read_source].pbmt) || arqos != 0) $fatal(1, "Read attributes");
         if (arprot != {accepted_request[read_source].fetch, 1'b0, accepted_request[read_source].privileged}) $fatal(1, "Read privilege");
         if ((accepted_request[read_source].size == 6 ? arsize != $clog2(DW/8) : arprot[2] ? (arsize != 2 && !(`COMPRESSED && arsize == 1)) : arsize > 3) ||
             (arlock && arsize != 2 && arsize != 3) || (araddr & ((1 << arsize) - 1)) != 0) $fatal(1, "Read alignment");
@@ -397,7 +398,7 @@ module core_tb;
       if (awvalid && awready) begin
         if (!console_address(64'(awaddr)) && (64'(awaddr) < base_address || 64'(awaddr) + (1 << awsize) > base_address + MB)) $fatal(1, "Truncated or unexpected write address");
         if (awid >= HARTS || active_source[bus_owner] < 0 || awid != IDW'(bus_owner / 2) || awlen != 0 || awsize > 3 || (awlock && awsize != 2 && awsize != 3) ||
-            awburst != 1 || awcache != expected_cache(64'(awaddr), 1 << awsize, 0, 1, awlock) ||
+            awburst != 1 || awcache != expected_cache(64'(awaddr), 1 << awsize, 0, 1, awlock, writeback_pending ? 2'b0 : accepted_request[bus_owner].pbmt) ||
             awprot != (writeback_pending ? 3'b001 : {2'b0, accepted_request[bus_owner].privileged}) || awqos != 0 ||
             (awaddr & ((1 << awsize) - 1)) != 0) $fatal(1, "Write attributes");
         aw_held <= 1;
@@ -559,11 +560,11 @@ module core_tb;
         if (exclusive_request(requests[source])) bus_owner <= source;
         if (HARTS > 1) $write("HART %0d ", source / 2);
         emit_source(context_index);
-        $display("REQUEST %s %016h %0d %016h %02h %01h",
+        $display("REQUEST %s %016h %0d %016h %02h %01h %01h",
           requests[source].cacheOperation == 3 ? "management" : requests[source].atomic ? "atomic" : (source % 2 == 0 ? "fetch" : (requests[source].write ? "write" : "read")),
           requests[source].address, 1 << requests[source].size,
           requests[source].write ? requests[source].data & access_mask(requests[source].size) : 64'b0,
-          requests[source].tag, requests[source].cacheOperation);
+          requests[source].tag, requests[source].cacheOperation, requests[source].pbmt);
         if (HARTS > 1) $write("HART %0d ", source / 2);
         if (`LOAD_QUEUE_ENTRIES == 2) emit_source(context_index);
         $display("ACCESS_PRIVILEGE %01h", requests[source].privileged);

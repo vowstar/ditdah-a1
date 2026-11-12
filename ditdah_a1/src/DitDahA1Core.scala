@@ -32,6 +32,7 @@ object DitDahA1Core extends Generator[DitDahA1Parameter, DitDahA1Layers, DitDahA
     if parameter.enableInterrupts then backend.io.interrupts.get :<= io.interrupts.get
     if parameter.pmpEntries != 0 then frontend.io.pmp.get :<= backend.io.pmp.get
     backend.io.instruction :<>= frontend.io.output
+    frontend.io.backendIdle.foreach(_ := backend.io.idle.get)
     if parameter.iCacheBytes != 0 then frontend.io.invalidate.get := backend.io.invalidate.get
     frontend.io.redirect := backend.io.redirect
     frontend.io.redirectPc := backend.io.redirectPc

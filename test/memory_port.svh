@@ -12,6 +12,7 @@ typedef struct packed {
   logic scEligible;
   logic [2:0] refillSize;
   logic [1:0] cacheOperation;
+  logic [1:0] pbmt;
 } request_t;
 typedef struct packed { logic [63:0] data; logic fault; logic [7:0] tag; logic last; } response_t;
 interface memory_port;
@@ -24,8 +25,14 @@ endinterface
 `else
 `define DEBUG_PORT(P, B)
 `endif
+`ifdef PBMT
+`define PBMT_PORT(P, B) .P``_request_bits_pbmt(B.request.pbmt),
+`else
+`define PBMT_PORT(P, B)
+`endif
 `define PORT(P, B) \
   `DEBUG_PORT(P, B) \
+  `PBMT_PORT(P, B) \
   .P``_request_ready(B.request_ready), .P``_request_valid(B.request_valid), \
   .P``_request_bits_address(B.request.address), .P``_request_bits_data(B.request.data), \
   .P``_request_bits_size(B.request.size), .P``_request_bits_mask(B.request.mask), \

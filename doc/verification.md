@@ -30,6 +30,7 @@ External software and model runs record their actual versions and inputs; unavai
 | `make check` | Parameter, region and serialization contracts | Command status and diagnostics |
 | `make verify-simulation` | Scalar and multicore RTL simulation | `result/verify`, `result/multicore` |
 | `make verify-software` | Freestanding console and integer programs | `result/software` |
+| `make verify-supervisor-memory` | Page attributes, maintenance, pointer masking and 1/2/16-hart software | `result/supervisor-memory` |
 | `make verify-jtag` | JTAG transport and DMI crossing simulation/formal | `result/jtag-signoff` |
 | `make verify-signoff` | Complete hardware campaign, including external debug and platform software | `result/` |
 | `make verify-width-software` | Same loaded software across 1–3 issue and 1/2/16 harts | `result/software/widths` |

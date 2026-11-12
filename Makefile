@@ -109,6 +109,33 @@ verify-signoff: verify-debug-core verify-jtag verify-debug-module verify-debug-s
 	$(MAKE) verify-cache-configuration
 	$(MAKE) verify-shared-cache
 	$(MAKE) verify-translation-context SOFTWARE_CONFIG=$(SHARED_OUTPUT)/software/w3-h16/input.json
+	$(MAKE) verify-supervisor-memory
+
+SUPERVISOR_MEMORY_OUTPUT ?= result/supervisor-memory
+SUPERVISOR_MEMORY_CASES = pbmt_nc_device pbmt_io_device pbmt_nc_atomic pbmt_io_atomic pbmt_nc_integer_stream pbmt_io_integer_stream svinval_context svinval_asid svinval_working_set pointer_pmm0_prv0_mxr0_tagaa pointer_pmm2_prv0_mxr0_tagaa pointer_pmm2_prv0_mxr1_tagaa pointer_pmm2_prv1_mxr0_tagaa pointer_pmm2_prv3_mxr0_tagaa pointer_pmm2_prv0_mxr0_tagab pointer_pmm2_prv0_mxr0_tag0 pointer_order_prv0_fiom00 pointer_order_prv0_fiom01 pointer_order_prv0_fiom10 pointer_order_prv0_fiom11 pointer_order_prv1_fiom00 pointer_order_prv1_fiom10
+SUPERVISOR_MEMORY_CASES += sv39_high_fetch pointer_cbo_fault $(foreach kind,success missing pmp,pointer_sv39_misaligned_$(kind) $(foreach bits,32 64,pointer_floating_sv39_$(bits)_misaligned_$(kind)))
+SUPERVISOR_MEMORY_CASES += pbmt_io_fetch_success pbmt_io_fetch_fault pointer_user_select
+SUPERVISOR_MEMORY_ARGS = --svpbmt --svnapot --svinval --ssnpm --no-m --width 64 --pmp-entries 16 --issue-width 3 --load-queue-entries 2 --fabric-read-slots 2 --floating-point-bits 64 --scalar Zicbom --misaligned --tlb-entries 4 --i-tlb-entries 4 --d-tlb-entries 4 --asid-bits 4 --icache-bytes 8192 --burst-refill --dcache-bytes 8192 --dcache-ways 2 --dcache-refill-bytes 64 --dcache-writeback --l2-cache-bytes 131072
+.PHONY: verify-supervisor-memory
+verify-supervisor-memory:
+	python3 test/verify.py $(SUPERVISOR_MEMORY_ARGS) $(foreach name,$(SUPERVISOR_MEMORY_CASES),--case $(name)) --output $(SUPERVISOR_MEMORY_OUTPUT)/native
+	python3 test/verify.py $(SUPERVISOR_MEMORY_ARGS) --compressed $(foreach name,pbmt_nc_integer_stream pbmt_io_integer_stream pbmt_io_fetch_success pbmt_io_fetch_fault compressed_boundary,--case $(name)) --output $(SUPERVISOR_MEMORY_OUTPUT)/compressed
+	python3 test/formal.py --rtl $(SUPERVISOR_MEMORY_OUTPUT)/compressed/irq-pmp16-axi64/rtl --output $(SUPERVISOR_MEMORY_OUTPUT)/compressed-formal --modules Pmp --jobs $(FORMAL_JOBS)
+	python3 test/formal.py --rtl $(SUPERVISOR_MEMORY_OUTPUT)/native/irq-pmp16-axi64/rtl --output $(SUPERVISOR_MEMORY_OUTPUT)/formal --modules IntegerDecode FloatingCsr SupervisorCsr SupervisorExecute Translation Axi ReadQueue --jobs $(FORMAL_JOBS)
+	python3 test/verify.py --ssnpm --svinval --misaligned --no-m --width 64 --pmp-entries 0 --case pointer_pmm2_prv0_mxr0_tagaa --case pointer_pmm2_prv0_mxr1_tagaa --case pointer_order_prv0_fiom00 $(foreach prv,0 1 3,$(foreach tvm,0 1,--case svinval_p$(prv)_tvm$(tvm))) --output $(SUPERVISOR_MEMORY_OUTPUT)/bare
+	python3 test/formal.py --rtl $(SUPERVISOR_MEMORY_OUTPUT)/bare/irq-axi64/rtl --output $(SUPERVISOR_MEMORY_OUTPUT)/bare-formal --modules LsuFragments SupervisorCsr SupervisorExecute IntegerDecode --jobs $(FORMAL_JOBS)
+	for count in 1 2 16; do \
+		image=$(SUPERVISOR_MEMORY_OUTPUT)/software/harts$$count; mkdir -p $$image; \
+		python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); d=d.get("parameters",d); h=int(sys.argv[2]); e=0 if h==1 else 2 if h==2 else 4; \
+d.update(hartCount=h, issueWidth=min(h,3), enableM=False, enableA=True, enableC=False, enableCounters=False, hpmCounters=0, enableSstc=False, enableJtag=False, \
+enableSupervisorMode=True, enableUserMode=True, enableInterrupts=True, virtualAddressBits=39, floatingPointBits=64, enableMisaligned=True, \
+enableSvinval=True, enableSvpbmt=True, enableSvnapot=True, enableSsnpm=True, enableZicbom=True, tlbEntries=e, iTlbEntries=e, dTlbEntries=e, asidBits=4 if e else 0, \
+axiDataBits=64, iCacheBytes=8192 if e else 0, dCacheBytes=8192 if e else 0, dCacheWays=2 if h==2 else 1, dCacheWriteback=bool(e), \
+enableBurstRefill=bool(e), dCacheRefillBytes=64 if e else 8, l2CacheBytes=131072 if h==16 else 0, loadQueueEntries=2, fabricReadSlots=2); \
+next(r for r in d["memoryRegions"] if int(r["base"])==int(d["resetVector"]) and r["writable"] and r["executable"])["size"]=str(1048576 if h==16 else 524288); json.dump(d,open(sys.argv[3],"w"))' $(SOFTWARE_CONFIG) $$count $$image/source.json && \
+		python3 scripts/build_software.py --config $$image/source.json --program software/tests/virtual_memory.S --isa rv64iafd --scalar Zicbom --harts $$count --expected-interrupt 3 --console-base 0x10000000 --output $$image && \
+		python3 test/verify.py --elf $$image/software.elf --config $$image/input.json --output $$image/verification --software-transactions $$(((count==16 ? 16384 : 8192)*count)) --jobs $(SOFTWARE_JOBS) || exit $$?; \
+	done
 
 MEMORY_OUTPUT ?= result/memory-contracts
 CBO_CASES = cbo_clean cbo_inval cbo_flush cbo_clean_readonly cbo_inval_readonly cbo_flush_readonly cbo_clean_device cbo_inval_device cbo_flush_device cbo_clean_denied cbo_inval_denied cbo_flush_denied cbo_zero

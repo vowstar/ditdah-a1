@@ -17,7 +17,7 @@ from types import SimpleNamespace
 
 from contracts import verify as verify_contracts, verify_storage, backend_control_signals, axi_cache_attributes, atomic_translation_entries
 from floating import FLOATING_FEATURES, FLOATING_ENCODINGS, floating_decode
-from model import SCALAR_ENCODINGS, is_mop, BITMANIP_ENCODINGS, ATOMIC_OPERATIONS, ExclusiveMonitor, Fault, LocalInterrupts, Model, MASK, atomic_value, cache_block_allowed, compressed_instruction, integer_value, pmp_allowed, sv39_walk, fragment_ranges, signed
+from model import SCALAR_ENCODINGS, is_mop, BITMANIP_ENCODINGS, ATOMIC_OPERATIONS, ExclusiveMonitor, Fault, LocalInterrupts, Model, MASK, atomic_value, cache_block_allowed, compressed_instruction, integer_value, pmp_allowed, pointer_address, sv39_walk, fragment_ranges, signed
 from programs import cases, multicore_cases, platform_program, load_fault_program, store_buffering_program
 
 
@@ -250,6 +250,9 @@ def compile_tb(rtl, directory, width, pa, top='core_tb', source=None, extra_file
 '''
         else:
             feedback = ''
+        io_wait = f'''    if ({fetch}.translation_response_valid && {fetch}.translation_response_bits_pbmt == 2 && !{fetch}.translation_response_ready) begin
+      {prefix}$display("IO_FETCH_WAIT %016h %02h %01h", {fetch}.packet_pc, {fetch}.packet_tag, {backend}.idle); end
+''' if parameters.get('enableSvpbmt') else ''
         observers.append(f'''  assign architectural_fetch_busy[{hart}] = !{fetch}.request_ready;
   assign architectural_fetch_pc[{hart}] = {fetch}.packet_pc;
   always @(posedge clock) if (!reset) begin
@@ -264,6 +267,7 @@ def compile_tb(rtl, directory, width, pa, top='core_tb', source=None, extra_file
     if ({fetch}.cancel) begin {prefix}$display("ARCH_CANCEL %016h %01h %016h %02h %016h", {order},
       {early}, {issued}_pc, {issued}_tag, {backend}.redirectPc); end
 {feedback}
+{io_wait}
   end''')
         translated = parameters.get('virtualAddressBits') == 39
         dual = parameters.get('loadQueueEntries', 1) == 2
@@ -306,13 +310,13 @@ def compile_tb(rtl, directory, width, pa, top='core_tb', source=None, extra_file
             for port in range(2):
                 observers.append(f'''  always @(posedge clock) if (!reset) begin
     if ({translation}.ports_{port}_request_valid && {translation}.ports_{port}_request_ready) begin
-      {prefix}$display("TRANSLATE_REQUEST {port} %016h %01h %01h %01h %016h %01h %01h %01h{ ' %01h' if parameters.get('enableZicbom') else ''}", {translation}.ports_{port}_request_bits_address,
+      {prefix}$display("TRANSLATE_REQUEST {port} %016h %01h %01h %01h %016h %01h %01h %01h{ ' %01h' if parameters.get('enableZicbom') else ''}{' %01h' if parameters.get('enableSvpbmt') else ''}", {translation}.ports_{port}_request_bits_address,
         {translation}.ports_{port}_request_bits_privilege, {translation}.ports_{port}_request_bits_fetch, {translation}.ports_{port}_request_bits_write,
-        {translation}.state_satp, {translation}.state_sum, {translation}.state_mxr, {translation}.ports_{port}_request_bits_atomic{f', {translation}.ports_{port}_request_bits_management' if parameters.get('enableZicbom') else ''});
+        {translation}.state_satp, {translation}.state_sum, {translation}.state_mxr, {translation}.ports_{port}_request_bits_atomic{f', {translation}.ports_{port}_request_bits_management' if parameters.get('enableZicbom') else ''}{f', {translation}.state_pbmte' if parameters.get('enableSvpbmt') else ''});
     end
     if ({translation}.ports_{port}_response_valid && {translation}.ports_{port}_response_ready) begin
-      {prefix}$display("TRANSLATE_RESPONSE {port} %016h %01h %016h", {translation}.ports_{port}_response_bits_address,
-        {translation}.ports_{port}_response_bits_fault, {translation}.ports_{port}_response_bits_cause);
+      {prefix}$display("TRANSLATE_RESPONSE {port} %016h %01h %016h{' %01h' if parameters.get('enableSvpbmt') else ''}", {translation}.ports_{port}_response_bits_address,
+        {translation}.ports_{port}_response_bits_fault, {translation}.ports_{port}_response_bits_cause{f', {translation}.ports_{port}_response_bits_pbmt' if parameters.get('enableSvpbmt') else ''});
     end
   end''')
             observers.append(f'''  always @(posedge clock) if (!reset) begin
@@ -333,11 +337,11 @@ def compile_tb(rtl, directory, width, pa, top='core_tb', source=None, extra_file
             invalid_address = cache + ('.probeRequest_address' if writeback else '.probe_request_bits_address')
             observers.append(f'''  always @(posedge clock) if (!reset) begin
     if ({core}_request_valid && {core}_request_ready) begin
-      {prefix}$display("ARCH_DATA_REQUEST %s %016h %0d %016h %02h %01h %01h",
+      {prefix}$display("ARCH_DATA_REQUEST %s %016h %0d %016h %02h %01h %01h{' %01h' if parameters.get('enableSvpbmt') else ''}",
         {core}_request_bits_cacheOperation == 3 ? "management" : {core}_request_bits_atomic ? "atomic" : ({core}_request_bits_write ? "write" : "read"),
         {core}_request_bits_address, 1 << {core}_request_bits_size,
         {core}_request_bits_write ? {core}_request_bits_data & access_mask({core}_request_bits_size) : 64'b0,
-        {core}_request_bits_tag, {core}_request_bits_privileged, {core}_request_bits_refillSize);
+        {core}_request_bits_tag, {core}_request_bits_privileged, {core}_request_bits_refillSize{f', {core}_request_bits_pbmt' if parameters.get('enableSvpbmt') else ''});
     end
 ''' + (f'''    if ({invalidate}) $display("INVALIDATE {hart} %016h %0d", {invalid_address}, cycles);
 ''' if top == 'core_tb' and parameters.get('dCacheRefillBytes', 8) == 64 else '') + (f'''    if ({sample}.sampleValid) begin
@@ -430,9 +434,11 @@ def compile_tb(rtl, directory, width, pa, top='core_tb', source=None, extra_file
         coherent = ' || '.join('(' + (f"request.address >= 64'd{int(r['base'])} && " if int(r['base']) else '') +
                               f"request.address < 64'd{int(r['base']) + int(r['size'])})"
                                for r in parameters['memoryRegions'] if r.get('dataCacheable') and r['readable'] and not r['device']) if writeback else "1'b0"
+        local = (f"(request.address >= 64'd{int(local_base)} && request.address < 64'd{int(local_base) + 65536})"
+                 if local_base is not None and parameters.get('enableSvpbmt') else "1'b0")
         bindings.append(f'''function automatic bit exclusive_request(input core_request_t request);
-    return request.cacheOperation != 0 || ({coherent or "1'b0"}) || request.write || request.atomic || (request.size > 3 && !(request.size == 6 &&
-      (request.fetch ? {int(parameters.get('enableBurstRefill', False))} : {int(parameters.get('dCacheRefillBytes') == 64)}))) || {devices};
+    return request.cacheOperation != 0 || ({coherent or "1'b0"}) || {local} || request.write || request.atomic || (request.size > 3 && !(request.size == 6 &&
+      (request.fetch ? {int(parameters.get('enableBurstRefill', False))} : {int(parameters.get('dCacheRefillBytes') == 64)}))) || request.pbmt == 2 || (request.pbmt == 0 && ({devices}));
   endfunction''')
         names = re.findall(r'\bDitDahA1Core\s+(\w+)\s*\(', (rtl / 'DitDahA1.sv').read_text())
         assert names == [f'core_{h}' for h in range(harts)], names
@@ -447,6 +453,7 @@ def compile_tb(rtl, directory, width, pa, top='core_tb', source=None, extra_file
                         bindings.append(f'assign {channel}_{field}[{index}] = {physical}_{channel}_{field};')
                     for field in (('cacheOperation', 'address', 'data', 'size', 'mask', 'tag', 'write', 'fetch', 'atomic', 'atomicOperation', 'scEligible', 'privileged', 'refillSize') if channel == 'request' else ('data', 'fault', 'tag', 'last')):
                         bindings.append(f'assign {channel}s[{index}].{field} = {physical}_{channel}_bits_{field};')
+                bindings.append(f'assign requests[{index}].pbmt = ' + (f'{physical}_request_bits_pbmt;' if parameters.get('enableSvpbmt') else "2'b0;"))
             if interrupts:
                 ports += [f'.interrupts_{hart}_{name}(irq_by_hart[{hart}][{index}]),'
                           for index, name in enumerate(('software', 'timer', 'external'))]
@@ -527,6 +534,7 @@ def compile_tb(rtl, directory, width, pa, top='core_tb', source=None, extra_file
          *(['-DSOFTWARE'] if software else []),
          *(['-DENABLE_DEBUG', '-I' + str(Path('test').resolve())] if parameters.get('enableJtag') else []),
          *(['-DENABLE_FLOATING'] if parameters.get('floatingPointBits') else []),
+         *(['-DPBMT'] if parameters.get('enableSvpbmt') else []),
          *([f'-DMEMORY_BYTES={software["memoryBytes"]}', f'-DTIME_TICK_CYCLES={software["timeTickCycles"]}'] if software else []),
          '--Mdir', str((directory / 'obj').resolve()), *files, *extra_files, source]
     binary, stamp = (directory / 'obj' / ('V' + top)).resolve(), directory / 'compile-inputs.json'
@@ -1157,6 +1165,10 @@ def check_writeback_guards(lines, config, program, name):
             dirty = int(events[index].split()[3], 16)
             mask = 1 << (8 * ((dirty & -dirty).bit_length() - 1))
         mutations.append((label, index, field, mask))
+    release = next((i for i, line in enumerate(events) if line.startswith('REQUEST ') and line.split()[6] == '2'), None)
+    if release is not None:
+        privilege = next(i for i in range(release + 1, len(events)) if events[i].startswith('ACCESS_PRIVILEGE '))
+        mutations.append(('releasePrivilege', privilege, 1, 1, 'Accepted access privilege differs from architectural context'))
     return check_event_guards(lines, config, program, name, mutations)
 
 
@@ -1184,7 +1196,7 @@ def translation_maintenance(trace):
     instruction = trace[2]
     funct3, address = (instruction >> 12) & 7, instruction >> 20
     write = instruction & 127 == 0x73 and funct3 in (1, 2, 3, 5, 6, 7) and (funct3 & 3 == 1 or (instruction >> 15) & 31)
-    return not trace[7] and (instruction & 0xfe007fff == 0x12000073 or write and
+    return not trace[7] and (instruction & 0xfe007fff in (0x12000073, 0x16000073) or write and
         (address == 0x180 or 0x3a0 <= address <= 0x3ae or 0x3b0 <= address <= 0x3ef))
 
 
@@ -1195,7 +1207,7 @@ def maintain_translation_history(trace, config, model, history):
     instruction = trace[2]
     cached = any(config.get(key) for key in ('tlbEntries', 'iTlbEntries', 'dTlbEntries'))
     precise = cached and any(config.get(key) for key in ('asidBits', 'iTlbEntries', 'dTlbEntries'))
-    if instruction & 0xfe007fff == 0x12000073 and precise:
+    if instruction & 0xfe007fff in (0x12000073, 0x16000073) and precise:
         rs1, rs2 = instruction >> 15 & 31, instruction >> 20 & 31
         address, asid = model.registers[rs1], model.registers[rs2] & ((1 << config.get('asidBits', 0)) - 1)
         canonical = address >> 39 == ((1 << 25) - 1 if address >> 38 & 1 else 0)
@@ -1228,7 +1240,8 @@ def check_translation_result(walk, result, config, model, history):
                 raise StopIteration
             assert not permitted_table_read(config, model, address), 'Permitted PTE omitted physical service'
             raise Fault(5, address)
-        assert entry[0] == address, 'PTE address differs from independent walk'
+        cached_napot = not walk['reads'] and config.get('enableSvnapot') and candidate[-1][1] >> 63
+        assert entry[0] == address or cached_napot and entry == candidate[-1] and entry[0] >> 7 == address >> 7, 'PTE address differs from independent walk'
         if entry[2]:
             raise Fault(5, address)
         return entry[1]
@@ -1244,15 +1257,19 @@ def check_translation_result(walk, result, config, model, history):
         reads = iter(candidate)
         expected, fault, cause = walk['address'], False, 0
         try:
-            expected = sv39_walk(walk['address'], walk['kind'], walk['privilege'], origin_satp, walk['status'], lambda address: read_pte(address, reads))
+            expected = sv39_walk(walk['address'], walk['kind'], walk['privilege'], origin_satp, walk['status'], lambda address: read_pte(address, reads),
+                                 svpbmt=config.get('enableSvpbmt', False), pbmte=bool(walk.get('pbmte')),
+                                 svnapot=config.get('enableSvnapot', False))
         except StopIteration:
             continue
         except Fault as error:
             fault, cause = True, error.cause
-        matches |= result == (expected, fault, cause) and next(reads, None) is None
+        memory_type = (candidate[-1][1] >> 61) & 3 if paged and candidate and not fault else 0
+        expected_result = (expected, fault, cause) + ((memory_type,) if config.get('enableSvpbmt') else ())
+        matches |= result == expected_result and next(reads, None) is None
         admitted = config.get('tlbEntries') or config.get('iTlbEntries' if walk['port'] == 0 else 'dTlbEntries') or walk['port'] == 1 and atomic_translation_entries(config) and walk.get('atomic', False)
         if admitted and paged and walk['reads'] and not fault and not (walk.get('stale') or walk.get('cancelled')):
-            bits = 12 + 9 * (3 - len(walk['reads']))
+            bits = 16 if walk['reads'][-1][1] >> 63 else 12 + 9 * (3 - len(walk['reads']))
             entry = walk['satp'], walk['address'] >> bits, bits, tuple(walk['reads']), walk['port']
             if entry not in history:
                 history.append(entry)
@@ -1262,6 +1279,7 @@ def check_translation_result(walk, result, config, model, history):
 
 def check_core_translations(lines, config, program, expected_requests):
     model, walks, request, architectural = Model(config, program.memory, program.faults), [None, None], None, []
+    memory_types = [0, 0]
     walker = None
     history = []
     parents = {}
@@ -1273,14 +1291,16 @@ def check_core_translations(lines, config, program, expected_requests):
             del parents[int(fields[1], 16)]
         elif fields[:1] == ['TRANSLATE_REQUEST']:
             port, address, privilege, fetch, write, satp, sum_enabled, mxr, atomic = (int(value, 16) for value in fields[1:10])
-            management = int(fields[10], 16) if len(fields) > 10 else 0
+            management = int(fields[10], 16) if config.get('enableZicbom') else 0
+            pbmte = int(fields[10 + bool(config.get('enableZicbom'))], 16) if config.get('enableSvpbmt') else 0
+            assert pbmte == bool(config.get('enableSvpbmt') and model.csrs[0x30a] >> 62 & 1), 'Translation PBMTE differs from architectural control'
             assert port in (0, 1) and walks[port] is None, 'Overlapping Core translation port'
             assert port != 0 or not atomic, 'Instruction translation is atomic'
             if port == 1 and atomic_translation_entries(config):
                 candidates = [raw for virtual, raw in parents.values() if virtual == address]
                 assert candidates and all(bool(atomic) == (raw & 127 == 47) for raw in candidates), 'Translation atomic class differs from live parent'
             walks[port] = dict(port=port, address=address, privilege=privilege, kind='management' if management else 'fetch' if fetch else 'write' if write else 'read',
-                        satp=satp, status=(sum_enabled << 18) | (mxr << 19), atomic=atomic, reads=[], acceptedHistory=tuple(history))
+                        satp=satp, status=(sum_enabled << 18) | (mxr << 19), pbmte=pbmte, atomic=atomic, reads=[], acceptedHistory=tuple(history))
         elif fields[:1] == ['ARCH_CANCEL'] and walks[0]:
             walks[0]['cancelled'] = True
         elif fields[:1] == ['WALK_REQUEST']:
@@ -1298,14 +1318,18 @@ def check_core_translations(lines, config, program, expected_requests):
             check_translation_result(walk, None, config, model, history)
             request = None
         elif fields[:1] == ['TRANSLATE_RESPONSE']:
-            port, physical, fault, cause = (int(value, 16) for value in fields[1:])
+            port, physical, fault, cause = (int(value, 16) for value in fields[1:5])
             assert port in (0, 1) and walks[port] and (request is None or request[2] != port), 'Unowned Core translation response'
             walk = walks[port]
-            check_translation_result(walk, (physical, fault, cause), config, model, history)
+            result = (physical, fault, cause) + ((int(fields[5], 16),) if config.get('enableSvpbmt') else ())
+            check_translation_result(walk, result, config, model, history)
+            memory_types[port] = int(fields[5], 16) if config.get('enableSvpbmt') else 0
             walks[port] = None
             if walker == port:
                 walker = None
         elif fields[:1] == ['ARCH_DATA_REQUEST']:
+            if config.get('enableSvpbmt'):
+                assert int(fields[8], 16) == memory_types[1], 'LSU lost its independently checked leaf type'
             architectural.append((fields[1], int(fields[2], 16), int(fields[3]), int(fields[4], 16)))
         elif fields[:1] == ['IRQ']:
             model.set_interrupts(int(fields[1], 16))
@@ -1545,6 +1569,10 @@ def compare(binary, directory, config, transport='axi', selected=()):
                         raise AssertionError('Line oracle accepted an unauthorized range')
                 cache_report = checked.get('dataCache')
                 translation_report = checked.get('translation')
+                if name == 'pbmt_io_integer_stream':
+                    assert translation_report.get('ioBusyWaits', 0), 'IO translation never waited for older backend work'
+                if name in ('pbmt_io_fetch_success', 'pbmt_io_fetch_fault'):
+                    assert translation_report.get('ioLoadWaits', 0), 'IO translation never waited for its older load'
                 shared_report = checked.get('sharedCache')
                 if name == 'sv39_reuse':
                     assert translation_report['pteReads'] == (3 if config.get('tlbEntries') else 99), 'Repeated page walk count'
@@ -1738,6 +1766,7 @@ def check_multicore(lines, config, program, name, atomic_metadata=False, softwar
     observed_data = data_cache or translated or tracked_lsu
     implicit, walkers = [None] * harts, [None] * harts
     walks = [[None, None] for _ in range(harts)]
+    memory_types = [[0, 0] for _ in range(harts)]
     translation_history = [[] for _ in range(harts)]
     translation_counts = Counter()
     fetch_privileges, retired_privileges = [3] * harts, [3] * harts
@@ -1820,11 +1849,11 @@ def check_multicore(lines, config, program, name, atomic_metadata=False, softwar
     for model in models:
         model.external_access = no_service
 
-    def ordinary(event):
+    def ordinary(event, memory_type=0):
         line = event[2] == 64 and (config.get('enableBurstRefill') if event[0] == 'fetch' else config.get('dCacheRefillBytes') == 64)
-        return not (writeback and cacheable(event[1], 1)) and event[0] in ('read', 'fetch') and (event[2] <= 8 or line) and not any(
+        return memory_type != 2 and not (writeback and cacheable(event[1], 1)) and event[0] in ('read', 'fetch') and (event[2] <= 8 or line) and (memory_type == 1 or not any(
             region['device'] and int(region['base']) <= event[1] < int(region['base']) + int(region['size'])
-            for region in config['memoryRegions'])
+            for region in config['memoryRegions']))
 
     def read_started(source):
         nonlocal read_peak, read_serial, line_peak
@@ -1945,7 +1974,8 @@ def check_multicore(lines, config, program, name, atomic_metadata=False, softwar
             sample = translations.popleft()
             assert sample[:5] == (address, 'write' if kind == 'atomic' else kind, privilege,
                                   models[hart].csrs[0x180], models[hart].csrs[0x300] & ((1 << 18) | (1 << 19))), 'Translation sampling context differs'
-            physical, fault, cause = sample[5:]
+            physical, fault, cause = sample[5:8]
+            models[hart].translation_pbmt = sample[8]
             if fault:
                 raise Fault(cause, address)
             return physical
@@ -2153,7 +2183,7 @@ def check_multicore(lines, config, program, name, atomic_metadata=False, softwar
             continue
         if fields[:1] == ['HART']:
             hart, fields = int(fields[1]), fields[2:]
-        elif harts == 1 and fields and fields[0] in ('ATOMIC_ACCEPT', 'LSU_REQUEST', 'LSU_RESPONSE', 'LSU_CANCEL', 'SOURCE', 'REQUEST', 'ACCESS_PRIVILEGE', 'ATOMIC', 'BUS', 'READ', 'LINE_BEAT', 'WRITE', 'INTERFERE', 'RESPONSE', 'FETCH', 'IRQ', 'TRACE', 'FETCH_RETIRE', 'ARCH_REQUEST', 'ARCH_FETCH', 'ARCH_CANCEL', 'LOCAL_REQUEST', 'LOCAL_RESPONSE', 'ARCH_DATA_REQUEST', 'ARCH_DATA_RESPONSE', 'CACHE_SAMPLE', 'CACHE_STORE', 'WRITEBACK_REQUEST', 'WRITEBACK_RESPONSE', 'TRANSLATE_REQUEST', 'TRANSLATE_RESPONSE', 'WALK_REQUEST', 'WALK_RESPONSE', 'PREDICT_CLEAR', 'PREDICT_UPDATE', 'BRANCH_RESOLVE', 'RECOVERY'):
+        elif harts == 1 and fields and fields[0] in ('ATOMIC_ACCEPT', 'LSU_REQUEST', 'LSU_RESPONSE', 'LSU_CANCEL', 'SOURCE', 'REQUEST', 'ACCESS_PRIVILEGE', 'ATOMIC', 'BUS', 'READ', 'LINE_BEAT', 'WRITE', 'INTERFERE', 'RESPONSE', 'FETCH', 'IRQ', 'TRACE', 'FETCH_RETIRE', 'ARCH_REQUEST', 'ARCH_FETCH', 'ARCH_CANCEL', 'IO_FETCH_WAIT', 'LOCAL_REQUEST', 'LOCAL_RESPONSE', 'ARCH_DATA_REQUEST', 'ARCH_DATA_RESPONSE', 'CACHE_SAMPLE', 'CACHE_STORE', 'WRITEBACK_REQUEST', 'WRITEBACK_RESPONSE', 'TRANSLATE_REQUEST', 'TRANSLATE_RESPONSE', 'WALK_REQUEST', 'WALK_RESPONSE', 'PREDICT_CLEAR', 'PREDICT_UPDATE', 'BRANCH_RESOLVE', 'RECOVERY'):
             hart = 0
         else:
             continue
@@ -2176,6 +2206,8 @@ def check_multicore(lines, config, program, name, atomic_metadata=False, softwar
             assert source % 2 == client, 'Source disagrees with client'
         physical_source = source
         if dual:
+            if kind in ('LOCAL_REQUEST', 'LOCAL_RESPONSE'):
+                transport_tag = int(fields[5 if kind == 'LOCAL_REQUEST' else 3], 16)
             candidates = [key for key in owners if key[0] == source]
             source = (source, transport_tag) if transport_tag is not None else candidates[0] if len(candidates) == 1 else (source, None)
         if explicit_source is None and (kind in ('WRITEBACK_REQUEST', 'WRITEBACK_RESPONSE') or kind == 'BUS' and fields[1] == 'writeback'):
@@ -2231,7 +2263,7 @@ def check_multicore(lines, config, program, name, atomic_metadata=False, softwar
                 concurrent['instructionCancelDuringDataService'] += int(any(owner['event'][0] == 'fetch' for owner in local) and
                     any(owner['event'][0] != 'fetch' for owner in local))
             continue
-        assert kind in ('ATOMIC_ACCEPT', 'LSU_REQUEST', 'LSU_RESPONSE', 'LSU_CANCEL', 'REQUEST', 'ACCESS_PRIVILEGE', 'ATOMIC', 'BUS', 'READ', 'LINE_BEAT', 'WRITE', 'INTERFERE', 'RESPONSE', 'FETCH', 'IRQ', 'TRACE', 'LOCAL_REQUEST', 'LOCAL_RESPONSE', 'ARCH_DATA_REQUEST', 'ARCH_DATA_RESPONSE', 'CACHE_SAMPLE', 'CACHE_STORE', 'WRITEBACK_REQUEST', 'WRITEBACK_RESPONSE', 'TRANSLATE_REQUEST', 'TRANSLATE_RESPONSE', 'WALK_REQUEST', 'WALK_RESPONSE'), 'Unknown hart event'
+        assert kind in ('ATOMIC_ACCEPT', 'LSU_REQUEST', 'LSU_RESPONSE', 'LSU_CANCEL', 'REQUEST', 'ACCESS_PRIVILEGE', 'ATOMIC', 'BUS', 'READ', 'LINE_BEAT', 'WRITE', 'INTERFERE', 'RESPONSE', 'FETCH', 'IRQ', 'TRACE', 'IO_FETCH_WAIT', 'LOCAL_REQUEST', 'LOCAL_RESPONSE', 'ARCH_DATA_REQUEST', 'ARCH_DATA_RESPONSE', 'CACHE_SAMPLE', 'CACHE_STORE', 'WRITEBACK_REQUEST', 'WRITEBACK_RESPONSE', 'TRANSLATE_REQUEST', 'TRANSLATE_RESPONSE', 'WALK_REQUEST', 'WALK_RESPONSE'), 'Unknown hart event'
         if kind == 'ATOMIC_ACCEPT':
             pc, word, address, size, fault, tag, slot = [int(value, 10 if index == 3 else 16) for index, value in enumerate(fields[1:])]
             assert config.get('enableA', True) and not fault and word & 127 == 47 and size in (4, 8), 'Invalid accepted atomic instruction'
@@ -2243,7 +2275,12 @@ def check_multicore(lines, config, program, name, atomic_metadata=False, softwar
             access = dict(tag=tag, pc=pc, fetchTag=fetch_tag, instruction=instruction)
             if fragmented or atomic_context:
                 address, input_fault = (int(value, 16) for value in fields[5:])
-                access.update(address=address, inputFault=input_fault)
+                raw_address = address
+                mask_enabled = models[hart].pointer_mask()
+                mask_virtual = bool(models[hart].csrs.get(0x180, 0) >> 60)
+                address = pointer_address(address, mask_enabled, mask_virtual)
+                access.update(address=address, rawAddress=raw_address, maskEnabled=mask_enabled,
+                              maskVirtual=mask_virtual, inputFault=input_fault)
             if fragmented:
                 packet = instruction_packets[hart].get(fetch_tag)
                 assert packet == (pc, instruction) or packet == (pc, None) and input_fault and instruction == 0, 'LSU parent lacks its sampled instruction'
@@ -2278,22 +2315,29 @@ def check_multicore(lines, config, program, name, atomic_metadata=False, softwar
             concurrent['faultCancel'] += int(younger is not None and bool(mask & (1 << younger['tag'])) and not (responding and response_tag == younger['tag']))
         elif kind == 'LSU_CANCEL':
             pass
+        elif kind == 'IO_FETCH_WAIT':
+            translation_counts['ioWaits'] += 1
+            translation_counts['ioBusyWaits'] += not int(fields[3], 16)
+            translation_counts['ioLoadWaits'] += any(not parent.get('done') and parent['instruction'] & 127 in (3, 7) for parent in lsu_order[hart])
         elif kind == 'TRANSLATE_REQUEST':
             port, address, privilege, fetch, write, satp, sum_enabled, mxr, atomic = (int(value, 16) for value in fields[1:10])
-            management = int(fields[10], 16) if len(fields) > 10 else 0
+            management = int(fields[10], 16) if config.get('enableZicbom') else 0
+            pbmte = int(fields[10 + bool(config.get('enableZicbom'))], 16) if config.get('enableSvpbmt') else 0
             assert translated and port in (0, 1) and walks[hart][port] is None, 'Overlapping translation port ownership'
             assert port != 0 or fetch and not write and not atomic and not management, 'Instruction translation changed its access class'
             assert privilege == (retired_privileges[hart] if port == 0 else models[hart].data_privilege()), 'Translation effective privilege'
             assert (satp, sum_enabled, mxr) == (models[hart].csrs[0x180], bool(models[hart].csrs[0x300] & (1 << 18)), bool(models[hart].csrs[0x300] & (1 << 19))), 'Translation context snapshot'
+            assert pbmte == bool(config.get('enableSvpbmt') and models[hart].csrs[0x30a] >> 62 & 1), 'Translation PBMTE differs from architectural control'
             walks[hart][port] = dict(port=port, address=address, privilege=privilege, kind='management' if management else 'fetch' if fetch else 'write' if write else 'read',
-                               satp=satp, status=(sum_enabled << 18) | (mxr << 19), atomic=atomic, reads=[], acceptedHistory=tuple(translation_history[hart]))
+                               satp=satp, status=(sum_enabled << 18) | (mxr << 19), pbmte=pbmte, atomic=atomic, reads=[], acceptedHistory=tuple(translation_history[hart]))
             if atomic_context and port == 1 and not fragmented:
                 candidates = [parent for parent in lsu_order[hart] if not parent.get('done') and not parent['inputFault'] and 'event' not in parent and parent['address'] == address]
                 assert candidates and all(bool(atomic) == (parent['instruction'] & 127 == 47) for parent in candidates), 'Translation atomic class differs from live parent'
             if fragmented and port == 1:
                 candidates = [parent for parent in lsu_order[hart] if not parent.get('done') and 'event' not in parent and
                               not parent['inputFault'] and sum(part['event'][2] for part in parent.get('parts', [])) < parent['width'] and
-                              (parent['address'] + (0 if parent.get('block') else sum(part['event'][2] for part in parent.get('parts', [])))) & MASK == address and
+                              pointer_address(parent['address'] + (0 if parent.get('block') else sum(part['event'][2] for part in parent.get('parts', []))),
+                                              parent['maskEnabled'], parent['maskVirtual']) == address and
                               (not parent.get('block') or not parent['translations']) and
                               not any(part['expected'][1] for part in parent.get('parts', []))]
                 assert len(candidates) == 1, 'Translation lacks a unique live child parent'
@@ -2304,16 +2348,19 @@ def check_multicore(lines, config, program, name, atomic_metadata=False, softwar
                 walks[hart][port]['parent'] = candidates[0]
             translation_counts['requests'] += 1
         elif kind == 'TRANSLATE_RESPONSE':
-            port, physical, fault, cause = (int(value, 16) for value in fields[1:])
+            port, physical, fault, cause = (int(value, 16) for value in fields[1:5])
             assert port in (0, 1), 'Unknown translation response port'
             walk = walks[hart][port]
             assert translated and walk and (implicit[hart] is None or implicit[hart]['port'] != port), 'Unowned translation response'
-            translation_counts['hits'] += check_translation_result(walk, (physical, fault, cause), config, models[hart], translation_history[hart])
+            memory_type = int(fields[5], 16) if config.get('enableSvpbmt') else 0
+            result = (physical, fault, cause) + ((memory_type,) if config.get('enableSvpbmt') else ())
+            translation_counts['hits'] += check_translation_result(walk, result, config, models[hart], translation_history[hart])
+            memory_types[hart][port] = memory_type
             if fragmented and port == 0 and not fault and not walk.get('cancelled'):
                 instruction_pages[hart][walk['address'] >> 12] = physical & ~4095
             if fragmented and port == 1:
                 walk['parent']['translations'].append((walk['address'], walk['kind'], walk['privilege'], walk['satp'],
-                    walk['status'], physical, fault, cause))
+                    walk['status'], physical, fault, cause, memory_type))
             translation_counts['responsesDuringPeerWalk'] += int(walkers[hart] is not None and walkers[hart] != port)
             walks[hart][port] = None
             if walkers[hart] == port:
@@ -2347,14 +2394,14 @@ def check_multicore(lines, config, program, name, atomic_metadata=False, softwar
                 index = len(access.get('parts', []))
                 assert index < len(pieces) and not any(part['expected'][1] for part in access.get('parts', [])), 'Child followed terminal fragment'
                 offset, expected_size = pieces[index]
-                virtual = (access['address'] + (0 if block else offset)) & MASK
+                virtual = pointer_address(access['address'] + (0 if block else offset), access['maskEnabled'], access['maskVirtual'])
                 assert not translated or access['translations'] and access['translations'][-1][0] == virtual, 'Child translation sequence differs from parent'
                 physical = access['translations'][-1][5] if translated else virtual
                 assert size == expected_size and address == ((physical & -64) + offset if block else physical), 'Child range differs from parent'
                 assert kind != 'atomic' or size == access['width'], 'Atomic access was split'
                 permission_kind = {2: 'read', 3: 'write'}.get(operation, 'atomic') if kind == 'atomic' else kind
                 assert protection(hart) == access['protection'], 'PMP changed before child authorization'
-                assert pmp_allowed(*access['protection'], address, size, permission_kind, config['physicalAddressBits'], privilege), 'Child escaped sampled PMP permission'
+                assert not config['pmpEntries'] or pmp_allowed(*access['protection'], address, size, permission_kind, config['physicalAddressBits'], privilege), 'Child escaped sampled PMP permission'
                 permission = {'read': 'readable', 'write': 'writable', 'atomic': 'atomic', 'management': 'readable'}[kind]
                 access['pma'] = any(int(r['base']) <= address and address + size <= int(r['base']) + int(r['size']) and r[permission] and
                                     (kind != 'atomic' or r['readable'] and r['writable'] and not r['device']) for r in config['memoryRegions'])
@@ -2365,6 +2412,9 @@ def check_multicore(lines, config, program, name, atomic_metadata=False, softwar
                 if translated:
                     assert len(access['translations']) == (1 if block else len(access.get('parts', [])) + 1) and access['translations'][-1][6] == 0, 'Child lost its authorized translation'
             certificate = int(fields[7], 16)
+            memory_type = int(fields[8], 16) if config.get('enableSvpbmt') else 0
+            assert memory_type == memory_types[hart][1], 'LSU lost its independently checked leaf type'
+            assert not memory_type or certificate == 0, 'Non-cacheable demand enlarged its refill'
             assert certificate in (0, 3, 6), 'Invalid refill certificate'
             if fragmented: assert not access.get('block') and access['address'] % access['width'] == 0 or certificate == 0, 'Split child enlarged refill'
             if certificate:
@@ -2373,11 +2423,11 @@ def check_multicore(lines, config, program, name, atomic_metadata=False, softwar
                 assert size <= config.get('dCacheRefillBytes', 8), 'Refill certificate exceeds configured span'
                 assert protected_read(hart, event[1], event[2]) and protected_read(hart, event[1] & -size, size), 'Refill certificate escaped PMP authorization'
             if tracked_lsu:
-                access.update(event=event, refillSize=certificate)
-                if any(region['device'] and int(region['base']) <= event[1] < int(region['base']) + int(region['size']) for region in config['memoryRegions']):
+                access.update(event=event, refillSize=certificate, memoryType=memory_type)
+                if memory_type == 2 or memory_type == 0 and any(region['device'] and int(region['base']) <= event[1] < int(region['base']) + int(region['size']) for region in config['memoryRegions']):
                     assert lsu_order[hart][0] is access and models[hart].pc == access['pc'], 'Device access preceded architectural authorization'
             else:
-                architectural[hart] = dict(event=event, tag=int(fields[5], 16), refillSize=certificate)
+                architectural[hart] = dict(event=event, tag=int(fields[5], 16), refillSize=certificate, memoryType=memory_type)
             cache_counts[hart]['accepted'] += 1
             cache_counts[hart]['reads'] += int(event[0] == 'read')
         elif kind in ('CACHE_SAMPLE', 'CACHE_STORE'):
@@ -2388,6 +2438,7 @@ def check_multicore(lines, config, program, name, atomic_metadata=False, softwar
             assert not store or writeback, 'Unexpected cache-local store'
             access = data_owner(hart, ('write' if store else 'read', address, size, value if store else 0), tag)
             assert data_cache and access and not access.get('physical') and 'expected' not in access, 'Unowned, duplicate or physically serviced cache sample'
+            assert access.get('memoryType', 0) == 0, 'Non-cacheable access was served by private storage'
             assert size in (1, 2, 4, 8) and address % size == 0 and cacheable(address & ~7), 'Cache sample outside permitted cacheable RAM'
             assert store or access.get('walk') or protected_read(hart, address, size), 'Cache sample bypassed demand protection'
             reserved = sum(address < base + length and base < address + size for base, length in monitor.reservations.values()) if store else 0
@@ -2459,9 +2510,10 @@ def check_multicore(lines, config, program, name, atomic_metadata=False, softwar
             event = fields[1], int(fields[2], 16), int(fields[3]), int(fields[4], 16)
             peers = [owner for owner in owners.values() if owner is not None]
             cache_operation = int(fields[6], 16) if len(fields) > 6 else 0
+            memory_type = int(fields[7], 16) if len(fields) > 7 else 0
             assert cache_operation in (0, 1, 2, 3) and (writeback or cache_operation in (0, 3)), 'Unexpected internal cache operation'
             assert (cache_operation == 3) == (event[0] == 'management') and (cache_operation != 3 or config.get('enableZicbom')), 'Management service class differs from its request'
-            assert not peers or read_slots > 0 and not cache_operation and len(peers) < read_slots and ordinary(event) and all(not owner.get('cacheOperation') and ordinary(owner['event']) for owner in peers), 'Exclusive request overlapped physical service or exceeded read slots'
+            assert not peers or read_slots > 0 and not cache_operation and len(peers) < read_slots and ordinary(event, memory_type) and all(not owner.get('cacheOperation') and ordinary(owner['event'], owner.get('memoryType', 0)) for owner in peers), 'Exclusive request overlapped physical service or exceeded read slots'
             tag = int(fields[5], 16)
             assert not dual or transport_tag == tag, 'Physical context tag disagrees with payload'
             same_client = [owner for key, owner in owners.items() if (key[0] if dual else key) == physical_source]
@@ -2473,8 +2525,13 @@ def check_multicore(lines, config, program, name, atomic_metadata=False, softwar
                 previous['physical'], previous['retry'] = False, True
                 cache_counts[hart]['refillRetries'] += 1
             access = data_owner(hart, event, tag, expanded=True) if observed_data and event[0] != 'fetch' and cache_operation != 2 else None
-            privilege = 1 if access and access.get('walk') else fetch_privileges[hart] if event[0] == 'fetch' else models[hart].data_privilege() if hasattr(models[hart], 'data_privilege') else 3
-            active = dict(hart=hart, event=event, tag=tag, cacheOperation=cache_operation, bus=False, response=None, expectedPrivileged=privilege != 0)
+            expected_type = memory_types[hart][0] if event[0] == 'fetch' else access.get('memoryType', 0) if access else 0
+            assert memory_type == expected_type and (not memory_type or event[2] <= 8), 'Physical service lost its leaf type or widened a non-cacheable access'
+            if event[0] == 'fetch' and memory_type == 2:
+                pcs = (models[hart].pc, (models[hart].pc + 2) & MASK) if config.get('enableC') else (models[hart].pc,)
+                assert event[1] in [models[hart].translate(pc, 'fetch') for pc in pcs] and event[2] <= 4, 'IO fetch preceded architectural authorization'
+            privilege = 3 if cache_operation == 2 else 1 if access and access.get('walk') else fetch_privileges[hart] if event[0] == 'fetch' else models[hart].data_privilege() if hasattr(models[hart], 'data_privilege') else 3
+            active = dict(hart=hart, event=event, tag=tag, cacheOperation=cache_operation, memoryType=memory_type, bus=False, response=None, expectedPrivileged=privilege != 0)
             owners[source] = active
             if fragmented and event[0] == 'fetch':
                 active['instructionEpoch'] = instruction_epoch[hart]
@@ -2844,7 +2901,7 @@ def check_multicore(lines, config, program, name, atomic_metadata=False, softwar
                 cache_counts[hart]['permissionChanges'] += 1
             if wanted[7] and wanted[8] == 7 and wanted[9] == getattr(program, 'dirty_permission', None):
                 cache_counts[hart]['permissionRejected'] += 1
-            if hasattr(program, 'dirty_pte') and wanted[2] == 0x12000073 and cache_counts[hart]['dirtyPteStores']:
+            if hasattr(program, 'dirty_pte') and wanted[2] in (0x12000073, 0x16000073) and cache_counts[hart]['dirtyPteStores']:
                 translation_counts['dirtyPteBarriers'] += 1
             wake[hart] = bool(models[hart].csrs[0x304] & models[hart].read_csr(0x344))
             wake_mask = (wake_mask & ~(1 << hart)) | (int(wake[hart]) << hart)
@@ -3267,6 +3324,7 @@ def load_software(image, config_path):
         Sscounterenw=config.get('enableCounters') and config.get('enableSupervisorMode'),
         Sscofpmf=config.get('enableCounters') and config.get('hpmCounters', 0) > 0 and config.get('enableInterrupts'),
         Sstc=config.get('enableSstc') and config.get('enableCounters') and config.get('enableSupervisorMode') and config.get('enableInterrupts'))
+    counter_features.update({name: config.get('enable' + ('Ssnpm' if name == 'Supm' else name)) for name in ('Svinval', 'Svpbmt', 'Svnapot', 'Ssnpm', 'Supm')})
     assert len(instructions) == len(set(instructions)) and set(instructions) <= SCALAR_ENCODINGS.keys() | FLOATING_ENCODINGS.keys(), 'Unsupported required instruction witnesses'
     assert set(required) <= {'M', 'A', 'C', 'F', 'D', 'Zba', 'Zbb', 'Zbs', 'Zicond', 'Zimop', 'Zcb', 'Zcmop', 'Zfa', 'Zfhmin', 'Zawrs', 'Zicbom', 'Zicboz', 'Zihintpause', 'Zihintntl'} | counter_features.keys() and all((counter_features[name] if name in counter_features else config.get('floatingPointBits', 0) >= (64 if name == 'D' else 32) if name in ('F', 'D') else name in ('Zihintpause', 'Zihintntl') or config.get('enable' + name, name in ('M', 'A'))) for name in required), 'Software requires disabled extensions'
     counter_csrs = manifest.get('requiredCsrs', [])
@@ -3426,6 +3484,7 @@ def check_software_output(lines, config, program, console):
         required.discard('F')
     required_instructions = set(program.software.get('requiredInstructions', []))
     observed, exercised, witnessed, csr_witnesses = set(), set(), set(), set()
+    maintenance = set()
     for line in log_lines(lines):
         fields = line.split()
         hart = int(fields[1]) if fields[:1] == ['HART'] else 0
@@ -3433,6 +3492,8 @@ def check_software_output(lines, config, program, console):
         if fields[:1] != ['TRACE'] or int(fields[8], 16):
             continue
         instruction = int(fields[3], 16)
+        if instruction in (0x18000073, 0x18100073) or instruction & 0xfe007fff == 0x16000073:
+            maintenance.add((hart, instruction & 0xfe007fff if instruction & 0xfe007fff == 0x16000073 else instruction))
         if instruction & 3 != 3:
             observed.add((hart, 'C'))
         canonical = compressed_instruction(instruction, config.get('floatingPointBits') == 64, config) if instruction & 3 != 3 else instruction
@@ -3469,6 +3530,8 @@ def check_software_output(lines, config, program, console):
             observed.add((hart, 'F' if floating[-1] == 32 else 'D'))
     assert {(hart, name) for hart in range(config['hartCount']) for name in required_instructions} <= witnessed, 'Software instruction target did not retire on every hart'
     assert {(hart, address) for hart in range(config['hartCount']) for address in program.software.get('requiredCsrs', [])} <= csr_witnesses, 'Software CSR target did not retire on every hart'
+    if 'Svinval' in program.software.get('requiredExtensions', []):
+        assert {(hart, word) for hart in range(config['hartCount']) for word in (0x16000073, 0x18000073, 0x18100073)} <= maintenance, 'Supervisor maintenance did not retire on every hart'
     assert target not in SCALAR_ENCODINGS or exercised == set(range(config['hartCount'])), 'Architecture test did not retire its scalar target'
     assert target not in FLOATING_ENCODINGS or exercised == set(range(config['hartCount'])), 'Architecture test did not retire its floating target'
     assert {(hart, name) for hart in range(config['hartCount']) for name in required} <= observed, 'Software profile lacks extension retirement on every hart'
@@ -3526,6 +3589,8 @@ def check_translation_guards(lines, config, program):
                  ('lsuAddress', 'ARCH_DATA_REQUEST', 2, 8))
     if atomic_translation_entries(config):
         mutations += (('atomicClass', 'TRANSLATE_REQUEST', 9, 1),)
+    if config.get('enableSvpbmt'):
+        mutations += (('pbmteControl', 'TRANSLATE_REQUEST', 10 + bool(config.get('enableZicbom')), 1),)
     if config.get('tlbEntries'):
         assert cached_response is not None, 'Translation cache was not exercised'
         mutations += (('cachedResult', 'TRANSLATE_RESPONSE', 2, 8),)
@@ -3840,6 +3905,10 @@ def main():
     parser.add_argument('--user-mode', action='store_true')
     parser.add_argument('--supervisor-mode', action='store_true')
     parser.add_argument('--sv39', action='store_true')
+    parser.add_argument('--svinval', action='store_true')
+    parser.add_argument('--svpbmt', action='store_true')
+    parser.add_argument('--svnapot', action='store_true')
+    parser.add_argument('--ssnpm', action='store_true')
     parser.add_argument('--compressed', action='store_true')
     parser.add_argument('--floating-point-bits', type=int, choices=(0, 32, 64), default=0)
     parser.add_argument('--scalar', nargs='+', choices=('Zicond', 'Zimop', 'Zcb', 'Zcmop', 'Zfa', 'Zfhmin', 'Zawrs', 'Zicbom', 'Zicboz'), default=[])
@@ -3894,9 +3963,13 @@ def main():
         parser.error('Select one software matrix dimension')
     if args.software_read_matrix and args.harts != [16]:
         parser.error('Read capacity software requires --harts 16')
+    if matrix and any((args.svpbmt, args.svnapot, args.svinval, args.ssnpm)):
+        parser.error('Configure supervisor memory extensions through --config for software matrices')
+    if args.svpbmt or args.svnapot:
+        args.sv39 = True
     if any((args.tlb_entries, args.i_tlb_entries, args.d_tlb_entries, args.asid_bits)) and not args.sv39:
         parser.error('Translation cache and ASID options require --sv39')
-    if args.sv39:
+    if args.sv39 or args.svinval or args.ssnpm:
         args.supervisor_mode = True
     if args.supervisor_mode:
         args.user_mode = args.interrupts = True
@@ -3952,7 +4025,7 @@ def main():
         directory = args.output / f'{"irq-" if interrupts else ""}{"pmp16-" if entries else ""}axi{width}'
         directory.mkdir(parents=True, exist_ok=True)
         config = configuration(width)
-        config.update(enableMisaligned=args.misaligned, enableCounters=args.counters, hpmCounters=args.hpm_counters, enableSstc=args.sstc)
+        config.update(enableMisaligned=args.misaligned, enableCounters=args.counters, hpmCounters=args.hpm_counters, enableSstc=args.sstc, enableSvinval=args.svinval, enableSvpbmt=args.svpbmt, enableSvnapot=args.svnapot, enableSsnpm=args.ssnpm)
         config.update({'enable' + name: name in args.scalar for name in ('Zicond', 'Zimop', 'Zcb', 'Zcmop', 'Zfa', 'Zfhmin', 'Zawrs', 'Zicbom', 'Zicboz')})
         config.update({'enable' + name: name in args.bitmanip for name in ('Zba', 'Zbb', 'Zbs')})
         config.update(enableM=not args.no_m, enableA=not args.no_a, enableC=args.compressed, floatingPointBits=args.floating_point_bits, l2CacheBytes=args.l2_cache_bytes or 0, issueWidth=args.issue_width, loadQueueEntries=args.load_queue_entries, pmpEntries=entries, enableInterrupts=interrupts, iCacheBytes=args.icache_bytes, dCacheBytes=args.dcache_bytes, dCacheWays=args.dcache_ways, dCacheRefillBytes=args.dcache_refill_bytes, dCacheWriteback=args.dcache_writeback, tlbEntries=args.tlb_entries, iTlbEntries=args.i_tlb_entries, dTlbEntries=args.d_tlb_entries, asidBits=args.asid_bits, enableBurstRefill=args.burst_refill, enableBranchPrediction=args.branch_prediction, branchPredictorEntries=args.branch_predictor_entries)
@@ -4024,7 +4097,7 @@ def main():
             directory.mkdir(parents=True, exist_ok=True)
             config = dict(configuration(width), enableM=not args.no_m, enableA=not args.no_a, l2CacheBytes=args.l2_cache_bytes or 0, issueWidth=args.issue_width, loadQueueEntries=args.load_queue_entries, hartCount=harts, pmpEntries=entries, enableInterrupts=interrupts, iCacheBytes=args.icache_bytes, dCacheBytes=args.dcache_bytes, dCacheWays=args.dcache_ways, dCacheRefillBytes=args.dcache_refill_bytes, dCacheWriteback=args.dcache_writeback, tlbEntries=args.tlb_entries, iTlbEntries=args.i_tlb_entries, dTlbEntries=args.d_tlb_entries, asidBits=args.asid_bits, enableBurstRefill=args.burst_refill, enableBranchPrediction=args.branch_prediction, branchPredictorEntries=args.branch_predictor_entries)
             config.update({'enable' + name: name in args.scalar for name in ('Zicond', 'Zimop', 'Zcb', 'Zcmop', 'Zfa', 'Zfhmin', 'Zawrs', 'Zicbom', 'Zicboz')})
-            config.update(enableMisaligned=args.misaligned, enableCounters=args.counters, hpmCounters=args.hpm_counters, enableSstc=args.sstc)
+            config.update(enableMisaligned=args.misaligned, enableCounters=args.counters, hpmCounters=args.hpm_counters, enableSstc=args.sstc, enableSvinval=args.svinval, enableSvpbmt=args.svpbmt, enableSvnapot=args.svnapot, enableSsnpm=args.ssnpm)
             config.update(enableC=args.compressed, floatingPointBits=args.floating_point_bits, **{'enable' + name: name in args.bitmanip for name in ('Zba', 'Zbb', 'Zbs')})
             if args.fabric_read_slots is not None:
                 config['fabricReadSlots'] = args.fabric_read_slots
